@@ -16,19 +16,19 @@ import unittest
 from pathlib import Path
 
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-from loom_mil_compiler.driver_builder import DriverContext
-from loom_mil_compiler.driver_components import (
+from loom_exporter.paths import CONVERTERS, driver_dir
+from loom_exporter.driver_builder import DriverContext
+from loom_exporter.driver_components import (
     CALLER, MASK, POSITION, ArgmaxEpilogue, ChainStage, CtcGreedyBuilder, CtcGreedyEpilogue,
     DriverInputs, ExportConstants, ModularChain,
     FlowMatchingSampler, LuaFragment, ModularChainBuilder, MonolithicCall, MultiPhaseDriverBuilder,
     PrefillArgmaxBuilder, PrefillDecodeLoop, RawLuaDriver, SubgraphCallComponent, caller_input,
     parse_run_subgraph_calls,
 )
-from loom_mil_compiler.driver_ir import (
+from loom_exporter.driver_ir import (
     BinOp, DriverIRError, Len, Lit, LuaCodegen, OutputRef, SubgraphCall, Var,
 )
-from loom_mil_compiler.spec_protocol import LinkError
+from loom_exporter.spec_protocol import LinkError
 
 
 def _topo(inputs=(), output="out"):
@@ -554,7 +554,7 @@ class TestTheAdoptedDriverIsActuallyChecked(unittest.TestCase):
         round-trip. The adoption is not dead code -- it is how the *next* family arrives -- so it is
         exercised against a real driver reassembled from a peeled family's own fragments, which is the
         closest thing to the shape it was written for."""
-        from loom_mil_compiler.matcha_export import TTSMatchaExportConfig
+        from loom_exporter.matcha_export import TTSMatchaExportConfig
 
         config = TTSMatchaExportConfig(model_dir="/unused", output_path="/unused",
                                        architecture="matcha")
@@ -644,8 +644,8 @@ class TestExternalTopologies(unittest.TestCase):
         need it. What is NOT asserted here is that every driver call resolves: that needs the real
         checkpoint, and `test_e2e_{kokoro,styletts2}_mil_lua_driver.cpp` are the authority, since they
         now load exactly one GGUF and a missing topology fails them outright."""
-        from loom_mil_compiler.kokoro_export import TTSKokoroExportConfig
-        from loom_mil_compiler.styletts2_export import TTSStyleTTS2ExportConfig
+        from loom_exporter.kokoro_export import TTSKokoroExportConfig
+        from loom_exporter.styletts2_export import TTSStyleTTS2ExportConfig
 
         kokoro = TTSKokoroExportConfig(model_dir="/u", output_path="/u", architecture="kokoro")
         styletts2 = TTSStyleTTS2ExportConfig(checkpoint_path="/u", output_path="/u",
@@ -731,7 +731,7 @@ class TestPeeledMatcha(unittest.TestCase):
         )
 
     def _config(self):
-        from loom_mil_compiler.matcha_export import TTSMatchaExportConfig
+        from loom_exporter.matcha_export import TTSMatchaExportConfig
 
         return TTSMatchaExportConfig(model_dir="/unused", output_path="/unused", architecture="matcha")
 
@@ -808,13 +808,13 @@ class TestPeeledSupertonic(unittest.TestCase):
     component, the component API would have been shaped by one example."""
 
     def _config(self):
-        from loom_mil_compiler.supertonic_export import TTSSupertonicExportConfig
+        from loom_exporter.supertonic_export import TTSSupertonicExportConfig
 
         return TTSSupertonicExportConfig(model_dir="/unused", output_path="/unused",
                                          architecture="supertonic")
 
     def _matcha_config(self):
-        from loom_mil_compiler.matcha_export import TTSMatchaExportConfig
+        from loom_exporter.matcha_export import TTSMatchaExportConfig
 
         return TTSMatchaExportConfig(model_dir="/unused", output_path="/unused", architecture="matcha")
 
@@ -841,7 +841,7 @@ class TestPeeledVits(unittest.TestCase):
     not."""
 
     def _components(self):
-        from loom_mil_compiler.vits_export import TTSVitsExportConfig
+        from loom_exporter.vits_export import TTSVitsExportConfig
 
         return TTSVitsExportConfig(checkpoint_path="/unused", output_path="/unused",
                                    architecture="vits").driver_components()
@@ -850,7 +850,7 @@ class TestPeeledVits(unittest.TestCase):
         self.assertEqual([c for c in self._components() if isinstance(c, FlowMatchingSampler)], [])
 
     def test_it_introduces_no_new_component_class(self):
-        from loom_mil_compiler.matcha_export import TTSMatchaExportConfig
+        from loom_exporter.matcha_export import TTSMatchaExportConfig
 
         matcha = {type(c) for c in TTSMatchaExportConfig(
             model_dir="/unused", output_path="/unused", architecture="matcha").driver_components()}
@@ -884,7 +884,7 @@ class TestPeeledKokoro(unittest.TestCase):
     their own call sites for exactly this reason."""
 
     def _components(self):
-        from loom_mil_compiler.kokoro_export import TTSKokoroExportConfig
+        from loom_exporter.kokoro_export import TTSKokoroExportConfig
 
         return TTSKokoroExportConfig(model_dir="/unused", output_path="/unused",
                                      architecture="kokoro").driver_components()
@@ -928,7 +928,7 @@ class TestPeeledStyleTTS2(unittest.TestCase):
     entry function at all. It is checked all the same, by the fragment that contains it (P4.0.18)."""
 
     def _config(self):
-        from loom_mil_compiler.styletts2_export import TTSStyleTTS2ExportConfig
+        from loom_exporter.styletts2_export import TTSStyleTTS2ExportConfig
 
         return TTSStyleTTS2ExportConfig(checkpoint_path="/unused", output_path="/unused",
                                         architecture="styletts2")
@@ -949,7 +949,7 @@ class TestPeeledStyleTTS2(unittest.TestCase):
         topology, the exact input set, and the line to open. `estimators()` declared the same two links
         by hand until P4.0.18; a parse of the real text cannot go stale against it, which is why the
         declaration went and this did not."""
-        from loom_mil_compiler.driver_components import RunSubgraphCall
+        from loom_exporter.driver_components import RunSubgraphCall
 
         fragment = next(f for f in self._fragments() if f.path.name == "02_style_diffusion.lua")
         calls = [s for s in fragment.sub_specs() if isinstance(s, RunSubgraphCall)]
@@ -964,7 +964,7 @@ class TestPeeledStyleTTS2(unittest.TestCase):
         StyleTTS2 calls them) but because the library is where hand-written Lua functions live at all.
         Being there is what makes "only StyleTTS2 ships them" a checked property instead of a
         side effect of which file they happened to be pasted into."""
-        from loom_mil_compiler.lua_library import LuaLibrary, resolve
+        from loom_exporter.lua_library import LuaLibrary, resolve
 
         library = next(c for c in self._config().driver_components() if isinstance(c, LuaLibrary))
         emitted = {fn.name for fn in resolve(library.uses)}
@@ -972,8 +972,8 @@ class TestPeeledStyleTTS2(unittest.TestCase):
                          {"karras_schedule", "adpm2_step", "adpm2_sample"})
 
     def test_no_other_family_ships_the_adpm2_sampler(self):
-        from loom_mil_compiler.lua_library import LuaLibrary, resolve
-        from loom_mil_compiler.matcha_export import TTSMatchaExportConfig
+        from loom_exporter.lua_library import LuaLibrary, resolve
+        from loom_exporter.matcha_export import TTSMatchaExportConfig
 
         matcha = TTSMatchaExportConfig(model_dir="/u", output_path="/u", architecture="matcha")
         library = next(c for c in matcha.driver_components() if isinstance(c, LuaLibrary))
@@ -995,7 +995,7 @@ class TestComputedCallSitesAreDeclared(unittest.TestCase):
         return [c for c in config.driver_components() if isinstance(c, LuaFragment)]
 
     def _kokoro(self):
-        from loom_mil_compiler.kokoro_export import TTSKokoroExportConfig
+        from loom_exporter.kokoro_export import TTSKokoroExportConfig
 
         return TTSKokoroExportConfig(model_dir="/unused", output_path="/unused",
                                      architecture="kokoro")
@@ -1022,11 +1022,11 @@ class TestComputedCallSitesAreDeclared(unittest.TestCase):
     def test_every_computed_call_site_in_every_family_is_declared(self):
         """The completeness direction, over the real fragments: a call site nobody declared is a
         topology nothing checks, which is exactly the state D.2 ends."""
-        from loom_mil_compiler.kokoro_export import TTSKokoroExportConfig
-        from loom_mil_compiler.matcha_export import TTSMatchaExportConfig
-        from loom_mil_compiler.styletts2_export import TTSStyleTTS2ExportConfig
-        from loom_mil_compiler.supertonic_export import TTSSupertonicExportConfig
-        from loom_mil_compiler.vits_export import TTSVitsExportConfig
+        from loom_exporter.kokoro_export import TTSKokoroExportConfig
+        from loom_exporter.matcha_export import TTSMatchaExportConfig
+        from loom_exporter.styletts2_export import TTSStyleTTS2ExportConfig
+        from loom_exporter.supertonic_export import TTSSupertonicExportConfig
+        from loom_exporter.vits_export import TTSVitsExportConfig
 
         configs = (
             self._kokoro(),
@@ -1045,7 +1045,7 @@ class TestComputedCallSitesAreDeclared(unittest.TestCase):
     def test_a_declaration_whose_call_site_was_renamed_is_reported(self):
         """The direction that turns a declaration into decoration: the Lua changes, the declaration
         stays, and it keeps checking a topology nothing runs."""
-        from loom_mil_compiler.driver_components import HelperCall
+        from loom_exporter.driver_components import HelperCall
 
         fragment = next(f for f in self._fragments(self._kokoro())
                         if f.path.name == "04_f0n.lua")
@@ -1064,7 +1064,7 @@ class TestComputedCallSitesAreDeclared(unittest.TestCase):
     def test_the_declarations_fail_the_link_check_against_a_topology_set_without_them(self):
         """End to end through the protocol rather than through `expand()`: this is the message a real
         export produces, and it is the ordinary `TopologyName` one."""
-        from loom_mil_compiler.spec_protocol import LinkChecker
+        from loom_exporter.spec_protocol import LinkChecker
 
         fragment = next(f for f in self._fragments(self._kokoro())
                         if f.path.name == "03_frame_expansion.lua")
@@ -1078,8 +1078,8 @@ class TestComputedCallSitesAreDeclared(unittest.TestCase):
         self.assertIn("via run_bi_lstm", message)
 
     def test_an_unknown_helper_is_reported_rather_than_expanding_to_nothing(self):
-        from loom_mil_compiler.driver_components import HelperCall
-        from loom_mil_compiler.spec_protocol import check_links
+        from loom_exporter.driver_components import HelperCall
+        from loom_exporter.spec_protocol import check_links
 
         with self.assertRaises(LinkError) as raised:
             check_links(HelperCall("array_sum", "whatever"))
@@ -1095,7 +1095,7 @@ class TestPeeledDriverCoverage(unittest.TestCase):
         BiLSTMs, each of which was four topologies (`_h_fwd`/`_c_fwd`/`_h_bwd`/`_c_bwd`) and is now two
         (`_fwd`/`_bwd`) -- 6 x 2 fewer. The halved ones were never a second computation the model
         needed, only a second declaration of the same one."""
-        from loom_mil_compiler.kokoro_export import TTSKokoroExportConfig
+        from loom_exporter.kokoro_export import TTSKokoroExportConfig
 
         config = TTSKokoroExportConfig(model_dir="/unused", output_path="/unused",
                                        architecture="kokoro")

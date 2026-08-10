@@ -2,7 +2,7 @@
 
 ## Context
 
-The MIL-based exporter (`tools/loom_mil_compiler/`) works and, as of this writing, has successfully
+The MIL-based exporter (`loom_exporter/`) works and, as of this writing, has successfully
 retrofitted all 8 target models (Qwen3, Conformer-CTC, Parakeet RNNT/TDT, VITS, Matcha, StyleTTS2,
 Kokoro, SupertonicTTS) end to end. But two real pain points surfaced while doing that retrofit work,
 and were discussed at length before writing this document (full transcript in
@@ -71,7 +71,7 @@ it obvious, for a given MIL op, exactly which guard conditions select which `ggm
 that logic is interleaved with side-effecting shape resolution code, making the decision criteria hard
 to audit at a glance.
 
-**Evidence**: `tools/loom_mil_compiler/exporter.py` is 4,440 lines; a `grep` for `if op_type ==`/`if op.op_type ==` turns up ~50+ direct branches plus nested special cases (e.g. lines 3565–3653 for `conv`/`conv_transpose`, 3356–3526 for the norm family).
+**Evidence**: `loom_exporter/exporter.py` is 4,440 lines; a `grep` for `if op_type ==`/`if op.op_type ==` turns up ~50+ direct branches plus nested special cases (e.g. lines 3565–3653 for `conv`/`conv_transpose`, 3356–3526 for the norm family).
 
 ### 2. Centralize shape/const resolution into one pre-pass
 
@@ -109,7 +109,7 @@ Python loop; they all rely on the loop being expressed through an explicit highe
 construct (or, like today's Lua driver, on the host language doing the looping around a traced
 single-step graph).
 
-**Evidence**: `tools/loom_mil_compiler/recurrent.py` lines 38–49 (the GRU `while_loop` finding);
+**Evidence**: `loom_exporter/recurrent.py` lines 38–49 (the GRU `while_loop` finding);
 `exporter.py` lines 1804/1815 (`while_loop`/`cond` handling already present, currently mostly unused).
 
 ### 4. Generalize a second family template for iterative-refinement models
@@ -126,7 +126,7 @@ driver (`export_styletts2_mil.py`: 340 lines, `export_kokoro_mil.py`: 503 lines)
 would shrink these the same way `ModularExportSpec` shrunk `export_qwen3_mil.py` to 28 lines, while
 still conceding true one-offs (custom vocoders, spline ops) as bespoke.
 
-**Evidence**: `tools/loom_mil_compiler/modular_export.py`'s `ModularExportSpec`
+**Evidence**: `loom_exporter/modular_export.py`'s `ModularExportSpec`
 (`prefix_attr`/`repeated_attr`/`suffix_attrs`/`aux_attr`) is the existing precedent for this pattern.
 This item is also a natural continuation of `BACKLOG.md`'s already-tracked, deliberately-deferred
 "Phase 2 (fully automatic prefix/suffix boundary discovery)" note under "Modular-export blueprint" —

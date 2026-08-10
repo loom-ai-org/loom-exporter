@@ -17,7 +17,7 @@ def _write_and_read_back(hparams):
     """Writes a minimal GGUF carrying `hparams` and returns `{key: value}` for its `loom.*` KVs."""
     from gguf import GGUFReader
 
-    from loom_mil_compiler.exporter import LoomGGUFExporter
+    from loom_exporter.exporter import LoomGGUFExporter
 
     with tempfile.TemporaryDirectory() as tmp:
         out = str(Path(tmp) / "hparams.gguf")
@@ -63,7 +63,7 @@ class TestEveryFamilyCarriesHparamsThrough(unittest.TestCase):
     no other symptom."""
 
     def test_backend_kwargs_carries_hparams(self):
-        from loom_mil_compiler.registry import default_registry
+        from loom_exporter.registry import default_registry
 
         checked = []
         for task, entry in sorted(default_registry()._entries.items()):

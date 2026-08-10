@@ -50,7 +50,7 @@ Trace-friendliness patches needed (same category as every prior MIL export in th
     EQUAL/SELECT/REDUCE_SUM ops is simpler and safer than trying to special-case every read site.
   - `nn.functional.pad(..., mode="replicate")` (every `ConvNextBlock` in this model pads this way before
     its depthwise conv) needed a NEW exporter capability, not a wrapper-level patch: see
-    `tools/loom_mil_compiler/exporter.py`'s `pad` translation, `mode == "replicate"` branch -- ggml has no
+    `loom_exporter/exporter.py`'s `pad` translation, `mode == "replicate"` branch -- ggml has no
     native replicate/edge-pad kernel (unlike PAD_1D/PAD_1D_REFLECT), so it's composed purely from
     already-existing primitives (VIEW the boundary column, REPEAT-broadcast it, CONCAT it on) rather than
     adding a new C++ op. Verified standalone (both symmetric and causal-only padding) via a small isolated

@@ -648,7 +648,7 @@ def _op_loom_broadcast_to(self, op, ctx):
 def _op_loom_spline(self, op, ctx):
     nodes, resolve, func_name = ctx.nodes, ctx.resolve, ctx.func_name
     # VITS's rational-quadratic spline inverse (StochasticDurationPredictor's ConvFlow) --
-    # see tools/loom_mil_compiler/vits_spline_op.py's module docstring for why this is a
+    # see loom_exporter/vits_spline_op.py's module docstring for why this is a
     # custom torch/MIL op at all (the real implementation's boolean-mask tensor indexing
     # can't be traced correctly). Composes down to the already-verified RQ_SPLINE_INVERSE
     # ggml primitive (src/ops/primitives_spline.cpp), which expects `inputs` [n_tokens],
@@ -2488,6 +2488,6 @@ def _op_random(self, op, ctx):
 
 
 if __name__ == "__main__":
-    # `python3 -m loom_mil_compiler.topology_ops` prints the whole rewrite table -- the audit view this
+    # `python3 -m loom_exporter.topology_ops` prints the whole rewrite table -- the audit view this
     # refactor exists to make possible.
     print(describe_topology_rules())

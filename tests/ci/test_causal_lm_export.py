@@ -16,15 +16,15 @@ from pathlib import Path
 
 import pytest
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-import loom_mil_compiler  # noqa: E402  registers the "loom" backend + torch-frontend patches
-from loom_mil_compiler.decomposition import Flattened, Modular  # noqa: E402
-from loom_mil_compiler.causal_lm_export import (  # noqa: E402
+from loom_exporter.paths import CONVERTERS, driver_dir
+import loom_exporter  # noqa: E402  registers the "loom" backend + torch-frontend patches
+from loom_exporter.decomposition import Flattened, Modular  # noqa: E402
+from loom_exporter.causal_lm_export import (  # noqa: E402
     LMCausalModelExportConfig,
 )
-from loom_mil_compiler.modular_export import ModularExportSpec  # noqa: E402
-from loom_mil_compiler.registry import default_registry  # noqa: E402
-from loom_mil_compiler.snapshot_gguf import snapshot  # noqa: E402
+from loom_exporter.modular_export import ModularExportSpec  # noqa: E402
+from loom_exporter.registry import default_registry  # noqa: E402
+from loom_exporter.snapshot_gguf import snapshot  # noqa: E402
 
 LFM2_DIR = Path("/home/flavio/Dev/models/lfm2-350m")
 QWEN3_DIR = Path("/home/flavio/Dev/models/qwen3-0.6b-base")
@@ -113,7 +113,7 @@ def test_the_generic_path_infers_the_tokenizer_the_specific_recognizers_hardcode
     if not model_dir.exists():
         pytest.skip(f"{model_dir} not available locally")
     from transformers import AutoTokenizer
-    from loom_mil_compiler.tokenizer_detect import detect_loom_pre_type, detect_vocab_family
+    from loom_exporter.tokenizer_detect import detect_loom_pre_type, detect_vocab_family
 
     assert detect_vocab_family(str(model_dir)) == "bpe"
     assert detect_loom_pre_type(AutoTokenizer.from_pretrained(str(model_dir))) == expected_pre

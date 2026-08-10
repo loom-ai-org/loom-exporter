@@ -7,7 +7,7 @@ The actual mechanics (load -> trace -> ct.convert -> LoomGGUFExporter) live in
 P3.1/P4.0.3) -- this module is a thin
 CLI/function shim over that class, kept for its existing entry point:
 
-  ~/.venvs/piper/bin/python3 -m tools.loom_mil_compiler.export_hf_causal_lm \\
+  ~/.venvs/piper/bin/python3 -m loom_exporter.export_hf_causal_lm \\
       /path/to/hf/model --architecture lfm2 --output model.gguf
 
 The tokenizer family ("bpe"/"wordpiece"/"sentencepiece_proto") and, for "bpe", the pretokenizer regex

@@ -18,12 +18,12 @@ import torch
 import torch.nn as nn
 
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-from loom_mil_compiler.modular_export import ModularExportSpec, export_modular
-from loom_mil_compiler.spec_protocol import (
+from loom_exporter.paths import CONVERTERS, driver_dir
+from loom_exporter.modular_export import ModularExportSpec, export_modular
+from loom_exporter.spec_protocol import (
     LinkError, dangling_coverage, undeclared_fields,
 )
-from loom_mil_compiler.spec_protocol import check_links
+from loom_exporter.spec_protocol import check_links
 
 
 class _Layer(nn.Module):

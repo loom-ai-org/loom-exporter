@@ -43,6 +43,6 @@ jobs:
       # Its own test covers this too; failing here names the fix in one line.
       - name: Check the generated catalogue is current
         run: |
-          python -m loom_mil_compiler.component_registry
+          python -m loom_exporter.component_registry
           git diff --exit-code docs/DRIVER-COMPONENTS.md \
-            || (echo "docs/DRIVER-COMPONENTS.md is stale -- run python -m loom_mil_compiler.component_registry" && exit 1)
+            || (echo "docs/DRIVER-COMPONENTS.md is stale -- run python -m loom_exporter.component_registry" && exit 1)

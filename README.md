@@ -33,7 +33,7 @@ architecture should cost a Python change rather than a specialized C++ driver.
 
 The task and architecture are detected from the checkpoint; `--task` and `--model` override that, and
 an unrecognised checkpoint gets a candidate list rather than a guess. The registry of what can be
-exported is in [`loom_mil_compiler/registry.py`](loom_mil_compiler/registry.py).
+exported is in [`loom_exporter/registry.py`](loom_exporter/registry.py).
 
 ## Testing
 

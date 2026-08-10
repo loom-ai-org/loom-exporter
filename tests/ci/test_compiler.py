@@ -11,9 +11,9 @@ import sys
 from pathlib import Path
 
 # Import the compiler to trigger the backend registration
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-import loom_mil_compiler
-from loom_mil_compiler.exporter import LoomGGUFExporter
+from loom_exporter.paths import CONVERTERS, driver_dir
+import loom_exporter
+from loom_exporter.exporter import LoomGGUFExporter
 
 class TestLoomMILCompiler(unittest.TestCase):
     def setUp(self):
@@ -52,7 +52,7 @@ class TestLoomMILCompiler(unittest.TestCase):
         )
         
         # 2. Invoke our custom backend to generate the GGUF file
-        backend = loom_mil_compiler.LoomGGUFBackend()
+        backend = loom_exporter.LoomGGUFBackend()
         mlmodel_path = backend(mil_prog, output_path=self.output_path, architecture="simple_test")
         
         self.assertEqual(mlmodel_path, self.output_path)
@@ -133,7 +133,7 @@ class TestLoomMILCompiler(unittest.TestCase):
         prog.functions["main"] = main_func.functions["main"]
 
         # Run conversion to "loom"
-        exporter = loom_mil_compiler.LoomGGUFBackend()
+        exporter = loom_exporter.LoomGGUFBackend()
         exporter(prog, output_path=self.output_path, architecture="multi_modular_test")
 
         self.assertTrue(os.path.exists(self.output_path))
@@ -214,7 +214,7 @@ class TestLoomMILCompiler(unittest.TestCase):
 
         prog.functions["main"] = main_func.functions["main"]
 
-        exporter = loom_mil_compiler.LoomGGUFBackend()
+        exporter = loom_exporter.LoomGGUFBackend()
         exporter(prog, output_path=self.output_path, architecture="multi_output_submodule_test")
 
         reader = GGUFReader(self.output_path)
@@ -246,7 +246,7 @@ class TestLoomMILCompiler(unittest.TestCase):
 
         prog.functions["main"] = main_func.functions["main"]
         
-        backend = loom_mil_compiler.LoomGGUFBackend()
+        backend = loom_exporter.LoomGGUFBackend()
         backend(prog, output_path=self.output_path, flat_namespace=True, architecture="mono_test")
         
         self.assertTrue(os.path.exists(self.output_path))
@@ -279,7 +279,7 @@ class TestLoomMILCompiler(unittest.TestCase):
 
         prog.functions["main"] = main_func.functions["main"]
 
-        backend = loom_mil_compiler.LoomGGUFBackend()
+        backend = loom_exporter.LoomGGUFBackend()
         backend(prog, output_path=self.output_path, architecture="random_test")
 
         reader = GGUFReader(self.output_path)
@@ -299,7 +299,7 @@ class TestLoomMILCompiler(unittest.TestCase):
 
         prog.functions["main"] = main_func.functions["main"]
 
-        backend = loom_mil_compiler.LoomGGUFBackend()
+        backend = loom_exporter.LoomGGUFBackend()
         with self.assertRaises(NotImplementedError) as ctx:
             backend(prog, output_path=self.output_path, flat_namespace=True, architecture="random_test")
         self.assertIn("ggml has no RNG-capable compute op", str(ctx.exception))

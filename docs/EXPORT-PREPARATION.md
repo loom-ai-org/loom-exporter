@@ -123,7 +123,7 @@ Two qualifications worth keeping honest:
   criterion these are model adaptation living in C++. They may be defensible as *task* primitives, the
   same category as a tokenizer or CTC decode — but that should be a recorded decision, not an accident.
 * Vocoders are already on the exporter side: HiFi-GAN and iSTFT are traced graph phases in families
-  7/8/9 and `tools/loom_mil_compiler/istft.py` exists. The "tokenizers and vocoders" exception is
+  7/8/9 and `loom_exporter/istft.py` exists. The "tokenizers and vocoders" exception is
   really just tokenizers.
 
 `include/loom/loom.h` is the artifact keeping the legacy drivers load-bearing: lines 14–24 re-export all
@@ -160,7 +160,7 @@ Eight shapes, not 120 models; two unstarted shapes account for ~36 models.
 
 ### 1.5 The builder substrate already exists and is under-used
 
-`tools/loom_mil_compiler/driver_ir.py` (456 lines) is a real IR, not a string helper:
+`loom_exporter/driver_ir.py` (456 lines) is a real IR, not a string helper:
 
 * expressions — `Var`, `Lit`, `BinOp`, `UnaryOp`, `Len`, `FieldAccess`, `Index`, `Call`, `TableLit`,
   `RawExpr`

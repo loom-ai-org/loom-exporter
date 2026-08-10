@@ -15,7 +15,7 @@ ggml primitive that computes the SAME transform via an unconditional elementwise
 branches for every element, select via a float mask -- no boolean indexing at all), the correct fix is a
 custom torch op that becomes a single OPAQUE node under tracing (never decomposed, so the boolean masking
 inside its eager fallback body never gets traced through), bridged to MIL's `loom_spline` op
-(tools/loom_mil_compiler/dialect.py -- previously-unwired scaffolding from an earlier prototype) via a
+(loom_exporter/dialect.py -- previously-unwired scaffolding from an earlier prototype) via a
 `@register_torch_op` hook. Mirrors the `torch.library.custom_op` precedent already established for the
 older `aten_to_loom` pipeline (tools/convert_generic/toy_llm_module.py's `rope_neox`/`attention`), applied
 here to coremltools' MIL frontend instead.

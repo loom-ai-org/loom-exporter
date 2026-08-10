@@ -10,7 +10,7 @@ checkpoint -- the equivalence claim is about torchaudio's arithmetic, so torchau
 a 450 MB download adds nothing to it. That the CHECKPOINT's own module also matches is checked at export
 time, on every export, by `_replace_mel_frontend`.
 
-Run: ~/.venvs/piper/bin/python3 -m pytest tools/loom_mil_compiler/test_gigaam_export.py
+Run: ~/.venvs/piper/bin/python3 -m pytest tests/ci/test_gigaam_export.py
 """
 import sys
 import types
@@ -21,8 +21,8 @@ import torch
 import torch.nn as nn
 import torchaudio
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-from loom_mil_compiler.gigaam_export import (  # noqa: E402
+from loom_exporter.paths import CONVERTERS, driver_dir
+from loom_exporter.gigaam_export import (  # noqa: E402
     GIGAAM_ENCODER_INPUT_NAMES,
     ASRGigaAMExportConfig,
     _TraceableMelSpectrogram,
@@ -106,7 +106,7 @@ class TestTheSwapIsCheckedAgainstTheModelItReplaces:
             def forward(self, waveform):
                 return super().forward(waveform) * 1.5
 
-        import loom_mil_compiler.gigaam_export as module
+        import loom_exporter.gigaam_export as module
 
         original = module._TraceableMelSpectrogram
         module._TraceableMelSpectrogram = _Wrong
@@ -123,7 +123,7 @@ class TestTheSwapIsCheckedAgainstTheModelItReplaces:
             def forward(self, waveform):
                 return super().forward(waveform)[..., :-1]
 
-        import loom_mil_compiler.gigaam_export as module
+        import loom_exporter.gigaam_export as module
 
         original = module._TraceableMelSpectrogram
         module._TraceableMelSpectrogram = _Shorter
@@ -168,14 +168,14 @@ class TestTheLoaderIsTheOnlyThingThisFamilyChanges:
         """NeMo's `forward(input_signal=, input_signal_length=)` and GigaAM's
         `forward(features=, feature_lengths=)` take the same two tensors. That difference is the whole
         of what the encoder half of the family needed to become loader-independent."""
-        from loom_mil_compiler.nemo_asr_export import ENCODER_INPUT_NAMES
+        from loom_exporter.nemo_asr_export import ENCODER_INPUT_NAMES
 
         wrapper = ASRGigaAMExportConfig(checkpoint="/unused").encoder_wrapper(nn.Identity())
         assert wrapper.input_names == GIGAAM_ENCODER_INPUT_NAMES
         assert wrapper.input_names != ENCODER_INPUT_NAMES
 
     def test_it_shares_the_transducer_familys_driver_rather_than_carrying_one(self):
-        from loom_mil_compiler.parakeet_export import ASRParakeetExportConfig
+        from loom_exporter.parakeet_export import ASRParakeetExportConfig
 
         gigaam = ASRGigaAMExportConfig(checkpoint="/unused")
         parakeet = ASRParakeetExportConfig(checkpoint="/unused.nemo")

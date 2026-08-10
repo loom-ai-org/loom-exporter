@@ -150,7 +150,7 @@ pass is what lets those be deleted with an argument rather than a hope.
 **Sequencing.** This is the one item that can be done incrementally with a hard gate at every step: each
 pass must be output-preserving under `snapshot_gguf.py` + `compare_snapshots.py`, and each one removes
 a guard from `topology_ops.py`'s rule table (which prints itself — `python3 -m
-loom_mil_compiler.topology_ops` — so the shrinkage is directly observable). Suggested order: the two
+loom_exporter.topology_ops` — so the shrinkage is directly observable). Suggested order: the two
 canonicalizers first (`normalize_matmul`, `insert_explicit_broadcasts`), because they are pure
 rewrites with no new ops; then the composite ops; then `annotate_dynamic_shapes`, which is the one that
 interacts with R1.

@@ -16,10 +16,10 @@ import torch
 import sys
 from pathlib import Path
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-import loom_mil_compiler  # noqa: F401 -- registers the "loom" backend + applies torch-frontend patches
+from loom_exporter.paths import CONVERTERS, driver_dir
+import loom_exporter  # noqa: F401 -- registers the "loom" backend + applies torch-frontend patches
 import coremltools as ct
-from loom_mil_compiler.recurrent import build_lstm_cell_topologies
+from loom_exporter.recurrent import build_lstm_cell_topologies
 
 
 def _run_topology(topo: dict, weights: dict, inputs: dict) -> np.ndarray:

@@ -22,13 +22,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-from loom_mil_compiler.paths import CONVERTERS, REPO_ROOT, driver_dir
-from loom_mil_compiler import component_registry as cr
-from loom_mil_compiler.driver_builder import DriverBuilder, DriverComponent, DriverContext
-from loom_mil_compiler.driver_components import (
+from loom_exporter.paths import CONVERTERS, REPO_ROOT, driver_dir
+from loom_exporter import component_registry as cr
+from loom_exporter.driver_builder import DriverBuilder, DriverComponent, DriverContext
+from loom_exporter.driver_components import (
     SYNTHESIZED_BUILDERS, DriverReturn, LuaFragment, ModularChainBuilder, PrefillArgmaxBuilder,
 )
-from loom_mil_compiler.driver_ir import RawBlock
+from loom_exporter.driver_ir import RawBlock
 
 
 def _ctx(**kwargs):
@@ -110,7 +110,7 @@ class TestTheBuilderConsultsIt(unittest.TestCase):
         component = OneOffComponent()
         original = type(component).__module__
         try:
-            type(component).__module__ = "loom_mil_compiler.some_new_family"
+            type(component).__module__ = "loom_exporter.some_new_family"
             with self.assertRaises(KeyError) as raised:
                 _OneComponent(component).build(_ctx())
         finally:
@@ -162,7 +162,7 @@ class TestUsageIsDerived(unittest.TestCase):
         the code that runs rather than about a hand-kept mapping."""
         self.assertIs(SYNTHESIZED_BUILDERS["Flattened"], PrefillArgmaxBuilder)
         self.assertIs(SYNTHESIZED_BUILDERS["Modular"], ModularChainBuilder)
-        source = (REPO_ROOT / "loom_mil_compiler" / "exporter.py").read_text()
+        source = (REPO_ROOT / "loom_exporter" / "exporter.py").read_text()
         self.assertIn('SYNTHESIZED_BUILDERS["Flattened"](', source)
         self.assertIn('SYNTHESIZED_BUILDERS["Modular"](', source)
 
@@ -199,7 +199,7 @@ class TestTheCatalogueIsGenerated(unittest.TestCase):
         current = cr.DOC.read_text()
         self.assertEqual(cr.rendered_doc(current), current,
                          "DRIVER-COMPONENTS.md is stale -- run "
-                         "`python -m loom_mil_compiler.component_registry` to regenerate it")
+                         "`python -m loom_exporter.component_registry` to regenerate it")
 
     def test_the_table_carries_what_a_link_says_when_it_fails(self):
         """Not just the link's type: `ConfigDerived` carries the message template that keeps this

@@ -6,8 +6,8 @@ import unittest
 from pathlib import Path
 
 
-from loom_mil_compiler import paths
-from loom_mil_compiler import tokenizer_detect as td
+from loom_exporter import paths
+from loom_exporter import tokenizer_detect as td
 
 
 class _FakeTokenizer:

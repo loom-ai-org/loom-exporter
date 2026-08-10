@@ -2,7 +2,7 @@
 Torch-frontend robustness patches for coremltools' PyTorch->MIL converter.
 
 Neither patch is model-specific: any HF causal-LM traced through this pipeline wants both, so they're
-applied once at `import loom_mil_compiler` time (see `__init__.py`) rather than re-pasted into every
+applied once at `import loom_exporter` time (see `__init__.py`) rather than re-pasted into every
 export script. Previously duplicated verbatim across export_lfm2_monolithic.py, the now-retired
 export_lfm2_atomic.py, and tools/convert_lfm/make_lfm2_gguf.py (EXPORT-IMPROVEMENT-BACKLOG.md item 1).
 """

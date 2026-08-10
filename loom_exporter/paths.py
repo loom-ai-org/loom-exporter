@@ -2,7 +2,7 @@
 
 Every family whose driver is assembled from hand-written Lua fragments needs to find them, and each
 used to spell that as `Path(__file__).resolve().parent.parent / "convert_kokoro" / "kokoro_driver"` --
-"my package's sibling". That worked while the package lived at `tools/loom_mil_compiler/` and the
+"my package's sibling". That worked while the package lived at `loom_exporter/` and the
 converters at `tools/convert_*/`, and broke the moment the package moved to the repo root, in twelve
 places at once, with the tests computing the same relationship a second time from *their* location.
 
@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-# The repo root: this file is `<root>/loom_mil_compiler/paths.py`.
+# The repo root: this file is `<root>/loom_exporter/paths.py`.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # The pre-MIL per-model converters. They are still here because several of them own something the MIL

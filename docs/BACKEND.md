@@ -61,7 +61,7 @@ used throughout is a **golden structural snapshot diff** over all 12 export scri
 1. Re-run every `export_*.py` against the real local checkpoints, from a pristine `git archive HEAD`
    copy of the repo (so the baseline cannot be contaminated by in-progress edits).
 2. Snapshot each resulting `.gguf` into diffable text with
-   **`tools/loom_mil_compiler/snapshot_gguf.py`** — every metadata KV, each `model.graph_topology.*`
+   **`loom_exporter/snapshot_gguf.py`** — every metadata KV, each `model.graph_topology.*`
    JSON pretty-printed and key-sorted, the embedded `model.driver_script` Lua, and one line per tensor
    (`name / shape / dtype / sha256-of-data`).
 3. Refactor, re-run, re-snapshot, and require a **zero-line diff** (`diff -r` over the two snapshot
@@ -106,7 +106,7 @@ then the identical failure on the identical op with the identical derived expres
 
 `generate_graph_topology`'s 2,000-line `if op_type == "..." / continue` chain is now a table lookup.
 
-- New `tools/loom_mil_compiler/topology_ops.py` holds the table: a `topology_rule(*op_types,
+- New `loom_exporter/topology_ops.py` holds the table: a `topology_rule(*op_types,
   guard=..., when=...)` decorator registers each handler, `lookup_topology_rule(exporter, op)` returns
   the first rule whose op type matches and whose guard accepts, and anything unclaimed still falls
   through to the generic `OP_MAP` path (unchanged).
@@ -119,7 +119,7 @@ then the identical failure on the identical op with the identical derived expres
 
 **Guards.** 37 rules over 37 MIL op types, 7 of them guarded. Most ops have a single unguarded rule; the
 four where the guard genuinely selects *which* ggml mapping applies are split into separate entries,
-which is the point of the exercise. `python3 -m loom_mil_compiler.topology_ops` prints the whole table,
+which is the point of the exercise. `python3 -m loom_exporter.topology_ops` prints the whole table,
 so the decision criteria are readable without tracing branch bodies:
 
 ```
@@ -140,7 +140,7 @@ unsupported rather than silently wrong" rejections are now table entries in thei
 nothing and reaches the generic path — a deliberate route in both cases, and the thing whose loss caused
 both the bug this refactor introduced and the StyleTTS2 regression it later repaired.
 
-`tools/loom_mil_compiler/test_topology_rules.py` pins the table's invariants: no rule may sit behind an
+`loom_exporter/test_topology_rules.py` pins the table's invariants: no rule may sit behind an
 unguarded catch-all for the same op type (silently unreachable), and each guarded family must select the
 composition its `when` text claims.
 
@@ -156,7 +156,7 @@ end of item 2.
 
 **Status:** implemented.
 
-New `tools/loom_mil_compiler/value_facts.py` is now the single place any "what is this Var's
+New `loom_exporter/value_facts.py` is now the single place any "what is this Var's
 compile-time value?" question is answered. It has two layers:
 
 - **Literal statics** — module-level `static_value / static_array / static_scalar / static_ints /
@@ -406,7 +406,7 @@ expressed host-side at all.
 **Status:** implemented for the Euler-CFM sampler family (Matcha + Supertonic); StyleTTS2's ADPM2
 sampler and the VITS/Kokoro duration loops deliberately left bespoke.
 
-New `tools/loom_mil_compiler/iterative_export.py` provides `IterativeRefinementSpec` +
+New `loom_exporter/iterative_export.py` provides `IterativeRefinementSpec` +
 `render_driver`, the analogue of `ModularExportSpec`. A spec declares the six things that actually
 differ between the two models — estimator topology, loop-carried input name, scalar-time input name, the
 per-step-constant inputs, and (at the call site) the state's element count and the `n_tokens` to build at
@@ -486,7 +486,7 @@ implementation, no drift), and `render_driver(..., estimators=[...])` checks cal
 `export_styletts2_mil.py` now declares its ADPM2 loop's `diffusion` call that way and keeps the loop
 hand-written; the emitted GGUF is unchanged, byte for byte, by adding the check.
 
-`tools/loom_mil_compiler/test_iterative_export.py` covers both halves — the emitted Lua's shape, and
+`loom_exporter/test_iterative_export.py` covers both halves — the emitted Lua's shape, and
 every rejection path of the validation.
 
 ---
@@ -581,7 +581,7 @@ third worked example of the pattern, and the first one where "re-derive everythi
 
 **Status:** implemented; all three exports byte-identical to their pre-template baselines.
 
-`tools/loom_mil_compiler/nemo_asr_export.py` holds `NeMoASREncoderSpec` + `EncoderOutput` +
+`loom_exporter/nemo_asr_export.py` holds `NeMoASREncoderSpec` + `EncoderOutput` +
 `export_nemo_asr_encoder`. The three export scripts are now a docstring, a spec, and a call:
 
 ```python
@@ -629,7 +629,7 @@ the diff could only be the template's doing — and snapshot-diffed against a pr
 baseline: `conformer_ctc_small_mil_monolithic`, `parakeet_tdt_encoder_mil_monolithic` and
 `parakeet_rnnt_encoder_mil_monolithic` are **byte-identical**, every metadata KV, the whole topology JSON
 and every tensor digest. The three reference tests still pass at their existing tolerances
-(`0.000164` / `0.000005` / `0.000010`). `tools/loom_mil_compiler/test_nemo_asr_export.py` (13 tests)
+(`0.000164` / `0.000005` / `0.000010`). `loom_exporter/test_nemo_asr_export.py` (13 tests)
 covers the validation paths without needing NeMo or a checkpoint — a fake model reproduces each mismatch
 shape, including the headline "CTC spec pointed at an RNNT checkpoint" case.
 
@@ -637,7 +637,7 @@ shape, including the headline "CTC spec pointed at an RNNT checkpoint" case.
 
 **Status:** implemented (the first of BACKLOG.md's three open follow-ups).
 
-New `tools/loom_mil_compiler/shape_expr.py`. The derivation walk in `_infer_dynamic_dim_expr_uncached`
+New `loom_exporter/shape_expr.py`. The derivation walk in `_infer_dynamic_dim_expr_uncached`
 and every derived value in `value_facts.py` now compose **sympy expressions**, and `render()` turns one
 into text exactly once, where a JSON attribute is emitted. The size of the improvement is easiest to see
 on Conformer-CTC's STFT frame count, which appears in dozens of shape attributes:
@@ -705,7 +705,7 @@ It is also the one that justifies the whole verification approach below: nothing
 failed, and both wrong shapes were still *shapes*.
 
 **Verification — the diff is read, not required to be empty.** This change rewrites every symbolic shape
-attribute by design, so `diff -r` cannot be the gate. New `tools/loom_mil_compiler/compare_snapshots.py`
+attribute by design, so `diff -r` cannot be the gate. New `loom_exporter/compare_snapshots.py`
 walks two snapshot trees in parallel and, for every differing value, evaluates **both** sides at 18
 concrete sequence lengths (odd, even, off-by-one neighbours, and the ends of the declared dynamic range)
 using the same grammar the engine uses; anything that is not numerically equivalent at every probe — or

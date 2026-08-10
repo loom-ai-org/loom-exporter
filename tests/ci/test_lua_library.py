@@ -16,13 +16,13 @@ import unittest
 from pathlib import Path
 
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-from loom_mil_compiler.driver_builder import DriverContext
-from loom_mil_compiler.lua_library import (
+from loom_exporter.paths import CONVERTERS, driver_dir
+from loom_exporter.driver_builder import DriverContext
+from loom_exporter.lua_library import (
     LIBRARY, LUA_DIR, DrivenTopologies, LuaFunction, LuaLibrary, catalogue, drives_mismatches,
     resolve, undeclared_calls, unused_requires,
 )
-from loom_mil_compiler.spec_protocol import LinkError
+from loom_exporter.spec_protocol import LinkError
 
 
 class TestTheManifestMatchesTheLua(unittest.TestCase):
@@ -67,14 +67,14 @@ class TestResolution(unittest.TestCase):
         self.assertIn("no such loom_lua function(s): ['array_summ']", str(raised.exception))
 
     def test_a_bad_declaration_fails_the_link_check(self):
-        from loom_mil_compiler.spec_protocol import check_links
+        from loom_exporter.spec_protocol import check_links
 
         with self.assertRaises(LinkError) as raised:
             check_links(LuaLibrary(uses=("array_summ",)))
         self.assertEqual(
             str(raised.exception),
             "LuaLibrary declares loom_lua function(s) ['array_summ'], which do not exist. The library "
-            "is tools/loom_mil_compiler/lua/, one file per function.",
+            "is loom_exporter/lua/, one file per function.",
         )
 
 
@@ -104,10 +104,10 @@ class TestTheRealFamilies(unittest.TestCase):
     calling one it stopped declaring -- fails here rather than at export time."""
 
     def _configs(self):
-        from loom_mil_compiler.kokoro_export import TTSKokoroExportConfig
-        from loom_mil_compiler.matcha_export import TTSMatchaExportConfig
-        from loom_mil_compiler.styletts2_export import TTSStyleTTS2ExportConfig
-        from loom_mil_compiler.vits_export import TTSVitsExportConfig
+        from loom_exporter.kokoro_export import TTSKokoroExportConfig
+        from loom_exporter.matcha_export import TTSMatchaExportConfig
+        from loom_exporter.styletts2_export import TTSStyleTTS2ExportConfig
+        from loom_exporter.vits_export import TTSVitsExportConfig
 
         return (
             TTSMatchaExportConfig(model_dir="/u", output_path="/u", architecture="matcha"),
@@ -117,7 +117,7 @@ class TestTheRealFamilies(unittest.TestCase):
         )
 
     def test_no_family_declares_a_function_its_driver_never_calls(self):
-        from loom_mil_compiler.driver_components import MultiPhaseDriverBuilder
+        from loom_exporter.driver_components import MultiPhaseDriverBuilder
 
         for config in self._configs():
             components = config.driver_components()
@@ -158,7 +158,7 @@ class TestTheRealFamilies(unittest.TestCase):
         self.assertEqual(drives_mismatches(), {})
 
     def test_a_renamed_suffix_is_caught_in_both_directions(self):
-        import loom_mil_compiler.lua_library as lua_library
+        import loom_exporter.lua_library as lua_library
 
         original = lua_library._FUNCTIONS
         broken = LuaFunction("run_bi_lstm", drives=DrivenTopologies(
@@ -173,7 +173,7 @@ class TestTheRealFamilies(unittest.TestCase):
         self.assertIn("body concatenates '_fwd'", complaints[1])
 
     def test_a_function_that_drives_topologies_without_saying_so_is_reported(self):
-        import loom_mil_compiler.lua_library as lua_library
+        import loom_exporter.lua_library as lua_library
 
         original = lua_library._FUNCTIONS
         try:

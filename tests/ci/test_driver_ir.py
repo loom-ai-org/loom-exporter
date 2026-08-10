@@ -3,7 +3,7 @@ pure Python and only reads plain dict topologies, so these exercise it directly 
 SubgraphCall/Function IR rather than tracing a real model."""
 import unittest
 
-from loom_mil_compiler.driver_ir import (
+from loom_exporter.driver_ir import (
     ArrayLit, BinOp, Call, CallStmt, DriverIRError, FieldAccess, Function, If, Index, IndexAssign,
     Len, Lit, Local, LuaCodegen, NumericFor, OutputRef, RetainedArgmax, Return, SubgraphCall, Var,
     While, check_subgraph_calls, evaluate, validate,

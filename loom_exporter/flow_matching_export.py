@@ -200,7 +200,7 @@ def render_sampler(spec: FlowMatchingSpec) -> str:
         for para in spec.note.strip().splitlines():
             lines.append(f"-- {para.rstrip()}")
     lines += [
-        "-- Generated from FlowMatchingSpec (tools/loom_mil_compiler/flow_matching_export.py):",
+        "-- Generated from FlowMatchingSpec (loom_exporter/flow_matching_export.py):",
         f'--   estimator="{spec.estimator}", carried="{spec.carried_input}", '
         f'time="{spec.time_input}", fixed=[{fixed}]',
         f"local function {spec.func_name}(length, n_elems, n_steps, step_inputs)",

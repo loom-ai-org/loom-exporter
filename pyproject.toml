@@ -27,13 +27,13 @@ dependencies = [
 test = ["pytest>=7"]
 
 [project.scripts]
-loom-export = "loom_mil_compiler.main_export:main"
+loom-export = "loom_exporter.main_export:main"
 
 [tool.setuptools]
-packages = ["loom_mil_compiler"]
+packages = ["loom_exporter"]
 
 [tool.pytest.ini_options]
-# The repo root on the path, so `tests/ci/` can `import loom_mil_compiler` while living outside it.
+# The repo root on the path, so `tests/ci/` can `import loom_exporter` while living outside it.
 # The tests used to sit inside the package and reach it by being in the same directory; moving them
 # to tests/ci/ is what makes "which class of test is this" a thing you can see from the path, and this
 # is the one line that costs.
