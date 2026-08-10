@@ -9,7 +9,7 @@
 
 <p align="center"><em>PyTorch checkpoint in, self-describing GGUF out</em></p>
 
-The export pipeline for [loom.cpp](https://github.com/femelo/loom.cpp). It traces a PyTorch model
+The export pipeline for [loom.cpp](https://github.com/loom-ai-org/loom.cpp). It traces a PyTorch model
 through Core ML Tools' MIL, lowers that program to the engine's own primitives, and writes a single
 GGUF carrying the weights, the **graph topologies** as JSON and the **driver script** as embedded Lua.
 The engine then runs that file without knowing anything about the architecture.
@@ -21,9 +21,9 @@ architecture should cost a Python change rather than a specialized C++ driver.
 
 | | |
 |---|---|
-| [**loom.cpp**](https://github.com/femelo/loom.cpp) | the runtime that executes what this produces |
-| [**loom-exporter**](https://github.com/femelo/loom-exporter) | this one — tracing, lowering, driver synthesis |
-| [**loom-py**](https://github.com/femelo/loom-py) | Python bindings to the engine |
+| [**loom.cpp**](https://github.com/loom-ai-org/loom.cpp) | the runtime that executes what this produces |
+| [**loom-exporter**](https://github.com/loom-ai-org/loom-exporter) | this one — tracing, lowering, driver synthesis |
+| [**loom-py**](https://github.com/loom-ai-org/loom-py) | Python bindings to the engine |
 
 ## Exporting
 
@@ -59,7 +59,7 @@ held to. It skips cleanly when the checkpoints are absent.
 | [`docs/LOOM_MIL_CONVERSION.md`](docs/LOOM_MIL_CONVERSION.md) | how a MIL program becomes engine primitives |
 | [`docs/BACKEND.md`](docs/BACKEND.md) | the working log of exporter findings |
 
-The project ledger lives with the engine, in [loom.cpp's `BACKLOG.md`](https://github.com/femelo/loom.cpp/blob/main/BACKLOG.md).
+The project ledger lives with the engine, in [loom.cpp's `BACKLOG.md`](https://github.com/loom-ai-org/loom.cpp/blob/main/BACKLOG.md).
 
 ## Licence
 
