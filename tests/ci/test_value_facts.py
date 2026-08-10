@@ -24,10 +24,10 @@ from coremltools.converters.mil.mil import Var
 import sys
 from pathlib import Path
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-import loom_mil_compiler  # noqa: F401 -- registers the "loom" backend + applies torch-frontend patches
-from loom_mil_compiler.shape_expr import N_TOKENS, as_expr
-from loom_mil_compiler.value_facts import (
+from loom_exporter.paths import CONVERTERS, driver_dir
+import loom_exporter  # noqa: F401 -- registers the "loom" backend + applies torch-frontend patches
+from loom_exporter.shape_expr import N_TOKENS, as_expr
+from loom_exporter.value_facts import (
     ValueFacts, is_const_producer, static_array, static_ints, static_scalar, static_value,
 )
 

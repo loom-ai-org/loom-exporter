@@ -5,7 +5,7 @@ emits something `src/core/symbol_env.cpp` cannot parse (and raises loudly instea
 exactly what `render` produces, and that the assumptions on shape symbols (positive integers) are what
 make the simplifications real rather than cosmetic.
 
-Run: ~/.venvs/piper/bin/python3 -m pytest tools/loom_mil_compiler/test_shape_expr.py
+Run: ~/.venvs/piper/bin/python3 -m pytest tests/ci/test_shape_expr.py
 """
 import re
 import sys
@@ -14,8 +14,8 @@ from pathlib import Path
 import pytest
 import sympy
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-from loom_mil_compiler.shape_expr import (  # noqa: E402
+from loom_exporter.paths import CONVERTERS, driver_dir
+from loom_exporter.shape_expr import (  # noqa: E402
     N_TOKENS,
     UnsupportedShapeExpression,
     as_expr,

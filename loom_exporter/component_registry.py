@@ -27,7 +27,7 @@ So the entries here are not a transcription. Everything in them is checked, in b
 for the shelf, and the shelf is the registry plus the checks, not the file layout. Splitting the module
 into a package would also silently weaken the standing rule: `test_spec_protocol`'s scan walks
 `pkgutil.iter_modules(package.__path__)` and imports each module, so a dataclass defined in
-`driver_components/foo.py` has `__module__ == "loom_mil_compiler.driver_components.foo"`, which the scan
+`driver_components/foo.py` has `__module__ == "loom_exporter.driver_components.foo"`, which the scan
 neither reaches nor reports as unimportable. A directory would therefore have cost a real check to buy a
 cosmetic one, which is the trade this roadmap keeps refusing.
 """
@@ -346,10 +346,11 @@ def unregistered_component_classes() -> List[str]:
     import inspect
     import pkgutil
 
-    # By `__name__`, not by a literal: this package is imported as `loom_mil_compiler` from the tests
-    # (which put `tools/` on the path) and as `tools.loom_mil_compiler` from the CLI, and a scan that
-    # silently found nothing under one of those spellings would report a clean result for the wrong
-    # reason.
+    # By `__name__`, not by a literal. There was a period when this package was importable under two
+    # spellings -- bare from the tests, and `tools.`-prefixed from the CLI -- and a scan that silently
+    # found nothing under one of them would have reported a clean result for the wrong reason. There is
+    # one spelling now, and deriving it rather than writing it down is also what let the package be
+    # renamed without this scan quietly covering nothing.
     package = importlib.import_module(_PACKAGE)
     registry()
     found = []
@@ -576,6 +577,6 @@ def rendered_doc(current: str) -> str:
     return out
 
 
-if __name__ == "__main__":  # `python -m loom_mil_compiler.component_registry` regenerates the doc
+if __name__ == "__main__":  # `python -m loom_exporter.component_registry` regenerates the doc
     DOC.write_text(rendered_doc(DOC.read_text()))
     print(f"regenerated the generated blocks of {DOC}")

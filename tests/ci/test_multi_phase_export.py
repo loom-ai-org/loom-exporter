@@ -11,7 +11,7 @@ The division of labour is the point, and it is not obvious from either side alon
   phase emits shape expressions over a symbol nothing else in the model uses. Wrong, not malformed, and
   no downstream gate looks at it.
 
-Run: ~/.venvs/piper/bin/python3 -m pytest tools/loom_mil_compiler/test_multi_phase_export.py
+Run: ~/.venvs/piper/bin/python3 -m pytest tests/ci/test_multi_phase_export.py
 """
 import sys
 import unittest
@@ -22,12 +22,12 @@ import numpy as np
 import torch.nn as nn
 
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-from loom_mil_compiler.multi_phase_export import (
+from loom_exporter.paths import CONVERTERS, driver_dir
+from loom_exporter.multi_phase_export import (
     BaseMultiPhaseModelExportConfig, ExportPhase, TTSFlowMatchingModelExportConfig,
 )
-from loom_mil_compiler.nemo_asr_export import ASRNemoEncoderExportConfig
-from loom_mil_compiler.spec_protocol import (
+from loom_exporter.nemo_asr_export import ASRNemoEncoderExportConfig
+from loom_exporter.spec_protocol import (
     LinkError, check_links, dangling_coverage, undeclared_fields,
 )
 
@@ -128,7 +128,7 @@ class TestASRRootAxisIsNowADeclaration(unittest.TestCase):
     declaration side"."""
 
     def _config(self, **kw):
-        from loom_mil_compiler.nemo_asr_export import EncoderOutput
+        from loom_exporter.nemo_asr_export import EncoderOutput
 
         return ASRNemoEncoderExportConfig(
             checkpoint="/nonexistent.nemo", output=EncoderOutput.CTC_LOG_PROBS,
@@ -168,7 +168,7 @@ class TestRecurrentPhase(unittest.TestCase):
     def _lstm_phase(self, input_dim=6, hidden=4, bidirectional=True, name="enc_lstm"):
         import torch
 
-        from loom_mil_compiler.multi_phase_export import RecurrentPhase
+        from loom_exporter.multi_phase_export import RecurrentPhase
 
         torch.manual_seed(0)
         lstm = torch.nn.LSTM(input_dim, hidden, batch_first=True, bidirectional=bidirectional)
@@ -216,7 +216,7 @@ class TestRecurrentPhase(unittest.TestCase):
         caller reassemble something the module already states."""
         import torch
 
-        from loom_mil_compiler.multi_phase_export import RecurrentPhase
+        from loom_exporter.multi_phase_export import RecurrentPhase
 
         stacked = torch.nn.LSTM(6, 4, num_layers=2, batch_first=True)
         topologies, weights = RecurrentPhase(name="pred", module=stacked).topologies()
@@ -234,7 +234,7 @@ class TestRecurrentPhase(unittest.TestCase):
     def test_a_module_with_no_lstm_at_all_is_rejected(self):
         import torch
 
-        from loom_mil_compiler.multi_phase_export import RecurrentPhase
+        from loom_exporter.multi_phase_export import RecurrentPhase
 
         with self.assertRaises(ValueError) as raised:
             RecurrentPhase(name="none", module=torch.nn.Linear(6, 6), input_dim=6).topologies()

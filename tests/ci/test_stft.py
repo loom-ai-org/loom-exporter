@@ -2,7 +2,7 @@
 Confirms EXPORT-IMPROVEMENT-BACKLOG.md item 4's STFT/complex-dialect finding actually holds end-to-end:
 `torch.stft` decomposes via coremltools' own `common::lower_complex_dialect_ops` pass into ops this
 exporter now fully covers (the new "pad"/"conv_transpose" handling in exporter.py), and the new
-`tools/loom_mil_compiler/istft.py` module lets the inverse transform -- which coremltools' torch frontend
+`loom_exporter/istft.py` module lets the inverse transform -- which coremltools' torch frontend
 has no handler for at all -- flow through the same standard pipeline instead of needing a bespoke
 hand-derived path (the way Kokoro's own STFT/ISTFT does today, outside this compiler entirely).
 """
@@ -14,10 +14,10 @@ import coremltools as ct
 import sys
 from pathlib import Path
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-import loom_mil_compiler  # noqa: F401 -- registers the "loom" backend + applies torch-frontend patches
-from loom_mil_compiler.exporter import LoomGGUFExporter
-from loom_mil_compiler.istft import ISTFT
+from loom_exporter.paths import CONVERTERS, driver_dir
+import loom_exporter  # noqa: F401 -- registers the "loom" backend + applies torch-frontend patches
+from loom_exporter.exporter import LoomGGUFExporter
+from loom_exporter.istft import ISTFT
 
 
 class RoundTripModule(torch.nn.Module):

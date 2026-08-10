@@ -77,7 +77,7 @@ class loom_fused_attention(Operation):
 class loom_spline(Operation):
     """
     Specialized Loom rational-quadratic spline inverse (VITS's StochasticDurationPredictor/ConvFlow).
-    See tools/loom_mil_compiler/vits_spline_op.py for the torch-level custom op bridged into this.
+    See loom_exporter/vits_spline_op.py for the torch-level custom op bridged into this.
     """
     input_spec = InputSpec(
         x=TensorInputType(type_domain="T"),

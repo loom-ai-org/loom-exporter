@@ -16,9 +16,9 @@ import unittest
 import sys
 from pathlib import Path
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-import loom_mil_compiler  # noqa: F401 -- registers the "loom" backend + applies torch-frontend patches
-from loom_mil_compiler.topology_ops import _RULES, describe_topology_rules, lookup_topology_rule
+from loom_exporter.paths import CONVERTERS, driver_dir
+import loom_exporter  # noqa: F401 -- registers the "loom" backend + applies torch-frontend patches
+from loom_exporter.topology_ops import _RULES, describe_topology_rules, lookup_topology_rule
 
 
 class _FakeVar:

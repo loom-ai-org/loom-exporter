@@ -12,8 +12,8 @@ import torch
 import torch.nn as nn
 
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-from loom_mil_compiler.transducer_export import _EmbedWrapper, _JointWrapper
+from loom_exporter.paths import CONVERTERS, driver_dir
+from loom_exporter.transducer_export import _EmbedWrapper, _JointWrapper
 
 
 class _FakeJoint(nn.Module):
@@ -77,7 +77,7 @@ class TestTheDurationSetIsCrossCheckedAgainstTheJoint(unittest.TestCase):
     """
 
     def test_a_duration_set_that_disagrees_with_the_joint_is_rejected(self):
-        from loom_mil_compiler.parakeet_export import ASRParakeetExportConfig
+        from loom_exporter.parakeet_export import ASRParakeetExportConfig
 
         class _Cfg:
             # What the checkpoint claims: five durations. The joint below emits 11 = 9 tokens + 2, so
@@ -113,13 +113,13 @@ class TestExportConstantsAreIRNotInterpolatedText(unittest.TestCase):
     """
 
     def _emit(self, values):
-        from loom_mil_compiler.driver_builder import DriverContext
-        from loom_mil_compiler.driver_components import ExportConstants
+        from loom_exporter.driver_builder import DriverContext
+        from loom_exporter.driver_components import ExportConstants
 
         return ExportConstants(values=values).emit(DriverContext(topologies={}))
 
     def test_scalars_and_lists_both_become_locals(self):
-        from loom_mil_compiler.driver_ir import LuaCodegen
+        from loom_exporter.driver_ir import LuaCodegen
 
         emitted = self._emit({"BLANK_ID": 8192, "DURATIONS": [0, 1, 2, 3, 4]})
         rendered = [LuaCodegen()._emit_stmt(st, 0)[0] for st in emitted]
@@ -131,7 +131,7 @@ class TestExportConstantsAreIRNotInterpolatedText(unittest.TestCase):
         self.assertEqual([st.defines() for st in emitted], [["BLANK_ID"], ["PRED_HIDDEN"]])
 
     def test_a_misspelled_read_fails_the_export(self):
-        from loom_mil_compiler.driver_ir import DriverIRError, Function, Return, Var, validate
+        from loom_exporter.driver_ir import DriverIRError, Function, Return, Var, validate
 
         fn = Function("infer", ["inputs"], self._emit({"BLANK_ID": 8192}) + [Return([Var("BLANK_ID_")])])
         with self.assertRaises(DriverIRError) as raised:

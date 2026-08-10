@@ -323,7 +323,7 @@ class LuaLibrary(DriverComponent):
             detail=lambda spec, ctx: sorted(set(spec.uses) - set(LIBRARY)),
             message=(
                 "{label} declares loom_lua function(s) {detail}, which do not exist. The library is "
-                "tools/loom_mil_compiler/lua/, one file per function."
+                "loom_exporter/lua/, one file per function."
             ),
             needs=(),
         ),

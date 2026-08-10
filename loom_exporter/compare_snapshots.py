@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from loom_mil_compiler.shape_expr import UnsupportedShapeExpression, parse, symbol  # noqa: E402
+from loom_exporter.shape_expr import UnsupportedShapeExpression, parse, symbol  # noqa: E402
 
 # Spread across the dynamic range every current model declares (0.1 s .. 20 s of 16 kHz audio, plus
 # token-count-sized values), including odd and even and off-by-one neighbours, so a pair that agrees
@@ -32,7 +32,7 @@ from loom_mil_compiler.shape_expr import UnsupportedShapeExpression, parse, symb
 PROBES = (1, 2, 3, 7, 16, 63, 64, 65, 101, 160, 161, 1600, 3200, 16000, 16001, 31999, 100000, 320000)
 
 # EXPORT-ROADMAP.md's R1: named axes replacing the single "n_tokens" fallback every dynamic dimension
-# used to render as (see tools/loom_mil_compiler/axes.py). {new axis name -> the expression that named
+# used to render as (see loom_exporter/axes.py). {new axis name -> the expression that named
 # the identical quantity before the rename} -- a declared claim ("n_samples IS what n_tokens used to
 # mean for this model"), not something this tool infers. Substituted into a NEW-side expression before
 # evaluating, so a pure rename compares as equivalent instead of structural. A rename not listed here

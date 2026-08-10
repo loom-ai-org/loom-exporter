@@ -20,17 +20,17 @@ from pathlib import Path
 
 import pytest
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-from loom_mil_compiler.registry import ModelRecognizer, TaskRegistry, TaskRegistryEntry  # noqa: E402
-from loom_mil_compiler.export_config import LoomExportConfig  # noqa: E402
-from loom_mil_compiler.tasks import known_tasks, task_spec  # noqa: E402
-from loom_mil_compiler.checkpoint_probe import probe_torch_checkpoint, read_json  # noqa: E402
-from loom_mil_compiler.causal_lm_export import (  # noqa: E402
+from loom_exporter.paths import CONVERTERS, driver_dir
+from loom_exporter.registry import ModelRecognizer, TaskRegistry, TaskRegistryEntry  # noqa: E402
+from loom_exporter.export_config import LoomExportConfig  # noqa: E402
+from loom_exporter.tasks import known_tasks, task_spec  # noqa: E402
+from loom_exporter.checkpoint_probe import probe_torch_checkpoint, read_json  # noqa: E402
+from loom_exporter.causal_lm_export import (  # noqa: E402
     _build_hf_causal_lm,
     _is_hf_causal_lm,
     _is_qwen3,
 )
-from loom_mil_compiler.nemo_asr_export import (  # noqa: E402
+from loom_exporter.nemo_asr_export import (  # noqa: E402
     _is_conformer_ctc,
     _is_parakeet_rnnt,
     _is_parakeet_tdt,
@@ -164,7 +164,7 @@ def test_the_generic_recognizer_survives_a_malformed_config(tmp_path):
 
 
 def test_a_llama_dir_resolves_through_the_registry_to_the_generic_recognizer(tmp_path):
-    from loom_mil_compiler.registry import default_registry
+    from loom_exporter.registry import default_registry
 
     path = _make_hf_dir(tmp_path, "llama", ["LlamaForCausalLM"])
     rec = default_registry().detect(path)
@@ -174,7 +174,7 @@ def test_a_llama_dir_resolves_through_the_registry_to_the_generic_recognizer(tmp
 def test_qwen3_still_resolves_to_its_own_recognizer_not_the_generic_one(tmp_path):
     """A real Qwen3 config declares `Qwen3ForCausalLM`, so the generic recognizer matches it too --
     A.3's specific-beats-fallback tiering is the only reason this still resolves to `qwen3`."""
-    from loom_mil_compiler.registry import default_registry
+    from loom_exporter.registry import default_registry
 
     path = _make_hf_dir(tmp_path, "qwen3", ["Qwen3ForCausalLM"])
     assert _is_hf_causal_lm(path), "the fixture must be one the generic recognizer really claims"
@@ -184,7 +184,7 @@ def test_qwen3_still_resolves_to_its_own_recognizer_not_the_generic_one(tmp_path
 def test_lfm2_still_raises_its_two_way_ambiguity(tmp_path):
     """Monolithic vs. modular is a caller decision; the generic recognizer must not silently resolve it
     by becoming a third match."""
-    from loom_mil_compiler.registry import default_registry
+    from loom_exporter.registry import default_registry
 
     path = _make_hf_dir(tmp_path, "lfm2", ["Lfm2ForCausalLM"])
     with pytest.raises(ValueError, match="matched more than one recognizer") as excinfo:
@@ -197,8 +197,8 @@ def test_the_generic_build_config_infers_everything_it_can(tmp_path):
     """`architecture`/`tokenizer_pre` left None on purpose -- resolved from the checkpoint's own
     `model_type` in `load_model` and from the tokenizer's own hash in `_write_tokenizer`. If these ever
     stop being None, adding a model stops being free again."""
-    from loom_mil_compiler.causal_lm_export import LMCausalModelExportConfig
-    from loom_mil_compiler.decomposition import Flattened
+    from loom_exporter.causal_lm_export import LMCausalModelExportConfig
+    from loom_exporter.decomposition import Flattened
 
     path = _make_hf_dir(tmp_path, "llama", ["LlamaForCausalLM"])
     config = _build_hf_causal_lm(path, "out.gguf")
@@ -211,7 +211,7 @@ def test_the_generic_build_config_infers_everything_it_can(tmp_path):
 def test_a_model_type_override_reaches_the_built_config(tmp_path, monkeypatch):
     """The table is empty today (see its comment for why that is a finding, not an omission); this is
     the mechanism working, so the first real exception does not have to prove the wiring too."""
-    from loom_mil_compiler import causal_lm_export
+    from loom_exporter import causal_lm_export
 
     monkeypatch.setitem(causal_lm_export._MODEL_TYPE_OVERRIDES, "llama", {"tokenizer_pre": "llama3"})
     path = _make_hf_dir(tmp_path, "llama", ["LlamaForCausalLM"])
@@ -280,7 +280,7 @@ def _make_gigaam_dir(tmp_path: Path, model_class: str = "rnnt", name: str = "gig
 
 
 def test_gigaam_rnnt_is_matched_by_its_own_head(tmp_path):
-    from loom_mil_compiler.gigaam_export import _is_gigaam_rnnt
+    from loom_exporter.gigaam_export import _is_gigaam_rnnt
 
     assert _is_gigaam_rnnt(_make_gigaam_dir(tmp_path))
 
@@ -290,8 +290,8 @@ def test_a_gigaam_ctc_variant_is_not_claimed_by_the_transducer_recognizer(tmp_pa
     this config is the `MultiPhase` transducer one. Nothing here has ever run against a CTC GigaAM
     checkpoint, so it fails detection -- naming the candidates -- rather than being exported by a path
     that would produce an artifact whose driver decodes a head the model does not have."""
-    from loom_mil_compiler.gigaam_export import _is_gigaam_rnnt
-    from loom_mil_compiler.registry import default_registry
+    from loom_exporter.gigaam_export import _is_gigaam_rnnt
+    from loom_exporter.registry import default_registry
 
     ctc_dir = _make_gigaam_dir(tmp_path, model_class="ctc", name="gigaam_ctc")
     assert not _is_gigaam_rnnt(ctc_dir)
@@ -302,7 +302,7 @@ def test_a_gigaam_ctc_variant_is_not_claimed_by_the_transducer_recognizer(tmp_pa
 def test_gigaam_rejects_other_families_hf_directories(tmp_path):
     """Including the one it is most likely to be confused with: `hf-causal-lm`'s generic fallback also
     reads `config.json`, and a `model_type` alone is not a GigaAM."""
-    from loom_mil_compiler.gigaam_export import _is_gigaam_rnnt
+    from loom_exporter.gigaam_export import _is_gigaam_rnnt
 
     assert not _is_gigaam_rnnt(_make_hf_dir(tmp_path, "qwen3"))
     assert not _is_gigaam_rnnt(_make_hf_dir(tmp_path, "whisper", ["WhisperForConditionalGeneration"]))
@@ -312,7 +312,7 @@ def test_gigaam_rejects_other_families_hf_directories(tmp_path):
 def test_gigaam_survives_a_malformed_or_shallow_config(tmp_path):
     """`detect()` runs against unidentified paths by construction, so every way the nested block can be
     absent has to be an answer rather than a traceback."""
-    from loom_mil_compiler.gigaam_export import _is_gigaam_rnnt
+    from loom_exporter.gigaam_export import _is_gigaam_rnnt
 
     broken = tmp_path / "broken"
     broken.mkdir()
@@ -326,7 +326,7 @@ def test_gigaam_survives_a_malformed_or_shallow_config(tmp_path):
 
 
 def test_default_registry_detects_a_synthetic_gigaam_dir(tmp_path):
-    from loom_mil_compiler.registry import default_registry
+    from loom_exporter.registry import default_registry
 
     assert default_registry().detect(_make_gigaam_dir(tmp_path)).name == "gigaam-rnnt"
 
@@ -430,11 +430,11 @@ def _make_supertonic_dir(tmp_path: Path) -> Path:
 
 
 def _tts_detectors():
-    from loom_mil_compiler.kokoro_export import _is_kokoro
-    from loom_mil_compiler.matcha_export import _is_matcha
-    from loom_mil_compiler.styletts2_export import _is_styletts2
-    from loom_mil_compiler.supertonic_export import _is_supertonic
-    from loom_mil_compiler.vits_export import _is_vits
+    from loom_exporter.kokoro_export import _is_kokoro
+    from loom_exporter.matcha_export import _is_matcha
+    from loom_exporter.styletts2_export import _is_styletts2
+    from loom_exporter.supertonic_export import _is_supertonic
+    from loom_exporter.vits_export import _is_vits
 
     return {"kokoro": _is_kokoro, "matcha": _is_matcha, "styletts2": _is_styletts2,
             "supertonic": _is_supertonic, "vits": _is_vits}
@@ -590,7 +590,7 @@ def test_registering_an_unrelated_config_class_raises():
 def test_the_real_tts_flow_matching_config_registers_under_the_tts_task():
     """The concrete case the relaxed check exists for, against the real classes rather than toys: today
     these are two tasks that A.2 merges, and both halves must pass the same base-class check."""
-    from loom_mil_compiler.multi_phase_export import (
+    from loom_exporter.multi_phase_export import (
         BaseMultiPhaseModelExportConfig,
         TTSFlowMatchingModelExportConfig,
     )
@@ -702,7 +702,7 @@ def test_every_recognizer_naming_one_concrete_model_is_specific():
     """A recognizer named after a single model must never be a fallback -- it would stop claiming its
     own checkpoint the moment anything generic matched too. (A.4 adds one genuinely generic recognizer;
     this check is what keeps that from spreading.)"""
-    from loom_mil_compiler.registry import default_registry
+    from loom_exporter.registry import default_registry
 
     per_model = {
         "qwen3", "lfm2-monolithic", "lfm2-modular", "conformer-ctc", "parakeet-tdt", "parakeet-rnnt",
@@ -736,7 +736,7 @@ def test_every_declared_base_config_resolves_and_is_a_loom_export_config():
 def test_audio_codec_is_reserved_and_unclaimed():
     """Decision 3: the name is declared now so family 11 does not invent a competing one, but no family
     registers against it until it exists."""
-    from loom_mil_compiler.registry import default_registry
+    from loom_exporter.registry import default_registry
 
     assert task_spec("audio-codec").reserved
     assert task_spec("audio-codec").base_config_class() is LoomExportConfig
@@ -746,7 +746,7 @@ def test_audio_codec_is_reserved_and_unclaimed():
 def test_a_declared_but_unclaimed_task_says_so_rather_than_unknown():
     """`--task audio-codec` is a valid argparse choice but has no family, and that is a different error
     from a typo -- conflating them sends the caller looking for a misspelling that isn't there."""
-    from loom_mil_compiler.registry import default_registry
+    from loom_exporter.registry import default_registry
 
     registry = default_registry()
     with pytest.raises(ValueError, match="declared but no family is registered against it yet"):
@@ -780,9 +780,9 @@ def test_get_raises_on_unknown_task():
 # -- the real default registry, structurally -------------------------------------------------------------
 
 def test_default_registry_registers_the_two_p32_tasks():
-    from loom_mil_compiler.registry import default_registry
-    from loom_mil_compiler.causal_lm_export import LMCausalModelExportConfig
-    from loom_mil_compiler.nemo_asr_export import ASRNemoEncoderExportConfig
+    from loom_exporter.registry import default_registry
+    from loom_exporter.causal_lm_export import LMCausalModelExportConfig
+    from loom_exporter.nemo_asr_export import ASRNemoEncoderExportConfig
 
     registry = default_registry()
     causal_lm = registry.get("text-generation", "qwen3")
@@ -799,7 +799,7 @@ def test_every_registered_task_is_canonical():
     """The whole point of P4.0.4's vocabulary: after A.2 there is no spelling in the registry that
     `tasks.py` does not declare, and no family left on a name that describes a decomposition or a
     loader library."""
-    from loom_mil_compiler.registry import default_registry
+    from loom_exporter.registry import default_registry
 
     registry = default_registry()
     assert set(registry._entries) <= set(known_tasks())
@@ -812,7 +812,7 @@ def test_the_five_tts_families_now_share_one_task():
     """`tts-multi-phase` + `tts-flow-matching` were one task whose members differ by a field, ever since
     P4.0.3 made decomposition a field. Flow-matching models register their `TTSFlowMatchingModelExportConfig`
     subclass under the same `text-to-speech` task as the plain multi-phase ones."""
-    from loom_mil_compiler.registry import default_registry
+    from loom_exporter.registry import default_registry
 
     registry = default_registry()
     names = {rec.name for rec in registry._entries["text-to-speech"].recognizers}
@@ -824,7 +824,7 @@ def test_the_five_tts_families_now_share_one_task():
 def test_the_pre_p404_task_spellings_are_gone():
     """No backwards-compatible aliases (A.2): the old names must fail like any other typo, naming the
     vocabulary that replaced them."""
-    from loom_mil_compiler.registry import default_registry
+    from loom_exporter.registry import default_registry
 
     registry = default_registry()
     for old in ("causal-lm", "nemo-asr-encoder", "tts-multi-phase", "tts-flow-matching"):
@@ -835,7 +835,7 @@ def test_the_pre_p404_task_spellings_are_gone():
 
 
 def test_default_registry_detects_a_synthetic_qwen3_dir(tmp_path):
-    from loom_mil_compiler.registry import default_registry
+    from loom_exporter.registry import default_registry
 
     registry = default_registry()
     rec = registry.detect(_make_hf_dir(tmp_path, "qwen3"))
@@ -843,7 +843,7 @@ def test_default_registry_detects_a_synthetic_qwen3_dir(tmp_path):
 
 
 def test_default_registry_detects_synthetic_nemo_archives(tmp_path):
-    from loom_mil_compiler.registry import default_registry
+    from loom_exporter.registry import default_registry
 
     registry = default_registry()
     assert registry.detect(_make_nemo_archive(tmp_path, "ctc", CTC_CONFIG)).name == "conformer-ctc"
@@ -856,7 +856,7 @@ def test_default_registry_detects_every_tts_family_end_to_end(tmp_path):
     all five TTS families through the same registry as the causal-LM and NeMo ones -- against the whole
     registry, not just each family's own recognizer, so an ambiguity introduced by any other family
     fails here."""
-    from loom_mil_compiler.registry import default_registry
+    from loom_exporter.registry import default_registry
 
     registry = default_registry()
     for family, path in _all_tts_fixtures(tmp_path).items():

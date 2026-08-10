@@ -40,7 +40,7 @@ from pathlib import Path
 
 import pytest
 
-from loom_mil_compiler.paths import REPO_ROOT
+from loom_exporter.paths import REPO_ROOT
 
 # The sweep, as (name, checkpoint subpath, extra loom-export arguments). Kept here rather than in a
 # config file because it is a statement about which architectures this repo claims to export, and the
@@ -73,7 +73,7 @@ def models_root() -> Path:
 
 def snapshot(gguf: Path, into: Path) -> Path:
     """`snapshot_gguf` over one artifact, returning the directory it wrote."""
-    from loom_mil_compiler import snapshot_gguf
+    from loom_exporter import snapshot_gguf
 
     snapshot_gguf.snapshot(gguf, into)
     return into / gguf.stem
@@ -83,7 +83,7 @@ def export(name: str, checkpoint: Path, extra: list, out_dir: Path) -> Path:
     """Run this repo's exporter in a subprocess, so one model's memory peak is one process's."""
     out = out_dir / f"{name}.gguf"
     result = subprocess.run(
-        [sys.executable, "-m", "loom_mil_compiler.main_export", str(checkpoint), "-o", str(out), *extra],
+        [sys.executable, "-m", "loom_exporter.main_export", str(checkpoint), "-o", str(out), *extra],
         cwd=REPO_ROOT, capture_output=True, text=True,
         env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
     )

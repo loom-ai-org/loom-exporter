@@ -13,9 +13,9 @@ import unittest
 import sys
 from pathlib import Path
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-from loom_mil_compiler.flow_matching_export import EstimatorSpec, FlowMatchingSpec, render_sampler
-from loom_mil_compiler.spec_protocol import check_links
+from loom_exporter.paths import CONVERTERS, driver_dir
+from loom_exporter.flow_matching_export import EstimatorSpec, FlowMatchingSpec, render_sampler
+from loom_exporter.spec_protocol import check_links
 
 
 def _check(spec, **topologies):
@@ -183,7 +183,7 @@ class TestSpecProtocolRetrofit(unittest.TestCase):
     def test_every_field_of_both_specs_is_declared(self):
         """The standing rule, on the first two specs to adopt the protocol: each field is either
         link-checked, covered by another field's link, or documented as uncheckable."""
-        from loom_mil_compiler.spec_protocol import dangling_coverage, undeclared_fields
+        from loom_exporter.spec_protocol import dangling_coverage, undeclared_fields
 
         for cls in (EstimatorSpec, FlowMatchingSpec):
             self.assertEqual(undeclared_fields(cls), [], cls.__name__)
@@ -192,7 +192,7 @@ class TestSpecProtocolRetrofit(unittest.TestCase):
     def test_a_deferred_link_is_reported_rather_than_skipped(self):
         """A spec registered with a checker that never gets the topologies must be REPORTED, not
         silently skipped. What must not happen is a caller believing the spec was validated."""
-        from loom_mil_compiler.spec_protocol import LinkChecker, LinkError
+        from loom_exporter.spec_protocol import LinkChecker, LinkError
 
         checker = LinkChecker()
         checker.check(MATCHA)

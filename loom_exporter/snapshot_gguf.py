@@ -15,9 +15,9 @@ Typical use -- prove a change is output-preserving:
 
     git archive HEAD | tar -x -C /tmp/baseline        # or any known-good tree
     (cd /tmp/baseline && python3 export_vits_mil.py)  # re-run the exports there
-    python3 tools/loom_mil_compiler/snapshot_gguf.py /tmp/snap_base /tmp/baseline/*.gguf
+    python3 loom_exporter/snapshot_gguf.py /tmp/snap_base /tmp/baseline/*.gguf
     python3 export_vits_mil.py                        # then in the working tree
-    python3 tools/loom_mil_compiler/snapshot_gguf.py /tmp/snap_new  *.gguf
+    python3 loom_exporter/snapshot_gguf.py /tmp/snap_new  *.gguf
     diff -r /tmp/snap_base /tmp/snap_new              # must be empty
 
 Note the `.gguf` files committed in the repo tree are `.gitignore`d build outputs and are routinely

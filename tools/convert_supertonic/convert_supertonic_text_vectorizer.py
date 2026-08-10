@@ -7,7 +7,7 @@ Unlike every other convert_supertonic_*.py script, this one converts no model we
 preprocessing pipeline (ported natively in supertonic_text_vectorizer.cpp; the JSON asset is the only
 per-checkpoint DATA this needs). `tokenizer.ggml.model`="supertonic" follows the same per-family-tag
 convention every other vocab schema in this project uses, though this isn't a generic HF tokenizer family
-(it doesn't go through tools/loom_mil_compiler/'s tokenizer_detect.py auto-detection at all).
+(it doesn't go through loom_exporter/'s tokenizer_detect.py auto-detection at all).
 
 Usage: python3 convert_supertonic_text_vectorizer.py <supertonic-tts repo root> <out_path.gguf>
 """

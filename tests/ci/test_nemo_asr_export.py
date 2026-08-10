@@ -6,7 +6,7 @@ faithfully (wrong forward arity, wrong channel count, missing preprocessor/encod
 rate). The real checkpoints are covered by the three end-to-end reference tests instead
 (`test_e2e_conformer_ctc_mil_export` and the two Parakeet equivalents).
 
-Run: ~/.venvs/piper/bin/python3 -m pytest tools/loom_mil_compiler/test_nemo_asr_export.py
+Run: ~/.venvs/piper/bin/python3 -m pytest tests/ci/test_nemo_asr_export.py
 """
 import sys
 import types
@@ -16,8 +16,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-from loom_mil_compiler.nemo_asr_export import (  # noqa: E402
+from loom_exporter.paths import CONVERTERS, driver_dir
+from loom_exporter.nemo_asr_export import (  # noqa: E402
     EncoderOutput,
     ASRNemoEncoderExportConfig,
     ASREncoderWrapper,
@@ -166,7 +166,7 @@ def test_the_three_registered_recognizers_declare_distinct_specs():
     are gone (BACKLOG.md P3.2: replaced by registry entries), so this now builds each recognizer's
     ASRNemoEncoderExportConfig directly via the registry instead, against the same three real checkpoint
     paths those scripts used to hardcode."""
-    from loom_mil_compiler.registry import default_registry
+    from loom_exporter.registry import default_registry
 
     checkpoints = {
         "conformer-ctc": "/home/flavio/Dev/models/conformer-ctc-small/stt_en_conformer_ctc_small.nemo",
@@ -255,7 +255,7 @@ def test_every_config_field_is_declared_including_the_inherited_ones():
     """The standing rule, on the family whose config carries the most inherited surface. `architecture`,
     `output_path` and `decomposition` come from LoomExportConfig and are declared there once -- if MRO
     merging broke, this is what would catch it."""
-    from loom_mil_compiler.spec_protocol import dangling_coverage, declared_raw, undeclared_fields
+    from loom_exporter.spec_protocol import dangling_coverage, declared_raw, undeclared_fields
 
     assert undeclared_fields(ASRNemoEncoderExportConfig) == []
     assert dangling_coverage(ASRNemoEncoderExportConfig) == []
@@ -267,7 +267,7 @@ def test_the_encoder_output_links_run_where_the_outputs_exist_and_nowhere_else()
     """EncoderOutput is a NestedSpec on the config: the checker deliberately does not walk into it,
     because its links need the traced forward's return value. Checking it from the config's own site
     must therefore report the missing context rather than quietly passing."""
-    from loom_mil_compiler.spec_protocol import LinkChecker, LinkError
+    from loom_exporter.spec_protocol import LinkChecker, LinkError
 
     checker = LinkChecker()
     checker.check(EncoderOutput.CTC_LOG_PROBS)

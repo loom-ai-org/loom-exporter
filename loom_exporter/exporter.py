@@ -1866,7 +1866,7 @@ class LoomGGUFExporter:
         # EXPORT-IMPROVEMENT-BACKLOG.md item 4: an "lstm" op can't be translated into ordinary static
         # topology nodes the way every other op_type below is -- ggml has no native LSTM/GRU op, and
         # unlike e.g. `linear`/`matmul`, correct recurrence needs a genuine host-side per-timestep loop
-        # (see recurrent.py's own module docstring and tools/loom_mil_compiler/test_recurrent.py's
+        # (see recurrent.py's own module docstring and loom_exporter/test_recurrent.py's
         # verified topology-generation logic), not a fixed sequence of graph nodes. `generate_graph_topology`
         # only ever returns ONE static topology for the whole `operations` list it's given; splitting a
         # function at an "lstm" op boundary into "pre-LSTM topology -> recurrent stepper call ->
@@ -1879,7 +1879,7 @@ class LoomGGUFExporter:
             raise NotImplementedError(
                 f"generate_graph_topology('{func_name}'): contains an '{next(op.op_type for op in operations if op.op_type in ('lstm', 'gru'))}' "
                 "op. ggml has no native LSTM/GRU op -- correct recurrence needs a real per-timestep "
-                "stepper (see tools/loom_mil_compiler/recurrent.py and the new "
+                "stepper (see loom_exporter/recurrent.py and the new "
                 "LoomLuaBridge::l_run_recurrent C++ binding, which generalizes the existing "
                 "BiLstmStepper), not a static topology. Auto-wiring this into the generic export "
                 "profiles (monolithic/modular-blueprint driver synthesis) is unimplemented "
@@ -2479,9 +2479,9 @@ class LoomGGUFExporter:
             write_wordpiece_vocab(w, tokenizer_dir)
         elif family == "sentencepiece_proto":
             from pathlib import Path
-            # Every entry point that imports loom_mil_compiler (export_hf_causal_lm.py,
+            # Every entry point that imports loom_exporter (export_hf_causal_lm.py,
             # export_lfm2_*.py) inserts tools/ itself (not its parent) onto sys.path, so convert_nemo/ is
-            # importable as a top-level package the same way loom_mil_compiler is -- not "tools.convert_nemo".
+            # importable as a top-level package the same way loom_exporter is -- not "tools.convert_nemo".
             from .spm_tokenizer_export import write_sentencepiece_vocab
             proto_path = next(p for p in (Path(tokenizer_dir) / "tokenizer.model",
                                            Path(tokenizer_dir) / "spiece.model") if p.exists())

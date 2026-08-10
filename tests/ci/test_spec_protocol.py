@@ -17,8 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-from loom_mil_compiler.spec_protocol import (
+from loom_exporter.paths import CONVERTERS, driver_dir
+from loom_exporter.spec_protocol import (
     Axis, ConfigDerived, DriverSymbol, EachOf, FieldRef, LinkChecker, LinkCheckContext, LinkError,
     ModuleAttrPath, TopologyInput, TopologyName, TopologyOutputArity, Unchecked, WeightName, WhenSet,
     check_links, dangling_coverage, declared_links, spec_label, undeclared_fields,
@@ -267,7 +267,7 @@ class TestWeightAndDriverLinks(unittest.TestCase):
         self.assertIn("2 tensors", msg)
 
     def test_driver_symbol_checks_against_a_real_ir_function(self):
-        from loom_mil_compiler.driver_ir import Function, Local, Lit
+        from loom_exporter.driver_ir import Function, Local, Lit
 
         @dataclass
         class D:
@@ -405,21 +405,21 @@ _MAY_NOT_IMPORT = {"compare_snapshots", "export_lstm_test_fixture"}
 
 
 def _package_dataclasses():
-    """Every dataclass defined in `loom_mil_compiler`, by `module.ClassName`, plus the modules that
+    """Every dataclass defined in `loom_exporter`, by `module.ClassName`, plus the modules that
     could not be imported."""
     import dataclasses
     import importlib
     import inspect
     import pkgutil
 
-    import loom_mil_compiler as package
+    import loom_exporter as package
 
     found, unimportable = {}, set()
     for module_info in pkgutil.iter_modules(package.__path__):
         if module_info.name.startswith("test_"):
             continue
         try:
-            module = importlib.import_module(f"loom_mil_compiler.{module_info.name}")
+            module = importlib.import_module(f"loom_exporter.{module_info.name}")
         except Exception:
             unimportable.add(module_info.name)
             continue
@@ -477,7 +477,7 @@ class TestStandingRuleAcrossThePackage(unittest.TestCase):
     def test_every_registered_config_class_is_covered(self):
         """The other direction: driven by what is actually registered, so a family that registers a
         config class the scan somehow missed still fails here."""
-        from loom_mil_compiler.registry import default_registry
+        from loom_exporter.registry import default_registry
 
         for task, entry in default_registry()._entries.items():
             self.assertEqual(undeclared_fields(entry.config_class), [], f"{task}/{entry.config_class}")

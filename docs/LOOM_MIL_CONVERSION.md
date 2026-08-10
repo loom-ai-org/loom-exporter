@@ -325,7 +325,7 @@ local xa = loom.run_subgraph('encoder', {waveform = input_wave})
 
 ## 5. Execution Backlog for the Implementing Agent
 
-1. **Setup Plugin Boilerplate:** Create a standalone python repository `loom_mil_compiler`. Setup environment loading dependencies (`coremltools`, `numpy`, `gguf`).
+1. **Setup Plugin Boilerplate:** Create a standalone python repository `loom_exporter`. Setup environment loading dependencies (`coremltools`, `numpy`, `gguf`).
 2. **Implement `LoomGGUFExporter`:** Fully implement the class to map intermediate variables to Lua-safe variables (replacing invalid characters like `%`, `.`, or `/` in MIL SSA names with safe characters like `_`).
 3. **Register Dynamic Backend:** Verify registration by running a minimal converted model using `convert_to="loom"`.
 4. **Develop GGUF Serializer:** Use standard `gguf` python package to write `model.graph_topology.<submodule_name>` keys, the `model.driver_script` key, and the block-quantized weights extracted from `exporter.weights`.

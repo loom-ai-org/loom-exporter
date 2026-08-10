@@ -15,7 +15,7 @@ checkable against the real model/topology, or explicitly documented as unchecked
 is which, and the counts come from the declarations themselves.
 
 **Everything between the generated markers is produced by
-`python -m loom_mil_compiler.component_registry` and `lua_library.catalogue()`, from the registry, the
+`python -m loom_exporter.component_registry` and `lua_library.catalogue()`, from the registry, the
 classes' own `__links__`/`__unchecked__` declarations, and the families' real component lists.**
 `test_component_registry.py` regenerates and compares, so this file cannot quietly fall out of date.
 Do not edit inside the markers; run the generator.
@@ -26,7 +26,7 @@ Related reading:
   (§1.3: lean runtime, fat exporter) and the stage plan these components were built under.
 * [`BACKLOG.md`](BACKLOG.md) P4.0.5–P4.0.7 — the spec protocol the links belong to, the builder, and
   this registry.
-* `tools/loom_mil_compiler/driver_builder.py` — the `DriverComponent`/`DriverBuilder` contract itself.
+* `loom_exporter/driver_builder.py` — the `DriverComponent`/`DriverBuilder` contract itself.
 
 ---
 
@@ -264,7 +264,7 @@ catalogue that says the declarations above are load-bearing rather than decorati
 **A component with no registry entry** (D.1 probe: `lua_fragment`'s entry removed, Kokoro export):
 
 ```
-KeyError: tools.loom_mil_compiler.driver_components.LuaFragment is a driver component but is not in
+KeyError: loom_exporter.driver_components.LuaFragment is a driver component but is not in
 the component registry, so it would appear in a shipped driver and in no catalogue. Add a
 ComponentEntry to component_registry._entries(). Registered: ['argmax_epilogue', 'driver_inputs',
 'driver_return', 'flow_matching_sampler', 'lua_library', 'modular_chain', 'monolithic_call',

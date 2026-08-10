@@ -22,14 +22,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-from loom_mil_compiler.paths import CONVERTERS, driver_dir
-from loom_mil_compiler.driver_builder import (
+from loom_exporter.paths import CONVERTERS, driver_dir
+from loom_exporter.driver_builder import (
     DriverBuilder, DriverComponent, DriverContext, DriverEntry, DriverScript,
 )
-from loom_mil_compiler.driver_ir import (
+from loom_exporter.driver_ir import (
     DriverIRError, Lit, Local, Return, SubgraphCall, Var,
 )
-from loom_mil_compiler.spec_protocol import (
+from loom_exporter.spec_protocol import (
     DriverSymbol, LinkChecker, LinkError, TopologyName, Unchecked, WeightName,
 )
 
@@ -296,7 +296,7 @@ class TestCheckerOwnership(unittest.TestCase):
 
 class TestTheDecompositionHook(unittest.TestCase):
     def test_the_base_hook_answers_none(self):
-        from loom_mil_compiler.decomposition import Decomposition
+        from loom_exporter.decomposition import Decomposition
 
         self.assertIsNone(Decomposition().driver_builder(config=None))
 

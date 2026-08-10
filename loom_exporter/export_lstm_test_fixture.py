@@ -18,9 +18,9 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import loom_mil_compiler  # noqa: F401 -- registers the "loom" backend + applies torch-frontend patches
+import loom_exporter  # noqa: F401 -- registers the "loom" backend + applies torch-frontend patches
 import coremltools as ct
-from loom_mil_compiler.recurrent import build_lstm_cell_topologies
+from loom_exporter.recurrent import build_lstm_cell_topologies
 
 HIDDEN_DIM = 6
 INPUT_DIM = 4

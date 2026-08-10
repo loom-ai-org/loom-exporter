@@ -24,11 +24,11 @@ from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import Program, types as mil_types
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Insert loom_mil_compiler into search path. Importing it applies the coremltools torch-frontend
+# Insert loom_exporter into search path. Importing it applies the coremltools torch-frontend
 # patches (robust cast + GQA-aware SDPA decomposition) as an import-time side effect -- see
-# tools/loom_mil_compiler/torch_patches.py.
+# loom_exporter/torch_patches.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import loom_mil_compiler
+import loom_exporter
 
 
 class EmbeddingSubmodule(torch.nn.Module):
@@ -181,7 +181,7 @@ def main():
     
     # 6. Compile and package everything to the final GGUF file
     print(f"Compiling MIL Program to unified GGUF target: {out_path}...")
-    backend = loom_mil_compiler.LoomGGUFBackend()
+    backend = loom_exporter.LoomGGUFBackend()
     backend(
         master_prog,
         output_path=out_path,
