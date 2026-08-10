@@ -1,13 +1,10 @@
-<p align="center">
+<h1 align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <img src="assets/logo.svg" alt="loom.cpp" width="96">
+    <img src="assets/logo.svg" alt="" width="52" align="middle">
   </picture>
-</p>
-
-<h1 align="center">loom-exporter</h1>
-
-<p align="center"><em>PyTorch checkpoint in, self-describing GGUF out</em></p>
+  &nbsp;loom-exporter
+</h1>
 
 The export pipeline for [loom.cpp](https://github.com/loom-ai-org/loom.cpp). It traces a PyTorch model
 through Core ML Tools' MIL, lowers that program to the engine's own primitives, and writes a single
