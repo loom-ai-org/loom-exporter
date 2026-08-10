@@ -23,7 +23,7 @@ architecture should cost a Python change rather than a specialized C++ driver.
 |---|---|
 | [**loom.cpp**](https://github.com/femelo/loom.cpp) | the runtime that executes what this produces |
 | [**loom-exporter**](https://github.com/femelo/loom-exporter) | this one — tracing, lowering, driver synthesis |
-| [**py-loom**](https://github.com/femelo/py-loom) | Python bindings to the engine |
+| [**loom-py**](https://github.com/femelo/loom-py) | Python bindings to the engine |
 
 ## Exporting
 
