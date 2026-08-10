@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loom-exporter"
+version = "0.1.0"
+description = "Turns a PyTorch checkpoint into a self-describing GGUF that loom.cpp runs"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+
+# Deliberately unpinned here and pinned in CI. The exporter is run by hand against checkpoints whose
+# own loaders pin transformers hard in either direction -- NeMo wants ~=4.53, Qwen3-ASR needs >=5.13 --
+# so there is no single resolve that exports every model, and pretending otherwise in metadata would
+# only move the conflict to install time. The two environments that actually work are described in
+# docs/EXPORT-PREPARATION.md.
+dependencies = [
+    "coremltools>=8",
+    "gguf>=0.17",
+    "numpy>=1.26",
+    "torch>=2.4",
+    "transformers>=4.53",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+loom-export = "loom_mil_compiler.main_export:main"
+
+[tool.setuptools]
+packages = ["loom_mil_compiler"]
+
+[tool.pytest.ini_options]
+# The repo root on the path, so `tests/ci/` can `import loom_mil_compiler` while living outside it.
+# The tests used to sit inside the package and reach it by being in the same directory; moving them
+# to tests/ci/ is what makes "which class of test is this" a thing you can see from the path, and this
+# is the one line that costs.
+pythonpath = ["."]
+testpaths = ["tests/ci"]
+markers = [
+    "gate: needs a real checkpoint on disk; not run by CI (see tests/gate/)",
+]

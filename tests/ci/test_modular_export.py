@@ -17,8 +17,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from loom_mil_compiler.paths import CONVERTERS, driver_dir
 from loom_mil_compiler.modular_export import ModularExportSpec, export_modular
 from loom_mil_compiler.spec_protocol import (
     LinkError, dangling_coverage, undeclared_fields,

@@ -21,8 +21,8 @@ import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from loom_mil_compiler.paths import CONVERTERS, driver_dir
 from loom_mil_compiler.driver_builder import (
     DriverBuilder, DriverComponent, DriverContext, DriverEntry, DriverScript,
 )

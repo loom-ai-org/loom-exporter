@@ -16,8 +16,8 @@ import torch.nn as nn
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from loom_mil_compiler.paths import CONVERTERS, driver_dir
 import loom_mil_compiler  # noqa: F401 -- registers the "loom" backend + applies torch-frontend patches
 import coremltools as ct
 from loom_mil_compiler.scripted_loop import RefinementLoop, convert_scripted_loop, count_mil_ops

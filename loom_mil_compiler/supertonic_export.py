@@ -75,6 +75,7 @@ import numpy as np
 import torch
 import coremltools as ct
 
+from .paths import CONVERTERS, driver_dir
 from .checkpoint_probe import probe_torch_checkpoint
 from .flow_matching_export import FlowMatchingSpec
 from .multi_phase_export import ExportPhase, TTSFlowMatchingModelExportConfig
@@ -205,7 +206,7 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         ),
     }
     # A DIRECTORY of `.lua` fragments -- Supertonic is peeled (P4.0.6/C.5). See `driver_components`.
-    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_supertonic" / "supertonic_driver"
+    driver_script_path: Path = driver_dir("convert_supertonic", "supertonic_driver")
 
     def driver_components(self) -> List:
         """Supertonic's driver, as components (P4.0.6/C.5).

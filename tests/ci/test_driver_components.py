@@ -15,8 +15,8 @@ import sys
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from loom_mil_compiler.paths import CONVERTERS, driver_dir
 from loom_mil_compiler.driver_builder import DriverContext
 from loom_mil_compiler.driver_components import (
     CALLER, MASK, POSITION, ArgmaxEpilogue, ChainStage, CtcGreedyBuilder, CtcGreedyEpilogue,
@@ -569,7 +569,7 @@ class TestTheAdoptedDriverIsActuallyChecked(unittest.TestCase):
     def test_no_whole_driver_lua_is_still_shipped(self):
         """C.4-C.8 peeled all five. Asserted rather than assumed, so a family reverting to one file is
         a deliberate act rather than a silent one."""
-        leftovers = sorted(Path(__file__).resolve().parents[1].glob("convert_*/*_driver_mil.lua"))
+        leftovers = sorted(CONVERTERS.glob("convert_*/*_driver_mil.lua"))
         self.assertEqual(leftovers, [])
 
 

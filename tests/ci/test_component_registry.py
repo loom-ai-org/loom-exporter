@@ -21,8 +21,8 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from loom_mil_compiler.paths import CONVERTERS, REPO_ROOT, driver_dir
 from loom_mil_compiler import component_registry as cr
 from loom_mil_compiler.driver_builder import DriverBuilder, DriverComponent, DriverContext
 from loom_mil_compiler.driver_components import (
@@ -141,7 +141,7 @@ class TestTheBuilderConsultsIt(unittest.TestCase):
         """`LuaFragment` emits a prelude when `top_level` is set and statements otherwise; neither
         instance is a drift, which is why the check is a subset one."""
         fragment = LuaFragment(
-            Path(__file__).resolve().parent.parent / "convert_supertonic" / "supertonic_driver"
+            driver_dir("convert_supertonic", "supertonic_driver")
             / "00_header.lua", top_level=True)
         script = _OneComponent(fragment).build(_ctx())
         self.assertTrue(script.prelude)
@@ -162,7 +162,7 @@ class TestUsageIsDerived(unittest.TestCase):
         the code that runs rather than about a hand-kept mapping."""
         self.assertIs(SYNTHESIZED_BUILDERS["Flattened"], PrefillArgmaxBuilder)
         self.assertIs(SYNTHESIZED_BUILDERS["Modular"], ModularChainBuilder)
-        source = (Path(__file__).resolve().parent / "exporter.py").read_text()
+        source = (REPO_ROOT / "loom_mil_compiler" / "exporter.py").read_text()
         self.assertIn('SYNTHESIZED_BUILDERS["Flattened"](', source)
         self.assertIn('SYNTHESIZED_BUILDERS["Modular"](', source)
 

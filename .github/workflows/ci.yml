@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Pinned exactly. These are the compiler this repo's tests trace THROUGH -- coremltools decides
+      # what a MIL program looks like and torch decides what tracing produces -- so an unpinned resolve
+      # makes CI's inputs a moving target and lets a green suite go red with no repo change. Bump
+      # deliberately, and re-run the sweep when you do, because a coremltools bump can legitimately
+      # change every exported artifact.
+      - name: Install dependencies
+        run: |
+          pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install "coremltools==9.0" "transformers==4.57.6" "gguf==0.17.1" "numpy==2.4.6" "pytest==8.3.4"
+
+      # tests/ci only. tests/gate exports real checkpoints -- tens of gigabytes of weights this runner
+      # will never have, and hours of CPU -- and is run on a machine that does, against a recorded
+      # baseline. See tests/gate/test_export_sweep.py.
+      - name: Test
+        run: pytest tests/ci -q
+
+      # The catalogue is generated from the component declarations, so a component added without
+      # regenerating it makes the one document that claims to account for them all quietly wrong.
+      # Its own test covers this too; failing here names the fix in one line.
+      - name: Check the generated catalogue is current
+        run: |
+          python -m loom_mil_compiler.component_registry
+          git diff --exit-code docs/DRIVER-COMPONENTS.md \
+            || (echo "docs/DRIVER-COMPONENTS.md is stale -- run python -m loom_mil_compiler.component_registry" && exit 1)

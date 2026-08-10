@@ -5,8 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from loom_mil_compiler import paths
 from loom_mil_compiler import tokenizer_detect as td
 
 
@@ -33,9 +33,17 @@ class TestTokenizerDetect(unittest.TestCase):
     def test_implemented_pre_types_match_bpe_vocab_cpp(self):
         """Every non-None loom pre_type value must appear in bpe_vocab.cpp's pre_spec_table() -- a
         divergence between the two tables (introduced by editing only one side) fails a test instead of
-        silently producing a GGUF the C++ loader then rejects at load time."""
-        cpp_path = Path(__file__).resolve().parent.parent.parent / "src" / "core" / "bpe_vocab.cpp"
-        cpp_src = cpp_path.read_text()
+        silently producing a GGUF the C++ loader then rejects at load time.
+
+        **The other table is in the other repo now.** This is the one check here that reaches into
+        loom.cpp, so it locates that checkout (`LOOM_CPP_ROOT`, or the sibling directory) and skips
+        when there is none -- the same discipline the gate suites use, and better than either
+        duplicating the C++ table here or dropping a check that catches a real class of broken GGUF.
+        """
+        engine = paths.engine_root()
+        if engine is None:
+            self.skipTest("no loom.cpp checkout found; set LOOM_CPP_ROOT to cross-check pre_spec_table()")
+        cpp_src = (engine / "src" / "core" / "bpe_vocab.cpp").read_text()
         implemented = {v for v in td._LLAMA_PRE_TO_LOOM_PRE_TYPE.values() if v is not None}
         for name in implemented:
             self.assertIn(f'"{name}"', cpp_src, f"{name!r} not found in bpe_vocab.cpp's pre_spec_table()")

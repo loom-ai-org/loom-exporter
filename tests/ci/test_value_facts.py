@@ -23,8 +23,8 @@ from coremltools.converters.mil.mil import Var
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from loom_mil_compiler.paths import CONVERTERS, driver_dir
 import loom_mil_compiler  # noqa: F401 -- registers the "loom" backend + applies torch-frontend patches
 from loom_mil_compiler.shape_expr import N_TOKENS, as_expr
 from loom_mil_compiler.value_facts import (

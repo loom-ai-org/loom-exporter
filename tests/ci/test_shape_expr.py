@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 import sympy
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from loom_mil_compiler.paths import CONVERTERS, driver_dir
 from loom_mil_compiler.shape_expr import (  # noqa: E402
     N_TOKENS,
     UnsupportedShapeExpression,

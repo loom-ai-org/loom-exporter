@@ -11,8 +11,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from loom_mil_compiler.paths import CONVERTERS, driver_dir
 from loom_mil_compiler.transducer_export import _EmbedWrapper, _JointWrapper
 
 

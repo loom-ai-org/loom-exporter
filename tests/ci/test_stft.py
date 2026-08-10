@@ -13,8 +13,8 @@ import coremltools as ct
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from loom_mil_compiler.paths import CONVERTERS, driver_dir
 import loom_mil_compiler  # noqa: F401 -- registers the "loom" backend + applies torch-frontend patches
 from loom_mil_compiler.exporter import LoomGGUFExporter
 from loom_mil_compiler.istft import ISTFT
