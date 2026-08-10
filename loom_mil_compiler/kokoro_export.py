@@ -54,6 +54,7 @@ import coremltools as ct
 from coremltools.converters.mil.frontend.torch import ops as _torch_ops
 from coremltools.converters.mil.mil import Builder as _mb
 
+from .paths import CONVERTERS, driver_dir
 from .checkpoint_probe import read_json
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase, RecurrentPhase
 from .patcher import ModelPatcher
@@ -101,7 +102,7 @@ class KokoroModelPatcher(ModelPatcher):
 
 KokoroModelPatcher.prepare_environment()
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "convert_kokoro"))
+sys.path.insert(0, str((CONVERTERS / "convert_kokoro")))
 from kokoro_stft_common import build_forward_dft_kernels, build_inverse_synth_kernels  # noqa: E402
 
 from kokoro.model import KModel  # noqa: E402
@@ -501,7 +502,7 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         ),
     }
     # A DIRECTORY of `.lua` fragments -- Kokoro is peeled (P4.0.6/C.7). See `driver_components`.
-    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_kokoro" / "kokoro_driver"
+    driver_script_path: Path = driver_dir("convert_kokoro", "kokoro_driver")
 
     def driver_components(self) -> List:
         """Kokoro's driver, as components (P4.0.6/C.7).

@@ -13,11 +13,11 @@ import unittest
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 from coremltools.converters.mil.mil import Builder as mb, get_new_symbol, types
 
+from loom_mil_compiler.paths import CONVERTERS, driver_dir
 from loom_mil_compiler.passes import PASS_REGISTRY, apply_loom_mil_passes
 
 

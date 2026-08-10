@@ -15,8 +15,8 @@ import sys
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from loom_mil_compiler.paths import CONVERTERS, driver_dir
 from loom_mil_compiler.driver_builder import DriverContext
 from loom_mil_compiler.lua_library import (
     LIBRARY, LUA_DIR, DrivenTopologies, LuaFunction, LuaLibrary, catalogue, drives_mismatches,
@@ -138,7 +138,7 @@ class TestTheRealFamilies(unittest.TestCase):
         shared = ("run_bi_lstm", "run_resblk_stack", "run_proj1x1", "to_row_major", "from_row_major",
                   "to_layout_a", "from_layout_a", "sigmoid", "round_half_to_even",
                   "predict_durations", "compute_wsum")
-        fragments = sorted(Path(__file__).resolve().parents[1].glob("convert_*/*_driver/*.lua"))
+        fragments = sorted(CONVERTERS.glob("convert_*/*_driver/*.lua"))
         self.assertTrue(fragments)
         text = "\n".join(p.read_text() for p in fragments)
         for name in shared:

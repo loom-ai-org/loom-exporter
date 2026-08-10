@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from loom_mil_compiler.paths import CONVERTERS, driver_dir
 import loom_mil_compiler  # noqa: E402  registers the "loom" backend + torch-frontend patches
 from loom_mil_compiler.decomposition import Flattened, Modular  # noqa: E402
 from loom_mil_compiler.causal_lm_export import (  # noqa: E402

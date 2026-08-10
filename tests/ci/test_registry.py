@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from loom_mil_compiler.paths import CONVERTERS, driver_dir
 from loom_mil_compiler.registry import ModelRecognizer, TaskRegistry, TaskRegistryEntry  # noqa: E402
 from loom_mil_compiler.export_config import LoomExportConfig  # noqa: E402
 from loom_mil_compiler.tasks import known_tasks, task_spec  # noqa: E402

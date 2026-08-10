@@ -16,8 +16,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from loom_mil_compiler.paths import CONVERTERS, driver_dir
 from loom_mil_compiler.spec_protocol import (
     Axis, ConfigDerived, DriverSymbol, EachOf, FieldRef, LinkChecker, LinkCheckContext, LinkError,
     ModuleAttrPath, TopologyInput, TopologyName, TopologyOutputArity, Unchecked, WeightName, WhenSet,

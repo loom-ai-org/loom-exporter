@@ -9,9 +9,9 @@ from gguf import GGUFReader
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Import the compiler to trigger the backend registration
+from loom_mil_compiler.paths import CONVERTERS, driver_dir
 import loom_mil_compiler
 from loom_mil_compiler.exporter import LoomGGUFExporter
 

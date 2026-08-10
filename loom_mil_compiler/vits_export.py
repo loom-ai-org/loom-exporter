@@ -55,12 +55,13 @@ import torch
 import torch.nn.functional as F
 import coremltools as ct
 
+from .paths import CONVERTERS, driver_dir
 from .checkpoint_probe import probe_torch_checkpoint
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .spec_protocol import Unchecked
 
 sys.path.insert(0, "/home/flavio/Dev/piper/src/python")
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "convert_piper_vits"))
+sys.path.insert(0, str((CONVERTERS / "convert_piper_vits")))
 
 from piper_train.vits.models import SynthesizerTrn  # noqa: E402
 from piper_train.vits import modules as vits_modules  # noqa: E402
@@ -325,7 +326,7 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
 
     checkpoint_path: str
     # A DIRECTORY of `.lua` fragments -- VITS is peeled (P4.0.6/C.6). See `driver_components`.
-    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_piper_vits" / "vits_driver"
+    driver_script_path: Path = driver_dir("convert_piper_vits", "vits_driver")
 
     def driver_components(self) -> List:
         """VITS's driver, as components (P4.0.6/C.6).

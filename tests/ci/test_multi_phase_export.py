@@ -21,8 +21,8 @@ import coremltools as ct
 import numpy as np
 import torch.nn as nn
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from loom_mil_compiler.paths import CONVERTERS, driver_dir
 from loom_mil_compiler.multi_phase_export import (
     BaseMultiPhaseModelExportConfig, ExportPhase, TTSFlowMatchingModelExportConfig,
 )

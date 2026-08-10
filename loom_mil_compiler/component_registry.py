@@ -549,7 +549,7 @@ def catalogue() -> str:
 
 # The catalogue lives in `DRIVER-COMPONENTS.md` between these markers, and the enforcing test
 # regenerates and compares -- the doc is a rendering of the code, not a second copy of it.
-DOC = Path(__file__).resolve().parents[2] / "DRIVER-COMPONENTS.md"
+DOC = Path(__file__).resolve().parents[1] / "docs" / "DRIVER-COMPONENTS.md"
 _BLOCKS = {"component catalogue": lambda: catalogue()}
 
 

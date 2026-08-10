@@ -61,6 +61,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 
+from .paths import CONVERTERS, driver_dir
 from .checkpoint_probe import probe_torch_checkpoint
 from .flow_matching_export import FlowMatchingSpec
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase, TTSFlowMatchingModelExportConfig
@@ -394,7 +395,7 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
     # A DIRECTORY of `.lua` fragments rather than one file: Matcha is peeled (P4.0.6/C.4), so its
     # driver is assembled from the components below and each surviving hand-written block is its own
     # fragment. See `driver_components`.
-    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_matcha" / "matcha_driver"
+    driver_script_path: Path = driver_dir("convert_matcha", "matcha_driver")
 
     def driver_components(self) -> List:
         """Matcha's driver, as components (P4.0.6/C.4 -- the first family peeled).

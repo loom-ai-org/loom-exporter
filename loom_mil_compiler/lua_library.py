@@ -33,6 +33,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .driver_builder import DriverComponent
 from .spec_protocol import ConfigDerived, Unchecked
+from .paths import CONVERTERS
 
 LUA_DIR = Path(__file__).resolve().parent / "lua"
 
@@ -369,7 +370,7 @@ def catalogue() -> str:
     import re
 
     families = {}
-    for driver in sorted(LUA_DIR.parent.parent.glob("convert_*/*_driver")):
+    for driver in sorted(CONVERTERS.glob("convert_*/*_driver")):
         text = "\n".join(p.read_text() for p in sorted(driver.glob("*.lua")))
         families[driver.name.replace("_driver", "")] = text
     rows = ["| function | requires | drives | called by |", "|---|---|---|---|"]

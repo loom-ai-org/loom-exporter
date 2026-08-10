@@ -58,6 +58,7 @@ import numpy as np
 import torch
 import coremltools as ct
 
+from .paths import CONVERTERS, driver_dir
 from .checkpoint_probe import probe_torch_checkpoint
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .patcher import ModelPatcher
@@ -93,7 +94,7 @@ from Modules.diffusion.modules import Transformer1d, AttentionBase  # noqa: E402
 from einops import rearrange  # noqa: E402
 from einops_exts import rearrange_many  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "convert_styletts2"))
+sys.path.insert(0, str(CONVERTERS / "convert_styletts2"))
 from convert_styletts2_diffusion import HP as DIFF_HP  # noqa: E402
 
 
@@ -319,7 +320,7 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
     hidden_per_dir: Optional[int] = field(default=None, init=False, repr=False)
     sigma_data: Optional[float] = field(default=None, init=False, repr=False)
     # A DIRECTORY of `.lua` fragments -- StyleTTS2 is peeled (P4.0.6/C.8). See `driver_components`.
-    driver_script_path: Path = Path(__file__).resolve().parent.parent / "convert_styletts2" / "styletts2_driver"
+    driver_script_path: Path = driver_dir("convert_styletts2", "styletts2_driver")
 
     def driver_components(self) -> List:
         """StyleTTS2's driver, as components (P4.0.6/C.8 -- the last family, and the one the plan
