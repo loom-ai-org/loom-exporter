@@ -19,6 +19,12 @@ embeddings, so those are out of scope here too):
                convention).
   - decoder:   real `SpeechDecoder.forward(latent)` -> flat waveform.
 
+The checkpoint's own grapheme vocabulary travels in the GGUF (`backend_kwargs`, below): the static
+`assets/onnx/unicode_indexer.json` codepoint table, which `loom::SupertonicTextVectorizer` reads back, so
+this is the one TTS family whose artifact takes text rather than externally-produced phoneme ids. It is
+data only -- the preprocessing pipeline around it is the engine's port of the real `TextVectorizer`. Note
+what T_TEXT_FIXED below does to its usefulness: 10 ids is about one character after the `<lang>` wrap.
+
 Text-length scope limitation (REAL, carried forward from the bespoke conversion, not a new one introduced
 here, and NOT merely a `loom::GraphBuilder` restriction -- see below): `T_TEXT` is FIXED at trace/export
 time for every topology that touches text (`T_TEXT_FIXED = 10`, matching `SupertonicConfig.txt_len_fixed`
@@ -67,6 +73,7 @@ Matcha's transformers/huggingface_hub dependencies), so there's no `ModelPatcher
 Usage:
   loom-export /path/to/supertonic/assets/pt -o supertonic_mil.gguf --task text-to-speech --model supertonic
 """
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -80,6 +87,7 @@ from .checkpoint_probe import probe_torch_checkpoint
 from .flow_matching_export import FlowMatchingSpec
 from .multi_phase_export import ExportPhase, TTSFlowMatchingModelExportConfig
 from .spec_protocol import Unchecked
+from .supertonic_tokenizer_export import INDEXER_RELPATH, find_indexer
 
 T_TEXT_FIXED = 10  # see module docstring -- matches SupertonicConfig.txt_len_fixed exactly
 
@@ -336,6 +344,34 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         )
 
         return [dp_phase, ttl_phase, vfe_phase, decoder_phase]
+
+    def backend_kwargs(self) -> dict:
+        """The checkpoint's own grapheme vocabulary travels with the model, so the artifact has a text
+        door on its own -- the one capability the standalone
+        `tools/convert_supertonic/convert_supertonic_text_vectorizer.py` GGUF had that this MIL export did
+        not. Same reasoning, and the same shape, as the NeMo families carrying their SentencePiece protobuf
+        (`nemo_asr_export.py`, `transducer_export.py`).
+
+        `tokenizer_family` is named rather than detected: `unicode_indexer.json` is not an HF tokenizer
+        directory, so `tokenizer_detect.detect_vocab_family` would find no file it recognizes and raise.
+
+        Warned-and-omitted rather than raised when the asset is missing, matching the NeMo families' own
+        `if tokenizer_dir is not None`. The four traced graphs are the export; the vocabulary is a real
+        improvement to it, but its absence makes the file worse rather than wrong -- and this method is
+        also called by callers that never trace (`component_registry.usage()` builds every registered
+        config). The warning is what keeps that from being silent, because the asset lives in a directory
+        NEXT TO the one the caller names, and is easy to leave behind when copying a checkpoint out.
+        """
+        kwargs = {"hparams": self.hparams()}
+        indexer = find_indexer(Path(self.model_dir))
+        if indexer is not None:
+            kwargs["tokenizer_dir"] = str(indexer.parent)
+            kwargs["tokenizer_family"] = "supertonic"
+        else:
+            print(f"warning: no {INDEXER_RELPATH} found near {self.model_dir} -- exporting without a "
+                  f"tokenizer, so this GGUF will take txt_ids only and `model.tokenizer` will be None",
+                  file=sys.stderr)
+        return kwargs
 
     def hparams(self) -> dict:
         """The one number a HOST cannot proceed without: how many `txt_ids` this export accepts.
