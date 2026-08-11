@@ -2462,12 +2462,19 @@ class LoomGGUFExporter:
         detecting both the family ("bpe"/"wordpiece"/"sentencepiece_proto") and, for "bpe", the
         pretokenizer regex shape (`tokenizer.ggml.pre`) unless explicitly overridden via
         `tokenizer_family`/`tokenizer_pre` kwargs -- see tokenizer_detect.py's own module docstring for
-        the detection recipes."""
+        the detection recipes.
+
+        "supertonic" is the one family that is never auto-detected: it is not an HF tokenizer directory at
+        all (no tokenizer.json, no protobuf -- one static JSON codepoint table), so a config that has one
+        names it explicitly via `tokenizer_family`, and `detect_vocab_family` is never asked."""
         from .tokenizer_detect import detect_vocab_family, detect_loom_pre_type
 
         family = self.kwargs.get("tokenizer_family") or detect_vocab_family(tokenizer_dir)
 
-        if family == "bpe":
+        if family == "supertonic":
+            from .supertonic_tokenizer_export import write_supertonic_vocab
+            write_supertonic_vocab(w, tokenizer_dir)
+        elif family == "bpe":
             from .bpe_tokenizer_export import write_bpe_vocab
             pre_type = self.kwargs.get("tokenizer_pre")
             if pre_type is None:
