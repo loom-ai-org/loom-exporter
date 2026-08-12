@@ -22,14 +22,14 @@ embeddings, so those are out of scope here too):
 The checkpoint's own grapheme vocabulary travels in the GGUF (`backend_kwargs`, below): the static
 `assets/onnx/unicode_indexer.json` codepoint table, which `loom::SupertonicTextVectorizer` reads back, so
 this is the one TTS family whose artifact takes text rather than externally-produced phoneme ids. It is
-data only -- the preprocessing pipeline around it is the engine's port of the real `TextVectorizer`. Note
-what T_TEXT_FIXED below does to its usefulness: 10 ids is about one character after the `<lang>` wrap.
+data only -- the preprocessing pipeline around it is the engine's port of the real `TextVectorizer`. That
+vocabulary was inspection-only until BACKLOG.md P4.6: `T_TEXT_FIXED` was 10, and `<en>` + the pipeline's
+inserted final period + `</en>` is exactly 10 ids for the EMPTY string, so every real sentence overflowed
+and synthesis effectively still took ids directly. It is 256 now, and the axis is PADDED.
 
 Text-length scope limitation (REAL, carried forward from the bespoke conversion, not a new one introduced
 here, and NOT merely a `loom::GraphBuilder` restriction -- see below): `T_TEXT` is FIXED at trace/export
-time for every topology that touches text (`T_TEXT_FIXED = 10`, matching `SupertonicConfig.txt_len_fixed`
-exactly so this MIL export's own end-to-end driver test can compare directly against the EXISTING bespoke
-`loom::SupertonicDriver` oracle). Two INDEPENDENT reasons force this, not one:
+time for every topology that touches text. Two INDEPENDENT reasons force this, not one:
   (1) `vfe` needs TWO independently-sized sequences at once (the CFM-iterated latent-frame count `T_lat`,
       and the text length `T_TEXT`) -- `loom::GraphBuilder::build(n_tokens, n_past)` only ever resolves
       ONE dynamic-length symbol per topology, so `T_lat` gets "$n_tokens" and `T_TEXT` must be static.
@@ -43,6 +43,19 @@ exactly so this MIL export's own end-to-end driver test can compare directly aga
       windowing needs a static T to build its lookup tables at all), not a coincidence.
   Net effect: ALL FOUR topologies (`dp`/`ttl_text`/`vfe`/`decoder`) are consistent in using this same fixed
   `T_TEXT_FIXED` wherever text length appears (`decoder` doesn't touch text at all, only `T_lat`).
+
+  What P4.6 changed is that the axis being fixed no longer means the TEXT has to be. `txt_msk` is a real
+  input, the driver pads `txt_ids` up to `T_TEXT` and builds the mask, and `_edge_fill` is what makes the
+  padding inert -- see its docstring, which is where the measurement lives. Text longer than `T_TEXT` is
+  still not synthesizable in one call; chunking it is a separate question this export does not open.
+
+  Why 256 and not 512, measured rather than chosen: the axis is static, so its cost is paid on EVERY
+  synthesis no matter how short the real text is. At 256 a full 1.6 s synthesis takes 2.14 s on this
+  machine and peaks at 291 MB; at 512, 2.72 s and 330 MB -- 27% more wall clock and 39 MB for capacity
+  that the overwhelming majority of calls would not use, on an engine whose target is edge devices.
+  Accuracy is identical between the two (the `ttl_text` gate reports 2.0843e-06 either way), so it does
+  not enter into it. 256 ids is roughly 245 characters after the wrap, i.e. a long sentence or a short
+  paragraph: "hello world" is 21 ids, a 44-character sentence is 53, a 155-character one is 161.
 
 Trace-friendliness patches needed (same category as every prior MIL export in this project):
   - `lat_msk` (always all-ones -- the latent axis is the one axis these topologies size dynamically, so
@@ -76,6 +89,7 @@ Usage:
   loom-export /path/to/supertonic/assets/pt -o supertonic_mil.gguf --task text-to-speech --model supertonic
 """
 import sys
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -91,7 +105,11 @@ from .multi_phase_export import ExportPhase, TTSFlowMatchingModelExportConfig
 from .spec_protocol import Unchecked
 from .supertonic_tokenizer_export import INDEXER_RELPATH, find_indexer
 
-T_TEXT_FIXED = 10  # see module docstring -- matches SupertonicConfig.txt_len_fixed exactly
+# The padded text axis every text-touching topology is traced at -- a CEILING on the ids a caller may
+# send, not a requirement, since P4.6. See the module docstring for why it is fixed at all, and for why
+# it is 256 rather than 512. It was 10 (`SupertonicConfig.txt_len_fixed`) until then, which is the empty
+# string after the `<lang>` wrap.
+T_TEXT_FIXED = 256
 
 # What the driver writes into the padded tail of `txt_ids`. Which id this is does not affect a single
 # output value -- `x = x * txt_msk` zeroes every padded position's embedding before anything reads it,
@@ -108,6 +126,83 @@ PAD_ID = 162
 # declared here rather than read, and it is declared HERE rather than restated by every host, which is
 # the whole point of P4.0.8's first follow-up. A release at a different rate needs this line changed.
 DEC_SAMPLE_RATE = 44100.0
+
+
+class _TextMask:
+    """The mask the patched `ConvNextBlock`s below read, set by the wrapper before it calls the real
+    module.
+
+    A holder rather than an argument because the mask has to reach code this export does not call:
+    `DPTextEncoder`/`TTLTextPreEncoder` invoke their blocks as `block(x)` and apply the mask
+    themselves afterwards (`x = block(x) * txt_msk`), so there is no argument to thread. The
+    alternative was reimplementing both encoders' `forward` in a wrapper, which would put a copy of
+    real checkpoint code in this file and make every future divergence silent."""
+
+    __slots__ = ("mask",)
+
+    def __init__(self):
+        self.mask = None
+
+
+def _edge_fill(x, msk):
+    """Replace `x`'s padded tail with a copy of its last REAL column: (B,C,T), (B,1,T) -> (B,C,T).
+
+    This is the whole of P4.6's correctness argument, so it is worth stating what it is for. A
+    `ConvNextBlock` pads with `mode="replicate"` before its depthwise conv, and that conv is the only
+    op in the block that reads across positions. On a MASKED tensor the "edge" it replicates is a zero
+    column, whereas the reference implementation -- which runs at T = the real length, never padded,
+    because `TextVectorizer.tokenize` pads only to the longest string in a batch and synthesis is a
+    batch of one -- replicates the last real column. That difference is not small: measured in
+    PyTorch, ten real ids padded to 256 moved `txt_emb` by 1.77 max-abs against a tensor whose own max
+    is 1.82, and the predicted duration by 0.17%. Filling the tail this way makes every real position's
+    conv window byte-for-byte what the unpadded run sees, which takes `txt_emb` to 2.6e-05 -- fp32
+    reduction-order noise from the wider matmuls, not a residual mechanism.
+
+    No gather, and that is deliberate: the last real index is data-dependent, but `msk` minus itself
+    shifted left is one-hot at exactly that column, so `(x * edge).sum()` selects it with a multiply
+    and a reduction the exporter already lowers. At an all-ones mask `edge` is one-hot at the last
+    column and `1 - msk` is zero, so this is the identity -- confirmed to 0.0 max-abs before it was
+    ever exported, which is why it costs the T_TEXT = 10 references nothing."""
+    msk_next = torch.nn.functional.pad(msk[:, :, 1:], (0, 1))
+    edge = msk - msk_next                                 # one-hot at the last real column
+    last = (x * edge).sum(dim=2, keepdim=True)            # (B, C, 1)
+    return x * msk + last.expand(-1, -1, x.shape[-1]) * (1.0 - msk)
+
+
+def _edge_fill_convnext_forward(self, x, msk=None):
+    """`ConvNextBlock.forward` with a mask-aware replicate pad -- see `_edge_fill`.
+
+    A line-for-line copy of the real `components.ConvNextBlock.forward`'s `msk is None` path with one
+    statement inserted, rather than a reimplementation: the two must not drift, and the diff being one
+    line is what makes that checkable by reading. Only the TEXT encoders' blocks are patched (see
+    `_patch_text_convnext`); the VectorFieldEstimator's own blocks take a real `msk` argument over the
+    latent axis, which this export sizes dynamically and therefore never pads."""
+    assert msk is None, "only the text encoders' blocks are patched, and they pass no mask"
+    m = self._loom_text_mask.mask
+    residual = x
+    y = _edge_fill(x, m)  # <-- the only line the real ConvNextBlock does not have
+    y = torch.nn.functional.pad(y, self.pad, mode="replicate")
+    y = self.dwconv(y)
+    y = y.transpose(1, 2)
+    y = self.norm(y)
+    y = y.transpose(1, 2)
+    y = self.pwconv1(y)
+    y = self.act(y)
+    y = self.pwconv2(y)
+    y = self.gamma * y
+    return residual + y
+
+
+def _patch_text_convnext(blocks, holder) -> None:
+    """Give every block in `blocks` the mask-aware pad, reading its mask from `holder`.
+
+    Per-INSTANCE (`types.MethodType`), not on the class: patching `ConvNextBlock.forward` would also
+    catch the VectorFieldEstimator's blocks, which are correct as they stand. Per-instance also leaves
+    the module tree and its state-dict paths untouched, which a wrapper module would not -- and those
+    paths are the exported tensor names."""
+    for block in blocks:
+        block._loom_text_mask = holder
+        block.forward = types.MethodType(_edge_fill_convnext_forward, block)
 
 
 def _ones_mask_from_float(x):
@@ -133,8 +228,16 @@ class DPWrapper(torch.nn.Module):
     def __init__(self, dp):
         super().__init__()
         self.dp = dp
+        self.text_mask = _TextMask()
+        _patch_text_convnext(dp.sentence_encoder.convnext, self.text_mask)
 
     def forward(self, txt_ids, stl_emb, txt_msk):
+        # `DPTextEncoder` prepends a learned `sentence_token` before its ConvNext stack and masks with
+        # the (B,1,T+1) `full_mask` that results, so that -- not `txt_msk` -- is what its blocks see.
+        # Restated here rather than reached into because it is one `cat`, and derived from `txt_msk`
+        # rather than built with `torch.ones` for the same reason `_ones_mask_from_float` is.
+        one = txt_msk[:, :, :1] * 0.0 + 1.0
+        self.text_mask.mask = torch.cat([one, txt_msk], dim=2)
         duration = self.dp(txt_ids, stl_emb, txt_msk)  # (1,)
         return duration.reshape(-1)
 
@@ -146,8 +249,11 @@ class TTLTextWrapper(torch.nn.Module):
     def __init__(self, te):
         super().__init__()
         self.te = te
+        self.text_mask = _TextMask()
+        _patch_text_convnext(te.text_encoder.convnext, self.text_mask)
 
     def forward(self, txt_ids, stl_emb, txt_msk):
+        self.text_mask.mask = txt_msk
         txt_emb = self.te(txt_ids, stl_emb, txt_msk)  # (1, 256, T_TEXT_FIXED)
         return txt_emb.squeeze(0)  # (256, T_TEXT_FIXED) -> ggml ne=[T_TEXT_FIXED,256], T-fast
 
@@ -405,13 +511,18 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         return kwargs
 
     def hparams(self) -> dict:
-        """The one number a HOST cannot proceed without: how many `txt_ids` this export accepts.
+        """The one number a HOST cannot proceed without: the MOST `txt_ids` this export accepts.
 
         Every text-touching topology here was traced at a FIXED text length (see the module
-        docstring's two independent reasons), so a caller that sends any other count is calling a model
-        that cannot run -- and until now the only place that said so was a comment in the driver and a
+        docstring's two independent reasons), so a caller that sends more than this is calling a model
+        that cannot run -- and the only place that used to say so was a comment in the driver and a
         literal in a C++ test header. Declaring it in the file is what makes the constraint checkable
-        by whoever is actually building the input."""
+        by whoever is actually building the input.
+
+        It was an EXACT count until P4.6, when the driver started padding: `txt_len` is now a ceiling
+        rather than a requirement, and every host that read it as the latter was rejecting text it can
+        now synthesize. The name did not change, because what a host does with it did not: compare its
+        id count against this number. Only the comparison did, from `==` to `<=`."""
         return {"txt_len": T_TEXT_FIXED}
 
     def samplers(self) -> List[FlowMatchingSpec]:

@@ -217,16 +217,15 @@ CATALOG = [
         summary="Supertone's Supertonic 2 on-device TTS model, exported for loom.cpp. Encodes text "
                 "itself -- no external phonemiser needed.",
         limitations=
-            "**The text length is fixed at 10 ids in this export**, which the file states as "
-            "`model.hparam(\"txt_len\")`. Every graph here that touches text was traced at that length, "
-            "so `infer` accepts exactly that many `txt_ids` and no other count. Ten ids is about one "
-            "character once the `<lang>...</lang>` wrap and the inserted final period are counted, so "
-            "the embedded tokenizer is presently useful for encoding and inspection rather than for "
-            "driving synthesis from arbitrary text. Two independent reasons force the length to be "
-            "*fixed* (a single dynamic-length symbol per graph, and a relative-position windowing step "
-            "that cannot be traced dynamically); the specific value of 10 is not one of them. Lifting it "
-            "usefully also needs a real attention mask threaded through, since this export currently "
-            "assumes every position is real text -- tracked as P4.6 in the project backlog.",
+            "**One synthesis call carries at most `model.hparam(\"txt_len\")` ids** -- 256 in this "
+            "export, roughly 245 characters once the `<lang>...</lang>` wrap and the inserted final "
+            "period are counted, so a long sentence or a short paragraph. Anything shorter is padded "
+            "by the driver and masked, so any count up to the ceiling synthesizes correctly; anything "
+            "longer has to be split by the caller, and this export does not do that for you. The "
+            "length is *fixed* rather than dynamic for two independent reasons (a single "
+            "dynamic-length symbol per graph, and a relative-position windowing step that cannot be "
+            "traced dynamically), and because it is fixed its cost is paid on every call regardless of "
+            "how short the text is -- which is why the ceiling is 256 rather than higher.",
     ),
     ModelCard(
         slug="vits-piper-en-gb-miro",
@@ -282,7 +281,7 @@ model = loom.Model.from_pretrained("{repo_id}")
 print(model.tokenizer)                       # kind, vocabulary size, default language
 txt_ids = model.tokenize("hello world")      # model.tokenize(..., lang="ko") to pick a language
 
-# Synthesis needs exactly `txt_len` ids -- see "Known limitations" below before calling infer.
+# Any length up to `model.hparam("txt_len")` -- the driver pads and masks the rest.
 # style_ttl / style_dp are precomputed style embeddings; model.driver_source gives their shapes.
 audio = model.infer(txt_ids=txt_ids, style_ttl=style_ttl, style_dp=style_dp, n_steps=4, seed=1234)
 """,
