@@ -29,7 +29,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+# torchaudio is a TEST dependency only -- nothing in `loom_exporter` imports it. `tests/ci/
+# test_gigaam_export.py` builds a real `torchaudio.transforms.MelSpectrogram` and requires
+# `_TraceableMelSpectrogram` to reproduce it exactly, so torchaudio is the authority that test checks
+# against and not an incidental import. Declared here because it was declared nowhere: CI installed
+# torch without it and the module therefore failed to COLLECT, which aborts the whole run.
+test = ["pytest>=7", "torchaudio>=2.4"]
 
 [project.scripts]
 loom-export = "loom_exporter.main_export:main"
