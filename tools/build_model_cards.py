@@ -217,15 +217,16 @@ CATALOG = [
         summary="Supertone's Supertonic 2 on-device TTS model, exported for loom.cpp. Encodes text "
                 "itself -- no external phonemiser needed.",
         limitations=
-            "**One synthesis call carries at most `model.hparam(\"txt_len\")` ids** -- 256 in this "
-            "export, roughly 245 characters once the `<lang>...</lang>` wrap and the inserted final "
-            "period are counted, so a long sentence or a short paragraph. Anything shorter is padded "
-            "by the driver and masked, so any count up to the ceiling synthesizes correctly; anything "
-            "longer has to be split by the caller, and this export does not do that for you. The "
-            "length is *fixed* rather than dynamic for two independent reasons (a single "
-            "dynamic-length symbol per graph, and a relative-position windowing step that cannot be "
-            "traced dynamically), and because it is fixed its cost is paid on every call regardless of "
-            "how short the text is -- which is why the ceiling is 256 rather than higher.",
+            "**One synthesis call carries at most `model.hparam(\"txt_len\")` ids** -- 512 in this "
+            "export, roughly 490 characters once the `<lang>...</lang>` wrap and the inserted final "
+            "period are counted, so a short paragraph. Anything shorter is padded and masked by the "
+            "driver, so any count up to the ceiling synthesizes correctly; anything longer has to be "
+            "split by the caller, and this export deliberately does not do that for you (where a "
+            "sentence may be broken is a text-domain decision, not a model contract). The text length "
+            "is *fixed* rather than dynamic for two independent reasons -- a single dynamic-length "
+            "symbol per graph, and a relative-position windowing step that cannot be traced "
+            "dynamically -- so the graphs are traced at several widths and the driver runs the "
+            "smallest that fits your text. Short text therefore does not pay for the ceiling.",
     ),
     ModelCard(
         slug="vits-piper-en-gb-miro",

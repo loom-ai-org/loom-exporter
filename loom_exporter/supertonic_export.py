@@ -23,9 +23,9 @@ The checkpoint's own grapheme vocabulary travels in the GGUF (`backend_kwargs`, 
 `assets/onnx/unicode_indexer.json` codepoint table, which `loom::SupertonicTextVectorizer` reads back, so
 this is the one TTS family whose artifact takes text rather than externally-produced phoneme ids. It is
 data only -- the preprocessing pipeline around it is the engine's port of the real `TextVectorizer`. That
-vocabulary was inspection-only until BACKLOG.md P4.6: `T_TEXT_FIXED` was 10, and `<en>` + the pipeline's
+vocabulary was inspection-only until BACKLOG.md P4.6: the one text width was 10, and `<en>` + the pipeline's
 inserted final period + `</en>` is exactly 10 ids for the EMPTY string, so every real sentence overflowed
-and synthesis effectively still took ids directly. It is 256 now, and the axis is PADDED.
+and synthesis effectively still took ids directly. The axis is PADDED now, and traced at five widths.
 
 Text-length scope limitation (REAL, carried forward from the bespoke conversion, not a new one introduced
 here, and NOT merely a `loom::GraphBuilder` restriction -- see below): `T_TEXT` is FIXED at trace/export
@@ -42,20 +42,33 @@ time for every topology that touches text. Two INDEPENDENT reasons force this, n
       reason the bespoke conversion fixed `T_TEXT` in the first place (its own hand-built rel-pos-attention
       windowing needs a static T to build its lookup tables at all), not a coincidence.
   Net effect: ALL FOUR topologies (`dp`/`ttl_text`/`vfe`/`decoder`) are consistent in using this same fixed
-  `T_TEXT_FIXED` wherever text length appears (`decoder` doesn't touch text at all, only `T_lat`).
+  bucket wherever text length appears (`decoder` doesn't touch text at all, only `T_lat`).
 
   What P4.6 changed is that the axis being fixed no longer means the TEXT has to be. `txt_msk` is a real
-  input, the driver pads `txt_ids` up to `T_TEXT` and builds the mask, and `_edge_fill` is what makes the
-  padding inert -- see its docstring, which is where the measurement lives. Text longer than `T_TEXT` is
-  still not synthesizable in one call; chunking it is a separate question this export does not open.
+  input, the driver pads `txt_ids` up to the axis and builds the mask, and `_edge_fill` is what makes the
+  padding inert -- see its docstring, which is where the measurement lives.
 
-  Why 256 and not 512, measured rather than chosen: the axis is static, so its cost is paid on EVERY
-  synthesis no matter how short the real text is. At 256 a full 1.6 s synthesis takes 2.14 s on this
-  machine and peaks at 291 MB; at 512, 2.72 s and 330 MB -- 27% more wall clock and 39 MB for capacity
-  that the overwhelming majority of calls would not use, on an engine whose target is edge devices.
-  Accuracy is identical between the two (the `ttl_text` gate reports 2.0843e-06 either way), so it does
-  not enter into it. 256 ids is roughly 245 characters after the wrap, i.e. a long sentence or a short
-  paragraph: "hello world" is 21 ids, a 44-character sentence is 53, a 155-character one is 161.
+  What P4.6a changed is that there is no longer ONE axis. A static width costs the same on every call
+  whatever the real text is, so a single width had to trade "long enough to be useful" against "cheap
+  enough to always pay" -- 256 was that compromise, and the trade is what bucketing removes. Each of the
+  three text-touching topologies is traced at every width in TEXT_BUCKETS, the driver picks the smallest
+  that fits, and the LARGEST is the ceiling. So the ceiling went 256 -> 512 while an ordinary sentence
+  got FASTER than it was at 256, which no single number could have done.
+
+  `vfe` is bucketed too, and it is the one that must be: it runs once per CFM step, so leaving it at the
+  ceiling would have given back most of what the other two save. That needed `FlowMatchingSpec` to learn
+  a computed estimator name (`estimator_variants`) -- a generalization of the shared sampler template,
+  not a Supertonic special case.
+
+  Why this ladder: `<lang>` + the inserted final period costs 10 ids flat, so 32 is about 22 real
+  characters ("Hi." is 12 ids, "hello world" 21), 128 a sentence (a 44-character one is 53), 512 a short
+  paragraph (~490 characters). Doubling keeps the worst-case waste at just under half the axis while
+  keeping the ladder short, and each rung costs only its own topology JSON: the GGUF writer dedups by
+  CONTENT hash, so every bucket's weights are the same bytes and alias automatically.
+
+  Text longer than the largest bucket is still not synthesizable in one call, and is refused by name
+  rather than truncated. Chunking it is a separate question this export deliberately does not open: it
+  is a decision about where sentences may be broken, which is preprocessing, not a model contract.
 
 Trace-friendliness patches needed (same category as every prior MIL export in this project):
   - `lat_msk` (always all-ones -- the latent axis is the one axis these topologies size dynamically, so
@@ -105,11 +118,19 @@ from .multi_phase_export import ExportPhase, TTSFlowMatchingModelExportConfig
 from .spec_protocol import Unchecked
 from .supertonic_tokenizer_export import INDEXER_RELPATH, find_indexer
 
-# The padded text axis every text-touching topology is traced at -- a CEILING on the ids a caller may
-# send, not a requirement, since P4.6. See the module docstring for why it is fixed at all, and for why
-# it is 256 rather than 512. It was 10 (`SupertonicConfig.txt_len_fixed`) until then, which is the empty
-# string after the `<lang>` wrap.
-T_TEXT_FIXED = 256
+# The padded text widths every text-touching topology is traced at. The driver picks the smallest that
+# fits the caller's ids, so the LARGEST is the ceiling and the others are what keep short text from
+# paying for it (BACKLOG.md P4.6a). One width, 10, until P4.6 -- which is the empty string after the
+# `<lang>` wrap -- then a single 256 until P4.6a. See the module docstring for why a width is fixed at
+# all, and for how the ladder was chosen.
+TEXT_BUCKETS = (32, 64, 128, 256, 512)
+T_TEXT_MAX = max(TEXT_BUCKETS)
+
+
+def bucket_topology(prefix: str, t_text: int) -> str:
+    """`"ttl_text", 64 -> "ttl_text_64"`. One function so the exported name and the name the driver
+    computes are the same rule rather than two string formats that agree today."""
+    return f"{prefix}_{t_text}"
 
 # What the driver writes into the padded tail of `txt_ids`. Which id this is does not affect a single
 # output value -- `x = x * txt_msk` zeroes every padded position's embedding before anything reads it,
@@ -254,15 +275,15 @@ class TTLTextWrapper(torch.nn.Module):
 
     def forward(self, txt_ids, stl_emb, txt_msk):
         self.text_mask.mask = txt_msk
-        txt_emb = self.te(txt_ids, stl_emb, txt_msk)  # (1, 256, T_TEXT_FIXED)
-        return txt_emb.squeeze(0)  # (256, T_TEXT_FIXED) -> ggml ne=[T_TEXT_FIXED,256], T-fast
+        txt_emb = self.te(txt_ids, stl_emb, txt_msk)  # (1, 256, T_TEXT)
+        return txt_emb.squeeze(0)  # (256, T_TEXT) -> ggml ne=[T_TEXT,256], T-fast
 
 
 class VFEWrapper(torch.nn.Module):
     """Real `VectorFieldEstimator.compute_velocity` (assets/pt/vector_estimator.pt) -- ONE Euler velocity
     evaluation; the `z += v*dt` update itself is a Lua/host-side loop (`supertonic_driver/`), same
     split as the bespoke `supertonic_driver.lua`. `txt_emb`'s own T axis is FIXED at trace time
-    (T_TEXT_FIXED) -- see module docstring for why. `t`: (1,) float fractional step in [0,1).
+    (one of TEXT_BUCKETS) -- see module docstring for why. `t`: (1,) float fractional step in [0,1).
 
     `txt_msk` is a real input here for a second reason on top of DP's/TTL's: `txt_emb`'s padded columns
     are zero, so a mask synthesized from `txt_emb` would be all-ones no matter how much of it is
@@ -351,21 +372,31 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         from .driver_components import (
             DriverReturn, ExportConstants, FlowMatchingSampler, LuaFragment, SubgraphCallComponent,
         )
-        from .driver_ir import BinOp, FieldAccess, Var
+        from .driver_ir import BinOp, FieldAccess, Lit, Var
 
         fragment = self.driver_script_path
         t_text, t_lat, lat_dim = Var("T_TEXT"), Var("t_lat"), Var("LAT_DIM")
         txt_ids, txt_msk = Var("txt_ids"), Var("txt_msk")
         sampler, = self.samplers()
+        # `"dp_" .. T_TEXT` and friends: the bucket the fragment picked, turned into the topology name
+        # by the same rule `bucket_topology` used to export it. `variants` states every name this can
+        # produce, so each is checked against a real topology and its declared inputs.
+        def bucket_call(prefix):
+            return BinOp("..", Lit(f"{prefix}_"), t_text), tuple(
+                bucket_topology(prefix, b) for b in TEXT_BUCKETS)
+
+        dp_expr, dp_names = bucket_call("dp")
+        ttl_expr, ttl_names = bucket_call("ttl_text")
+        vfe_expr, _ = bucket_call("vfe")
         return [
             LuaFragment(fragment / "00_header.lua", top_level=True),
-            # The six numbers the caller used to have to supply (P4.0.8's first follow-up). Four are
-            # the model's -- the fixed text length every text-touching topology was traced at, and the
-            # three the SpeechDecoder states about itself -- the fifth is the release's sample
-            # rate, which is genuinely not in the checkpoint (see DEC_SAMPLE_RATE), and PAD_ID joined
-            # them in P4.6, when the text axis started being padded.
+            # The numbers the caller used to have to supply (P4.0.8's first follow-up). The three the
+            # SpeechDecoder states about itself, the release's sample rate -- which is genuinely not
+            # in the checkpoint (see DEC_SAMPLE_RATE) -- PAD_ID, which joined them in P4.6 when the
+            # text axis started being padded, and TEXT_BUCKETS, which joined in P4.6a when there
+            # stopped being one text width. T_TEXT is no longer among them: it is chosen per call now.
             ExportConstants(values={
-                "T_TEXT": T_TEXT_FIXED,
+                "TEXT_BUCKETS": list(TEXT_BUCKETS),
                 "PAD_ID": PAD_ID,
                 "LAT_DIM": self.lat_dim,
                 "SAMPLE_RATE": DEC_SAMPLE_RATE,
@@ -373,10 +404,11 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
                 "COMPRESSION_FACTOR": self.compression_factor,
             }),
             LuaFragment(fragment / "01_lengths.lua"),
-            LuaFragment(fragment / "01_text_inputs.lua", reads=("T_TEXT", "PAD_ID"),
-                        defines=("n_txt", "txt_ids", "txt_msk")),
+            LuaFragment(fragment / "01_text_inputs.lua", reads=("TEXT_BUCKETS", "PAD_ID"),
+                        defines=("n_txt", "T_TEXT", "txt_ids", "txt_msk")),
             SubgraphCallComponent(
-                topology="dp", outputs=("dur_arr",), length=t_text,
+                topology=bucket_topology("dp", T_TEXT_MAX), topology_expr=dp_expr, variants=dp_names,
+                outputs=("dur_arr",), length=t_text,
                 inputs={"txt_ids": txt_ids, "stl_emb": FieldAccess("inputs", "style_dp"),
                         "txt_msk": txt_msk},
                 note="--- DurationPredictor: DPTextEncoder + MLP head -> scalar duration (seconds) ---"),
@@ -384,7 +416,8 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
                         reads=("dur_arr", "SAMPLE_RATE", "BASE_CHUNK_SIZE", "COMPRESSION_FACTOR"),
                         defines=("duration", "wav_length", "latent_size", "t_lat")),
             SubgraphCallComponent(
-                topology="ttl_text", outputs=("txt_emb",), length=t_text,
+                topology=bucket_topology("ttl_text", T_TEXT_MAX), topology_expr=ttl_expr,
+                variants=ttl_names, outputs=("txt_emb",), length=t_text,
                 inputs={"txt_ids": txt_ids, "stl_emb": FieldAccess("inputs", "style_ttl"),
                         "txt_msk": txt_msk},
                 note="--- TTLTextEncoder -> txt_emb, ne=[t_text,txt_dim] (T-fast, the traced module's\n"
@@ -392,12 +425,12 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
                      "    bespoke driver's Layout A/B bridging, since \"vfe\" was traced expecting\n"
                      "    exactly this same layout for its own txt_emb input). ---"),
             FlowMatchingSampler(
-                spec=sampler, result="z", length=t_lat,
+                spec=sampler, result="z", length=t_lat, estimator=vfe_expr,
                 n_elems=BinOp("*", t_lat, lat_dim), n_steps=FieldAccess("inputs", "n_steps"),
                 step_inputs={"txt_emb": Var("txt_emb"), "stl_emb": FieldAccess("inputs", "style_ttl"),
                              "txt_msk": txt_msk},
-                note="--- Deterministic Euler CFM sampling over VectorFieldEstimator -- see\n"
-                     "    sample_vfe above. ---"),
+                note="--- Deterministic Euler CFM sampling over VectorFieldEstimator, at the same\n"
+                     "    text bucket the two encoders above ran at -- see sample_vfe above. ---"),
             SubgraphCallComponent(
                 topology="decoder", outputs=("waveform",), length=t_lat,
                 inputs={"latent": Var("z")},
@@ -423,64 +456,76 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         self.base_chunk_size = int(dec.head_layer2.out_channels)
 
         torch.manual_seed(0)
-        dummy_txt_ids = torch.randint(1, 163, (1, T_TEXT_FIXED), dtype=torch.int64)
         dummy_dp_stl = torch.randn(1, 8, 16)
         dummy_ttl_stl = torch.randn(1, 50, 256)
-        # An all-ones dummy mask traces the same graph a padded one does -- every read of it is a real
-        # op either way (multiply, `== 0.0`, `.sum()`), none of them shape-dependent. What the dummy's
-        # CONTENT decides is nothing; what its SHAPE decides is T_TEXT, same as `dummy_txt_ids`.
-        dummy_txt_msk = torch.ones(1, 1, T_TEXT_FIXED)
-        txt_msk_input = ct.TensorType(name="txt_msk", shape=(1, 1, T_TEXT_FIXED), dtype=np.float32)
-
-        print("Tracing DurationPredictor...")
-        dp_phase = ExportPhase(
-            name="dp", wrapper=DPWrapper(dp).eval(),
-            dummy_inputs=(dummy_txt_ids, dummy_dp_stl, dummy_txt_msk),
-            mil_inputs=[
-                ct.TensorType(name="txt_ids", shape=(1, T_TEXT_FIXED), dtype=np.int32),
-                ct.TensorType(name="stl_emb", shape=(1, 8, 16), dtype=np.float32),
-                txt_msk_input,
-            ],
-        )
-
-        print("Tracing TTLTextEncoder...")
-        ttl_phase = ExportPhase(
-            name="ttl_text", wrapper=TTLTextWrapper(te).eval(),
-            dummy_inputs=(dummy_txt_ids, dummy_ttl_stl, dummy_txt_msk),
-            mil_inputs=[
-                ct.TensorType(name="txt_ids", shape=(1, T_TEXT_FIXED), dtype=np.int32),
-                ct.TensorType(name="stl_emb", shape=(1, 50, 256), dtype=np.float32),
-                txt_msk_input,
-            ],
-        )
-
-        print("Tracing VectorFieldEstimator...")
         lat_seq_dim = ct.RangeDim(1, 512)
         dummy_L = 9
         dummy_z = torch.randn(1, 144, dummy_L)
-        dummy_txt_emb = torch.randn(1, 256, T_TEXT_FIXED)
         dummy_t = torch.tensor([0.3])
-        vfe_phase = ExportPhase(
-            name="vfe", wrapper=VFEWrapper(vfe).eval(),
-            dummy_inputs=(dummy_z, dummy_txt_emb, dummy_ttl_stl, dummy_t, dummy_txt_msk),
-            mil_inputs=[
-                ct.TensorType(name="z_t", shape=(1, 144, lat_seq_dim), dtype=np.float32),
-                ct.TensorType(name="txt_emb", shape=(1, 256, T_TEXT_FIXED), dtype=np.float32),
-                ct.TensorType(name="stl_emb", shape=(1, 50, 256), dtype=np.float32),
-                ct.TensorType(name="t", shape=(1,), dtype=np.float32),
-                txt_msk_input,
-            ],
-        )
+
+        # One wrapper per module, reused across every bucket. The wrappers patch their encoders'
+        # ConvNext blocks in `__init__` (`_patch_text_convnext`), and patching the same block twice
+        # would nest the patched forward inside itself -- so building three wrappers and tracing each
+        # five times is not merely tidier here, it is the only correct order.
+        dp_wrapper = DPWrapper(dp).eval()
+        ttl_wrapper = TTLTextWrapper(te).eval()
+        vfe_wrapper = VFEWrapper(vfe).eval()
+
+        phases: List[ExportPhase] = []
+        for t_text in TEXT_BUCKETS:
+            print(f"Tracing DurationPredictor / TTLTextEncoder / VectorFieldEstimator at T_TEXT={t_text}...")
+            dummy_txt_ids = torch.randint(1, 163, (1, t_text), dtype=torch.int64)
+            # An all-ones dummy mask traces the same graph a padded one does -- every read of it is a
+            # real op either way (multiply, `== 0.0`, `.sum()`), none of them shape-dependent. What the
+            # dummy's CONTENT decides is nothing; what its SHAPE decides is the bucket.
+            dummy_txt_msk = torch.ones(1, 1, t_text)
+            dummy_txt_emb = torch.randn(1, 256, t_text)
+            txt_msk_input = ct.TensorType(name="txt_msk", shape=(1, 1, t_text), dtype=np.float32)
+            txt_ids_input = ct.TensorType(name="txt_ids", shape=(1, t_text), dtype=np.int32)
+
+            phases += [
+                ExportPhase(
+                    name=bucket_topology("dp", t_text), wrapper=dp_wrapper,
+                    dummy_inputs=(dummy_txt_ids, dummy_dp_stl, dummy_txt_msk),
+                    mil_inputs=[
+                        txt_ids_input,
+                        ct.TensorType(name="stl_emb", shape=(1, 8, 16), dtype=np.float32),
+                        txt_msk_input,
+                    ],
+                ),
+                ExportPhase(
+                    name=bucket_topology("ttl_text", t_text), wrapper=ttl_wrapper,
+                    dummy_inputs=(dummy_txt_ids, dummy_ttl_stl, dummy_txt_msk),
+                    mil_inputs=[
+                        txt_ids_input,
+                        ct.TensorType(name="stl_emb", shape=(1, 50, 256), dtype=np.float32),
+                        txt_msk_input,
+                    ],
+                ),
+                ExportPhase(
+                    name=bucket_topology("vfe", t_text), wrapper=vfe_wrapper,
+                    dummy_inputs=(dummy_z, dummy_txt_emb, dummy_ttl_stl, dummy_t, dummy_txt_msk),
+                    mil_inputs=[
+                        ct.TensorType(name="z_t", shape=(1, 144, lat_seq_dim), dtype=np.float32),
+                        ct.TensorType(name="txt_emb", shape=(1, 256, t_text), dtype=np.float32),
+                        ct.TensorType(name="stl_emb", shape=(1, 50, 256), dtype=np.float32),
+                        ct.TensorType(name="t", shape=(1,), dtype=np.float32),
+                        txt_msk_input,
+                    ],
+                ),
+            ]
 
         print("Tracing SpeechDecoder...")
         dec_seq_dim = ct.RangeDim(1, 512)
         dummy_latent = torch.randn(1, 144, 4)
-        decoder_phase = ExportPhase(
+        # Not bucketed, and the only one of the four that isn't: it never touches the text axis, only
+        # `T_lat`, which is dynamic.
+        phases.append(ExportPhase(
             name="decoder", wrapper=DecoderWrapper(dec).eval(), dummy_inputs=(dummy_latent,),
             mil_inputs=[ct.TensorType(name="latent", shape=(1, 144, dec_seq_dim), dtype=np.float32)],
-        )
+        ))
 
-        return [dp_phase, ttl_phase, vfe_phase, decoder_phase]
+        return phases
 
     def backend_kwargs(self) -> dict:
         """The checkpoint's own grapheme vocabulary travels with the model, so the artifact has a text
@@ -522,15 +567,27 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         It was an EXACT count until P4.6, when the driver started padding: `txt_len` is now a ceiling
         rather than a requirement, and every host that read it as the latter was rejecting text it can
         now synthesize. The name did not change, because what a host does with it did not: compare its
-        id count against this number. Only the comparison did, from `==` to `<=`."""
-        return {"txt_len": T_TEXT_FIXED}
+        id count against this number. Only the comparison did, from `==` to `<=`.
+
+        P4.6a made the text axis bucketed, and this stayed ONE number for the same reason: a host's
+        question is still "will my ids fit", and the answer is still the largest width. Which bucket a
+        call lands in is the driver's business and deliberately not a host's -- publishing the ladder
+        here would invite callers to pad to a bucket themselves, which is exactly the job the driver
+        took over. It is readable anyway, by anyone who wants it, in the embedded driver's own
+        `TEXT_BUCKETS` local."""
+        return {"txt_len": T_TEXT_MAX}
 
     def samplers(self) -> List[FlowMatchingSpec]:
         # Same shared family as Matcha's own sampler (EXPORT-IMPROVEMENT.md item 4) -- only the
-        # estimator, the loop-carried input's name, and the per-step-constant inputs differ.
+        # estimator, the loop-carried input's name, and the per-step-constant inputs differ. Since
+        # P4.6a the estimator is a SET rather than a name, because `vfe` is traced once per text
+        # bucket; `estimator` is the canonical member every other link checks against, and the driver
+        # passes the one it picked. Matcha's own sampler is unaffected -- it declares no variants and
+        # its generated Lua is unchanged.
         return [FlowMatchingSpec(
             func_name="sample_vfe",
-            estimator="vfe",
+            estimator=bucket_topology("vfe", T_TEXT_MAX),
+            estimator_variants=tuple(bucket_topology("vfe", b) for b in TEXT_BUCKETS),
             carried_input="z_t",
             time_input="t",
             fixed_inputs=["txt_emb", "stl_emb", "txt_msk"],

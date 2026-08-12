@@ -1512,6 +1512,18 @@ class SubgraphCallComponent(DriverComponent):
     axes: Optional[dict] = None
     note: Optional[str] = None
     multiline: bool = False
+    # A call site whose topology is chosen at RUN time: `topology_expr` is the IR that produces the
+    # name, and `variants` is the complete set it can produce. `topology` stays a real name -- the
+    # canonical member -- so every check this component already had keeps running, and `sub_specs`
+    # extends the input check to the rest. Supertonic's text buckets are the case this exists for
+    # (BACKLOG.md P4.6a): the same graph traced at several widths, picked by how long the text is.
+    #
+    # Declaring the set is the whole point. Kokoro's and StyleTTS2's computed call sites live in
+    # hand-written Lua and are declared with `ComputedCall`, which is the same idea one layer out; this
+    # is what lets a SYNTHESIZED call be computed without dropping to text and losing the IR checks
+    # (output arity, define-before-read) that `ComputedCall` cannot perform.
+    topology_expr: object = None
+    variants: Tuple[str, ...] = ()
     # Keep this call's outputs in the module's own `OutputStore` instead of marshalling them into Lua
     # tables (BACKLOG.md P4.0.12). A later call reaches them with an `OutputRef` -- a backend-side
     # tensor copy -- so a chain edge never becomes a list of Lua doubles. Whisper's encoder is the case
@@ -1545,10 +1557,32 @@ class SubgraphCallComponent(DriverComponent):
             "driver_ir.check_subgraph_calls rejects an `OutputRef` naming a module no earlier call "
             "retained, which is the failure a wrong value here would cause."
         ),
+        "topology_expr": Unchecked(
+            "the driver_ir expression producing the topology name, over locals earlier components "
+            "bind -- validate() is its authority, the same as `length`. What it may EVALUATE to is a "
+            "different question and a checked one: see `variants`"
+        ),
+        "variants": NestedSpec(
+            where="DriverBuilder.build, via sub_specs() -- one EstimatorSpec per alternative name, so "
+                  "each is checked against the real topologies and their declared inputs by the same "
+                  "implementation a hand-written call site uses"
+        ),
     }
 
     def link_label(self) -> str:
         return f"loom.run_subgraph({self.topology!r})"
+
+    def sub_specs(self):
+        """One `EstimatorSpec` per alternative name, so a computed call is checked in full.
+
+        `topology` carries every link this component already had -- it names a real topology, and its
+        declared inputs must match `inputs` exactly -- but when `topology_expr` is set it is only the
+        CANONICAL member of the set. These are the others, checked by the same implementation a
+        hand-written call site uses rather than a second one written for this case."""
+        from .flow_matching_export import EstimatorSpec
+
+        return [EstimatorSpec(topology=name, inputs=list(self.inputs))
+                for name in self.variants if name != self.topology]
 
     def emit(self, ctx):
         axes = self.axes
@@ -1557,7 +1591,7 @@ class SubgraphCallComponent(DriverComponent):
         return _note_block(self.note) + [SubgraphCall(
             outputs=list(self.outputs), extra_outputs=list(self.extra_outputs),
             module=self.topology, axes=axes, inputs=dict(self.inputs), multiline=self.multiline,
-            retain=self.retain,
+            retain=self.retain, module_expr=self.topology_expr,
         )]
 
 
@@ -1818,6 +1852,10 @@ class FlowMatchingSampler(DriverComponent):
     n_steps: object
     step_inputs: dict
     note: Optional[str] = None
+    # The IR expression naming which estimator to integrate, for a spec that declares variants.
+    # Required then and meaningless otherwise -- `emit` raises rather than defaulting, because a
+    # sampler over several graphs with nothing choosing between them is a mis-declaration.
+    estimator: object = None
 
     __links__ = {
         "spec": NestedSpec(
@@ -1838,13 +1876,21 @@ class FlowMatchingSampler(DriverComponent):
             "spec's own TopologyInput link over its supplied_inputs -- what is unchecked is the "
             "expression each maps to, which is a driver local like any other"
         ),
+        "estimator": Unchecked(
+            "same -- the IR expression naming which variant to integrate. What it may evaluate to is "
+            "checked, per name, by the spec's own estimator_specs() through sub_specs(); that it is "
+            "PRESENT at all when the spec declares variants is checked by emit(), which raises"
+        ),
     }
 
     def link_label(self) -> str:
         return f"FlowMatchingSampler({self.spec.func_name!r})"
 
     def sub_specs(self):
-        return [self.spec]
+        # `estimator_specs()` is `[estimator_spec()]` unless the spec declares variants, in which case
+        # it is one per bucket -- so a bucketed sampler is checked by the same code as an unbucketed
+        # one, once per name the caller may pass.
+        return [self.spec, *self.spec.estimator_specs()]
 
     def prelude(self, ctx):
         from .flow_matching_export import render_sampler
@@ -1852,9 +1898,19 @@ class FlowMatchingSampler(DriverComponent):
         return render_sampler(self.spec).split("\n") + [""]
 
     def emit(self, ctx):
-        return _note_block(self.note) + [Local(self.result, Call(self.spec.func_name, [
-            self.length, self.n_elems, self.n_steps, TableLit(dict(self.step_inputs)),
-        ]))]
+        args = [self.length, self.n_elems, self.n_steps, TableLit(dict(self.step_inputs))]
+        if self.spec.estimator_variants:
+            # The generated function takes the estimator's name first when it is computed; this is the
+            # expression that produces it. Refusing to guess one is deliberate -- a sampler over
+            # variants with nothing to pick between them is a mis-declaration, not a default.
+            if self.estimator is None:
+                raise ValueError(
+                    f"FlowMatchingSampler({self.spec.func_name!r}): the spec declares "
+                    f"estimator_variants {list(self.spec.estimator_variants)}, so this component must "
+                    f"supply `estimator` -- the IR expression choosing between them."
+                )
+            args.insert(0, self.estimator)
+        return _note_block(self.note) + [Local(self.result, Call(self.spec.func_name, args))]
 
 
 @dataclass
@@ -1983,8 +2039,15 @@ class MultiPhaseDriverBuilder(DriverBuilder):
                 names.add(component.spec.estimator)
             for spec in getattr(component, "sub_specs", list)():
                 names.update(call.topology for call in getattr(spec, "expand", list)())
-                if isinstance(spec, RunSubgraphCall):
-                    names.add(spec.topology)
+                # Any sub-spec that NAMES a topology counts, read off the field rather than off a list
+                # of spec classes -- the same reasoning as `_names_a_topology` above, and for the same
+                # reason: P4.6a made `SubgraphCallComponent.variants` and
+                # `FlowMatchingSpec.estimator_variants` declare their alternatives as `EstimatorSpec`s,
+                # and an `isinstance(spec, RunSubgraphCall)` list reported all twelve of Supertonic's
+                # text buckets as topologies no call site names while the driver was calling them.
+                topology = getattr(spec, "topology", None)
+                if isinstance(topology, str):
+                    names.add(topology)
         return names
 
     def coverage(self, ctx) -> str:
