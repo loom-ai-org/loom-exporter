@@ -380,6 +380,17 @@ class SubgraphCall(Stmt):
     axes: dict  # str (axis name) -> Expr
     inputs: dict  # str -> Expr
     extra_outputs: list = dataclasses.field(default_factory=list)
+    # When set, the module name is COMPUTED: this expression is rendered in place of the literal, and
+    # `module` becomes the canonical member of the set it can evaluate to rather than the only one.
+    #
+    # Every check in this file still runs against `module`, which is what makes this safe to add: the
+    # declared inputs, the output arity and the retained-output adjacency are properties of the
+    # topology, and a family that computes a name does it precisely because the alternatives are the
+    # same graph at different sizes (Supertonic's text buckets) or the same block repeated (Kokoro's
+    # `duration_adaln_` loop). What that leaves unchecked is whether the OTHER names exist and agree,
+    # which is `SubgraphCallComponent.variants`' job -- stated there rather than inferred here,
+    # because this node cannot know the set.
+    module_expr: object = None  # Optional[Expr]
     # Render the input table one entry per line. Off by default so every existing call's text is
     # unchanged; a call with seven inputs (Kokoro's decoder_vocoder) is unreadable on one line, and
     # the embedded driver_script is something people read out of the GGUF.
@@ -402,6 +413,8 @@ class SubgraphCall(Stmt):
 
     def reads(self) -> list[str]:
         out: list[str] = []
+        if self.module_expr is not None:
+            out.extend(self.module_expr.reads())
         for e in self.axes.values():
             out.extend(e.reads())
         for v in self.inputs.values():
@@ -807,13 +820,14 @@ class LuaCodegen:
         anything is bound -- `multiline` (an input table one entry per line, for calls whose seven inputs are
         unreadable on one) applies to both, and factoring it here is what keeps that true."""
         pad = self.indent * depth
+        name = stmt.module_expr if stmt.module_expr is not None else Lit(stmt.module)
         if stmt.multiline:
             inner = self.indent * (depth + 1)
-            lines = [f"{pad}{prefix}{fn}({Lit(stmt.module).render()}, {TableLit(stmt.axes).render()}, {{"]
+            lines = [f"{pad}{prefix}{fn}({name.render()}, {TableLit(stmt.axes).render()}, {{"]
             lines.extend(f"{inner}{k} = {v.render()}," for k, v in stmt.inputs.items())
             lines.append(f"{pad}}})")
             return lines
-        call = Call(fn, [Lit(stmt.module), TableLit(stmt.axes), TableLit(stmt.inputs)])
+        call = Call(fn, [name, TableLit(stmt.axes), TableLit(stmt.inputs)])
         return [f"{pad}{prefix}{call.render()}"]
 
     def _emit_stmt(self, stmt: Stmt, depth: int) -> list:

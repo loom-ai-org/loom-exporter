@@ -823,15 +823,41 @@ class TestPeeledSupertonic(unittest.TestCase):
         matcha = {type(c) for c in self._matcha_config().driver_components()}
         self.assertEqual(supertonic - matcha, set())
 
+    def _ctx(self):
+        """The topologies a real Supertonic export produces: the three text-touching ones once per
+        text bucket, plus the decoder, which never touches text (BACKLOG.md P4.6a).
+
+        Built from `TEXT_BUCKETS` rather than spelled out, because the point of the check downstream
+        is that the driver's computed names land on real topologies -- writing the names here by hand
+        would make this test agree with itself rather than with the export. `txt_msk` is a real
+        declared input on all three since P4.6; dropping it is what this check caught when it was
+        added."""
+        from loom_exporter.supertonic_export import TEXT_BUCKETS, bucket_topology
+
+        topologies = {"decoder": _topo(["latent"])}
+        for bucket in TEXT_BUCKETS:
+            topologies[bucket_topology("dp", bucket)] = _topo(["txt_ids", "stl_emb", "txt_msk"])
+            topologies[bucket_topology("ttl_text", bucket)] = _topo(["txt_ids", "stl_emb", "txt_msk"])
+            topologies[bucket_topology("vfe", bucket)] = _topo(
+                ["z_t", "txt_emb", "stl_emb", "t", "txt_msk"])
+        return DriverContext(topologies=topologies,
+                             axes={n: "n_tokens" for n in topologies})
+
     def test_it_assembles_into_a_driver_that_validates(self):
-        ctx = DriverContext(
-            topologies={"dp": _topo(["txt_ids", "stl_emb"]), "ttl_text": _topo(["txt_ids", "stl_emb"]),
-                        "vfe": _topo(["z_t", "txt_emb", "stl_emb", "t"]), "decoder": _topo(["latent"])},
-            axes={n: "n_tokens" for n in ("dp", "ttl_text", "vfe", "decoder")},
-        )
-        text = MultiPhaseDriverBuilder(peeled=self._config().driver_components()).render(ctx)
+        text = MultiPhaseDriverBuilder(peeled=self._config().driver_components()).render(self._ctx())
         self.assertLess(text.index("local function sample_vfe"), text.index("function infer"))
         self.assertTrue(text.endswith("    return waveform\nend\n"))
+
+    def test_every_text_call_site_is_computed_from_the_bucket(self):
+        """The three text topologies must be named at run time and the decoder must not.
+
+        Worth asserting separately because the failure it catches is silent: a call site left at a
+        literal name still exports, still validates, and simply always runs the widest graph -- which
+        is P4.6a undone, with nothing reporting it."""
+        text = MultiPhaseDriverBuilder(peeled=self._config().driver_components()).render(self._ctx())
+        for prefix in ("dp", "ttl_text", "vfe"):
+            self.assertIn(f"('{prefix}_' .. T_TEXT)", text)
+        self.assertIn("loom.run_subgraph('decoder'", text)
 
 
 class TestPeeledVits(unittest.TestCase):
