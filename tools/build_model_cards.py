@@ -37,6 +37,9 @@ DEFAULT_MODELS_ROOT = Path("/home/flavio/Dev/models")
 DEFAULT_OUTPUT_DIR = REPO_ROOT.parent / "hf-models"
 
 LOOM_PY_URL = "https://github.com/loom-ai-org/loom-py"
+# The loom-py release these cards tell a reader to install. Bump when a card's example needs something
+# a older loom-py does not have -- it is a floor, not a pin, so it does not need touching per release.
+LOOM_PY_MIN_VERSION = "1.0.0rc1"
 EXPORTER_URL = "https://github.com/loom-ai-org/loom-exporter"
 
 
@@ -84,6 +87,15 @@ class ModelCard:
     # Markdown rendered as a "Known limitations" section. For anything a user would otherwise discover
     # by getting a wrong answer -- a constraint the export carries that the upstream model does not.
     limitations: Optional[str] = None
+    # Markdown appended after the usage code block, for a model whose API needs more than the shared
+    # per-task snippet can say. Supertonic is the case it exists for: its GGUF embeds one voice and the
+    # repo ships nine more as loose files, so "how do I use a different voice" is a real question that
+    # only this model has. Bring your own fenced code block -- this lands as raw markdown, after the
+    # snippet's fence has closed.
+    usage_extra: Optional[str] = None
+    # Extra bullets for the "Files" section, for a repo that ships more than the GGUF. Each string is
+    # one bullet, markdown, without the leading "- ".
+    extra_files: List[str] = field(default_factory=list)
 
 
 # The 17 models the exporter can produce today (BACKLOG.md's implementation-sequence table, P4/P5).
@@ -231,6 +243,38 @@ CATALOG = [
             "voice as a `style_ttl`/`style_dp` pair. What this export does *not* carry is the two "
             "style encoders, so it cannot derive a style from your own audio -- cloning a new voice "
             "needs the upstream checkpoint. Selecting among existing voices does not.",
+        usage_extra="""### Choosing a voice
+
+This file embeds one voice (`F1`) and uses it whenever no style is passed. Nine more ship in this repo
+under `voice_styles/`:
+
+```python
+import json
+from huggingface_hub import hf_hub_download
+
+path = hf_hub_download("loom-ai-org/supertonic-2-loom", filename="voice_styles/M1.json")
+style = json.load(open(path))
+
+# Each file holds two embeddings, stored with a leading batch axis: style_ttl is (1, 50, 256) and
+# style_dp is (1, 8, 16). `infer` takes them flat, so drop the batch axis and concatenate the rows.
+flatten = lambda entry: [v for row in entry["data"][0] for v in row]
+style_ttl = flatten(style["style_ttl"])   # 50 * 256 = 12800 floats
+style_dp = flatten(style["style_dp"])     #  8 *  16 =   128 floats
+
+audio = model.infer(txt_ids=txt_ids, style_ttl=style_ttl, style_dp=style_dp, n_steps=4, seed=1234)
+```
+
+The two arguments travel together: pass neither for the built-in voice, or both to select another. A
+different voice predicts a different duration, so the waveform generally changes length as well as
+timbre.
+
+Plain lists are fine -- this package has no runtime dependencies and accepts any sequence of floats, so
+`numpy.asarray(...).ravel()` works equally well if numpy is already around.""",
+        extra_files=[
+            "`voice_styles/*.json` -- ten precomputed voices (`F1`-`F5`, `M1`-`M5`), copied unmodified\n"
+            "  from the upstream checkpoint. `F1` is also embedded in the GGUF as the default, so these\n"
+            "  are only needed to select a different voice. See the usage example above.",
+        ],
     ),
     ModelCard(
         slug="vits-piper-en-gb-miro",
@@ -289,11 +333,7 @@ txt_ids = model.tokenize("hello world")      # model.tokenize(..., lang="ko") to
 # Any length up to `model.hparam("txt_len")` -- the driver pads and masks the rest.
 audio = model.infer(txt_ids=txt_ids, n_steps=4, seed=1234)
 
-# That uses this file's built-in default voice. To synthesize in a different one, pass a pair of
-# style embeddings -- style_ttl is (50, 256) and style_dp is (8, 16), flattened; the upstream
-# checkpoint ships ten of them in assets/voice_styles/*.json, and model.driver_source shows exactly
-# where they go.
-audio = model.infer(txt_ids=txt_ids, style_ttl=style_ttl, style_dp=style_dp, n_steps=4, seed=1234)
+# That uses whatever voice the file itself defaults to. See below for choosing another.
 """,
 }
 
@@ -355,6 +395,10 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
         lang_line += f"\n\n{card.language_note}"
 
     limitations_section = f"\n## Known limitations\n\n{card.limitations}\n" if card.limitations else ""
+    # Both land verbatim: `usage_extra` right after the snippet's closing fence, `extra_files` as
+    # further bullets under the GGUF's own.
+    usage_extra_section = f"\n{card.usage_extra}\n" if card.usage_extra else ""
+    extra_files_section = "".join(f"- {bullet}\n" for bullet in card.extra_files)
 
     body = f"""# {card.title}
 
@@ -382,19 +426,19 @@ loom.cpp's GGUF format.
 Run it with [loom-py]({LOOM_PY_URL}) -- `loom-py-rt` on PyPI:
 
 ```sh
-pip install loom-py-rt[hub]
+pip install "loom-py-rt[hub]>={LOOM_PY_MIN_VERSION}"
 ```
 
 ```python
 {USAGE_SNIPPETS[snippet_key(card)].format(repo_id=repo_id(card), slug=card.slug)}```
-
+{usage_extra_section}
 `model.driver_source` prints the exact driver script this GGUF embeds, including a header comment
 documenting every argument `model.infer()`/`model.generate()` accepts for this model.
 {limitations_section}
 ## Files
 
 - `{gguf_name}` -- the model, exported with loom-exporter.
-"""
+{extra_files_section}"""
     return "\n".join(frontmatter) + body
 
 
