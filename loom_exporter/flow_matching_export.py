@@ -61,7 +61,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from .spec_protocol import (
-    CoveredBy, DriverSymbol, FieldRef, TopologyInput, TopologyName, TopologyOutputArity,
+    CoveredBy, DriverSymbol, FieldRef, NestedSpec, TopologyInput, TopologyName, TopologyOutputArity,
     Unchecked,
 )
 
@@ -124,6 +124,8 @@ class FlowMatchingSpec:
 
     func_name: str
     # The traced per-step estimator's topology name, as registered in the exporter's `topologies` dict.
+    # When `estimator_variants` is set this is the CANONICAL member of that set rather than the only
+    # one -- see below.
     estimator: str
     # The estimator input that receives the loop-carried state (Matcha "z", Supertonic "z_t").
     carried_input: str
@@ -135,6 +137,22 @@ class FlowMatchingSpec:
     # Human-readable note rendered above the generated function, so the embedded driver script still
     # explains itself to someone reading the GGUF rather than this file.
     note: Optional[str] = None
+    # The complete set of estimator topologies the CALLER may choose between at run time. Empty for
+    # the ordinary case, where the estimator is one graph and its name is a literal in the emitted
+    # `loom.run_subgraph`.
+    #
+    # Set, the generated function takes the name as its first argument. Supertonic's text buckets are
+    # what this is for (BACKLOG.md P4.6a): `vfe` is traced at several text widths and the driver picks
+    # one per call, and the estimator is called once per CFM step, so leaving it at the maximum width
+    # would give back most of what bucketing buys. Nothing about the LOOP changes -- which is the
+    # reason this is a field here rather than a second sampler template.
+    #
+    # `estimator` must be one of these, and is what every other link checks against. That is sound
+    # precisely because the variants are one wrapper traced at different sizes: the declared inputs,
+    # the output arity and the integration rule are identical by construction, and the half that is
+    # NOT -- whether the other names exist and declare the same inputs -- is checked per variant
+    # through `estimator_specs()`.
+    estimator_variants: tuple = ()
 
     __links__ = {
         "estimator": [
@@ -158,6 +176,14 @@ class FlowMatchingSpec:
         # the prelude and the line calling it as IR, so the name the call uses and the name the
         # definition binds are one field checked in one place (P4.0.18).
         "func_name": DriverSymbol(),
+        # Every name the caller may pass, each checked against a real topology and its declared
+        # inputs. `estimator` is one of them and carries the arity check too, which is sound because
+        # the variants are one wrapper traced at different sizes -- `estimator_specs()` raises if it
+        # is NOT one of them, since that would leave the whole set unchecked.
+        "estimator_variants": NestedSpec(
+            where="FlowMatchingSampler.sub_specs, via estimator_specs() -- one EstimatorSpec per "
+                  "variant, checked by the same implementation a hand-written call site uses"
+        ),
     }
     __unchecked__ = {
         "note": Unchecked("cosmetic: rendered as a comment above the generated sampler."),
@@ -182,6 +208,21 @@ class FlowMatchingSpec:
         so both share one validation implementation and cannot drift apart."""
         return EstimatorSpec(topology=self.estimator, inputs=self.supplied_inputs)
 
+    def estimator_specs(self) -> List[EstimatorSpec]:
+        """The same declaration for every name the caller may pass, when the estimator is computed.
+
+        Just `[estimator_spec()]` in the ordinary case, which is what keeps the two paths from
+        diverging: a bucketed sampler is checked by the same code as an unbucketed one, once per
+        bucket."""
+        names = self.estimator_variants or (self.estimator,)
+        if self.estimator not in names:
+            raise ValueError(
+                f"FlowMatchingSpec({self.func_name!r}): estimator {self.estimator!r} must be one of "
+                f"its own estimator_variants {list(names)} -- it is the member every other link "
+                f"checks against, so a name outside the set would leave the set unchecked."
+            )
+        return [EstimatorSpec(topology=n, inputs=self.supplied_inputs) for n in names]
+
     def validate_against_topology(self, topology: dict):
         self.estimator_spec().validate_against_topology(
             topology, label=f"FlowMatchingSpec({self.func_name!r})")
@@ -195,15 +236,22 @@ def render_sampler(spec: FlowMatchingSpec) -> str:
     through them, the reference `loom::MatchaDriver` / `loom::SupertonicDriver` C++ oracles).
     """
     fixed = ", ".join(f'"{n}"' for n in spec.fixed_inputs)
+    # A computed estimator arrives as the function's first argument rather than as a literal in the
+    # call -- see FlowMatchingSpec.estimator_variants.
+    computed = bool(spec.estimator_variants)
+    params = "estimator, length, n_elems, n_steps, step_inputs" if computed \
+        else "length, n_elems, n_steps, step_inputs"
+    estimator_desc = (f'estimator=one of [{", ".join(chr(34) + n + chr(34) for n in spec.estimator_variants)}]'
+                      if computed else f'estimator="{spec.estimator}"')
     lines = []
     if spec.note:
         for para in spec.note.strip().splitlines():
             lines.append(f"-- {para.rstrip()}")
     lines += [
         "-- Generated from FlowMatchingSpec (loom_exporter/flow_matching_export.py):",
-        f'--   estimator="{spec.estimator}", carried="{spec.carried_input}", '
+        f'--   {estimator_desc}, carried="{spec.carried_input}", '
         f'time="{spec.time_input}", fixed=[{fixed}]',
-        f"local function {spec.func_name}(length, n_elems, n_steps, step_inputs)",
+        f"local function {spec.func_name}({params})",
         "    local z = loom.gaussian_array(n_elems)",
         "    local dt = 1.0 / n_steps",
         "    for step = 0, n_steps - 1 do",
@@ -216,7 +264,8 @@ def render_sampler(spec: FlowMatchingSpec) -> str:
     lines += [
         f"            {spec.time_input} = {{ t }},",
         "        }",
-        f'        local v = loom.run_subgraph("{spec.estimator}", {{n_tokens = length, n_past = 0}}, args)',
+        f'        local v = loom.run_subgraph({"estimator" if computed else chr(34) + spec.estimator + chr(34)}, '
+        "{n_tokens = length, n_past = 0}, args)",
         "        for i = 1, #z do",
         "            z[i] = z[i] + v[i] * dt",
         "        end",
