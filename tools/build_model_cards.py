@@ -152,7 +152,7 @@ CATALOG = [
         title="Conformer-CTC Small (en)", summary="NVIDIA NeMo's small Conformer-CTC English ASR model, exported for loom.cpp.",
     ),
     ModelCard(
-        slug="parakeet-tdt-0.6b-v3", checkpoint=Path("parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo"),
+        slug="parakeet-tdt-0.6b", checkpoint=Path("parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo"),
         export_task="automatic-speech-recognition", export_model="parakeet-tdt",
         task_type="automatic-speech-recognition",
         base_repo="nvidia/parakeet-tdt-0.6b-v3", license_id="cc-by-4.0",
