@@ -96,16 +96,40 @@ class MatchaModelPatcher(ModelPatcher):
 
 MatchaModelPatcher.prepare_environment()
 
-sys.path.insert(0, "/home/flavio/Dev/Matcha-TTS")
-
 import coremltools as ct  # noqa: E402
 
 from . import group_norm_op  # noqa: E402,F401  patches nn.GroupNorm.forward globally
 
-from matcha.models.components.text_encoder import TextEncoder, RotaryPositionalEmbeddings  # noqa: E402
-from matcha.models.components.decoder import Decoder  # noqa: E402
-from matcha.hifigan.config import v1 as HIFIGAN_V1  # noqa: E402
-from matcha.hifigan.models import Generator  # noqa: E402
+# Where the Matcha-TTS checkout lives. `matcha` is not a PyPI package -- it is a git clone put on
+# `sys.path` -- so unlike Kokoro's `kokoro`, no `pip install` could ever have made this module
+# importable on another machine. That is the sharpest form of the problem `load_matcha()` solves.
+MATCHA_REPO = "/home/flavio/Dev/Matcha-TTS"
+
+# Matcha's classes, bound by `load_matcha()` rather than imported here -- see `kokoro_export`'s note.
+TextEncoder = RotaryPositionalEmbeddings = Decoder = Generator = HIFIGAN_V1 = None
+
+
+def load_matcha() -> None:
+    """Import the Matcha-TTS checkout and apply the trace-friendly RoPE patches that used to be applied
+    at module scope. Idempotent."""
+    global TextEncoder, RotaryPositionalEmbeddings, Decoder, Generator, HIFIGAN_V1
+    if Decoder is not None:
+        return
+
+    sys.path.insert(0, MATCHA_REPO)
+    from matcha.models.components.text_encoder import (
+        TextEncoder as _TextEncoder, RotaryPositionalEmbeddings as _Rope,
+    )
+    from matcha.models.components.decoder import Decoder as _Decoder
+    from matcha.hifigan.config import v1 as _HIFIGAN_V1
+    from matcha.hifigan.models import Generator as _Generator
+
+    TextEncoder, RotaryPositionalEmbeddings = _TextEncoder, _Rope
+    HIFIGAN_V1, Generator = _HIFIGAN_V1, _Generator
+    Decoder = _Decoder
+
+    RotaryPositionalEmbeddings._build_cache = _rope_build_cache_traceable
+    RotaryPositionalEmbeddings.forward = _rope_forward_traceable
 
 
 def _rope_build_cache_traceable(self, seq_len, device):
@@ -155,9 +179,6 @@ def _rope_forward_traceable(self, x):
     x_rope = (x_rope * self.cos_cached) + (neg_half_x * self.sin_cached)
     return rearrange(torch.cat((x_rope, x_pass), dim=-1), "t b h d -> b h t d")
 
-
-RotaryPositionalEmbeddings._build_cache = _rope_build_cache_traceable
-RotaryPositionalEmbeddings.forward = _rope_forward_traceable
 
 
 class AttrDict(dict):
@@ -320,6 +341,7 @@ class VocoderWrapper(torch.nn.Module):
 
 
 def load_text_encoder(matcha_ckpt_path: str):
+    load_matcha()
     ckpt = torch.load(matcha_ckpt_path, map_location="cpu", weights_only=False)
     hp = ckpt["hyper_parameters"]
     sd = ckpt["state_dict"]
@@ -338,6 +360,7 @@ def load_text_encoder(matcha_ckpt_path: str):
 
 
 def load_decoder(hp, sd):
+    load_matcha()
     n_feats = hp["n_feats"]
     dec = Decoder(in_channels=2 * n_feats, out_channels=n_feats, **hp["decoder"])
     dec_sd = {k[len("decoder.estimator."):]: v for k, v in sd.items() if k.startswith("decoder.estimator.")}
@@ -348,6 +371,7 @@ def load_decoder(hp, sd):
 
 
 def load_vocoder(hifigan_ckpt_path: str):
+    load_matcha()
     ckpt = torch.load(hifigan_ckpt_path, map_location="cpu", weights_only=False)
     sd = ckpt["generator"]
     h = AttrDict(dict(HIFIGAN_V1))

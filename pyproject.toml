@@ -19,6 +19,11 @@ dependencies = [
     "coremltools>=8",
     "gguf>=0.17",
     "numpy>=1.26",
+    # `spm_tokenizer_export` reads a SentencePiece protobuf through the package's own bundled
+    # `sentencepiece_model_pb2`, which every NeMo/GigaAM family needs to write its vocabulary. A real
+    # exporter dependency, unlike the checkpoint libraries the export modules now import lazily -- and
+    # undeclared until the module turned out not to import in a clean environment.
+    "sentencepiece>=0.1.99",
     "torch>=2.4",
     "transformers>=4.53",
 ]
