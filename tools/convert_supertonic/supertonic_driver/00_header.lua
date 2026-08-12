@@ -15,9 +15,10 @@
 -- exactly T_TEXT before that, when the mask was synthesized inside the trace as all-ones. The GGUF
 -- says what T_TEXT is where a host can read it, as the `loom.txt_len` hparam.
 --
--- inputs: txt_ids (int array, length 1..T_TEXT), style_ttl (flat f32 array,
--- n_style_ttl*style_dim_ttl), style_dp (flat f32 array, n_style_dp*style_dim_dp), n_steps (int),
--- seed (int, seeds loom.gaussian_array).
+-- inputs: txt_ids (int array, length 1..T_TEXT), n_steps (int), seed (int, seeds
+-- loom.gaussian_array), and OPTIONALLY style_ttl (flat f32 array, n_style_ttl*style_dim_ttl) and
+-- style_dp (flat f32 array, n_style_dp*style_dim_dp) -- the voice. Omit either and this export's own
+-- default style is used instead (P4.6b); pass them to synthesize in a different voice.
 --
 -- t_text, lat_dim, sample_rate, base_chunk_size and compression_factor used to be inputs too. They are
 -- the T_TEXT/LAT_DIM/SAMPLE_RATE/BASE_CHUNK_SIZE/COMPRESSION_FACTOR locals below now (P4.0.8's first
