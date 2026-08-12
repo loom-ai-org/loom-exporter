@@ -30,7 +30,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
-          pip install "coremltools==9.0" "transformers==4.57.6" "gguf==0.17.1" "numpy==2.4.6" "pytest==8.3.4"
+          pip install "coremltools==9.0" "transformers==4.57.6" "gguf==0.17.1" "numpy==2.4.6" "pytest==8.3.4" "sentencepiece==0.2.0"
 
       # tests/ci only. tests/gate exports real checkpoints -- tens of gigabytes of weights this runner
       # will never have, and hours of CPU -- and is run on a machine that does, against a recorded
