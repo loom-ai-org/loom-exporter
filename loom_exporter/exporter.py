@@ -2506,6 +2506,26 @@ class LoomGGUFExporter:
 
         self._prune_dead_weights()
 
+        # Tensors the DRIVER reads (`loom.get_weight`) rather than any topology node -- added after
+        # pruning, deliberately and not incidentally: `_prune_dead_weights` drops anything no node
+        # names as an input, which is exactly what these are. Pruning runs first because its own job
+        # is to catch MIL's incidental attribute constants, and exempting a name from it would be a
+        # weaker rule than adding after it.
+        #
+        # The case this exists for is Supertonic's default voice style (BACKLOG.md P4.6b): 12928
+        # floats that make the artifact usable with no style supplied. They cannot be `ExportConstants`
+        # -- that would put 13k number literals into a driver script that is 6 KB and meant to be read
+        # out of the GGUF by a person -- and they are not weights of any graph, so this is the third
+        # thing a GGUF can carry and the first time anything needed it.
+        for name, array in (self.kwargs.get("driver_weights") or {}).items():
+            if name in self.weights:
+                raise ValueError(
+                    f"driver_weights[{name!r}] collides with a real graph weight of the same name. "
+                    f"These are written into one namespace that `loom.get_weight` and every node "
+                    f"input resolve through, so a collision would hand one of them the other's data."
+                )
+            self.weights[name] = array
+
         arch = self.kwargs.get("architecture") or os.environ.get("LOOM_ARCH", "mil_model")
         w = GGUFWriter(self.output_path, f"loom-{arch}")
         w.add_string("loom.architecture", arch)

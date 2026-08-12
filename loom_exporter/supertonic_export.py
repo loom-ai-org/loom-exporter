@@ -10,7 +10,8 @@ doesn't reuse any of its op-building code).
 
 Four topologies (same names/roles `loom::SupertonicDriver`/`supertonic_driver.lua` already established --
 real `SpeechGenerator.predict()` never calls the two style encoders itself, always taking PRECOMPUTED style
-embeddings, so those are out of scope here too):
+embeddings, so those are out of scope here too; see the voice-style note below for what that costs and
+what P4.6b did about it):
   - dp:        real `DurationPredictor.forward(txt_ids, stl_emb, txt_msk)` -> scalar duration (seconds).
   - ttl_text:  real `TTLTextEncoder.forward(txt_ids, stl_emb, txt_msk)` -> txt_emb, ne=[T_TEXT,256].
   - vfe:       real `VectorFieldEstimator.compute_velocity(z_t, txt_emb, stl_emb, lat_msk, txt_msk, t)` --
@@ -70,6 +71,20 @@ time for every topology that touches text. Two INDEPENDENT reasons force this, n
   rather than truncated. Chunking it is a separate question this export deliberately does not open: it
   is a decision about where sentences may be broken, which is preprocessing, not a model contract.
 
+The default voice style travels in the GGUF too (`backend_kwargs`, `DEFAULT_VOICE_STYLE`), as two
+`driver_weights` tensors the driver reads with `loom.get_weight` when the caller supplies no style.
+
+That is worth being precise about, because the thing it fixed was easy to misread as the opposite.
+`style_ttl`/`style_dp` have ALWAYS been `infer` inputs and a different pair has always selected a
+different voice -- what was missing is that a published GGUF carried no styles at all, so every caller
+had to have the upstream checkpoint repo to get any. The default makes the artifact usable on its own
+and changes nothing about passing one; both paths are gated (P4.6b).
+
+What is still out of scope is deriving a style from your own audio, which is a different thing again:
+`SpeechGenerator.encode_voice_style` runs mel -> `SpeechEncoder` -> `lat_compressor` -> the two style
+encoders, i.e. three more real modules than this export traces. Selecting among existing voices needs
+none of it.
+
 Trace-friendliness patches needed (same category as every prior MIL export in this project):
   - `lat_msk` (always all-ones -- the latent axis is the one axis these topologies size dynamically, so
     it is never padded) constructed via direct arithmetic on an already-real graph tensor
@@ -125,6 +140,56 @@ from .supertonic_tokenizer_export import INDEXER_RELPATH, find_indexer
 # all, and for how the ladder was chosen.
 TEXT_BUCKETS = (32, 64, 128, 256, 512)
 T_TEXT_MAX = max(TEXT_BUCKETS)
+
+
+# The voice style this export falls back to when a caller supplies none, and the tensor names it
+# travels under. F1 rather than any other of the ten in `assets/voice_styles/`: it is the one the
+# frozen end-to-end reference waveform was recorded with
+# (`legacy_driver_reference/supertonic_driver_waveform_F1.npy`), so "call `infer` with no style at all"
+# is gated by ground truth that already exists rather than by a new fixture recording this decision.
+#
+# A DEFAULT, not a restriction -- `style_ttl`/`style_dp` remain ordinary `infer` inputs and override it
+# (BACKLOG.md P4.6b). The two are different sizes because they feed different encoders: TTL takes
+# (50, 256) and DP takes (8, 16).
+DEFAULT_VOICE_STYLE = "F1"
+DEFAULT_STYLE_TTL_TENSOR = "loom.default_style.ttl"
+DEFAULT_STYLE_DP_TENSOR = "loom.default_style.dp"
+
+
+def find_voice_style(model_dir: Path, name: str = DEFAULT_VOICE_STYLE) -> Optional[Path]:
+    """The `assets/voice_styles/<name>.json` belonging to the checkpoint at `model_dir`, or None.
+
+    Same two spellings of the same place as `find_indexer`, and for the same reason: `model_dir` is
+    the `assets/pt` directory, so the asset is a sibling of it -- reached from the repo root two
+    levels up, or directly, which is what makes a copied-out `assets/` tree work on its own."""
+    for candidate in (model_dir.parent.parent / "assets" / "voice_styles" / f"{name}.json",
+                      model_dir.parent / "voice_styles" / f"{name}.json"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_voice_style(path: Path) -> dict:
+    """`{tensor name: float32 array}` for one real `assets/voice_styles/*.json`.
+
+    The file is the real `SpeechGenerator.export_voice_style` output -- `{"style_ttl": {"data": [...],
+    "dims": [...]}, "style_dp": {...}}` -- so the dims are checked against what the traced graphs
+    declare rather than trusted. A style of the wrong shape would otherwise reach `loom.get_weight`,
+    come back as a flat array of the wrong length, and fail deep inside the engine as a shape mismatch
+    on an input the caller never passed."""
+    import json
+
+    with path.open() as f:
+        style = json.load(f)
+    out = {}
+    for field, tensor_name, dims in (("style_ttl", DEFAULT_STYLE_TTL_TENSOR, [1, 50, 256]),
+                                      ("style_dp", DEFAULT_STYLE_DP_TENSOR, [1, 8, 16])):
+        entry = style[field]
+        if list(entry["dims"]) != dims:
+            raise ValueError(f"{path}: {field} has dims {entry['dims']}, expected {dims} -- this is "
+                             f"the shape the traced graphs declare for it.")
+        out[tensor_name] = np.asarray(entry["data"], dtype=np.float32).reshape(-1)
+    return out
 
 
 def bucket_topology(prefix: str, t_text: int) -> str:
@@ -406,10 +471,11 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
             LuaFragment(fragment / "01_lengths.lua"),
             LuaFragment(fragment / "01_text_inputs.lua", reads=("TEXT_BUCKETS", "PAD_ID"),
                         defines=("n_txt", "T_TEXT", "txt_ids", "txt_msk")),
+            LuaFragment(fragment / "01_styles.lua", defines=("style_ttl", "style_dp")),
             SubgraphCallComponent(
                 topology=bucket_topology("dp", T_TEXT_MAX), topology_expr=dp_expr, variants=dp_names,
                 outputs=("dur_arr",), length=t_text,
-                inputs={"txt_ids": txt_ids, "stl_emb": FieldAccess("inputs", "style_dp"),
+                inputs={"txt_ids": txt_ids, "stl_emb": Var("style_dp"),
                         "txt_msk": txt_msk},
                 note="--- DurationPredictor: DPTextEncoder + MLP head -> scalar duration (seconds) ---"),
             LuaFragment(fragment / "02_latent_length.lua",
@@ -418,7 +484,7 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
             SubgraphCallComponent(
                 topology=bucket_topology("ttl_text", T_TEXT_MAX), topology_expr=ttl_expr,
                 variants=ttl_names, outputs=("txt_emb",), length=t_text,
-                inputs={"txt_ids": txt_ids, "stl_emb": FieldAccess("inputs", "style_ttl"),
+                inputs={"txt_ids": txt_ids, "stl_emb": Var("style_ttl"),
                         "txt_msk": txt_msk},
                 note="--- TTLTextEncoder -> txt_emb, ne=[t_text,txt_dim] (T-fast, the traced module's\n"
                      "    own native torch layout -- no host-side layout crossing needed, unlike the\n"
@@ -427,7 +493,7 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
             FlowMatchingSampler(
                 spec=sampler, result="z", length=t_lat, estimator=vfe_expr,
                 n_elems=BinOp("*", t_lat, lat_dim), n_steps=FieldAccess("inputs", "n_steps"),
-                step_inputs={"txt_emb": Var("txt_emb"), "stl_emb": FieldAccess("inputs", "style_ttl"),
+                step_inputs={"txt_emb": Var("txt_emb"), "stl_emb": Var("style_ttl"),
                              "txt_msk": txt_msk},
                 note="--- Deterministic Euler CFM sampling over VectorFieldEstimator, at the same\n"
                      "    text bucket the two encoders above ran at -- see sample_vfe above. ---"),
@@ -553,6 +619,23 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
             print(f"warning: no {INDEXER_RELPATH} found near {self.model_dir} -- exporting without a "
                   f"tokenizer, so this GGUF will take txt_ids only and `model.tokenizer` will be None",
                   file=sys.stderr)
+
+        # The default voice style, on exactly the same terms as the vocabulary above: an asset from
+        # NEXT TO the directory the caller names, warned-and-omitted when absent because its absence
+        # makes the file worse rather than wrong. The four traced graphs are still the export.
+        #
+        # Without it this artifact cannot synthesize AT ALL on its own. `style_ttl`/`style_dp` have
+        # always been `infer` inputs, so different styles were always possible -- but the values had to
+        # come from the checkpoint repo, which a published GGUF is not distributed with, so the honest
+        # description of the old state is "every caller must supply a style and nothing here provides
+        # one" (BACKLOG.md P4.6b).
+        style_path = find_voice_style(Path(self.model_dir))
+        if style_path is not None:
+            kwargs["driver_weights"] = load_voice_style(style_path)
+        else:
+            print(f"warning: no assets/voice_styles/{DEFAULT_VOICE_STYLE}.json found near "
+                  f"{self.model_dir} -- exporting without a default voice style, so every `infer` call "
+                  f"on this GGUF must supply style_ttl and style_dp itself", file=sys.stderr)
         return kwargs
 
     def hparams(self) -> dict:

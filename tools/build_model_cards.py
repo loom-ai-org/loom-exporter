@@ -226,7 +226,11 @@ CATALOG = [
             "is *fixed* rather than dynamic for two independent reasons -- a single dynamic-length "
             "symbol per graph, and a relative-position windowing step that cannot be traced "
             "dynamically -- so the graphs are traced at several widths and the driver runs the "
-            "smallest that fits your text. Short text therefore does not pay for the ceiling.",
+            "smallest that fits your text. Short text therefore does not pay for the ceiling.\n\n"
+            "**One voice is built in.** `infer` uses it when you pass no style, and takes any other "
+            "voice as a `style_ttl`/`style_dp` pair. What this export does *not* carry is the two "
+            "style encoders, so it cannot derive a style from your own audio -- cloning a new voice "
+            "needs the upstream checkpoint. Selecting among existing voices does not.",
     ),
     ModelCard(
         slug="vits-piper-en-gb-miro",
@@ -283,7 +287,12 @@ print(model.tokenizer)                       # kind, vocabulary size, default la
 txt_ids = model.tokenize("hello world")      # model.tokenize(..., lang="ko") to pick a language
 
 # Any length up to `model.hparam("txt_len")` -- the driver pads and masks the rest.
-# style_ttl / style_dp are precomputed style embeddings; model.driver_source gives their shapes.
+audio = model.infer(txt_ids=txt_ids, n_steps=4, seed=1234)
+
+# That uses this file's built-in default voice. To synthesize in a different one, pass a pair of
+# style embeddings -- style_ttl is (50, 256) and style_dp is (8, 16), flattened; the upstream
+# checkpoint ships ten of them in assets/voice_styles/*.json, and model.driver_source shows exactly
+# where they go.
 audio = model.infer(txt_ids=txt_ids, style_ttl=style_ttl, style_dp=style_dp, n_steps=4, seed=1234)
 """,
 }
