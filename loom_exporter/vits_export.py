@@ -60,13 +60,38 @@ from .checkpoint_probe import probe_torch_checkpoint
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .spec_protocol import Unchecked
 
-sys.path.insert(0, "/home/flavio/Dev/piper/src/python")
-sys.path.insert(0, str((CONVERTERS / "convert_piper_vits")))
+# Where the Piper checkout lives. `piper_train` is not a PyPI package -- it is a git clone put on
+# `sys.path` -- so this module was importable on exactly one machine, and CI could not import it at all.
+PIPER_REPO = "/home/flavio/Dev/piper/src/python"
 
-from piper_train.vits.models import SynthesizerTrn  # noqa: E402
-from piper_train.vits import modules as vits_modules  # noqa: E402
-from piper_train.vits.attentions import MultiHeadAttention  # noqa: E402
-from vits_common import load_piper_checkpoint  # noqa: E402
+# Piper's classes, bound by `load_piper()` rather than imported here -- see `kokoro_export`'s note for
+# the reasoning and why these are module globals rather than per-site local imports.
+SynthesizerTrn = vits_modules = MultiHeadAttention = load_piper_checkpoint = None
+
+
+def load_piper() -> None:
+    """Import the Piper checkout and apply the trace-friendly attention/WN patches that used to be
+    applied at module scope. Idempotent."""
+    global SynthesizerTrn, vits_modules, MultiHeadAttention, load_piper_checkpoint
+    if SynthesizerTrn is not None:
+        return
+
+    sys.path.insert(0, PIPER_REPO)
+    sys.path.insert(0, str((CONVERTERS / "convert_piper_vits")))
+    from piper_train.vits.models import SynthesizerTrn as _SynthesizerTrn
+    from piper_train.vits import modules as _vits_modules
+    from piper_train.vits.attentions import MultiHeadAttention as _MultiHeadAttention
+    from vits_common import load_piper_checkpoint as _load_piper_checkpoint
+
+    vits_modules, MultiHeadAttention = _vits_modules, _MultiHeadAttention
+    load_piper_checkpoint = _load_piper_checkpoint
+    SynthesizerTrn = _SynthesizerTrn
+
+    # In the order they were applied at module scope.
+    MultiHeadAttention._get_relative_embeddings = _get_relative_embeddings_traceable
+    MultiHeadAttention._relative_position_to_absolute_position = _relative_position_to_absolute_position_traceable
+    MultiHeadAttention._absolute_position_to_relative_position = _absolute_position_to_relative_position_traceable
+    vits_modules.WN.forward = _wn_forward_traceable
 
 HP = dict(
     n_vocab=256, spec_channels=513, segment_size=8192,
@@ -164,10 +189,6 @@ def _absolute_position_to_relative_position_traceable(self, x):
     return x_final
 
 
-MultiHeadAttention._get_relative_embeddings = _get_relative_embeddings_traceable
-MultiHeadAttention._relative_position_to_absolute_position = _relative_position_to_absolute_position_traceable
-MultiHeadAttention._absolute_position_to_relative_position = _absolute_position_to_relative_position_traceable
-
 
 def _wn_forward_traceable(wn, x, x_mask, g=None, **kwargs):
     """Real WN.forward's body, with `n_channels_tensor = torch.IntTensor([self.hidden_channels])` (the
@@ -203,8 +224,6 @@ def _wn_forward_traceable(wn, x, x_mask, g=None, **kwargs):
             output = output + res_skip_acts
     return output * x_mask
 
-
-vits_modules.WN.forward = _wn_forward_traceable
 
 
 def _text_encoder_forward(enc, tokens):
@@ -406,6 +425,8 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
     }
 
     def phases(self) -> List[ExportPhase]:
+        # The Piper checkout and this module's trace patches, before anything is traced.
+        load_piper()
         print(f"Loading checkpoint {self.checkpoint_path}...")
         full_sd = load_piper_checkpoint(self.checkpoint_path)
         sd = {k[len("model_g."):]: v for k, v in full_sd.items() if k.startswith("model_g.")}
