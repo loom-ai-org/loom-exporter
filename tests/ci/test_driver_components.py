@@ -825,8 +825,12 @@ class TestPeeledSupertonic(unittest.TestCase):
 
     def test_it_assembles_into_a_driver_that_validates(self):
         ctx = DriverContext(
-            topologies={"dp": _topo(["txt_ids", "stl_emb"]), "ttl_text": _topo(["txt_ids", "stl_emb"]),
-                        "vfe": _topo(["z_t", "txt_emb", "stl_emb", "t"]), "decoder": _topo(["latent"])},
+            # `txt_msk` is a real declared input on all three text-touching topologies since P4.6 --
+            # dropping it here is what this check exists to catch, and it caught it.
+            topologies={"dp": _topo(["txt_ids", "stl_emb", "txt_msk"]),
+                        "ttl_text": _topo(["txt_ids", "stl_emb", "txt_msk"]),
+                        "vfe": _topo(["z_t", "txt_emb", "stl_emb", "t", "txt_msk"]),
+                        "decoder": _topo(["latent"])},
             axes={n: "n_tokens" for n in ("dp", "ttl_text", "vfe", "decoder")},
         )
         text = MultiPhaseDriverBuilder(peeled=self._config().driver_components()).render(ctx)

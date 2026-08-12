@@ -45,15 +45,17 @@ exactly so this MIL export's own end-to-end driver test can compare directly aga
   `T_TEXT_FIXED` wherever text length appears (`decoder` doesn't touch text at all, only `T_lat`).
 
 Trace-friendliness patches needed (same category as every prior MIL export in this project):
-  - `txt_msk`/`lat_msk` (always all-ones for this project's "single, unpadded utterance" convention, exactly
-    like every other model) constructed via direct arithmetic on an already-real graph tensor (`txt_ids.
-    unsqueeze(1).float()*0.0+1.0`, `z_t[:,:1,:]*0.0+1.0` -- NOT `torch.ones`/`torch.full`/`ones_like`),
-    same "avoid a separate fill-shaped op" reasoning as every prior model's own mask construction. Unlike
-    Matcha's Decoder (where every mask multiply was a provable no-op, so the mask was never even
-    constructed), SupertonicTTS's masks are genuinely READ (softmax masking via `==0.0`/`masked_fill`,
-    `.sum()` to recover fractional-RoPE sequence lengths) -- constructing a real all-ones tensor and letting
-    those reads trace as real (structurally harmless, since the comparison is against a tensor of all 1s)
+  - `lat_msk` (always all-ones -- the latent axis is the one axis these topologies size dynamically, so
+    it is never padded) constructed via direct arithmetic on an already-real graph tensor
+    (`z_t[:,:1,:]*0.0+1.0` -- NOT `torch.ones`/`torch.full`/`ones_like`), same "avoid a separate
+    fill-shaped op" reasoning as every prior model's own mask construction. Unlike Matcha's Decoder
+    (where every mask multiply was a provable no-op, so the mask was never even constructed),
+    SupertonicTTS's masks are genuinely READ (softmax masking via `==0.0`/`masked_fill`, `.sum()` to
+    recover fractional-RoPE sequence lengths) -- constructing a real all-ones tensor and letting those
+    reads trace as real (structurally harmless, since the comparison is against a tensor of all 1s)
     EQUAL/SELECT/REDUCE_SUM ops is simpler and safer than trying to special-case every read site.
+    `txt_msk` was built this same way until P4.6 and is a real traced input now, because the text axis
+    is padded (see the text-length section below).
   - `nn.functional.pad(..., mode="replicate")` (every `ConvNextBlock` in this model pads this way before
     its depthwise conv) needed a NEW exporter capability, not a wrapper-level patch: see
     `loom_exporter/exporter.py`'s `pad` translation, `mode == "replicate"` branch -- ggml has no
@@ -91,6 +93,14 @@ from .supertonic_tokenizer_export import INDEXER_RELPATH, find_indexer
 
 T_TEXT_FIXED = 10  # see module docstring -- matches SupertonicConfig.txt_len_fixed exactly
 
+# What the driver writes into the padded tail of `txt_ids`. Which id this is does not affect a single
+# output value -- `x = x * txt_msk` zeroes every padded position's embedding before anything reads it,
+# and ids 0/1/162 were measured to give bit-identical `txt_emb` and duration (BACKLOG.md P4.6). It is
+# 162 because that is the vocabulary's one unused row: `SupertonicTextVectorizer::n_tokens()` is 162
+# against an `nn.Embedding(163)`, so no codepoint maps to it and a dump of the padded ids reads
+# unambiguously as "these are padding".
+PAD_ID = 162
+
 # The output sample rate of the SupertonicTTS v2 release. Unlike every other number this export binds
 # into the driver, this one genuinely is NOT in the checkpoint: the four `.pt` files are pickled
 # `nn.Module`s and none of them carries it -- it lives in `supertonic_tts.lightning`'s own
@@ -100,14 +110,13 @@ T_TEXT_FIXED = 10  # see module docstring -- matches SupertonicConfig.txt_len_fi
 DEC_SAMPLE_RATE = 44100.0
 
 
-def _ones_mask_from_ids(txt_ids):
-    """(B,T) int -> (B,1,T) float, all-ones, derived via arithmetic on a real tensor (not torch.ones/
-    ones_like/full) -- see module docstring."""
-    return txt_ids.unsqueeze(1).to(torch.float32) * 0.0 + 1.0
-
-
 def _ones_mask_from_float(x):
-    """(B,C,T) float -> (B,1,T) float, all-ones, derived via arithmetic on `x` itself."""
+    """(B,C,T) float -> (B,1,T) float, all-ones, derived via arithmetic on `x` itself (not torch.ones/
+    ones_like/full) -- see module docstring.
+
+    Only `lat_msk` is still built this way. The latent axis is the ONE dynamic axis these topologies
+    have, so it is never padded and its mask is all-ones by construction; `txt_msk` was built the same
+    way until P4.6 and is a real traced input now, because the text axis IS padded."""
     return x[:, :1, :] * 0.0 + 1.0
 
 
@@ -117,13 +126,15 @@ class DPWrapper(torch.nn.Module):
     py`'s own usage, `dp(txt_ids, stl_emb, txt_msk)`). `stl_emb` (the DP style) is a precomputed input,
     matching `supertonic_driver.lua`'s own "dp" call (`stl_emb = inputs.style_dp`) -- `DPStyleEncoder` is
     out of scope here, same "basic synthesis from a precomputed style" precedent as every other model.
+
+    `txt_msk` is a real forward argument, which the real module already accepted: P4.6 un-faked it
+    rather than inventing it.
     """
     def __init__(self, dp):
         super().__init__()
         self.dp = dp
 
-    def forward(self, txt_ids, stl_emb):
-        txt_msk = _ones_mask_from_ids(txt_ids)
+    def forward(self, txt_ids, stl_emb, txt_msk):
         duration = self.dp(txt_ids, stl_emb, txt_msk)  # (1,)
         return duration.reshape(-1)
 
@@ -136,8 +147,7 @@ class TTLTextWrapper(torch.nn.Module):
         super().__init__()
         self.te = te
 
-    def forward(self, txt_ids, stl_emb):
-        txt_msk = _ones_mask_from_ids(txt_ids)
+    def forward(self, txt_ids, stl_emb, txt_msk):
         txt_emb = self.te(txt_ids, stl_emb, txt_msk)  # (1, 256, T_TEXT_FIXED)
         return txt_emb.squeeze(0)  # (256, T_TEXT_FIXED) -> ggml ne=[T_TEXT_FIXED,256], T-fast
 
@@ -147,14 +157,18 @@ class VFEWrapper(torch.nn.Module):
     evaluation; the `z += v*dt` update itself is a Lua/host-side loop (`supertonic_driver/`), same
     split as the bespoke `supertonic_driver.lua`. `txt_emb`'s own T axis is FIXED at trace time
     (T_TEXT_FIXED) -- see module docstring for why. `t`: (1,) float fractional step in [0,1).
+
+    `txt_msk` is a real input here for a second reason on top of DP's/TTL's: `txt_emb`'s padded columns
+    are zero, so a mask synthesized from `txt_emb` would be all-ones no matter how much of it is
+    padding, and `VFTextCrossAttention` reads the mask twice -- once to `masked_fill` the attention
+    scores, once as `txt_len = txt_msk.sum()` for its fractional RoPE (`vector_field_estimator.py`).
     """
     def __init__(self, vfe):
         super().__init__()
         self.vfe = vfe
 
-    def forward(self, z_t, txt_emb, stl_emb, t):
+    def forward(self, z_t, txt_emb, stl_emb, t, txt_msk):
         lat_msk = _ones_mask_from_float(z_t)
-        txt_msk = _ones_mask_from_float(txt_emb)
         v = self.vfe.compute_velocity(z_t, txt_emb, stl_emb, lat_msk, txt_msk, t)  # (1, 144, L)
         return v.squeeze(0)  # (144, L) -> ggml ne=[L,144], T-fast
 
@@ -235,32 +249,38 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
 
         fragment = self.driver_script_path
         t_text, t_lat, lat_dim = Var("T_TEXT"), Var("t_lat"), Var("LAT_DIM")
-        txt_ids = FieldAccess("inputs", "txt_ids")
+        txt_ids, txt_msk = Var("txt_ids"), Var("txt_msk")
         sampler, = self.samplers()
         return [
             LuaFragment(fragment / "00_header.lua", top_level=True),
-            # The five numbers the caller used to have to supply (P4.0.8's first follow-up). Four are
+            # The six numbers the caller used to have to supply (P4.0.8's first follow-up). Four are
             # the model's -- the fixed text length every text-touching topology was traced at, and the
-            # three the SpeechDecoder states about itself -- and the fifth is the release's sample
-            # rate, which is genuinely not in the checkpoint (see DEC_SAMPLE_RATE).
+            # three the SpeechDecoder states about itself -- the fifth is the release's sample
+            # rate, which is genuinely not in the checkpoint (see DEC_SAMPLE_RATE), and PAD_ID joined
+            # them in P4.6, when the text axis started being padded.
             ExportConstants(values={
                 "T_TEXT": T_TEXT_FIXED,
+                "PAD_ID": PAD_ID,
                 "LAT_DIM": self.lat_dim,
                 "SAMPLE_RATE": DEC_SAMPLE_RATE,
                 "BASE_CHUNK_SIZE": self.base_chunk_size,
                 "COMPRESSION_FACTOR": self.compression_factor,
             }),
             LuaFragment(fragment / "01_lengths.lua"),
+            LuaFragment(fragment / "01_text_inputs.lua", reads=("T_TEXT", "PAD_ID"),
+                        defines=("n_txt", "txt_ids", "txt_msk")),
             SubgraphCallComponent(
                 topology="dp", outputs=("dur_arr",), length=t_text,
-                inputs={"txt_ids": txt_ids, "stl_emb": FieldAccess("inputs", "style_dp")},
+                inputs={"txt_ids": txt_ids, "stl_emb": FieldAccess("inputs", "style_dp"),
+                        "txt_msk": txt_msk},
                 note="--- DurationPredictor: DPTextEncoder + MLP head -> scalar duration (seconds) ---"),
             LuaFragment(fragment / "02_latent_length.lua",
                         reads=("dur_arr", "SAMPLE_RATE", "BASE_CHUNK_SIZE", "COMPRESSION_FACTOR"),
                         defines=("duration", "wav_length", "latent_size", "t_lat")),
             SubgraphCallComponent(
                 topology="ttl_text", outputs=("txt_emb",), length=t_text,
-                inputs={"txt_ids": txt_ids, "stl_emb": FieldAccess("inputs", "style_ttl")},
+                inputs={"txt_ids": txt_ids, "stl_emb": FieldAccess("inputs", "style_ttl"),
+                        "txt_msk": txt_msk},
                 note="--- TTLTextEncoder -> txt_emb, ne=[t_text,txt_dim] (T-fast, the traced module's\n"
                      "    own native torch layout -- no host-side layout crossing needed, unlike the\n"
                      "    bespoke driver's Layout A/B bridging, since \"vfe\" was traced expecting\n"
@@ -268,7 +288,8 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
             FlowMatchingSampler(
                 spec=sampler, result="z", length=t_lat,
                 n_elems=BinOp("*", t_lat, lat_dim), n_steps=FieldAccess("inputs", "n_steps"),
-                step_inputs={"txt_emb": Var("txt_emb"), "stl_emb": FieldAccess("inputs", "style_ttl")},
+                step_inputs={"txt_emb": Var("txt_emb"), "stl_emb": FieldAccess("inputs", "style_ttl"),
+                             "txt_msk": txt_msk},
                 note="--- Deterministic Euler CFM sampling over VectorFieldEstimator -- see\n"
                      "    sample_vfe above. ---"),
             SubgraphCallComponent(
@@ -299,22 +320,31 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         dummy_txt_ids = torch.randint(1, 163, (1, T_TEXT_FIXED), dtype=torch.int64)
         dummy_dp_stl = torch.randn(1, 8, 16)
         dummy_ttl_stl = torch.randn(1, 50, 256)
+        # An all-ones dummy mask traces the same graph a padded one does -- every read of it is a real
+        # op either way (multiply, `== 0.0`, `.sum()`), none of them shape-dependent. What the dummy's
+        # CONTENT decides is nothing; what its SHAPE decides is T_TEXT, same as `dummy_txt_ids`.
+        dummy_txt_msk = torch.ones(1, 1, T_TEXT_FIXED)
+        txt_msk_input = ct.TensorType(name="txt_msk", shape=(1, 1, T_TEXT_FIXED), dtype=np.float32)
 
         print("Tracing DurationPredictor...")
         dp_phase = ExportPhase(
-            name="dp", wrapper=DPWrapper(dp).eval(), dummy_inputs=(dummy_txt_ids, dummy_dp_stl),
+            name="dp", wrapper=DPWrapper(dp).eval(),
+            dummy_inputs=(dummy_txt_ids, dummy_dp_stl, dummy_txt_msk),
             mil_inputs=[
                 ct.TensorType(name="txt_ids", shape=(1, T_TEXT_FIXED), dtype=np.int32),
                 ct.TensorType(name="stl_emb", shape=(1, 8, 16), dtype=np.float32),
+                txt_msk_input,
             ],
         )
 
         print("Tracing TTLTextEncoder...")
         ttl_phase = ExportPhase(
-            name="ttl_text", wrapper=TTLTextWrapper(te).eval(), dummy_inputs=(dummy_txt_ids, dummy_ttl_stl),
+            name="ttl_text", wrapper=TTLTextWrapper(te).eval(),
+            dummy_inputs=(dummy_txt_ids, dummy_ttl_stl, dummy_txt_msk),
             mil_inputs=[
                 ct.TensorType(name="txt_ids", shape=(1, T_TEXT_FIXED), dtype=np.int32),
                 ct.TensorType(name="stl_emb", shape=(1, 50, 256), dtype=np.float32),
+                txt_msk_input,
             ],
         )
 
@@ -326,12 +356,13 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         dummy_t = torch.tensor([0.3])
         vfe_phase = ExportPhase(
             name="vfe", wrapper=VFEWrapper(vfe).eval(),
-            dummy_inputs=(dummy_z, dummy_txt_emb, dummy_ttl_stl, dummy_t),
+            dummy_inputs=(dummy_z, dummy_txt_emb, dummy_ttl_stl, dummy_t, dummy_txt_msk),
             mil_inputs=[
                 ct.TensorType(name="z_t", shape=(1, 144, lat_seq_dim), dtype=np.float32),
                 ct.TensorType(name="txt_emb", shape=(1, 256, T_TEXT_FIXED), dtype=np.float32),
                 ct.TensorType(name="stl_emb", shape=(1, 50, 256), dtype=np.float32),
                 ct.TensorType(name="t", shape=(1,), dtype=np.float32),
+                txt_msk_input,
             ],
         )
 
@@ -391,7 +422,7 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
             estimator="vfe",
             carried_input="z_t",
             time_input="t",
-            fixed_inputs=["txt_emb", "stl_emb"],
+            fixed_inputs=["txt_emb", "stl_emb", "txt_msk"],
             note="Deterministic Euler CFM sampling over SupertonicTTS's VectorFieldEstimator:\n"
                  "z <- z + v(z, txt_emb, stl_emb, t) * dt, uniform dt = 1/n_steps.",
         )]
