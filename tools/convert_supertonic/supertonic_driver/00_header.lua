@@ -9,18 +9,20 @@
 -- Expects four modules pre-registered by the host: "dp", "ttl_text", "vfe", "decoder" (none use a
 -- KvCache) -- SAME names/roles as the bespoke driver.
 --
--- Text-length scope note (see supertonic_export.py's own module docstring): "vfe"'s own `txt_emb`
--- input has a FIXED shape (T_TEXT, baked in at export time) -- `inputs.txt_ids` MUST be exactly that
--- length for this driver to run correctly, same real constraint the bespoke driver already carries.
--- The GGUF now says so where a host can read it, as the `loom.txt_len` hparam.
+-- Text-length scope note (see supertonic_export.py's own module docstring): every text-touching
+-- topology has a FIXED text axis (T_TEXT, baked in at export time). `inputs.txt_ids` may be ANY
+-- length up to T_TEXT -- this driver pads them and builds the matching `txt_msk` (P4.6); it had to be
+-- exactly T_TEXT before that, when the mask was synthesized inside the trace as all-ones. The GGUF
+-- says what T_TEXT is where a host can read it, as the `loom.txt_len` hparam.
 --
--- inputs: txt_ids (int array, length T_TEXT), style_ttl (flat f32 array, n_style_ttl*style_dim_ttl),
--- style_dp (flat f32 array, n_style_dp*style_dim_dp), n_steps (int), seed (int, seeds
--- loom.gaussian_array).
+-- inputs: txt_ids (int array, length 1..T_TEXT), n_steps (int), seed (int, seeds
+-- loom.gaussian_array), and OPTIONALLY style_ttl (flat f32 array, n_style_ttl*style_dim_ttl) and
+-- style_dp (flat f32 array, n_style_dp*style_dim_dp) -- the voice. Omit either and this export's own
+-- default style is used instead (P4.6b); pass them to synthesize in a different voice.
 --
 -- t_text, lat_dim, sample_rate, base_chunk_size and compression_factor used to be inputs too. They are
 -- the T_TEXT/LAT_DIM/SAMPLE_RATE/BASE_CHUNK_SIZE/COMPRESSION_FACTOR locals below now (P4.0.8's first
 -- follow-up): four are read off the real SpeechDecoder or off the trace, and only SAMPLE_RATE is
--- declared, because the pickled modules genuinely do not carry it.
+-- declared, because the pickled modules genuinely do not carry it. PAD_ID joined them in P4.6.
 --
 -- Returns: the raw waveform (flat f32 array).
