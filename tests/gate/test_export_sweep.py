@@ -42,6 +42,25 @@ import pytest
 
 from loom_exporter.paths import REPO_ROOT
 
+# The release the `qwen3_asr` module first ships in -- see [[env-python-venvs-export]] and
+# docs/EXPORT-PREPARATION.md for why that forces a second environment.
+QWEN3_ASR_MIN_TRANSFORMERS = (5, 13)
+
+
+def _transformers_version() -> tuple:
+    """`(major, minor)` of the installed transformers, or `()` when it is not installed.
+
+    Read from package metadata rather than by importing transformers: this runs at COLLECTION time,
+    for every invocation of this file, and importing transformers to decide whether to skip one
+    parameter would cost every other model's run several seconds."""
+    try:
+        from importlib.metadata import version
+
+        return tuple(int(part) for part in version("transformers").split(".")[:2])
+    except Exception:
+        return ()
+
+
 # The sweep, as (name, checkpoint subpath, extra loom-export arguments). Kept here rather than in a
 # config file because it is a statement about which architectures this repo claims to export, and the
 # thing that should fail review when a family is added and not swept.
@@ -54,13 +73,36 @@ MODELS = [
     ("lfm2-monolithic", "lfm2-350m", ["--task", "text-generation", "--model", "lfm2-monolithic"]),
     ("lfm2-modular", "lfm2-350m", ["--task", "text-generation", "--model", "lfm2-modular"]),
     ("qwen3", "qwen3-0.6b-base", []),
+    ("smollm2", "smollm2-360m-it", []),
+    ("gemma-3-270m-it", "gemma-3-270m-it", []),
     ("whisper", "whisper-small", []),
     ("granite-speech", "granite-speech-4.0.1b", []),
+    ("parakeet-tdt", "parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo",
+     ["--task", "automatic-speech-recognition", "--model", "parakeet-tdt"]),
+    ("parakeet-rnnt", "parakeet_rnnt_model/parakeet-rnnt-0.6b.nemo",
+     ["--task", "automatic-speech-recognition", "--model", "parakeet-rnnt"]),
+    ("styletts2", "styletts2_model/ckpt/Models/LJSpeech/epoch_2nd_00100.pth",
+     ["--task", "text-to-speech", "--model", "styletts2"]),
+    # These two checkpoints are whole repos rather than directories under one models root, so they
+    # name their own variable (see `resolve_checkpoint`) instead of pinning one machine's layout here.
+    ("supertonic", "$LOOM_SUPERTONIC_ROOT/assets/pt",
+     ["--task", "text-to-speech", "--model", "supertonic"]),
+    ("vits", "$LOOM_VITS_CHECKPOINT", ["--task", "text-to-speech", "--model", "vits"]),
     # Qwen3-ASR needs transformers >= 5.13 and the rest of the sweep needs <= 4.57, so it cannot run
     # in the same interpreter as its neighbours here. It is swept from the other environment; see
     # docs/EXPORT-PREPARATION.md.
+    #
+    # Conditional on the INTERPRETER rather than marked skip outright, which is what it was: an
+    # unconditional skip meant this entry ran in no environment at all, so the one model that most
+    # needs saying "sweep me from over there" was the one nothing ever swept. Now `-k qwen3-asr` from
+    # the transformers>=5.13 venv runs it and the piper venv still skips it, with a reason that names
+    # the version it actually found.
     pytest.param("qwen3-asr", "qwen3-asr-0.6b-hf", [],
-                 marks=pytest.mark.skip(reason="needs the transformers>=5.13 environment")),
+                 marks=pytest.mark.skipif(
+                     _transformers_version() < QWEN3_ASR_MIN_TRANSFORMERS,
+                     reason=f"needs transformers >= "
+                            f"{'.'.join(map(str, QWEN3_ASR_MIN_TRANSFORMERS))}; this interpreter has "
+                            f"{'.'.join(map(str, _transformers_version())) or 'none'}")),
 ]
 
 
@@ -69,6 +111,22 @@ def models_root() -> Path:
     if not root:
         pytest.skip("LOOM_MODELS is not set; it names the directory holding the real checkpoints")
     return Path(root)
+
+
+def resolve_checkpoint(subpath: str) -> Path:
+    """`LOOM_MODELS`-relative, unless the entry names its own variable.
+
+    Most checkpoints are directories under one root. Two are not -- the Supertonic fork and the Piper
+    VITS voice are separate repos -- so those entries are written `$VAR/rest` and skip when `VAR` is
+    unset, rather than pinning one machine's paths into a list that is meant to be a statement about
+    which architectures this repo exports."""
+    if subpath.startswith("$"):
+        var, _, rest = subpath[1:].partition("/")
+        root = os.environ.get(var)
+        if not root:
+            pytest.skip(f"{var} is not set; it names the checkpoint this entry needs")
+        return Path(root) / rest if rest else Path(root)
+    return models_root() / subpath
 
 
 def snapshot(gguf: Path, into: Path) -> Path:
@@ -101,7 +159,7 @@ def diff_snapshots(baseline: Path, current: Path) -> str:
 @pytest.mark.gate
 @pytest.mark.parametrize("name,subpath,extra", MODELS)
 def test_export_matches_baseline(name, subpath, extra, tmp_path):
-    checkpoint = models_root() / subpath
+    checkpoint = resolve_checkpoint(subpath)
     if not checkpoint.exists():
         pytest.skip(f"{checkpoint} is not present")
 
@@ -109,6 +167,11 @@ def test_export_matches_baseline(name, subpath, extra, tmp_path):
     assert gguf.exists() and gguf.stat().st_size > 0
 
     current = snapshot(gguf, tmp_path / "snap")
+    # The artifact's whole purpose here is the snapshot, and pytest keeps `tmp_path` for the session
+    # (and for two sessions after it), so holding these would make the sweep's disk cost the SUM over
+    # models instead of the largest one. Granite-Speech alone is 8.75 GB and the full list is ~30 GB;
+    # this machine has run as low as 19 GB free. Nothing below reads the file again.
+    gguf.unlink()
     # Self-describing, whatever the baseline says: an artifact with no topologies and no driver is
     # broken in a way a matching baseline would not catch, because the baseline would be broken too.
     assert (current / "kv.txt").exists()
