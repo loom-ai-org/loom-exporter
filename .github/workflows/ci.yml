@@ -27,9 +27,14 @@ jobs:
       # makes CI's inputs a moving target and lets a green suite go red with no repo change. Bump
       # deliberately, and re-run the sweep when you do, because a coremltools bump can legitimately
       # change every exported artifact.
+      # torchaudio shares torch's line and its `--index-url`, which is load-bearing rather than tidy:
+      # resolved from PyPI instead it comes CUDA-built, and a CUDA torchaudio against a `+cpu` torch
+      # fails at import with `OSError: libcudart.so.13` -- taking `import transformers` down with it,
+      # since transformers imports torchaudio from its RNNT loss module. One line, one index, one
+      # build flavour.
       - name: Install dependencies
         run: |
-          pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cpu
           pip install "coremltools==9.0" "transformers==4.57.6" "gguf==0.17.1" "numpy==2.4.6" "pytest==8.3.4"
 
       # tests/ci only. tests/gate exports real checkpoints -- tens of gigabytes of weights this runner
