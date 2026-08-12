@@ -80,19 +80,57 @@ class StyleTTS2ModelPatcher(ModelPatcher):
 StyleTTS2ModelPatcher.prepare_environment()
 
 from transformers import AlbertConfig  # noqa: E402
-from kokoro.modules import CustomAlbert, ProsodyPredictor, TextEncoder  # noqa: E402
-from kokoro.istftnet import Decoder  # noqa: E402
 
-# `kokoro_export`'s own import applies its trace-friendly monkeypatches (AdainResBlk1d/SineGen/
-# SourceModuleHnNSF/Generator/Decoder) globally as an import side effect -- needed before tracing
-# StyleTTS2's OWN Decoder instance below, since it's the exact same class. `build_decoder_vocoder_phase`
-# is reused directly rather than re-implemented (BACKLOG.md P3.3's "real cross-model dependency" note).
+# `kokoro_export` is imported for its module, not its side effect: it used to apply its trace-friendly
+# monkeypatches (AdainResBlk1d/SineGen/SourceModuleHnNSF/Generator/Decoder) as an IMPORT side effect,
+# which is what `load_styletts2()` below now asks for by name via `kokoro_export.load_kokoro()`. Those
+# patches are needed before tracing StyleTTS2's OWN Decoder instance, since it is the exact same class,
+# and `build_decoder_vocoder_phase` is reused directly rather than re-implemented (BACKLOG.md P3.3's
+# "real cross-model dependency" note).
 from . import kokoro_export  # noqa: E402
 
-sys.path.insert(0, "/home/flavio/Dev/styletts2")  # read-only reference clone, see memory: readonly repos
-from Modules.diffusion.modules import Transformer1d, AttentionBase  # noqa: E402
-from einops import rearrange  # noqa: E402
-from einops_exts import rearrange_many  # noqa: E402
+# The `kokoro` package's and the StyleTTS2 clone's classes, bound by `load_styletts2()` rather than
+# imported here -- see `kokoro_export`'s own note for why. This module had the stronger version of the
+# problem: the StyleTTS2 diffusion modules come off a read-only reference CLONE at a hardcoded absolute
+# path, so no package install could have made this module importable anywhere but one machine.
+CustomAlbert = ProsodyPredictor = TextEncoder = Decoder = None
+Transformer1d = AttentionBase = None
+rearrange = rearrange_many = None
+
+# Where that clone lives. Still a hardcoded path, and still the reason this module cannot be imported
+# off this machine WITHOUT the deferral below -- it is only reached when someone actually exports
+# StyleTTS2, which is the point.
+STYLETTS2_REPO = "/home/flavio/Dev/styletts2"  # read-only reference clone, see memory: readonly repos
+
+
+def load_styletts2() -> None:
+    """Import the StyleTTS2 clone and the `kokoro` package, and apply the trace-friendly patches that
+    used to be applied at module scope. Idempotent."""
+    global CustomAlbert, ProsodyPredictor, TextEncoder, Decoder
+    global Transformer1d, AttentionBase, rearrange, rearrange_many
+    if Transformer1d is not None:
+        return
+
+    kokoro_export.load_kokoro()
+    from kokoro.modules import (
+        CustomAlbert as _CustomAlbert, ProsodyPredictor as _ProsodyPredictor,
+        TextEncoder as _TextEncoder,
+    )
+    from kokoro.istftnet import Decoder as _Decoder
+
+    sys.path.insert(0, STYLETTS2_REPO)
+    from Modules.diffusion.modules import Transformer1d as _Transformer1d, AttentionBase as _AttentionBase
+    from einops import rearrange as _rearrange
+    from einops_exts import rearrange_many as _rearrange_many
+
+    CustomAlbert, ProsodyPredictor, TextEncoder = _CustomAlbert, _ProsodyPredictor, _TextEncoder
+    Decoder = _Decoder
+    rearrange, rearrange_many = _rearrange, _rearrange_many
+    Transformer1d, AttentionBase = _Transformer1d, _AttentionBase
+
+    # In the order they were applied at module scope.
+    AttentionBase.forward = _attention_base_forward_traceable
+    Transformer1d.run = _transformer1d_run_traceable
 
 sys.path.insert(0, str(CONVERTERS / "convert_styletts2"))
 from convert_styletts2_diffusion import HP as DIFF_HP  # noqa: E402
@@ -117,8 +155,6 @@ def _attention_base_forward_traceable(self, q, k, v):
     out = rearrange(out, "b h n d -> b n (h d)")
     return self.to_out(out)
 
-
-AttentionBase.forward = _attention_base_forward_traceable
 
 
 def _transformer1d_run_traceable(self, x, time, embedding, features):
@@ -184,8 +220,6 @@ def _transformer1d_run_traceable(self, x, time, embedding, features):
     x_full = x_full.transpose(-1, -2)
     return x_full
 
-
-Transformer1d.run = _transformer1d_run_traceable
 
 
 def load_submodule(module, state_dict):
@@ -496,6 +530,8 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
     }
 
     def phases(self) -> List[ExportPhase]:
+        # The clone, the kokoro package and both sets of patches, before anything is traced.
+        load_styletts2()
         print(f"Loading StyleTTS2 checkpoint {self.checkpoint_path}...")
         sd_all = torch.load(self.checkpoint_path, map_location="cpu", weights_only=True)["net"]
 
