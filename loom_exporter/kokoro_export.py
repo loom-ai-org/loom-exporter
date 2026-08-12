@@ -102,11 +102,60 @@ class KokoroModelPatcher(ModelPatcher):
 
 KokoroModelPatcher.prepare_environment()
 
-sys.path.insert(0, str((CONVERTERS / "convert_kokoro")))
-from kokoro_stft_common import build_forward_dft_kernels, build_inverse_synth_kernels  # noqa: E402
+# The `kokoro` package's classes, bound by `load_kokoro()` rather than imported here.
+#
+# **Why this is deferred at all.** `kokoro` is a CHECKPOINT dependency, not an exporter one: nothing in
+# this module needs it to be *imported*, only to be *exported from*. Importing it at module scope made
+# `import loom_exporter.kokoro_export` fail wherever the package is absent -- which is every CI runner
+# -- and since `tests/ci` imports the whole package to enumerate its spec classes, one absent
+# checkpoint library made the suite fail to COLLECT, taking every unrelated test down with it. This is
+# the pattern `nemo_asr_export` already used for `nemo`, applied to the three modules that did not.
+#
+# **Why globals rather than local imports at each use site.** Every use is inside a function, and a
+# function's global lookup resolves through this module's dict -- so rebinding these names is enough to
+# leave all ~20 call sites exactly as they were. That matters more than tidiness here: these modules
+# emit real artifacts, and a refactor that touched every site would have to prove it changed none of
+# them. `None` until loaded, so a use before `load_kokoro()` fails as an obvious AttributeError on None
+# rather than a NameError from nowhere.
+KModel = None
+AdainResBlk1d = SineGen = SourceModuleHnNSF = Generator = Decoder = None
+build_forward_dft_kernels = build_inverse_synth_kernels = None
 
-from kokoro.model import KModel  # noqa: E402
-from kokoro.istftnet import AdainResBlk1d, SineGen, SourceModuleHnNSF, Generator, Decoder  # noqa: E402
+
+def load_kokoro() -> None:
+    """Import the `kokoro` package and apply this module's trace-friendly `forward` patches. Idempotent.
+
+    The patches were five module-level assignments, so *importing* this module used to apply them --
+    which is the contract `styletts2_export` depends on, since it traces the same `Decoder` class. That
+    contract still holds, it just has a name now: `styletts2_export` calls this instead of relying on an
+    import side effect, which is the same thing said out loud.
+    """
+    global KModel, AdainResBlk1d, SineGen, SourceModuleHnNSF, Generator, Decoder
+    global build_forward_dft_kernels, build_inverse_synth_kernels
+    if KModel is not None:
+        return
+
+    sys.path.insert(0, str((CONVERTERS / "convert_kokoro")))
+    import kokoro_stft_common
+    from kokoro.model import KModel as _KModel
+    from kokoro.istftnet import (
+        AdainResBlk1d as _AdainResBlk1d, SineGen as _SineGen,
+        SourceModuleHnNSF as _SourceModuleHnNSF, Generator as _Generator, Decoder as _Decoder,
+    )
+
+    build_forward_dft_kernels = kokoro_stft_common.build_forward_dft_kernels
+    build_inverse_synth_kernels = kokoro_stft_common.build_inverse_synth_kernels
+    AdainResBlk1d, SineGen = _AdainResBlk1d, _SineGen
+    SourceModuleHnNSF, Generator, Decoder = _SourceModuleHnNSF, _Generator, _Decoder
+    KModel = _KModel
+
+    # Applied here, in the order they were applied at module scope. `SineGen` takes two.
+    AdainResBlk1d.forward = _adain_resblk1d_forward_traceable
+    SineGen._f02sine = _f02sine_traceable
+    SineGen.forward = _sine_gen_forward_traceable
+    SourceModuleHnNSF.forward = _source_module_forward_traceable
+    Generator.forward = _generator_forward_traceable
+    Decoder.forward = _decoder_forward_traceable
 
 _STFT_N_FFT = 20  # gen_istft_n_fft, real checkpoint config
 _STFT_HOP = 5  # gen_istft_hop_size
@@ -128,8 +177,6 @@ def _adain_resblk1d_forward_traceable(self, x, s):
     return (out + self._shortcut(x)) * _INV_SQRT2
 
 
-AdainResBlk1d.forward = _adain_resblk1d_forward_traceable
-
 
 class VerifiedSTFT(torch.nn.Module):
     """Replaces istftnet.py's CustomSTFT -- same conv-based DFT kernels
@@ -146,6 +193,7 @@ class VerifiedSTFT(torch.nn.Module):
 
     def __init__(self, n_fft, hop):
         super().__init__()
+        load_kokoro()  # binds the DFT-kernel helpers below; see its docstring
         self.n_fft = n_fft
         self.hop = hop
         cos_k, neg_sin_k, boundary_mask = build_forward_dft_kernels(n_fft)
@@ -266,9 +314,6 @@ def _sine_gen_forward_traceable(self, f0, rand_ini, noise_in):
     return sine_waves, uv, noise
 
 
-SineGen._f02sine = _f02sine_traceable
-SineGen.forward = _sine_gen_forward_traceable
-
 
 def _source_module_forward_traceable(self, x, rand_ini, noise_in):
     sine_wavs, uv, _ = self.l_sin_gen(x, rand_ini, noise_in)
@@ -276,8 +321,6 @@ def _source_module_forward_traceable(self, x, rand_ini, noise_in):
     noise = noise_in[..., :1] * 0.0  # unused downstream (Generator never reads noise/uv outputs)
     return sine_merge, noise, uv
 
-
-SourceModuleHnNSF.forward = _source_module_forward_traceable
 
 
 def _generator_forward_traceable(self, x, s, f0, rand_ini, noise_in, wsum):
@@ -307,8 +350,6 @@ def _generator_forward_traceable(self, x, s, f0, rand_ini, noise_in, wsum):
     return self.verified_stft.inverse(spec, phase, wsum)
 
 
-Generator.forward = _generator_forward_traceable
-
 
 def _decoder_forward_traceable(self, asr, F0_curve, N, s, rand_ini, noise_in, wsum):
     F0 = self.F0_conv(F0_curve.unsqueeze(1))
@@ -325,8 +366,6 @@ def _decoder_forward_traceable(self, asr, F0_curve, N, s, rand_ini, noise_in, ws
             res = False
     return self.generator(x, s, F0_curve, rand_ini, noise_in, wsum)
 
-
-Decoder.forward = _decoder_forward_traceable
 
 
 class AlbertBertEncoderWrapper(torch.nn.Module):
@@ -645,6 +684,8 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         return {}
 
     def phases(self) -> List[ExportPhase]:
+        # The `kokoro` package and this module's trace-friendly patches, before anything is traced.
+        load_kokoro()
         ckpt_path = Path(self.model_dir) / "kokoro-v1_0.pth"
         config_path = Path(self.model_dir) / "config.json"
         print(f"Loading checkpoint {ckpt_path}...")
