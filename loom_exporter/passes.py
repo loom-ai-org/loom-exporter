@@ -806,6 +806,209 @@ class fuse_rms_norm(AbstractGraphPass):
         return (axis + rank if axis < 0 else axis) == rank - 1
 
 
+def _squares(var, x) -> bool:
+    """Whether `var` is `x` squared, in either spelling MIL uses for it.
+
+    `pow(x, 2)` is what a trace produces and `square` is what `lower_pow` rewrites it to, so a matcher
+    that knew only one would silently depend on pass ordering -- and the ordering that breaks it is the
+    one where somebody moves `lower_pow` earlier for an unrelated reason.
+    """
+    producer = getattr(var, "op", None)
+    if producer is None:
+        return False
+    if producer.op_type == "square":
+        return producer.inputs.get("x") is x
+    if producer.op_type != "pow" or producer.inputs.get("x") is not x:
+        return False
+    exponent = static_value(producer.inputs.get("y"))
+    if exponent is None or np.asarray(exponent).size != 1:
+        return False
+    return float(np.asarray(exponent).reshape(-1)[0]) == 2.0
+
+
+@register_pass(namespace="loom")
+class lower_pow(AbstractGraphPass):
+    """
+    Rewrites `pow(x, 2)` into MIL's own `square`, which `exporter.py` already maps to the engine's `SQR`
+    primitive -- replacing a `ggml_map_custom` host callback with a real ggml op.
+
+    **Every `POW` this exporter has ever emitted is a square.** Counted across the thirteen fixture
+    models: 149 `pow` ops, exponent 2.0 in every single one (Kokoro 50, StyleTTS2 50, Matcha 38, the
+    NeMo encoders 3 each, GigaAM and Whisper 1 each). So this is not a special case carved out of a
+    general op -- it is the only case there has ever been.
+
+    **Only 2.** `pow(x, 0.5)` is `sqrt` and would be one more line, but no traced model has produced one,
+    and this repo adds a primitive path when a model needs it rather than speculatively (see the
+    attention-variant note in BACKLOG.md's scope limitations). The general `pow` path stays exactly where
+    it was for anything else.
+    """
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            self._rewrite_block(f)
+
+    @block_context_manager
+    def _rewrite_block(self, block):
+        for op in list(block.operations):
+            if getattr(op, "enclosing_block", block) is None:
+                continue
+            for b in op.blocks:
+                self._rewrite_block(b)
+            if op.op_type == "pow":
+                self._try_transform(op, block)
+
+    @staticmethod
+    def _try_transform(op, block) -> bool:
+        exponent = static_value(op.inputs.get("y"))
+        if exponent is None or np.asarray(exponent).size != 1:
+            return False
+        if float(np.asarray(exponent).reshape(-1)[0]) != 2.0:
+            return False
+        with _scope_ctx_like(op):
+            new_out = mb.square(x=op.inputs["x"], name=op.outputs[0].name, before_op=op)
+        if not block.try_replace_uses_of_var_after_op(anchor_op=op, old_var=op.outputs[0], new_var=new_out):
+            return False
+        block.remove_ops([op])
+        return True
+
+
+@register_pass(namespace="loom")
+class fuse_layer_norm(AbstractGraphPass):
+    """
+    Recognises a HAND-ROLLED layer norm -- the four-op statistic a model writes when it normalizes a
+    channel axis itself instead of calling `torch.nn.LayerNorm` -- and replaces it with MIL's own
+    `layer_norm`, transposed into place when the axis it normalizes is not the trailing one:
+
+        mean = reduce_mean(x, axes=[a], keep_dims=True)
+        out  = mul(sub(x, mean), rsqrt(add(reduce_mean(square(sub(x, mean)), axes=[a]), eps)))
+
+    **`ggml_norm` only ever normalizes ne[0]**, so an axis that is already trailing lowers to MIL's
+    `layer_norm` directly and any other axis is transposed into place first -- `transpose → layer_norm →
+    transpose`, built here in MIL so the existing `transpose` rule lowers each half rather than
+    `topology_ops.py`'s `layer_norm` rule growing ne-order arithmetic of its own. The engine's
+    `LAYER_NORM` calls `ensure_packed`, so the non-contiguous view a permute produces is handled there.
+
+    **Those two copies per norm are not the cost they look like, and this was measured properly because
+    the first measurement of it was wrong.** On Matcha's `encoder_mu`, best of six interleaved rounds of
+    twenty runs each (a single best-of-three said the opposite, twice, in both directions -- this module
+    swings 33-85 ms between runs on the same binary):
+
+        unfused chain               cpu 50.5 ms   gpu 45.7 ms
+        transpose + layer_norm      cpu 44.2 ms   gpu 12.1 ms
+        div(centered, sqrt(...))    cpu 54.5 ms   gpu 12.8 ms
+
+    Transposing is the fastest of the three on the CPU as well as on the device: `ggml_norm` is one fused
+    pass over the data where the chain it replaces is eight, and that buys more than two copies cost. The
+    third row is the alternative rewrite that avoids moving anything -- turning the reciprocal back into
+    a division, which removes the `rsqrt` host callback just as well -- and it is the slowest on the CPU
+    and no better on the device, so it is not what this pass does.
+
+    **What it is worth.** Matcha-TTS writes this in its text encoder over the channel axis of a (B, C, T)
+    tensor: 32 `rsqrt` between its three topologies, every one a `ggml_map_custom` host callback that cut
+    a device graph. Eight ops become three, 61 scheduler splits become one, and nothing falls back.
+
+    Deliberately NOT folded into `fuse_rms_norm`: the two differ by exactly the mean-centring, and a
+    matcher that treated `sub(x, mean)` as optional would emit `RMS_NORM` for a layer norm the moment a
+    `sub` failed to match for some unrelated reason. They are separate patterns and separate passes.
+    """
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            self._rewrite_block(f)
+
+    @block_context_manager
+    def _rewrite_block(self, block):
+        for op in list(block.operations):
+            if getattr(op, "enclosing_block", block) is None:
+                continue
+            for b in op.blocks:
+                self._rewrite_block(b)
+            if op.op_type == "mul":
+                self._try_transform(op, block)
+
+    @classmethod
+    def _try_transform(cls, mul_op, block) -> bool:
+        producer = fuse_rms_norm._producer
+        for centered, maybe_rsqrt in ((mul_op.inputs.get("x"), mul_op.inputs.get("y")),
+                                       (mul_op.inputs.get("y"), mul_op.inputs.get("x"))):
+            if centered is None or maybe_rsqrt is None:
+                continue
+            # The centred tensor feeds BOTH the variance and this multiply, so unlike every other
+            # intermediate here it legitimately has two consumers -- asked for directly rather than
+            # through the single-consumer `_producer`.
+            sub_op = getattr(centered, "op", None)
+            if sub_op is None or sub_op.op_type != "sub":
+                continue
+            x = sub_op.inputs.get("x")
+            mean_op = producer(sub_op.inputs.get("y"), "reduce_mean")
+            if x is None or mean_op is None or mean_op.inputs.get("x") is not x:
+                continue
+
+            rsqrt_op = producer(maybe_rsqrt, "rsqrt")
+            if rsqrt_op is None:
+                continue
+            add_op = producer(rsqrt_op.inputs.get("x"), "add")
+            if add_op is None:
+                continue
+            for variance, eps_var in ((add_op.inputs.get("x"), add_op.inputs.get("y")),
+                                       (add_op.inputs.get("y"), add_op.inputs.get("x"))):
+                eps = static_value(eps_var)
+                if eps is None or np.asarray(eps).size != 1:
+                    continue
+                var_mean_op = producer(variance, "reduce_mean")
+                if var_mean_op is None or not _squares(var_mean_op.inputs.get("x"), centered):
+                    continue
+                axis = cls._shared_axis(mean_op, var_mean_op, x)
+                if axis is None:
+                    continue
+                if not (bool(static_value(mean_op.inputs.get("keep_dims"), False))
+                        and bool(static_value(var_mean_op.inputs.get("keep_dims"), False))):
+                    continue
+
+                rsqrt_eps = static_value(rsqrt_op.inputs.get("epsilon"), 0.0)
+                total_eps = float(np.asarray(eps).reshape(-1)[0]) + float(np.asarray(rsqrt_eps).reshape(-1)[0])
+                rank = len(x.shape)
+                out_name = mul_op.outputs[0].name
+
+                with _scope_ctx_like(mul_op):
+                    if axis == rank - 1:
+                        new_out = mb.layer_norm(x=x, axes=[-1], epsilon=np.float32(total_eps),
+                                                 name=out_name, before_op=mul_op)
+                    else:
+                        # An involution: the same permutation undoes itself, so one list serves both ends.
+                        perm = list(range(rank))
+                        perm[axis], perm[rank - 1] = perm[rank - 1], perm[axis]
+                        moved = mb.transpose(x=x, perm=perm, name=f"{out_name}_ln_perm", before_op=mul_op)
+                        normed = mb.layer_norm(x=moved, axes=[-1], epsilon=np.float32(total_eps),
+                                                name=f"{out_name}_ln", before_op=mul_op)
+                        new_out = mb.transpose(x=normed, perm=perm, name=out_name, before_op=mul_op)
+                if not block.try_replace_uses_of_var_after_op(
+                        anchor_op=mul_op, old_var=mul_op.outputs[0], new_var=new_out):
+                    return False
+                block.remove_ops([mul_op])
+                return True
+        return False
+
+    @staticmethod
+    def _shared_axis(mean_op, var_mean_op, x):
+        """The one axis both reductions agree on, normalized to a non-negative index -- or None.
+
+        Both means must reduce the SAME axis: a graph where they differ is not a layer norm, whatever
+        else it is."""
+        if x.shape is None:
+            return None
+        rank = len(x.shape)
+        axes = []
+        for op in (mean_op, var_mean_op):
+            got = static_ints(op.inputs.get("axes"))
+            if got is None or len(got) != 1:
+                return None
+            axes.append(got[0] + rank if got[0] < 0 else got[0])
+        if axes[0] != axes[1] or not (0 <= axes[0] < rank):
+            return None
+        return axes[0]
+
+
 @register_pass(namespace="loom")
 class fuse_loom_attention(AbstractGraphPass):
     """
@@ -1297,6 +1500,14 @@ _LOOM_PASS_NAMES = [
     # `reduce_sum` + `loom_scale` -- still fusable, but only by a matcher that knows about a rewrite that
     # has nothing to do with it.
     "loom::fuse_rms_norm",
+    # After fuse_rms_norm (an RMS norm has no mean-centring, so it cannot match this one, but matching
+    # the cheaper pattern first keeps the layer-norm matcher off graphs that are already gone) and
+    # before lower_pow, so this still sees the `pow` spelling it was written against -- `_squares`
+    # accepts both, so the order is a preference rather than a dependency.
+    "loom::fuse_layer_norm",
+    # Last of the three, deliberately: it mops up every square the two fusions did NOT claim, and
+    # running it earlier would only mean the fusions had to match `square` instead.
+    "loom::lower_pow",
     "loom::lower_reduce_mean",
     "common::dead_code_elimination",
 ]
