@@ -1490,6 +1490,21 @@ def _op_loom_mean(self, op, ctx):
     })
 
 
+@topology_rule('loom_rms_norm')
+def _op_loom_rms_norm(self, op, ctx):
+    # One node, no attrs beyond eps: `ggml_rms_norm` normalizes ne[0] and supplies its own element
+    # count, and the model's learned `weight` stays a separate MUL -- the same convention LAYER_NORM and
+    # GROUP_NORM follow above. `passes.py`'s fuse_rms_norm has already checked the axis and folded MIL's
+    # own rsqrt epsilon into this one; see loom_rms_norm's docstring in dialect.py for why that sum is
+    # not just the constant the model wrote.
+    ctx.nodes.append({
+        "op": "RMS_NORM",
+        "inputs": [ctx.resolve(self.safe_name(op.inputs["x"].name))],
+        "outputs": [self.safe_name(op.outputs[0].name)],
+        "attrs": {"eps": float(static_value(op.inputs["epsilon"]))},
+    })
+
+
 @topology_rule('loom_scale')
 def _op_loom_scale(self, op, ctx):
     # `1.0 / n` is computed HERE, in plain Python double precision, rather than carried on the op
