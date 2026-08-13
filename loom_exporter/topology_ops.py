@@ -1029,99 +1029,12 @@ def _op_pad(self, op, ctx):
             "(only 'constant', 'reflect', and 'replicate' are)."
         )
 
-    if mapped_op == "PAD_1D_REFLECT" and lp0 + rp0 <= _REFLECT_PAD_COMPOSE_LIMIT:
-        _emit_reflect_pad_composition(self, op, ctx, x_var_obj, x_var, output_var, lp0, rp0)
-        return
-
     nodes.append({
         "op": mapped_op,
         "inputs": [resolve(x_var)],
         "outputs": [output_var],
         "attrs": {"lp0": lp0, "rp0": rp0},
     })
-
-
-# Reflect pads wider than this keep the `PAD_1D_REFLECT` primitive. The composition below costs
-# `2 * (lp0 + rp0)` topology nodes -- a VIEW and a CONCAT per padded element -- because `ggml_concat` is
-# two-input, so there is a width past which trading one node for dozens stops being sensible whatever it
-# buys on a device. 32 is chosen to cover every reflect pad any exported model has actually asked for
-# (the widest is Kokoro's and StyleTTS2's 10+10 STFT centre-framing, 40 nodes against a 1692-node
-# topology) with room to spare, and to stop well short of the hundreds a genuinely wide pad would emit.
-_REFLECT_PAD_COMPOSE_LIMIT = 32
-
-
-def _emit_reflect_pad_composition(self, op, ctx, x_var_obj, x_var, output_var, lp0, rp0):
-    """Reflect padding built from VIEW + CONCAT instead of the `PAD_1D_REFLECT` primitive.
-
-    **Why, given the primitive exists and is correct.** `ggml_pad_reflect_1d` is a real ggml op, but
-    **ggml-vulkan does not implement it** -- so on a device build every reflect pad is a node the
-    scheduler must run on the CPU, and each one cuts the graph. Measured on Kokoro's `decoder_vocoder`
-    by substituting device-supported stand-ins of identical shape (loom.cpp BACKLOG.md P4.7c):
-
-        as exported                        7 splits, 4 CPU nodes
-        if the ATAN were device-native     5 splits
-        if the reflect pads were native    3 splits
-        if both were                       1 split,  0 CPU nodes
-
-    Its two reflect pads cost **four** of the six removable splits -- twice what the remaining `ATAN`
-    host callback costs -- and unlike the `ATAN` this one has an exact fix, because reflect padding is
-    not a transcendental. It is a slice and a concatenation.
-
-    **The composition, and why it is exact.** Torch's "reflect" mode excludes the edge element itself:
-    `[a,b,c,d]` with (1,1) becomes `[b,a,b,c,d,c]`. So the left block is elements `lp0..1` in that order
-    and the right block is `T-2` down to `T-1-rp0` -- each a one-element VIEW of the original tensor,
-    concatenated. No arithmetic happens, so there is nothing to round: this reproduces the primitive
-    bit-for-bit rather than approximating it.
-
-    **VIEW inherits the parent's strides** (see `op_view` in primitives_basic.cpp, which takes `nb1..nb3`
-    from the parent unless told otherwise), so a `[1, *ne_rest]` view at byte offset `k * 4` selects
-    element `k` along ne[0] for every row and channel -- which is what makes this correct for a rank-2
-    `[T, C]` tensor and not only for the effectively-1-D waveform that motivated it. The same property is
-    what `loom_replicate_pad`'s rule above relies on.
-
-    The right block's offsets are dynamic (they count back from the run-time length), via the same
-    `_infer_dynamic_dim_expr` backward walk every other dynamic-offset VIEW in this exporter uses.
-    """
-    nodes, resolve = ctx.nodes, ctx.resolve
-    ne_rest = list(self.get_var_info(x_var_obj)["shape"][1:])
-    rank = len(x_var_obj.shape)
-    source = resolve(x_var)
-
-    def element_view(name, byte_offset):
-        nodes.append({
-            "op": "VIEW", "inputs": [source], "outputs": [name],
-            "attrs": {"shape": [1, *ne_rest], "offset": byte_offset},
-        })
-        return name
-
-    def concat_chain(pieces, label):
-        """Left-to-right pairwise CONCAT -- ggml_concat is two-input, so a block of n elements is n-1
-        nodes. They are all one element wide, so the copying is negligible; the only full-size copies in
-        this composition are the two that join the blocks to the tensor, which is exactly what the
-        primitive itself would have done."""
-        cur = pieces[0]
-        for i, piece in enumerate(pieces[1:], start=1):
-            out = f"{output_var}_{label}_cat{i}"
-            nodes.append({"op": "CONCAT", "inputs": [cur, piece], "outputs": [out], "attrs": {"dim": 0}})
-            cur = out
-        return cur
-
-    cur = source
-    if lp0 > 0:
-        # Elements lp0, lp0-1, ..., 1 -- the reflection of the head, edge element excluded.
-        left = [element_view(f"{output_var}_reflpad_l{i}", k * 4)
-                for i, k in enumerate(range(lp0, 0, -1))]
-        block = concat_chain(left, "reflpad_l") if len(left) > 1 else left[0]
-        out = f"{output_var}_reflpad_left" if rp0 > 0 else output_var
-        nodes.append({"op": "CONCAT", "inputs": [block, cur], "outputs": [out], "attrs": {"dim": 0}})
-        cur = out
-    if rp0 > 0:
-        t_expr = self._infer_dynamic_dim_expr(x_var_obj, rank - 1)
-        # Elements T-2, T-3, ..., T-1-rp0 -- the reflection of the tail, edge element excluded.
-        right = [element_view(f"{output_var}_reflpad_r{j}", render((t_expr - 2 - j) * 4))
-                 for j in range(rp0)]
-        block = concat_chain(right, "reflpad_r") if len(right) > 1 else right[0]
-        nodes.append({"op": "CONCAT", "inputs": [cur, block], "outputs": [output_var], "attrs": {"dim": 0}})
 
 
 @topology_rule('loom_replicate_pad')
