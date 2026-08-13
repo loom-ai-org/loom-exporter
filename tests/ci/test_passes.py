@@ -243,6 +243,108 @@ class TestLowerStack(unittest.TestCase):
         self.assertEqual(tuple(out_var.shape), (1, 4, 5))
 
 
+class TestFuseRmsNorm(unittest.TestCase):
+    """`fuse_rms_norm` collapses PyTorch's RMSNorm chain to one `loom_rms_norm`.
+
+    Every negative case below is a graph that LOOKS like the pattern and is not one, because that is
+    where a fusion pass does its damage: emitting `RMS_NORM` for a chain that normalizes a different
+    tensor, a different axis, or by something other than the mean square is silently wrong arithmetic
+    that no shape check downstream would catch.
+    """
+
+    @staticmethod
+    def _rms_program(eps=1e-6, exponent=2.0, axes=(-1,), keep_dims=True, feed_back_same_x=True):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 4, 8), dtype=types.fp32)])
+        def prog(x):
+            squared = mb.pow(x=x, y=np.float32(exponent))
+            variance = mb.reduce_mean(x=squared, axes=list(axes), keep_dims=keep_dims)
+            shifted = mb.add(x=variance, y=np.float32(eps))
+            scale = mb.rsqrt(x=shifted)
+            other = x if feed_back_same_x else mb.identity(x=x)
+            return mb.mul(x=other, y=scale)
+        return prog
+
+    def test_the_chain_becomes_one_op(self):
+        prog = self._rms_program()
+        PASS_REGISTRY["loom::fuse_rms_norm"](prog)
+        PASS_REGISTRY["common::dead_code_elimination"](prog)
+
+        self.assertEqual(_ops(prog), ["loom_rms_norm"])
+
+    def test_epsilon_includes_mils_own_rsqrt_epsilon(self):
+        """MIL's `rsqrt` computes 1/sqrt(x + epsilon) with an epsilon of its own, so the value the
+        engine must add to the mean square is the SUM of the two -- not the constant the model wrote.
+        Getting this wrong is a wrong answer nothing else would flag."""
+        prog = self._rms_program(eps=1e-6)
+        PASS_REGISTRY["loom::fuse_rms_norm"](prog)
+
+        op = next(o for o in prog.functions["main"].operations if o.op_type == "loom_rms_norm")
+        rsqrt_default = 1e-12
+        self.assertAlmostEqual(float(op.epsilon.val), 1e-6 + rsqrt_default, places=12)
+        self.assertGreater(float(op.epsilon.val), 1e-6)
+
+    def test_operands_may_be_written_in_either_order(self):
+        """MIL does not normalize commutative operands, and both `x * rsqrt(v)` and `rsqrt(v) * x` are
+        written in the wild."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 4, 8), dtype=types.fp32)])
+        def prog(x):
+            squared = mb.pow(x=x, y=np.float32(2.0))
+            variance = mb.reduce_mean(x=squared, axes=[-1], keep_dims=True)
+            scale = mb.rsqrt(x=mb.add(x=np.float32(1e-6), y=variance))
+            return mb.mul(x=scale, y=x)
+
+        PASS_REGISTRY["loom::fuse_rms_norm"](prog)
+        PASS_REGISTRY["common::dead_code_elimination"](prog)
+        self.assertEqual(_ops(prog), ["loom_rms_norm"])
+
+    def test_a_multiply_by_a_different_tensor_is_not_rms_norm(self):
+        """The tensor being scaled must be the very one that was squared. Two structurally identical
+        tensors are still two tensors, and normalizing by the wrong one is the bug this refuses."""
+        prog = self._rms_program(feed_back_same_x=False)
+        PASS_REGISTRY["loom::fuse_rms_norm"](prog)
+        self.assertIn("rsqrt", _ops(prog))
+        self.assertNotIn("loom_rms_norm", _ops(prog))
+
+    def test_a_mean_over_another_axis_is_not_rms_norm(self):
+        """`ggml_rms_norm` normalizes ne[0] and nothing else."""
+        prog = self._rms_program(axes=(1,))
+        PASS_REGISTRY["loom::fuse_rms_norm"](prog)
+        self.assertNotIn("loom_rms_norm", _ops(prog))
+
+    def test_a_power_other_than_two_is_not_rms_norm(self):
+        prog = self._rms_program(exponent=3.0)
+        PASS_REGISTRY["loom::fuse_rms_norm"](prog)
+        self.assertNotIn("loom_rms_norm", _ops(prog))
+
+    def test_a_shared_intermediate_is_left_alone(self):
+        """A `variance` some other node also reads must survive the rewrite, so the rewrite does not
+        happen. DCE would otherwise not collect it and the graph would keep both spellings."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 4, 8), dtype=types.fp32)])
+        def prog(x):
+            squared = mb.pow(x=x, y=np.float32(2.0))
+            variance = mb.reduce_mean(x=squared, axes=[-1], keep_dims=True)
+            scale = mb.rsqrt(x=mb.add(x=variance, y=np.float32(1e-6)))
+            normed = mb.mul(x=x, y=scale)
+            # `variance` escapes as a second output -- a real thing a traced model can do.
+            return mb.add(x=normed, y=variance)
+
+        PASS_REGISTRY["loom::fuse_rms_norm"](prog)
+        self.assertNotIn("loom_rms_norm", _ops(prog))
+
+    def test_the_learned_affine_stays_a_separate_multiply(self):
+        """`ggml_rms_norm` has no affine of its own, matching LAYER_NORM/GROUP_NORM's convention."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 4, 8), dtype=types.fp32)])
+        def prog(x):
+            squared = mb.pow(x=x, y=np.float32(2.0))
+            variance = mb.reduce_mean(x=squared, axes=[-1], keep_dims=True)
+            scale = mb.rsqrt(x=mb.add(x=variance, y=np.float32(1e-6)))
+            return mb.mul(x=mb.mul(x=x, y=scale), y=np.random.rand(8).astype(np.float32))
+
+        PASS_REGISTRY["loom::fuse_rms_norm"](prog)
+        PASS_REGISTRY["common::dead_code_elimination"](prog)
+        self.assertEqual(_ops(prog), ["loom_rms_norm", "mul"])
+
+
 class TestLowerReduceMean(unittest.TestCase):
     def test_static_count_becomes_reduce_sum_and_loom_scale(self):
         @mb.program(input_specs=[mb.TensorSpec(shape=(4, 192, 1), dtype=types.fp32)])

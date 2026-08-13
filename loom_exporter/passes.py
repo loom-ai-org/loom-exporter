@@ -679,6 +679,134 @@ class lower_reduce_mean(AbstractGraphPass):
 
 
 @register_pass(namespace="loom")
+class fuse_rms_norm(AbstractGraphPass):
+    """
+    Replaces the five-op chain PyTorch's RMSNorm traces to with one `loom_rms_norm`, which
+    `topology_ops.py` lowers to the engine's `RMS_NORM` primitive.
+
+        pow(x, 2) -> reduce_mean(axes=[-1], keep_dims) -> add(eps) -> rsqrt -> mul(x, .)
+
+    **Unconditional, unlike `fuse_loom_attention`.** That pass is opt-in because fusing changes what a
+    model MEANS -- an ATTENTION node can reach a KV cache, which is wrong for a non-autoregressive
+    model. This one changes nothing but the node count: same arithmetic, same axis, same epsilon. There
+    is no model for which emitting `RMS_NORM` here would be the wrong answer, so there is no flag.
+
+    **What it is worth.** `pow` and `rsqrt` are `ggml_map_custom` host callbacks -- C function pointers,
+    which no backend but the CPU can dispatch -- so on a device build each one cuts the graph and costs a
+    device→host→device round trip. Qwen3-0.6B traced 113 of each, which is what put its 3050-node graph
+    into 453 scheduler splits and cost it its entire GPU speedup (BACKLOG.md P4.7).
+
+    **Anchored on the `mul`, because that is where the pattern closes.** Matching from `pow` forward
+    would find the chain but could not confirm the multiply feeds back the SAME `x` the square was taken
+    of, which is the whole difference between RMS normalization and an unrelated rsqrt.
+    """
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            self._rewrite_block(f)
+
+    @block_context_manager
+    def _rewrite_block(self, block):
+        for op in list(block.operations):
+            if getattr(op, "enclosing_block", block) is None:
+                continue
+            for b in op.blocks:
+                self._rewrite_block(b)
+            if op.op_type == "mul":
+                self._try_transform(op, block)
+
+    @staticmethod
+    def _producer(var, op_type):
+        """`var`'s producing op when it is of `op_type` AND nothing else consumes `var`.
+
+        The second half is what makes the rewrite safe rather than merely correct-looking: every
+        intermediate in this chain is about to become unreachable, and a `variance` that some other node
+        also reads is one this pass must leave alone.
+        """
+        producer = getattr(var, "op", None)
+        if producer is None or producer.op_type != op_type:
+            return None
+        if len(getattr(var, "child_ops", []) or []) != 1:
+            return None
+        return producer
+
+    @classmethod
+    def _try_transform(cls, mul_op, block) -> bool:
+        # mul(x, rsqrt(...)) in either operand order -- MIL does not normalize commutative operands, and
+        # `x * torch.rsqrt(v)` and `torch.rsqrt(v) * x` are both written in the wild.
+        x_in, y_in = mul_op.inputs.get("x"), mul_op.inputs.get("y")
+        for x, maybe_rsqrt in ((x_in, y_in), (y_in, x_in)):
+            if x is None or maybe_rsqrt is None:
+                continue
+            rsqrt_op = cls._producer(maybe_rsqrt, "rsqrt")
+            if rsqrt_op is None:
+                continue
+            add_op = cls._producer(rsqrt_op.inputs.get("x"), "add")
+            if add_op is None:
+                continue
+            # add(variance, eps) in either order, again.
+            for variance, eps_var in ((add_op.inputs.get("x"), add_op.inputs.get("y")),
+                                       (add_op.inputs.get("y"), add_op.inputs.get("x"))):
+                eps = static_value(eps_var)
+                if eps is None or np.asarray(eps).size != 1:
+                    continue
+                mean_op = cls._producer(variance, "reduce_mean")
+                if mean_op is None:
+                    continue
+                pow_op = cls._producer(mean_op.inputs.get("x"), "pow")
+                if pow_op is None:
+                    continue
+                # The multiply must feed back the very var that was squared. Identity, not equality:
+                # two structurally identical tensors are still two tensors, and normalizing by the wrong
+                # one is exactly the bug this check exists to refuse.
+                if pow_op.inputs.get("x") is not x:
+                    continue
+                exponent = static_value(pow_op.inputs.get("y"))
+                if exponent is None or np.asarray(exponent).size != 1 or float(np.asarray(exponent).reshape(-1)[0]) != 2.0:
+                    continue
+                if not cls._reduces_last_axis(mean_op, x):
+                    continue
+                # keep_dims=False would leave the multiply broadcasting against a rank it no longer has;
+                # torch's RMSNorm always keeps it, and a trace that did not is not this pattern.
+                if not bool(static_value(mean_op.inputs.get("keep_dims"), False)):
+                    continue
+
+                # The real epsilon is the sum of the two: MIL's rsqrt adds its own (default 1e-12) on top
+                # of the traced `variance + self.eps`. Summed in Python double precision and stored once,
+                # because MIL casts every float const to fp32 anyway.
+                rsqrt_eps = static_value(rsqrt_op.inputs.get("epsilon"), 0.0)
+                total_eps = float(np.asarray(eps).reshape(-1)[0]) + float(np.asarray(rsqrt_eps).reshape(-1)[0])
+
+                with _scope_ctx_like(mul_op):
+                    new_out = mb.loom_rms_norm(
+                        x=x,
+                        epsilon=np.float32(total_eps),
+                        name=mul_op.outputs[0].name,
+                        before_op=mul_op,
+                    )
+                if not block.try_replace_uses_of_var_after_op(
+                        anchor_op=mul_op, old_var=mul_op.outputs[0], new_var=new_out):
+                    return False
+                # Only the anchor is removed here; `pow`/`reduce_mean`/`add`/`rsqrt` are now unreachable
+                # and `common::dead_code_elimination` -- which apply_loom_mil_passes runs after every
+                # rewrite, for exactly this -- collects them along with the consts they read.
+                block.remove_ops([mul_op])
+                return True
+        return False
+
+    @staticmethod
+    def _reduces_last_axis(mean_op, x) -> bool:
+        """`ggml_rms_norm` normalizes ne[0] and nothing else, so a mean over any other axis is not this
+        primitive however much the surrounding chain looks like it."""
+        axes = static_ints(mean_op.inputs.get("axes"))
+        if axes is None or len(axes) != 1 or x.shape is None:
+            return False
+        rank = len(x.shape)
+        axis = axes[0]
+        return (axis + rank if axis < 0 else axis) == rank - 1
+
+
+@register_pass(namespace="loom")
 class fuse_loom_attention(AbstractGraphPass):
     """
     Replaces each traced scaled-dot-product-attention block with one `loom_fused_attention` op, which
@@ -1164,6 +1292,11 @@ _LOOM_PASS_NAMES = [
     "loom::canonicalize_replicate_pad",
     "loom::canonicalize_conv_transpose_dw",
     "loom::lower_stack",
+    # Before lower_reduce_mean, and that ordering is the whole reason this is a list rather than a set:
+    # the RMS-norm chain contains a `reduce_mean`, and lowering it first would leave the pattern spelled
+    # `reduce_sum` + `loom_scale` -- still fusable, but only by a matcher that knows about a rewrite that
+    # has nothing to do with it.
+    "loom::fuse_rms_norm",
     "loom::lower_reduce_mean",
     "common::dead_code_elimination",
 ]

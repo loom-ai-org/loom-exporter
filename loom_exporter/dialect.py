@@ -304,6 +304,45 @@ class loom_scale(Operation):
 
 
 @register_op(namespace="loom")
+class loom_rms_norm(Operation):
+    """
+    Root-mean-square normalization over the fastest-varying (last, MIL-order) axis, standing in for the
+    five-op chain PyTorch's RMSNorm actually traces to -- lowered by `topology_ops.py` to the engine's
+    `RMS_NORM` primitive (`ggml_rms_norm`, which normalizes ne[0] and supplies its own element count).
+
+    **Why this op exists at all, given `exporter.py` already mapped `"rms_norm" -> "RMS_NORM"`.** That
+    entry maps an op MIL does not have: there is no `rms_norm` in coremltools' op registry (checked --
+    the only `*norm*` core ops are batch/instance/l2/layer/local_response). PyTorch's RMSNorm therefore
+    arrives as `pow -> reduce_mean -> add -> rsqrt -> mul`, five ops of which two (`pow`, `rsqrt`) become
+    `ggml_map_custom` host callbacks in the engine. The mapping could never fire, so the primitive was
+    never once emitted: across thirteen exported models `RMS_NORM` appears zero times and `POW` appears
+    in ten of them (BACKLOG.md P4.7).
+
+    **The affine stays outside**, matching the convention `LAYER_NORM` and `GROUP_NORM` already follow:
+    a model's learned `weight` is a separate `MUL` node, not a `gamma` input here. `ggml_rms_norm` has
+    no affine of its own, so folding one in would mean this op lowering to two nodes instead of one, for
+    no gain.
+
+    `epsilon` is the value that is really added to the mean square, which is NOT simply the constant the
+    traced `variance + self.eps` carries: MIL's own `rsqrt` takes an `epsilon` input of its own (default
+    1e-12) and computes `1/sqrt(x + epsilon)`, so the two are summed by the pass that builds this op. It
+    is a fp32 const like every other MIL float, which is why the pass computes the sum in Python and
+    stores the result rather than carrying both terms.
+    """
+    input_spec = InputSpec(
+        x=TensorInputType(type_domain="T"),
+        epsilon=TensorInputType(const=True, type_domain="T"),
+    )
+
+    type_domains = {
+        "T": (types.fp16, types.fp32),
+    }
+
+    def type_inference(self):
+        return self.x.sym_type
+
+
+@register_op(namespace="loom")
 class loom_short_conv(Operation):
     """
     One causal depthwise convolution that owns its cross-step history -- lowered by `topology_ops.py` to
