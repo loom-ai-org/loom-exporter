@@ -37,9 +37,6 @@ DEFAULT_MODELS_ROOT = Path("/home/flavio/Dev/models")
 DEFAULT_OUTPUT_DIR = REPO_ROOT.parent / "hf-models"
 
 LOOM_PY_URL = "https://github.com/loom-ai-org/loom-py"
-# The loom-py release these cards tell a reader to install. Bump when a card's example needs something
-# a older loom-py does not have -- it is a floor, not a pin, so it does not need touching per release.
-LOOM_PY_MIN_VERSION = "1.0.0rc1"
 EXPORTER_URL = "https://github.com/loom-ai-org/loom-exporter"
 
 
@@ -243,7 +240,24 @@ CATALOG = [
             "voice as a `style_ttl`/`style_dp` pair. What this export does *not* carry is the two "
             "style encoders, so it cannot derive a style from your own audio -- cloning a new voice "
             "needs the upstream checkpoint. Selecting among existing voices does not.",
-        usage_extra="""### Choosing a voice
+        usage_extra="""### Saving the audio
+
+`infer` returns the waveform as a plain list of floats in `[-1, 1]` at **44.1 kHz**. Writing it to a
+`.wav` is a scale and a write -- numpy and scipy are not loom dependencies, they are just the shortest
+way to say it:
+
+```python
+import numpy as np
+import scipy.io.wavfile as wavfile
+
+sample_rate = 44100                                    # Supertonic 2's output rate
+
+# 16-bit PCM is the usual container format, so scale the floats to its integer range.
+audio_int16 = (np.asarray(audio, dtype=np.float32) * 32767).astype(np.int16)
+wavfile.write("output.wav", sample_rate, audio_int16)
+```
+
+### Choosing a voice
 
 This file embeds one voice (`F1`) and uses it whenever no style is passed. Nine more ship in this repo
 under `voice_styles/`:
@@ -426,7 +440,7 @@ loom.cpp's GGUF format.
 Run it with [loom-py]({LOOM_PY_URL}) -- `loom-py-rt` on PyPI:
 
 ```sh
-pip install "loom-py-rt[hub]>={LOOM_PY_MIN_VERSION}"
+pip install -U "loom-py-rt[hub]"
 ```
 
 ```python
