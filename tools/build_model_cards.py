@@ -56,6 +56,12 @@ class ModelCard:
     # produces outside the engine, while a grapheme model (Supertonic) encodes text itself. Only read
     # for task_type == "text-to-speech"; the LM and ASR families all carry one.
     takes_text: bool = False
+    # Output sample rate in Hz, required for task_type == "text-to-speech" and unused elsewhere. It is a
+    # per-card constant rather than something read off the GGUF because no TTS export declares it as an
+    # hparam -- the number reaches the engine as a driver constant at most (Supertonic's SAMPLE_RATE),
+    # and a waveform whose rate the caller has to guess is a waveform played at the wrong speed. Each
+    # card's value is sourced in a comment beside it.
+    sample_rate: Optional[int] = None
     # `--task`/`--model` for loom-export; empty means auto-detection resolves both.
     export_task: Optional[str] = None
     export_model: Optional[str] = None
@@ -204,6 +210,9 @@ CATALOG = [
     ModelCard(
         slug="kokoro-82m", checkpoint=Path("kokoro_model"),
         export_task="text-to-speech", export_model="kokoro", task_type="text-to-speech",
+        # Not in the checkpoint's config.json: upstream hardcodes it in `Generator.__init__`, which is
+        # where tools/convert_kokoro/convert_kokoro_sinegen.py reads its own copy from.
+        sample_rate=24000,
         base_repo="hexgrad/Kokoro-82M", license_id="apache-2.0", language=["en"],
         language_note="upstream's own `language:` tag is `en`; the model card additionally documents 8 languages / 54 voices",
         title="Kokoro-82M", summary="hexgrad's Kokoro-82M TTS model, exported for loom.cpp. Takes phoneme ids, not text.",
@@ -211,6 +220,7 @@ CATALOG = [
     ModelCard(
         slug="matcha-tts-ljspeech", checkpoint=Path("matcha_model/ckpt"),
         export_task="text-to-speech", export_model="matcha", task_type="text-to-speech",
+        sample_rate=22050,  # matcha_ljspeech.ckpt's own `datamodule_hyper_parameters["sample_rate"]`
         source_url="https://github.com/shivammehta25/Matcha-TTS", source_name="Matcha-TTS (LJSpeech checkpoint)",
         license_id="mit", language=["en"],
         title="Matcha-TTS (LJSpeech)", summary="Matcha-TTS's LJSpeech flow-matching TTS checkpoint, exported for loom.cpp. Takes phoneme ids, not text.",
@@ -219,6 +229,7 @@ CATALOG = [
         slug="supertonic-2", checkpoint=Path("/home/flavio/Dev/supertonic-tts/assets/pt"),
         export_task="text-to-speech", export_model="supertonic", task_type="text-to-speech",
         takes_text=True,
+        sample_rate=44100,  # loom_exporter.supertonic_export.DEC_SAMPLE_RATE, and see its comment
         base_repo="Supertone/supertonic-2", license_id="other",
         license_name="OpenRAIL-M", license_url="https://huggingface.co/Supertone/supertonic-2/blob/main/LICENSE",
         language=["en", "ko", "es", "pt", "fr"],
@@ -240,24 +251,7 @@ CATALOG = [
             "voice as a `style_ttl`/`style_dp` pair. What this export does *not* carry is the two "
             "style encoders, so it cannot derive a style from your own audio -- cloning a new voice "
             "needs the upstream checkpoint. Selecting among existing voices does not.",
-        usage_extra="""### Saving the audio
-
-`infer` returns the waveform as a plain list of floats in `[-1, 1]` at **44.1 kHz**. Writing it to a
-`.wav` is a scale and a write -- numpy and scipy are not loom dependencies, they are just the shortest
-way to say it:
-
-```python
-import numpy as np
-import scipy.io.wavfile as wavfile
-
-sample_rate = 44100                                    # Supertonic 2's output rate
-
-# 16-bit PCM is the usual container format, so scale the floats to its integer range.
-audio_int16 = (np.asarray(audio, dtype=np.float32) * 32767).astype(np.int16)
-wavfile.write("output.wav", sample_rate, audio_int16)
-```
-
-### Choosing a voice
+        usage_extra="""### Choosing a voice
 
 This file embeds one voice (`F1`) and uses it whenever no style is passed. Nine more ship in this repo
 under `voice_styles/`:
@@ -294,6 +288,7 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         slug="vits-piper-en-gb-miro",
         checkpoint=Path("/home/flavio/Dev/piper/pipertts_en-GB_miro/epoch=9772-step=1494014.ckpt"),
         export_task="text-to-speech", export_model="vits", task_type="text-to-speech",
+        sample_rate=22050,  # the voice's own miro_en-GB.onnx.json `audio.sample_rate`
         base_repo="OpenVoiceOS/pipertts_en-GB_miro", license_id="other",
         license_name=None, license_url=None,
         language=["en"],
@@ -305,6 +300,9 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         slug="styletts2-ljspeech",
         checkpoint=Path("styletts2_model/ckpt/Models/LJSpeech/epoch_2nd_00100.pth"),
         export_task="text-to-speech", export_model="styletts2", task_type="text-to-speech",
+        # config.yml's `preprocess_params.sr`. NOT the `sr: 16000` further up, which belongs to the
+        # SLM (WavLM) discriminator used in training and says nothing about the decoder's output.
+        sample_rate=24000,
         base_repo="yl4579/StyleTTS2-LJSpeech", license_id="mit",
         language_note="the HF repo carries no `license:`/`language:` tags; MIT per the upstream "
                        "GitHub repo's LICENSE (github.com/yl4579/StyleTTS2)",
@@ -364,6 +362,38 @@ def snippet_key(card: ModelCard) -> str:
     return card.task_type
 
 
+def wav_section(card: ModelCard) -> str:
+    """The "Saving the audio" section every TTS card gets, or "" for a non-TTS one.
+
+    Shared rather than per-card because the step after `infer` is the same for all five TTS families --
+    scale the floats to int16 and write -- and the only thing that differs is the rate, which is exactly
+    the part a caller cannot infer and the part that is silently wrong if they guess. A waveform written
+    at the wrong rate still plays; it just plays at the wrong pitch and speed, which is why this is in
+    the card at all rather than left as an exercise."""
+    if card.task_type != "text-to-speech":
+        return ""
+    if card.sample_rate is None:
+        raise ValueError(f"{card.slug}: a text-to-speech card must declare sample_rate")
+    khz = f"{card.sample_rate / 1000:g}"
+    return f"""### Saving the audio
+
+`infer` returns the waveform as a plain list of floats in `[-1, 1]` at **{khz} kHz**. Writing it to a
+`.wav` is a scale and a write -- numpy and scipy are not loom dependencies, they are just the shortest
+way to say it:
+
+```python
+import numpy as np
+import scipy.io.wavfile as wavfile
+
+sample_rate = {card.sample_rate}   # {card.title}'s output rate -- playing it at any other rate shifts pitch and speed
+
+# 16-bit PCM is the usual container format, so scale the floats to its integer range.
+audio_int16 = (np.asarray(audio, dtype=np.float32) * 32767).astype(np.int16)
+wavfile.write("output.wav", sample_rate, audio_int16)
+```
+"""
+
+
 def resolve_checkpoint(card: ModelCard, models_root: Path) -> Path:
     return card.checkpoint if card.checkpoint.is_absolute() else models_root / card.checkpoint
 
@@ -413,6 +443,10 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
     # further bullets under the GGUF's own.
     usage_extra_section = f"\n{card.usage_extra}\n" if card.usage_extra else ""
     extra_files_section = "".join(f"- {bullet}\n" for bullet in card.extra_files)
+    # Before `usage_extra`, so a TTS card reads snippet -> what to do with the waveform -> whatever else
+    # that one model needs said (Supertonic's voice selection).
+    wav = wav_section(card)
+    wav_section_md = f"\n{wav}" if wav else ""
 
     body = f"""# {card.title}
 
@@ -445,7 +479,7 @@ pip install -U "loom-py-rt[hub]"
 
 ```python
 {USAGE_SNIPPETS[snippet_key(card)].format(repo_id=repo_id(card), slug=card.slug)}```
-{usage_extra_section}
+{wav_section_md}{usage_extra_section}
 `model.driver_source` prints the exact driver script this GGUF embeds, including a header comment
 documenting every argument `model.infer()`/`model.generate()` accepts for this model.
 {limitations_section}
