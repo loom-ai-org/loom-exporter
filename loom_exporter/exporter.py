@@ -83,7 +83,11 @@ class LoomGGUFExporter:
         "gather": "GET_ROWS",
         "reduce_mean": "MEAN",
         "layer_norm": "LAYER_NORM",
-        "rms_norm": "RMS_NORM",
+        # No "rms_norm" entry, deliberately: MIL has no such op (its only *norm* core ops are
+        # batch/instance/l2/layer/local_response), so this mapped an op that could never arrive, and
+        # would have emitted a `RMS_NORM` node with no `eps` attr -- which the engine raises on -- if one
+        # ever did. RMS normalization reaches the primitive through `passes.py`'s fuse_rms_norm and the
+        # `loom_rms_norm` rule in topology_ops.py instead.
         "sigmoid": "SIGMOID",
         "tanh": "TANH",
         "exp": "EXP",
