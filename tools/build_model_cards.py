@@ -62,6 +62,23 @@ class ModelCard:
     # and a waveform whose rate the caller has to guess is a waveform played at the wrong speed. Each
     # card's value is sourced in a comment beside it.
     sample_rate: Optional[int] = None
+    # INPUT sample rate in Hz for task_type == "automatic-speech-recognition", and unused elsewhere --
+    # the mirror of `sample_rate` above, which is an OUTPUT rate for TTS. Same reasoning applies in
+    # reverse: audio resampled to the wrong rate is not rejected, it is transcribed badly, so a caller
+    # who has to guess this gets a worse transcript and no error.
+    #
+    # A per-card constant rather than something read off the GGUF, because only ONE export declares it:
+    # `whisper_mil.gguf` carries `loom.sample_rate = 16000`, and the other five ASR GGUFs carry no
+    # sample-rate key at all. Rather than have the cards be sometimes-derived and sometimes-hardcoded,
+    # every value here is sourced from the upstream checkpoint in a comment, exactly as the TTS rates
+    # above are. If the exporter ever emits this for every ASR family, this field is what to delete.
+    input_sample_rate: Optional[int] = None
+    # Audio length the export FIXES, in samples, or None when the model accepts any length. Only
+    # Whisper has one: its topology declares `waveform` as `["480000", "1"]` -- a literal, not the
+    # symbolic `["n_samples", "1"]` every other ASR export uses -- so 480000 samples at 16 kHz is
+    # exactly 30 seconds and nothing else will load. Shorter audio must be padded and longer audio
+    # chunked, which is a thing a caller discovers by crashing unless the card says so.
+    fixed_audio_samples: Optional[int] = None
     # `--task`/`--model` for loom-export; empty means auto-detection resolves both.
     export_task: Optional[str] = None
     export_model: Optional[str] = None
@@ -149,6 +166,9 @@ CATALOG = [
     ModelCard(
         slug="whisper-small", checkpoint=Path("whisper-small"),
         task_type="automatic-speech-recognition",
+        # whisper_mil.gguf's own `loom.sample_rate`, the one ASR export that declares it, and its
+        # `loom.n_samples` -- which the topology repeats as a literal `waveform` dim of 480000.
+        input_sample_rate=16000, fixed_audio_samples=480000,
         base_repo="openai/whisper-small", license_id="apache-2.0",
         language=["en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar",
                   "sv", "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu",
@@ -160,14 +180,18 @@ CATALOG = [
         title="Whisper Small", summary="OpenAI's Whisper small encoder-decoder ASR model, exported for loom.cpp.",
     ),
     ModelCard(
-        slug="conformer-ctc-small", checkpoint=Path("conformer-ctc-small/stt_en_conformer_ctc_small.nemo"),
+        slug="conformer-ctc-small",
+        # stt_en_conformer_ctc_small.nemo's model_config.yaml `sample_rate`.
+        input_sample_rate=16000, checkpoint=Path("conformer-ctc-small/stt_en_conformer_ctc_small.nemo"),
         export_task="automatic-speech-recognition", export_model="conformer-ctc",
         task_type="automatic-speech-recognition",
         base_repo="nvidia/stt_en_conformer_ctc_small", license_id="cc-by-4.0", language=["en"],
         title="Conformer-CTC Small (en)", summary="NVIDIA NeMo's small Conformer-CTC English ASR model, exported for loom.cpp.",
     ),
     ModelCard(
-        slug="parakeet-tdt-0.6b", checkpoint=Path("parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo"),
+        slug="parakeet-tdt-0.6b",
+        # parakeet-tdt-0.6b-v3.nemo's model_config.yaml `sample_rate`.
+        input_sample_rate=16000, checkpoint=Path("parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo"),
         export_task="automatic-speech-recognition", export_model="parakeet-tdt",
         task_type="automatic-speech-recognition",
         base_repo="nvidia/parakeet-tdt-0.6b-v3", license_id="cc-by-4.0",
@@ -176,21 +200,27 @@ CATALOG = [
         title="Parakeet-TDT 0.6B v3", summary="NVIDIA NeMo's multilingual Parakeet-TDT 0.6B ASR model, exported for loom.cpp.",
     ),
     ModelCard(
-        slug="parakeet-rnnt-0.6b", checkpoint=Path("parakeet_rnnt_model/parakeet-rnnt-0.6b.nemo"),
+        slug="parakeet-rnnt-0.6b",
+        # parakeet-rnnt-0.6b.nemo's model_config.yaml `sample_rate`.
+        input_sample_rate=16000, checkpoint=Path("parakeet_rnnt_model/parakeet-rnnt-0.6b.nemo"),
         export_task="automatic-speech-recognition", export_model="parakeet-rnnt",
         task_type="automatic-speech-recognition",
         base_repo="nvidia/parakeet-rnnt-0.6b", license_id="cc-by-4.0", language=["en"],
         title="Parakeet-RNNT 0.6B", summary="NVIDIA NeMo's Parakeet-RNNT 0.6B English ASR model, exported for loom.cpp.",
     ),
     ModelCard(
-        slug="gigaam-v3-rnnt", checkpoint=Path("gigaam-v3"),
+        slug="gigaam-v3-rnnt",
+        # gigaam-v3/config.json `cfg.model.cfg.preprocessor.sample_rate`.
+        input_sample_rate=16000, checkpoint=Path("gigaam-v3"),
         export_task="automatic-speech-recognition", export_model="gigaam-rnnt",
         task_type="automatic-speech-recognition",
         base_repo="ai-sage/GigaAM-v3", license_id="mit", language=["ru", "en"],
         title="GigaAM-v3 RNNT", summary="Sber's GigaAM-v3 Conformer RNNT Russian/English ASR model, exported for loom.cpp.",
     ),
     ModelCard(
-        slug="qwen3-asr-0.6b", checkpoint=Path("qwen3-asr-0.6b-hf"), venv="ovos",
+        slug="qwen3-asr-0.6b",
+        # qwen3-asr-0.6b-hf/processor_config.json `feature_extractor.sampling_rate`.
+        input_sample_rate=16000, checkpoint=Path("qwen3-asr-0.6b-hf"), venv="ovos",
         task_type="automatic-speech-recognition",
         base_repo="Qwen/Qwen3-ASR-0.6B", license_id="apache-2.0",
         language=["zh", "en", "yue", "ar", "de", "fr", "es", "pt", "id", "it", "ko", "ru", "th", "vi",
@@ -201,7 +231,9 @@ CATALOG = [
         title="Qwen3-ASR-0.6B", summary="Alibaba's Qwen3-ASR 0.6B multilingual ASR model, exported for loom.cpp.",
     ),
     ModelCard(
-        slug="granite-speech-4.0-1b", checkpoint=Path("granite-speech-4.0.1b"),
+        slug="granite-speech-4.0-1b",
+        # granite-speech-4.0.1b/preprocessor_config.json `sampling_rate`.
+        input_sample_rate=16000, checkpoint=Path("granite-speech-4.0.1b"),
         task_type="automatic-speech-recognition",
         base_repo="ibm-granite/granite-4.0-1b-speech", license_id="apache-2.0",
         language=["en", "fr", "de", "es", "pt", "ja"], language_note="upstream also tags the model \"multilingual\"",
@@ -394,6 +426,76 @@ wavfile.write("output.wav", sample_rate, audio_int16)
 """
 
 
+def audio_section(card: ModelCard) -> str:
+    """The "Loading the audio" section every ASR card gets, or "" for a non-ASR one.
+
+    The exact mirror of wav_section, and it exists for the same reason: the usage snippet says
+    `waveform=audio` without ever saying where `audio` comes from, and every way of getting it wrong
+    is silent. Audio at the wrong rate transcribes badly rather than failing; a stereo file transcribes
+    one interleaved channel as if it were twice the length; int16 samples read as floats are 32767x
+    too loud. None of those raise -- they just produce a worse transcript, which the caller has no way
+    to attribute."""
+    if card.task_type != "automatic-speech-recognition":
+        return ""
+    if card.input_sample_rate is None:
+        raise ValueError(f"{card.slug}: an ASR card must declare input_sample_rate")
+
+    khz = f"{card.input_sample_rate / 1000:g}"
+    body = f"""### Loading the audio
+
+`infer` takes a plain list of floats in `[-1, 1]` at **{khz} kHz**, mono. Getting there from a `.wav`
+is a read, a rate check and a scale -- numpy and scipy are not loom dependencies, they are just the
+shortest way to say it:
+
+```python
+import numpy as np
+import scipy.io.wavfile as wavfile
+
+SAMPLE_RATE = {card.input_sample_rate}   # what {card.title} was trained on; other rates transcribe badly rather than failing
+
+rate, data = wavfile.read("speech.wav")
+assert rate == SAMPLE_RATE, f"expected {{SAMPLE_RATE}} Hz, got {{rate}} -- resample first (e.g. `ffmpeg -i in.wav -ar {card.input_sample_rate} -ac 1 speech.wav`)"
+
+# Mono. A stereo file read as-is is two interleaved channels, which transcribes as noise.
+if data.ndim > 1:
+    data = data.mean(axis=1)
+
+# int16 PCM is the usual container; the model wants floats in [-1, 1].
+audio = (data.astype(np.float32) / 32768.0) if data.dtype == np.int16 else data.astype(np.float32)
+```
+"""
+
+    if card.fixed_audio_samples is not None:
+        seconds = card.fixed_audio_samples / card.input_sample_rate
+        body += f"""
+### This model takes exactly {seconds:g} seconds, and `infer` will not pad for you
+
+{card.title}'s export declares its `waveform` input as a literal **{card.fixed_audio_samples} samples**
+-- {seconds:g} s at {khz} kHz -- where every other ASR export here declares a symbolic length. The GGUF says so
+in `loom.n_samples`, and that is the only ASR export that carries the key.
+
+**Which half of loom you use decides whether you notice.** `loom_cli` reads `loom.n_samples` and does
+the windowing itself -- zero-padding a short clip and splitting a long one, following Whisper's own
+`pad_or_trim` convention -- so a file of any length transcribes with no special handling. `model.infer()`
+does not: it passes the waveform you give it straight through. That difference is why a clip that works
+on the command line can surprise you from Python.
+
+```python
+WINDOW = {card.fixed_audio_samples}   # {seconds:g} s at {khz} kHz, fixed by the export
+
+if len(audio) < WINDOW:
+    audio = np.pad(audio, (0, WINDOW - len(audio)))   # silence, as Whisper itself pads
+else:
+    audio = audio[:WINDOW]                            # one window per call -- see below for longer audio
+```
+
+Padding with silence is what the upstream model does, so a short clip transcribes normally. Audio
+longer than {seconds:g} s needs splitting into consecutive windows and transcribing each, concatenating the
+transcripts -- this export gives you one window per `infer` call.
+"""
+    return body
+
+
 def resolve_checkpoint(card: ModelCard, models_root: Path) -> Path:
     return card.checkpoint if card.checkpoint.is_absolute() else models_root / card.checkpoint
 
@@ -447,6 +549,12 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
     # that one model needs said (Supertonic's voice selection).
     wav = wav_section(card)
     wav_section_md = f"\n{wav}" if wav else ""
+    # BEFORE the snippet, not after, and the asymmetry with wav_section is deliberate: the ASR snippet
+    # passes `waveform=audio` without `audio` existing yet, so a reader meets an undefined name unless
+    # the loading comes first. TTS is the other way round -- `infer` produces the waveform, and saving
+    # it is what happens next.
+    audio = audio_section(card)
+    audio_section_md = f"{audio}\n" if audio else ""
 
     body = f"""# {card.title}
 
@@ -477,7 +585,7 @@ Run it with [loom-py]({LOOM_PY_URL}) -- `loom-py-rt` on PyPI:
 pip install -U "loom-py-rt[hub]"
 ```
 
-```python
+{audio_section_md}```python
 {USAGE_SNIPPETS[snippet_key(card)].format(repo_id=repo_id(card), slug=card.slug)}```
 {wav_section_md}{usage_extra_section}
 `model.driver_source` prints the exact driver script this GGUF embeds, including a header comment
