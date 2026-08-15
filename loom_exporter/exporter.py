@@ -2570,6 +2570,30 @@ class LoomGGUFExporter:
                     f"rendering. The contract is names, numbers and flat homogeneous tables of them."
                 )
 
+        # The phoneme vocabulary, for a model whose input is phoneme ids. Written under the same
+        # `tokenizer.ggml.*` schema every other vocabulary uses, because that is what it is: a symbol
+        # table plus the ids it maps to. `loom::PhonemeVocab` reads it back, and `model.tokenizer` stops
+        # being None for the four TTS families that had no text door at all.
+        #
+        # `tokens` is indexed BY id -- the engine's vocabularies are id-indexed arrays, and piper's map
+        # is not dense in general, so the gaps are filled with a name no phonemizer can emit rather than
+        # with empty strings that would all collide on lookup.
+        table = self.kwargs.get("phoneme_table") or {}
+        if table:
+            symbols, ids = table["symbols"], table["ids"]
+            tokens = [f"<unused{i}>" for i in range(max(ids) + 1)]
+            for symbol, token_id in zip(symbols, ids):
+                tokens[token_id] = symbol
+            w.add_string("tokenizer.ggml.model", "phonemes")
+            w.add_array("tokenizer.ggml.tokens", tokens)
+            # The assembly around the lookup, which is a property of this checkpoint and not of the
+            # table: piper builds [BOS, p1, blank, p2, ..., pn, blank, EOS]. Declared so the engine
+            # applies it and no caller reimplements it.
+            w.add_int32("tokenizer.ggml.phoneme.bos_id", int(table["bos"]))
+            w.add_int32("tokenizer.ggml.phoneme.eos_id", int(table["eos"]))
+            w.add_int32("tokenizer.ggml.phoneme.blank_id", int(table["blank"]))
+            w.add_bool("tokenizer.ggml.phoneme.interleave_blank", bool(table["interleave_blank"]))
+
         tokenizer_dir = self.kwargs.get("tokenizer_dir") or os.environ.get("LOOM_TOKENIZER_DIR")
         if tokenizer_dir:
             self._write_tokenizer(w, tokenizer_dir)

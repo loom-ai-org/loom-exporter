@@ -115,6 +115,7 @@ class LoomExportConfig:
         kwargs = dict(self.backend_kwargs())
         kwargs.setdefault("hparams", self.hparams())
         kwargs["contract"] = self.contract()
+        kwargs["phoneme_table"] = self.phoneme_table()
         return kwargs
 
     def driver_input_aliases(self) -> dict:
@@ -126,6 +127,30 @@ class LoomExportConfig:
         builder normalises the inputs table once at the top of `infer`, and this is what it needs.
 
         Empty means the body already reads canonical names, which is every synthesized driver.
+        """
+        return {}
+
+    def phoneme_table(self) -> dict:
+        """The phoneme vocabulary this model consumes, or `{}` for a model that takes no phonemes.
+
+        `{"symbols": [...], "ids": [...], "bos": int, "eos": int, "blank": int, "interleave_blank": bool}`.
+
+        THE TABLE IS DATA THAT WAS ALREADY IN THE CHECKPOINT AND SIMPLY NOT EXPORTED. Piper's
+        `phoneme_id_map` is 159 entries of symbol -> id; Kokoro, StyleTTS2 and Matcha each carry their
+        own. Without it a GGUF takes raw integers no caller can produce, which is why `model.tokenizer`
+        is None for four of the five TTS families and why `synthesize(text=...)` had nothing to encode
+        with. With it they gain a real vocabulary, exactly as Supertonic already has for graphemes -- and
+        no licence question arises anywhere, because a lookup table is not a phonemizer (BACKLOG.md
+        Task #79, which this splits in two).
+
+        **The assembly is part of it, and is not part of the table.** A lookup is not the whole
+        conversion: Piper builds `[BOS, p1, blank, p2, blank, ..., pn, blank, EOS]` -- a blank between
+        every phoneme, none right after BOS. That interleaving is a property of the CHECKPOINT, so it is
+        declared here and applied by the engine's vocabulary rather than being reimplemented by every
+        caller. Supertonic's `<lang>` wrap is the same shape of fact one modality over.
+
+        What is NOT here is grapheme -> phoneme, which is a property of the LANGUAGE rather than of any
+        checkpoint and lives outside the file entirely.
         """
         return {}
 
