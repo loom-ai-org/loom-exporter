@@ -543,6 +543,28 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
     # A DIRECTORY of `.lua` fragments -- Kokoro is peeled (P4.0.6/C.7). See `driver_components`.
     driver_script_path: Path = driver_dir("convert_kokoro", "kokoro_driver")
 
+    def phoneme_table(self) -> dict:
+        """Kokoro's own `vocab`, straight off the checkpoint's config.json.
+
+        114 symbols over an id space of `n_token` (178), so the table is SPARSE -- the writer fills the
+        gaps with a name no phonemizer can emit rather than leaving empty strings that would all collide
+        on lookup.
+
+        No interleaved blank and no BOS/EOS pair: Kokoro's driver wraps the ids with a leading and
+        trailing 0 itself (its own header says so), which makes that assembly the driver's rather than
+        the vocabulary's. Declaring it here too would apply it twice.
+        """
+        import json
+
+        config = Path(self.model_dir) / "config.json"
+        vocab = json.loads(config.read_text())["vocab"]
+        symbols = sorted(vocab, key=lambda sym: vocab[sym])
+        return {
+            "symbols": symbols,
+            "ids": [int(vocab[sym]) for sym in symbols],
+            "bos": -1, "eos": -1, "blank": -1, "interleave_blank": False,
+        }
+
     def driver_input_aliases(self) -> dict:
         """The canonical names this driver answers to. See the base declaration."""
         return {"input_ids": "tokens"}
