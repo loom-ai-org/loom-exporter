@@ -234,7 +234,8 @@ class MultiPhase(Decomposition):
         """
         from .driver_components import MultiPhaseDriverBuilder
 
-        return MultiPhaseDriverBuilder(peeled=config.driver_components())
+        return MultiPhaseDriverBuilder(peeled=config.driver_components(),
+                                      primary_input=config.driver_primary_input())
 
     def export(self, config) -> str:
         import gc

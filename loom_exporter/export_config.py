@@ -117,6 +117,20 @@ class LoomExportConfig:
         kwargs["contract"] = self.contract()
         return kwargs
 
+    def driver_primary_input(self) -> str:
+        """The name this family's driver body reads its primary input under, when it is not `tokens`.
+
+        A host addresses every primary input canonically -- `tokens` for text or ids, `waveform` for
+        audio -- because the name follows from `loom.input.kind` and never from which model it is. That
+        is what lets loom-py offer one `text2speech.infer(...)` with no table of model names in it.
+
+        `driver_components.caller_input()` already makes it true for a synthesized driver by aliasing at
+        every read site. The five drivers adopted from hand-written Lua read their own name directly, so
+        the builder normalises the inputs table once at the top of `infer` instead; this is what it needs
+        to know to do that. Empty means the body already reads the canonical name.
+        """
+        return ""
+
     def contract(self) -> dict:
         """What this export declares about ITSELF -- the task, and the modality pair it maps between.
 

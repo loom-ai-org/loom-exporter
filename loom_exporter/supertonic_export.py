@@ -422,6 +422,10 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
     # A DIRECTORY of `.lua` fragments -- Supertonic is peeled (P4.0.6/C.5). See `driver_components`.
     driver_script_path: Path = driver_dir("convert_supertonic", "supertonic_driver")
 
+    def driver_primary_input(self) -> str:
+        """This driver reads `txt_ids`; a host says `tokens`. See the base declaration."""
+        return "txt_ids"
+
     def driver_components(self) -> List:
         """Supertonic's driver, as components (P4.0.6/C.5).
 
@@ -675,6 +679,12 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         contract = super().contract()
         contract["input.kind"] = "text"
         contract["text.frontend"] = "vocab"
+        # The rate the waveform coming out of `decoder` is at. Declared because a host cannot recover it
+        # from a list of floats and getting it wrong is SILENT -- 44.1 kHz audio played at 22.05 kHz is
+        # not an error, it is a slow voice. `DEC_SAMPLE_RATE` is already the one place this export states
+        # it (the driver reads it as a local constant), so this is a second rendering of one fact rather
+        # than a second authority for it.
+        contract["sample_rate"] = int(DEC_SAMPLE_RATE)
         return contract
 
     def samplers(self) -> List[FlowMatchingSpec]:

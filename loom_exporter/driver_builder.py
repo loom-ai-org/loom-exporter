@@ -50,7 +50,7 @@ import dataclasses
 from typing import Dict, List, Optional
 
 from .driver_ir import Function as IRFunction
-from .driver_ir import LuaCodegen, Stmt, check_subgraph_calls, validate
+from .driver_ir import LuaCodegen, RawBlock, Stmt, check_subgraph_calls, validate
 from .spec_protocol import LinkChecker, NestedSpec, Unchecked, declared_links
 
 
@@ -248,6 +248,23 @@ class DriverBuilder:
     entry_name = "infer"
     entry_params = ("inputs",)
 
+    #: The name THIS driver's body reads its primary input under, when that is not the canonical one.
+    #:
+    #: A host addresses every model's primary input as `tokens` (for text or ids) or `waveform` (for
+    #: audio) -- the name follows from `loom.input.kind` and never from which model it is, which is what
+    #: lets loom-py offer `text2speech.infer(...)` without a table of model names in it.
+    #:
+    #: `caller_input()` already makes that true for a SYNTHESIZED driver, aliasing the traced graph's
+    #: own name at every read site. It could not for the five drivers adopted from hand-written Lua
+    #: (P4.0.6/C.3), whose bodies read `txt_ids` / `input_ids` / `token_ids` directly -- so four of the
+    #: five TTS families rejected the canonical name, and `Text2Speech.infer` failed on all of them
+    #: while every unit test passed, because a test double records whatever it is handed.
+    #:
+    #: Declared here rather than written into the GGUF: the canonical name is the only public one, and
+    #: a file that published its private spelling would invite hosts to use it. Empty means the body
+    #: already reads the canonical name, which is every synthesized driver and Matcha.
+    primary_input: str = ""
+
     def components(self) -> List[DriverComponent]:
         raise NotImplementedError
 
@@ -315,7 +332,19 @@ class DriverBuilder:
                 postlude.extend(contributions[POSTLUDE])
             return body
 
-        entry = IRFunction(self.entry_name, list(self.entry_params), emit_body(components))
+        entry_body = emit_body(components)
+        # The canonical name, accepted before the body reads anything. One line, at the top of `infer`,
+        # rather than an alias at every read site: the adopted drivers read their own name in up to a
+        # dozen places across as many fragments, and normalising the table once is both smaller and
+        # impossible to half-apply. `or` rather than an unconditional assignment so a caller using the
+        # driver's own name still works -- this widens what `infer` accepts and takes nothing away.
+        if self.primary_input:
+            entry_body = [RawBlock([
+                f"-- `tokens` is the name a host addresses any primary input by; this driver's body",
+                f"-- reads `{self.primary_input}`. Accept both.",
+                f"inputs.{self.primary_input} = inputs.{self.primary_input} or inputs.tokens",
+            ])] + entry_body
+        entry = IRFunction(self.entry_name, list(self.entry_params), entry_body)
         extra_functions = [
             IRFunction(spec.name, list(spec.params), emit_body(spec.components)) for spec in extra
         ]

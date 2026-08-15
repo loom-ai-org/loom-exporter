@@ -356,6 +356,10 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
     # A DIRECTORY of `.lua` fragments -- StyleTTS2 is peeled (P4.0.6/C.8). See `driver_components`.
     driver_script_path: Path = driver_dir("convert_styletts2", "styletts2_driver")
 
+    def driver_primary_input(self) -> str:
+        """This driver reads `input_ids`; a host says `tokens`. See the base declaration."""
+        return "input_ids"
+
     def driver_components(self) -> List:
         """StyleTTS2's driver, as components (P4.0.6/C.8 -- the last family, and the one the plan
         predicted would "stay partly raw").
