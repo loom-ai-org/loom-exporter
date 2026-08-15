@@ -248,22 +248,22 @@ class DriverBuilder:
     entry_name = "infer"
     entry_params = ("inputs",)
 
-    #: The name THIS driver's body reads its primary input under, when that is not the canonical one.
+    #: `{the name this driver's body reads: the canonical name a host passes}`.
     #:
-    #: A host addresses every model's primary input as `tokens` (for text or ids) or `waveform` (for
-    #: audio) -- the name follows from `loom.input.kind` and never from which model it is, which is what
-    #: lets loom-py offer `text2speech.infer(...)` without a table of model names in it.
+    #: A host addresses an input by what it IS -- `tokens` for text or ids, `waveform` for audio,
+    #: `n_steps` for a sampler's step count -- because that follows from the kind or the role and never
+    #: from which model it is. That is what lets loom-py offer one `text2speech.infer(...)` with no
+    #: table of model names in it.
     #:
-    #: `caller_input()` already makes that true for a SYNTHESIZED driver, aliasing the traced graph's
-    #: own name at every read site. It could not for the five drivers adopted from hand-written Lua
-    #: (P4.0.6/C.3), whose bodies read `txt_ids` / `input_ids` / `token_ids` directly -- so four of the
-    #: five TTS families rejected the canonical name, and `Text2Speech.infer` failed on all of them
-    #: while every unit test passed, because a test double records whatever it is handed.
+    #: `caller_input()` already makes it true for a SYNTHESIZED driver, aliasing at every read site. It
+    #: could not for the five drivers adopted from hand-written Lua (P4.0.6/C.3), whose bodies read
+    #: `txt_ids` / `input_ids` / `diffusion_steps` directly -- so four of the five TTS families rejected
+    #: the canonical primary input and `Text2Speech.infer` failed on all of them, while every unit test
+    #: passed because a test double records whatever it is handed.
     #:
-    #: Declared here rather than written into the GGUF: the canonical name is the only public one, and
-    #: a file that published its private spelling would invite hosts to use it. Empty means the body
-    #: already reads the canonical name, which is every synthesized driver and Matcha.
-    primary_input: str = ""
+    #: Declared here and NOT written into the GGUF: the canonical name is the only public one, and a
+    #: file that published its private spelling would invite hosts to use it.
+    input_aliases: Dict[str, str] = {}
 
     def components(self) -> List[DriverComponent]:
         raise NotImplementedError
@@ -338,12 +338,12 @@ class DriverBuilder:
         # dozen places across as many fragments, and normalising the table once is both smaller and
         # impossible to half-apply. `or` rather than an unconditional assignment so a caller using the
         # driver's own name still works -- this widens what `infer` accepts and takes nothing away.
-        if self.primary_input:
-            entry_body = [RawBlock([
-                f"-- `tokens` is the name a host addresses any primary input by; this driver's body",
-                f"-- reads `{self.primary_input}`. Accept both.",
-                f"inputs.{self.primary_input} = inputs.{self.primary_input} or inputs.tokens",
-            ])] + entry_body
+        if self.input_aliases:
+            lines = []
+            for own, canonical in sorted(self.input_aliases.items()):
+                lines.append(f"-- `{canonical}` is the name a host passes; this body reads `{own}`.")
+                lines.append(f"inputs.{own} = inputs.{own} or inputs.{canonical}")
+            entry_body = [RawBlock(lines)] + entry_body
         entry = IRFunction(self.entry_name, list(self.entry_params), entry_body)
         extra_functions = [
             IRFunction(spec.name, list(spec.params), emit_body(spec.components)) for spec in extra
