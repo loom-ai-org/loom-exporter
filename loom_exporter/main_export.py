@@ -28,6 +28,12 @@ def main_export(model_path: str, output_path: str, task: str = None, model: str 
     path = Path(model_path)
     recognizer = registry.get(task, model) if model is not None else registry.detect(path, task)
     config = recognizer.build_config(path, output_path)
+    # The task, onto the config, because this is the last point at which anything knows it: `detect()`
+    # returns a recognizer and `build_config` is handed a path and an output path. It used to stop here
+    # -- `tasks.py` argued a task name "never reaches build_config, let alone a KV" -- which was right
+    # while no host offered a task-shaped door and stopped being right the moment one did. It is written
+    # into the file as `loom.task` now (loom.cpp docs/HIGH-LEVEL-API.md §3).
+    config.task = recognizer.task
     return config.export()
 
 

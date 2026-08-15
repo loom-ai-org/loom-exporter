@@ -55,6 +55,15 @@ class LoomExportConfig:
             "where to write. Nothing real to check it against: the file does not exist yet, and "
             "whether its directory is writable is the filesystem's error to raise, not a spec claim."
         ),
+        "task": Unchecked(
+            "which task this export was produced under, written into the GGUF as `loom.task` so a host "
+            "can dispatch on what the file says rather than on which architecture it recognises. Set by "
+            "`main_export` from the recognizer that matched, never by a family -- and unchecked here "
+            "because the check that matters is structural rather than a spec claim: "
+            "`TaskRegistry.register()` stamps it from the entry, so a recognizer's task IS the task it "
+            "was registered under and the two cannot disagree. Empty when a config is built directly "
+            "rather than through `main_export`, which `contract()` reads as 'declare nothing'."
+        ),
     }
 
     def export(self) -> str:
@@ -84,6 +93,62 @@ class LoomExportConfig:
         `test_export_hparams.py` walks the registry to check they still do. A hook honoured by one path
         out of four is worse than no hook: it reads as available and silently does nothing."""
         return {"hparams": self.hparams()}
+
+    # Which task this export was produced under. Set on the INSTANCE by `main_export`, from the
+    # recognizer that matched, because that is the last point where the task is known. A class attribute
+    # rather than a dataclass field on purpose: every family's config subclasses this one and several
+    # declare required fields, so adding a defaulted field here would constrain their field order for
+    # nothing.
+    task: str = ""
+
+    def resolved_backend_kwargs(self) -> dict:
+        """`backend_kwargs()` plus what EVERY export must carry, merged here so a family cannot drop it.
+
+        This is the structural version of the warning above. `hparams` is universal and is nonetheless
+        passed by hand in four overrides, held in place only by a test that walks the registry checking
+        they still do -- which catches a family that forgets one commit after it ships. The contract is
+        universal in the same way and is deliberately NOT routed that way: it is merged over whatever
+        the family returns, so forgetting it is not expressible.
+
+        `setdefault` for `hparams` rather than assignment, so an override that does pass it still wins.
+        """
+        kwargs = dict(self.backend_kwargs())
+        kwargs.setdefault("hparams", self.hparams())
+        kwargs["contract"] = self.contract()
+        return kwargs
+
+    def contract(self) -> dict:
+        """What this export declares about ITSELF -- the task, and the modality pair it maps between.
+
+        Written into the GGUF as `loom.task` / `loom.input.kind` / `loom.output.kind` and read back by
+        `loom::ModelContract`. It exists because a host had no way to know what a model was for: the file
+        said `loom.architecture`, a per-MODEL name, so any end-to-end door a host offered had to be
+        reached through a table of architecture names -- the per-architecture host code all three repos
+        forbid. See loom.cpp `docs/HIGH-LEVEL-API.md`.
+
+        The defaults below are per-TASK and cover every family registered today. A family overrides this
+        only where its own contract differs from its task's usual one -- Supertonic taking graphemes
+        where the other four TTS families take phoneme ids -- or to add a task-specific table, which is
+        what Whisper does with the ASR decode ids.
+
+        Empty when `task` is unset, which is what happens when a config is constructed directly rather
+        than through `main_export`. An export that cannot say which task it is declares NOTHING rather
+        than guessing: a wrong `loom.task` is worse for a host than an absent one, because absence is
+        something a host can detect and a wrong name is not.
+        """
+        if not self.task:
+            return {}
+        pair = {
+            "text-generation": ("text", "text"),
+            "automatic-speech-recognition": ("audio", "token_ids"),
+            # Four of the five TTS families take phoneme ids a G2P step produces outside the engine;
+            # Supertonic encodes graphemes itself and overrides this. The distinction is per-model and is
+            # exactly what a host needs in order to know whether it can offer a text door at all.
+            "text-to-speech": ("phoneme_ids", "audio"),
+        }.get(self.task)
+        if pair is None:
+            return {"task": self.task}
+        return {"task": self.task, "input.kind": pair[0], "output.kind": pair[1]}
 
     def hparams(self) -> dict:
         """`{key: number}` a **host** needs in order to call this model's driver at all -- written into

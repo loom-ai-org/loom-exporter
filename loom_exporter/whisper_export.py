@@ -328,6 +328,19 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
         self.max_target_positions = int(cfg.max_target_positions)
         self.prompt_constants = decoder_prompt_constants(
             model.generation_config, self.n_audio_ctx, cfg.vocab_size, self.max_target_positions)
+        # The language and task tables by NAME, kept for `contract()`. The driver needs only the id
+        # WINDOW (it detects with one restricted argmax over it), which is why `decoder_prompt_constants`
+        # returns bounds; a host asked for `language="en"` needs the individual ids, and only the
+        # checkpoint's own tables have them. HF spells these keys either `"<|en|>"` or `"en"` depending
+        # on version, so the brackets are stripped rather than assumed absent.
+        def _bare(name: str) -> str:
+            return name[2:-2] if name.startswith("<|") and name.endswith("|>") else name
+
+        gen_cfg = model.generation_config
+        self.lang_to_id = {_bare(str(k)): int(v)
+                           for k, v in (getattr(gen_cfg, "lang_to_id", None) or {}).items()}
+        self.task_to_id = {_bare(str(k)): int(v)
+                           for k, v in (getattr(gen_cfg, "task_to_id", None) or {}).items()}
 
         mel = WhisperMelFrontend(extractor.n_fft, extractor.hop_length, np.array(extractor.mel_filters))
 
@@ -401,6 +414,51 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
             "n_text_ctx": self.max_target_positions,
             "sample_rate": self.sample_rate,
         }
+
+    def contract(self) -> dict:
+        """The task's default pair, plus the ASR decode table -- the ids that make a transcription loop
+        this model's rather than Whisper's.
+
+        Everything here already existed as a number this export computed; none of it is newly derived.
+        What changes is WHERE it is written down. The engine used to recover the same facts by spelling
+        Whisper's tokens -- `piece_to_id("<|0.00|>")`, `"<|" + language + "|>"`, `<|notimestamps|>` --
+        which worked because Whisper is the only timestamped family exported so far, and would have cost
+        engine code for the second one: Canary, Qwen3-ASR and Granite-Speech spell all three differently.
+        A checkpoint's own token ids are a property of the checkpoint, so they belong in the file
+        (loom.cpp docs/HIGH-LEVEL-API.md §2/§3).
+
+        Omission is meaningful and is used: an English-only checkpoint has no language tokens at all, so
+        the language table is empty and is left out entirely rather than written as an empty array. A
+        host reads that as "this model has no languages to name", which is true, and different from
+        "this export predates the table".
+        """
+        contract = super().contract()
+        c = self.prompt_constants
+        if c["TS_LO"]:
+            contract["asr.timestamp_first_id"] = int(c["TS_LO"])
+            # Seconds per timestamp token: one encoder frame. The engine used to derive this from three
+            # separate hparams, which is the same arithmetic in a place that cannot check it -- and it is
+            # only Whisper's arithmetic. A family whose timestamps step differently declares the number.
+            contract["asr.timestamp_step_sec"] = (self.n_samples / self.sample_rate) / self.n_audio_ctx
+        if c["NO_TIMESTAMPS"]:
+            # Dropped before detokenizing: the model stating something about the decode rather than a
+            # word that was spoken. EOS is NOT listed -- every vocabulary family names it in
+            # `tokenizer.ggml.eos_token_id`, so it needs no per-task declaration to be found.
+            contract["asr.control_ids"] = [int(c["NO_TIMESTAMPS"])]
+        if self.lang_to_id:
+            # Parallel arrays, because a GGUF array is homogeneous and there is no map type. Sorted so
+            # the export is deterministic -- two runs of the same checkpoint must produce byte-identical
+            # files, and dict order is not something to bet that on.
+            names = sorted(self.lang_to_id)
+            contract["asr.language_names"] = names
+            contract["asr.language_ids"] = [self.lang_to_id[n] for n in names]
+        if self.task_to_id:
+            names = sorted(self.task_to_id)
+            contract["asr.task_names"] = names
+            contract["asr.task_ids"] = [self.task_to_id[n] for n in names]
+        contract["asr.prev_context"] = int(self.max_target_positions)
+        contract["text.frontend"] = "vocab"
+        return contract
 
     def backend_kwargs(self) -> dict:
         # The tokenizer travels with the model. `tokenizer_pre` is named rather than left to the hash
