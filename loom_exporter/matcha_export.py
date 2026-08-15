@@ -421,6 +421,39 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
     # fragment. See `driver_components`.
     driver_script_path: Path = driver_dir("convert_matcha", "matcha_driver")
 
+    def contract(self) -> dict:
+        """The task default, plus what this sampler needs to be callable at all.
+
+        A step count is a property of the EXPORT, not of the caller: this driver fails inside Lua
+        without one, and a host inventing a number is how two front ends produce different audio from
+        the same file. 10 is Matcha's own CLI default, and what every gate in this tree runs it at.
+        """
+        contract = super().contract()
+        contract["tts.default_steps"] = 10
+        contract["text.frontend"] = "phonemes"
+        contract["text.phoneme_alphabet"] = "ipa"
+        return contract
+
+    def phoneme_table(self) -> dict:
+        """Matcha's own symbol list, from the clone this export already traces against.
+
+        It lives in the LIBRARY rather than the checkpoint, like StyleTTS2's -- the `.ckpt` carries
+        weights and no statement of which symbol each id is -- so it is read from the same source that
+        defines the model. That is the exporter's job: turn a checkpoint plus its library into a file
+        that needs neither.
+
+        Ids are positions in the list, which is what `matcha.text.text_to_sequence` uses them as. No
+        assembly is declared: this driver takes the ids as given.
+        """
+        load_matcha()
+        from matcha.text.symbols import symbols
+
+        return {
+            "symbols": list(symbols),
+            "ids": list(range(len(symbols))),
+            "bos": -1, "eos": -1, "blank": -1, "interleave_blank": False,
+        }
+
     def driver_components(self) -> List:
         """Matcha's driver, as components (P4.0.6/C.4 -- the first family peeled).
 

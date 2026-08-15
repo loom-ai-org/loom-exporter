@@ -356,6 +356,40 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
     # A DIRECTORY of `.lua` fragments -- StyleTTS2 is peeled (P4.0.6/C.8). See `driver_components`.
     driver_script_path: Path = driver_dir("convert_styletts2", "styletts2_driver")
 
+    def contract(self) -> dict:
+        """The task default, plus what this sampler needs to be callable at all.
+
+        A step count is a property of the EXPORT, not of the caller: this driver fails inside Lua
+        without one, and a host inventing a number is how two front ends produce different audio from
+        the same file. 5 is the count StyleTTS2's own reference forward uses, and what the gates run.
+        """
+        contract = super().contract()
+        contract["tts.default_steps"] = 5
+        contract["text.frontend"] = "phonemes"
+        contract["text.phoneme_alphabet"] = "ipa"
+        return contract
+
+    def phoneme_table(self) -> dict:
+        """StyleTTS2's symbol table, from the clone's own `TextCleaner`.
+
+        It lives in the LIBRARY rather than the checkpoint -- `config.yml` declares `n_token: 178` and
+        nothing about which symbols those ids are -- so it is read from the same source that defines the
+        model this export traces. That is the exporter's job: turn a checkpoint plus its library into a
+        file that needs neither.
+
+        No assembly declared: this driver takes the ids as given, the same as Kokoro's.
+        """
+        load_styletts2()
+        from text_utils import TextCleaner
+
+        vocab = TextCleaner().word_index_dictionary
+        symbols = sorted(vocab, key=lambda sym: vocab[sym])
+        return {
+            "symbols": symbols,
+            "ids": [int(vocab[sym]) for sym in symbols],
+            "bos": -1, "eos": -1, "blank": -1, "interleave_blank": False,
+        }
+
     def driver_input_aliases(self) -> dict:
         """The canonical names this driver answers to. See the base declaration."""
         return {"input_ids": "tokens", "diffusion_steps": "n_steps"}
