@@ -1985,10 +1985,22 @@ class MultiPhaseDriverBuilder(DriverBuilder):
 
     driver: Optional[RawLuaDriver] = None
     peeled: Optional[list] = None
+    # The name this family's driver body reads its primary input under; see `DriverBuilder`. Empty for
+    # a body that already reads the canonical `tokens`, which is Matcha among the adopted five.
+    input_aliases: dict = dataclass_field(default_factory=dict)
 
     __links__ = {
         "driver": NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN),
         "peeled": NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN),
+    }
+    __unchecked__ = {
+        "input_aliases": Unchecked(
+            "the name this family's driver body reads its primary input under. Nothing here can check "
+            "it: the body is Lua, and the only authority on which field it reads is the Lua itself. "
+            "What DOES check it is the gate -- a wrong name emits an alias onto a field nothing reads, "
+            "and the canonical `tokens` then arrives as nil in the driver, which is the failure this "
+            "field exists to remove rather than a new one it introduces."
+        ),
     }
 
     entry_name = "infer"

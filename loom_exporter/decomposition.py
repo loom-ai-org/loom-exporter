@@ -133,7 +133,7 @@ class Flattened(Decomposition):
             program,
             output_path=config.output_path,
             architecture=config.export_architecture(),
-            **config.backend_kwargs(),
+            **config.resolved_backend_kwargs(),
         )
         print(f"SUCCESS! Flattened model exported cleanly to: {config.output_path}")
         return config.output_path
@@ -204,7 +204,7 @@ class Modular(Decomposition):
             output_path=config.output_path,
             architecture=config.export_architecture(),
             modular_layout=result,
-            **config.backend_kwargs(),
+            **config.resolved_backend_kwargs(),
         )
         print(f"SUCCESS! Modular-blueprint model exported cleanly to: {config.output_path}")
         return config.output_path
@@ -234,7 +234,8 @@ class MultiPhase(Decomposition):
         """
         from .driver_components import MultiPhaseDriverBuilder
 
-        return MultiPhaseDriverBuilder(peeled=config.driver_components())
+        return MultiPhaseDriverBuilder(peeled=config.driver_components(),
+                                      input_aliases=config.driver_input_aliases())
 
     def export(self, config) -> str:
         import gc
@@ -329,7 +330,7 @@ class MultiPhase(Decomposition):
         # `backend_kwargs()` reaches the OUTPUT exporter, not just the per-phase ones -- which is where
         # anything about the artifact as a whole belongs (the tokenizer vocab, notably). It was dropped
         # entirely before, so a multi-phase family had no way to say anything about its own GGUF.
-        out_kwargs = dict(config.backend_kwargs())
+        out_kwargs = dict(config.resolved_backend_kwargs())
         if capacities:
             out_kwargs["kv_cache_size"] = capacities.pop()
         out_exporter = LoomGGUFExporter(

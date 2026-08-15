@@ -33,6 +33,12 @@ class ModelRecognizer:
     name: str
     detect: Callable[[Path], bool]
     build_config: Callable[[Path, str], LoomExportConfig]
+    # Which task this recognizer was registered under. NOT passed by the family that constructs it --
+    # `TaskRegistry.register()` stamps it from the entry, so the two cannot disagree and no family has
+    # to repeat itself. It exists because the task now has to reach the exported file (`loom.task`), and
+    # this is the last point where it is known: `detect()` returns a recognizer, and everything after
+    # that point has a config and no idea which task produced it.
+    task: str = ""
     # A *generic* recognizer for its task -- one that claims a whole class of checkpoints rather than
     # one model, e.g. "any HF directory declaring a `*ForCausalLM` architecture" (P4.0.4). Consulted
     # only when no specific recognizer matched, so adding one cannot make an existing detection
@@ -88,6 +94,14 @@ class TaskRegistry:
                 f"{entry.config_class!r} -- a family registered under a task whose export shape it "
                 f"does not build"
             )
+        # Stamped here rather than passed by each family, so a recognizer's task is the task it was
+        # actually registered under by construction. `tasks.py` used to argue the task was a CLI
+        # argument that never reached an export; it reaches the file now (`loom.task`), and a host that
+        # dispatches on it must not be able to read a name a family typed independently of its
+        # registration. See loom.cpp docs/HIGH-LEVEL-API.md §3.
+        for rec in entry.recognizers:
+            rec.task = entry.task
+
         existing = self._entries.get(entry.task)
         if existing is None:
             self._entries[entry.task] = entry

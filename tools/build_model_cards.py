@@ -37,6 +37,7 @@ DEFAULT_MODELS_ROOT = Path("/home/flavio/Dev/models")
 DEFAULT_OUTPUT_DIR = REPO_ROOT.parent / "hf-models"
 
 LOOM_PY_URL = "https://github.com/loom-ai-org/loom-py"
+LOOM_CPP_URL = "https://github.com/loom-ai-org/loom.cpp"
 # The loom-py release these cards tell a reader to install. Bump when a card's example needs something
 # a older loom-py does not have -- it is a floor, not a pin, so it does not need touching per release.
 LOOM_PY_MIN_VERSION = "1.0.0rc1"
@@ -261,6 +262,8 @@ flatten = lambda entry: [v for row in entry["data"][0] for v in row]
 style_ttl = flatten(style["style_ttl"])   # 50 * 256 = 12800 floats
 style_dp = flatten(style["style_dp"])     #  8 *  16 =   128 floats
 
+# A specific voice is a knob the high-level door does not name, so this goes through `infer`.
+txt_ids = model.tokenize("hello world")
 audio = model.infer(txt_ids=txt_ids, style_ttl=style_ttl, style_dp=style_dp, n_steps=4, seed=1234)
 ```
 
@@ -302,16 +305,25 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
 CATALOG_BY_SLUG = {m.slug: m for m in CATALOG}
 
 USAGE_SNIPPETS = {
+    # The HIGH-LEVEL door for each task, because that is what a reader arriving from a model page
+    # wants: one call, end to end, with the windowing/sampling/assembly a model needs already applied.
+    # The low-level API is one line at the bottom of every card pointing at the repos, since which
+    # inputs a driver takes is a property of the model rather than of a card template.
     "text-generation": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
-print(model.generate("The capital of France is", max_new_tokens=14))
+print(model.text2text.infer("The capital of France is", max_new_tokens=14))
 """,
     "automatic-speech-recognition": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
-transcript = model.detokenize(model.infer(waveform=audio, audio_samples=len(audio)))
-print(transcript)
+
+# Audio is a mono float list at 16 kHz. Long files are windowed for you, and a model that emits
+# timestamps is seeked to where it closed its last segment rather than cut at a fixed stride.
+result = model.speech2text.infer(audio, language="en", timestamps=True)
+print(result.text)
+for segment in result.segments:
+    print(segment.start, segment.end, segment.text)
 """,
     # Two TTS snippets, because "TTS" is not one answer. Which one a model gets is `takes_text` below,
     # a per-model fact read off the export rather than assumed from the task -- the single phoneme-ids
@@ -319,19 +331,24 @@ print(transcript)
     "text-to-speech": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
-# {slug} takes phoneme ids, not text -- see model.driver_source for the exact driver inputs.
-audio = model.infer(tokens=[16, 40, 22, 30, 12, 3], n_steps=4, seed=1234)
+
+# {slug} is trained on phonemes. Its symbol table ships in the GGUF, so the only piece that is not in
+# the file is grapheme-to-phoneme -- a property of the language rather than of this checkpoint:
+#     pip install "loom-py-rt[phonemes]"
+audio = model.text2speech.infer("hello world")
+audio.save("out.wav")
+
+# Without that extra, or with your own G2P, pass phonemes instead:
+audio = model.text2speech.infer(phonemes=model.tokenize("h\u0259\u02c8lo\u028a"))
 """,
     "text-to-speech-with-vocab": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
 
-# This model encodes text itself -- no external phonemiser needed.
+# This model encodes text itself -- no phonemiser needed at all.
 print(model.tokenizer)                       # kind, vocabulary size, default language
-txt_ids = model.tokenize("hello world")      # model.tokenize(..., lang="ko") to pick a language
-
-# Any length up to `model.hparam("txt_len")` -- the driver pads and masks the rest.
-audio = model.infer(txt_ids=txt_ids, n_steps=4, seed=1234)
+audio = model.text2speech.infer("hello world")
+audio.save("out.wav")
 
 # That uses whatever voice the file itself defaults to. See below for choosing another.
 """,
@@ -432,8 +449,16 @@ pip install "loom-py-rt[hub]>={LOOM_PY_MIN_VERSION}"
 ```python
 {USAGE_SNIPPETS[snippet_key(card)].format(repo_id=repo_id(card), slug=card.slug)}```
 {usage_extra_section}
-`model.driver_source` prints the exact driver script this GGUF embeds, including a header comment
-documenting every argument `model.infer()`/`model.generate()` accepts for this model.
+### The layer underneath
+
+The call above is the high-level door: one per task, named for the modality pair it maps between, with
+the windowing, sampling and assembly this model needs already applied. Under it, `model.infer(...)`
+passes your arguments straight to the driver this GGUF embeds -- which is where you go for a knob the
+door does not name.
+
+`model.driver_source` prints that driver, including a header comment documenting every argument it
+accepts for this model, and is the authority on it. See [loom-py]({LOOM_PY_URL}) for the API and
+[loom.cpp]({LOOM_CPP_URL}) for what the engine does between the two.
 {limitations_section}
 ## Files
 
