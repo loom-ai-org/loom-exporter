@@ -660,6 +660,23 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         `TEXT_BUCKETS` local."""
         return {"txt_len": T_TEXT_MAX}
 
+    def contract(self) -> dict:
+        """Supertonic takes TEXT, which is what makes it the exception in its own task.
+
+        The `text-to-speech` default is `phoneme_ids`, because four of the five families in it consume
+        ids a phonemiser produces outside the engine and have no vocabulary embedded to do otherwise.
+        This one encodes graphemes itself -- its `TextVectorizer` is a unicode codepoint table that
+        ships in the GGUF -- so declaring the task default here would be stating something false about
+        the model, and a host reading it would refuse the text door this model actually has.
+
+        Caught by the export sweep, which is the only thing that would have: every unit test on the
+        default passed, and the wrong value is only visible next to the model it is wrong about.
+        """
+        contract = super().contract()
+        contract["input.kind"] = "text"
+        contract["text.frontend"] = "vocab"
+        return contract
+
     def samplers(self) -> List[FlowMatchingSpec]:
         # Same shared family as Matcha's own sampler (EXPORT-IMPROVEMENT.md item 4) -- only the
         # estimator, the loop-carried input's name, and the per-step-constant inputs differ. Since
