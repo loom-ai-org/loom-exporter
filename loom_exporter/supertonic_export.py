@@ -422,6 +422,10 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
     # A DIRECTORY of `.lua` fragments -- Supertonic is peeled (P4.0.6/C.5). See `driver_components`.
     driver_script_path: Path = driver_dir("convert_supertonic", "supertonic_driver")
 
+    def driver_input_aliases(self) -> dict:
+        """The canonical names this driver answers to. See the base declaration."""
+        return {"txt_ids": "tokens"}
+
     def driver_components(self) -> List:
         """Supertonic's driver, as components (P4.0.6/C.5).
 
@@ -659,6 +663,29 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         took over. It is readable anyway, by anyone who wants it, in the embedded driver's own
         `TEXT_BUCKETS` local."""
         return {"txt_len": T_TEXT_MAX}
+
+    def contract(self) -> dict:
+        """Supertonic takes TEXT, which is what makes it the exception in its own task.
+
+        The `text-to-speech` default is `phoneme_ids`, because four of the five families in it consume
+        ids a phonemiser produces outside the engine and have no vocabulary embedded to do otherwise.
+        This one encodes graphemes itself -- its `TextVectorizer` is a unicode codepoint table that
+        ships in the GGUF -- so declaring the task default here would be stating something false about
+        the model, and a host reading it would refuse the text door this model actually has.
+
+        Caught by the export sweep, which is the only thing that would have: every unit test on the
+        default passed, and the wrong value is only visible next to the model it is wrong about.
+        """
+        contract = super().contract()
+        contract["input.kind"] = "text"
+        contract["text.frontend"] = "vocab"
+        # The rate the waveform coming out of `decoder` is at. Declared because a host cannot recover it
+        # from a list of floats and getting it wrong is SILENT -- 44.1 kHz audio played at 22.05 kHz is
+        # not an error, it is a slow voice. `DEC_SAMPLE_RATE` is already the one place this export states
+        # it (the driver reads it as a local constant), so this is a second rendering of one fact rather
+        # than a second authority for it.
+        contract["sample_rate"] = int(DEC_SAMPLE_RATE)
+        return contract
 
     def samplers(self) -> List[FlowMatchingSpec]:
         # Same shared family as Matcha's own sampler (EXPORT-IMPROVEMENT.md item 4) -- only the

@@ -347,6 +347,70 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
     # A DIRECTORY of `.lua` fragments -- VITS is peeled (P4.0.6/C.6). See `driver_components`.
     driver_script_path: Path = driver_dir("convert_piper_vits", "vits_driver")
 
+    def contract(self) -> dict:
+        """The task default, plus what the newly-exported phoneme vocabulary lets a host say.
+
+        `text.frontend = "phonemes"` rather than `"vocab"`: this model now HAS a vocabulary, but it maps
+        phonemes rather than text, so a host still cannot go from a sentence to ids without a G2P step
+        outside the engine. The distinction is what stops `text2speech.infer("hello")` from looking
+        available when it is not.
+        """
+        contract = super().contract()
+        contract["text.frontend"] = "phonemes"
+        contract["text.phoneme_alphabet"] = "ipa"
+        return contract
+
+    def phoneme_table(self) -> dict:
+        """Piper's own `phoneme_id_map`, read off the voice's config JSON beside the checkpoint.
+
+        The map is `{symbol: [id, ...]}` -- a list because the format allows a symbol to expand to
+        several ids, though every real voice this project has seen uses exactly one. A multi-id entry is
+        refused rather than silently truncated: taking `[0]` of it would produce a plausible id sequence
+        that is not what the voice was trained on.
+
+        `phonemes_to_ids` in `tools/convert_piper_vits/reference_forward_vits.py` is the authority on the
+        assembly, and it is the reason `interleave_blank` exists: piper puts a blank between every
+        phoneme and none right after BOS.
+        """
+        import json
+
+        config = Path(str(self.checkpoint_path) + ".json")
+        if not config.is_file():
+            # A voice's config sits beside its checkpoint; piper names it `<voice>.onnx.json` and the
+            # trainer's own `.ckpt` has it one directory up. Look for the single JSON rather than
+            # pinning one layout, and say so plainly when there is not exactly one.
+            candidates = sorted(Path(self.checkpoint_path).parent.glob("*.json"))
+            if len(candidates) != 1:
+                raise FileNotFoundError(
+                    f"expected one voice config JSON beside {self.checkpoint_path} to read "
+                    f"`phoneme_id_map` from, found {len(candidates)}: {[c.name for c in candidates]}"
+                )
+            config = candidates[0]
+
+        id_map = json.loads(config.read_text())["phoneme_id_map"]
+        multi = {sym: ids for sym, ids in id_map.items() if len(ids) != 1}
+        if multi:
+            raise ValueError(
+                f"{config.name}'s phoneme_id_map maps {len(multi)} symbols to more than one id "
+                f"({list(multi)[:4]}). This export writes one id per symbol; a multi-id symbol needs the "
+                f"vocabulary to model expansion, which no voice has required yet."
+            )
+        symbols = sorted(id_map, key=lambda sym: id_map[sym][0])
+        return {
+            "symbols": symbols,
+            "ids": [id_map[sym][0] for sym in symbols],
+            # Piper's own constants (`reference_forward_vits.phonemes_to_ids`): 1 opens, 2 closes, 0 is
+            # the blank interleaved between phonemes.
+            "bos": 1,
+            "eos": 2,
+            "blank": 0,
+            "interleave_blank": True,
+        }
+
+    def driver_input_aliases(self) -> dict:
+        """The canonical names this driver answers to. See the base declaration."""
+        return {"token_ids": "tokens"}
+
     def driver_components(self) -> List:
         """VITS's driver, as components (P4.0.6/C.6).
 

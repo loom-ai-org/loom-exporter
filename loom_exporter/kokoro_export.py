@@ -543,6 +543,76 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
     # A DIRECTORY of `.lua` fragments -- Kokoro is peeled (P4.0.6/C.7). See `driver_components`.
     driver_script_path: Path = driver_dir("convert_kokoro", "kokoro_driver")
 
+    def backend_kwargs(self) -> dict:
+        """...plus this export's default voice, so the artifact is usable on its own.
+
+        `ref_s` has always been an `infer` input and a different vector has always selected a different
+        voice. What was missing is that a published GGUF carried NO voice at all, so every caller needed
+        the original checkpoint repo to obtain one -- and a driver handed none fails inside Lua on a nil
+        index rather than saying what to supply. Exactly the gap Supertonic closed in P4.6b, closed the
+        same way: one style travels as a `driver_weights` tensor the driver reads with `loom.get_weight`
+        when the caller passes none. Passing a different one is unchanged.
+
+        PROVENANCE, because it is not an upstream voice pack. This is the style vector in the
+        checkpoint's own `ref/` dump -- real style data (verified against the synthetic pattern the gate
+        uses, which it is not), from whichever voice produced those reference forwards. Naming it here
+        rather than shipping it as though it were `af_heart` is the honest version: a caller who wants a
+        specific upstream voice still passes it.
+        """
+        kwargs = super().backend_kwargs()
+        style = self._default_voice()
+        if style is not None:
+            kwargs["driver_weights"] = {DEFAULT_STYLE_TENSOR: style}
+        else:
+            print(f"warning: no ref/ style vectors found under {self.model_dir}; this export will have "
+                  f"no default voice and `infer` will require `ref_s`")
+        return kwargs
+
+    def _default_voice(self):
+        """The two 128-float halves as one `ref_s`, or None when the checkpoint carries no dump.
+
+        Concatenated in the order the driver slices them -- decoder half first, predictor second -- and
+        checked against `style_dim` rather than trusted: a vector of the wrong length would reach
+        `loom.get_weight`, come back flat and wrong, and fail deep inside the engine as a shape mismatch
+        on an input the caller never passed.
+        """
+        ref = Path(self.model_dir) / "ref"
+        decoder, predictor = ref / "ref_decoder_core_style.npy", ref / "ref_duration_style.npy"
+        if not (decoder.is_file() and predictor.is_file()):
+            return None
+        halves = [np.asarray(np.load(path), dtype=np.float32).reshape(-1) for path in (decoder, predictor)]
+        for path, half in zip((decoder, predictor), halves):
+            if half.size != self.style_dim:
+                raise ValueError(f"{path.name} has {half.size} floats, expected style_dim "
+                                 f"({self.style_dim}) -- `ref_s` is the two halves back to back.")
+        return np.concatenate(halves)
+
+    def phoneme_table(self) -> dict:
+        """Kokoro's own `vocab`, straight off the checkpoint's config.json.
+
+        114 symbols over an id space of `n_token` (178), so the table is SPARSE -- the writer fills the
+        gaps with a name no phonemizer can emit rather than leaving empty strings that would all collide
+        on lookup.
+
+        No interleaved blank and no BOS/EOS pair: Kokoro's driver wraps the ids with a leading and
+        trailing 0 itself (its own header says so), which makes that assembly the driver's rather than
+        the vocabulary's. Declaring it here too would apply it twice.
+        """
+        import json
+
+        config = Path(self.model_dir) / "config.json"
+        vocab = json.loads(config.read_text())["vocab"]
+        symbols = sorted(vocab, key=lambda sym: vocab[sym])
+        return {
+            "symbols": symbols,
+            "ids": [int(vocab[sym]) for sym in symbols],
+            "bos": -1, "eos": -1, "blank": -1, "interleave_blank": False,
+        }
+
+    def driver_input_aliases(self) -> dict:
+        """The canonical names this driver answers to. See the base declaration."""
+        return {"input_ids": "tokens"}
+
     def driver_components(self) -> List:
         """Kokoro's driver, as components (P4.0.6/C.7).
 
@@ -738,6 +808,9 @@ def _is_kokoro(path: Path) -> bool:
 
 def _build_kokoro(path: Path, output_path: str) -> TTSKokoroExportConfig:
     return TTSKokoroExportConfig(architecture="loom-kokoro-mil", output_path=output_path, model_dir=str(path))
+
+
+DEFAULT_STYLE_TENSOR = "loom.default_style.ref_s"
 
 
 def register(registry) -> None:
