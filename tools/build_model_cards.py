@@ -38,9 +38,6 @@ DEFAULT_OUTPUT_DIR = REPO_ROOT.parent / "hf-models"
 
 LOOM_PY_URL = "https://github.com/loom-ai-org/loom-py"
 LOOM_CPP_URL = "https://github.com/loom-ai-org/loom.cpp"
-# The loom-py release these cards tell a reader to install. Bump when a card's example needs something
-# a older loom-py does not have -- it is a floor, not a pin, so it does not need touching per release.
-LOOM_PY_MIN_VERSION = "1.0.0rc1"
 EXPORTER_URL = "https://github.com/loom-ai-org/loom-exporter"
 
 
@@ -443,7 +440,7 @@ loom.cpp's GGUF format.
 Run it with [loom-py]({LOOM_PY_URL}) -- `loom-py-rt` on PyPI:
 
 ```sh
-pip install "loom-py-rt[hub]>={LOOM_PY_MIN_VERSION}"
+pip install -U "loom-py-rt[hub]"
 ```
 
 ```python
