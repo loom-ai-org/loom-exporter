@@ -422,9 +422,9 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
     # A DIRECTORY of `.lua` fragments -- Supertonic is peeled (P4.0.6/C.5). See `driver_components`.
     driver_script_path: Path = driver_dir("convert_supertonic", "supertonic_driver")
 
-    def driver_primary_input(self) -> str:
-        """This driver reads `txt_ids`; a host says `tokens`. See the base declaration."""
-        return "txt_ids"
+    def driver_input_aliases(self) -> dict:
+        """The canonical names this driver answers to. See the base declaration."""
+        return {"txt_ids": "tokens"}
 
     def driver_components(self) -> List:
         """Supertonic's driver, as components (P4.0.6/C.5).
