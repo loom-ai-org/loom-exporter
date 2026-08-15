@@ -2534,6 +2534,42 @@ class LoomGGUFExporter:
         w = GGUFWriter(self.output_path, f"loom-{arch}")
         w.add_string("loom.architecture", arch)
 
+        # What this file IS, as opposed to what it is called. `loom.architecture` above is a per-MODEL
+        # name and is the only thing a host had to go on, which meant every end-to-end door was reached
+        # through a table of architecture names -- the per-architecture host code all three repos
+        # forbid. `LoomExportConfig.contract()` is where these come from and loom.cpp's
+        # `include/loom/core/model_contract.h` is what reads them back; keep the two in step, since a key
+        # spelled differently at either end is simply an absent key with no error anywhere.
+        #
+        # Types follow the value: strings for names, lists for tables, int/float for scalars. A GGUF
+        # array must be homogeneous, which is why the language and task tables are written as PARALLEL
+        # name/id arrays rather than as one map.
+        for key, value in (self.kwargs.get("contract") or {}).items():
+            full_key = f"loom.{key}"
+            if isinstance(value, str):
+                w.add_string(full_key, value)
+            elif isinstance(value, bool):
+                raise TypeError(
+                    f"contract[{key!r}] is a bool. Nothing in the contract is a flag -- a capability is "
+                    f"declared by the key being PRESENT (a model with no timestamps omits the timestamp "
+                    f"ids), which is what lets a host tell 'this model cannot' from 'this export is old'."
+                )
+            elif isinstance(value, int):
+                # Ids can be negative sentinels, so i32 rather than u32 -- and a count written as i32
+                # reads back the same, where an id written as u32 would not.
+                w.add_int32(full_key, value)
+            elif isinstance(value, float):
+                w.add_float32(full_key, value)
+            elif isinstance(value, (list, tuple)):
+                if not value:
+                    continue  # an empty table says nothing; omit it rather than declare a present-but-empty one
+                w.add_array(full_key, list(value))
+            else:
+                raise TypeError(
+                    f"contract[{key!r}] is {value!r} ({type(value).__name__}), which has no GGUF "
+                    f"rendering. The contract is names, numbers and flat homogeneous tables of them."
+                )
+
         tokenizer_dir = self.kwargs.get("tokenizer_dir") or os.environ.get("LOOM_TOKENIZER_DIR")
         if tokenizer_dir:
             self._write_tokenizer(w, tokenizer_dir)
