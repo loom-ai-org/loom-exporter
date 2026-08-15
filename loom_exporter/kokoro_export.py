@@ -543,6 +543,10 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
     # A DIRECTORY of `.lua` fragments -- Kokoro is peeled (P4.0.6/C.7). See `driver_components`.
     driver_script_path: Path = driver_dir("convert_kokoro", "kokoro_driver")
 
+    def driver_primary_input(self) -> str:
+        """This driver reads `input_ids`; a host says `tokens`. See the base declaration."""
+        return "input_ids"
+
     def driver_components(self) -> List:
         """Kokoro's driver, as components (P4.0.6/C.7).
 

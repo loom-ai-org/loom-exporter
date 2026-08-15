@@ -347,6 +347,10 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
     # A DIRECTORY of `.lua` fragments -- VITS is peeled (P4.0.6/C.6). See `driver_components`.
     driver_script_path: Path = driver_dir("convert_piper_vits", "vits_driver")
 
+    def driver_primary_input(self) -> str:
+        """This driver reads `token_ids`; a host says `tokens`. See the base declaration."""
+        return "token_ids"
+
     def driver_components(self) -> List:
         """VITS's driver, as components (P4.0.6/C.6).
 
