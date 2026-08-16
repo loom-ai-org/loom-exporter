@@ -377,7 +377,16 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
         model this export traces. That is the exporter's job: turn a checkpoint plus its library into a
         file that needs neither.
 
-        No assembly declared: this driver takes the ids as given, the same as Kokoro's.
+        A LEADING pad and nothing else. `Demo/Inference_LJSpeech.ipynb` is `tokens.insert(0, 0)` with no
+        matching append, and `meldataset.py` wraps BOTH edges at training -- the asymmetry is real, not a
+        reference-notebook slip: this driver's `pred_dur[-1] += 5` IS StyleTTS2's own compensation for the
+        trailing pad it drops at inference, so declaring `eos: 0` here would pad the tail twice.
+
+        Declared rather than left to the caller, which is what `bos: -1` used to mean and what made a
+        synthesized "hello world" come back as "llo world": with no wrap the first phoneme lands at
+        position 0, where the text encoder and the duration predictor have only ever seen `$`, and the
+        onset is spent on it. Kokoro's edge wrap (`bos: 0, eos: 0`) is the same declaration for the same
+        reason -- both models read the same 178-symbol table, and neither can be handed bare ids.
         """
         load_styletts2()
         from text_utils import TextCleaner
@@ -387,7 +396,7 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
         return {
             "symbols": symbols,
             "ids": [int(vocab[sym]) for sym in symbols],
-            "bos": -1, "eos": -1, "blank": -1, "interleave_blank": False,
+            "bos": 0, "eos": -1, "blank": -1, "interleave_blank": False,
         }
 
     def driver_input_aliases(self) -> dict:

@@ -19,8 +19,10 @@
 -- "stft_forward", "generator" -- none use a KvCache. The Kokoro-equivalent "stft_inverse" topology is
 -- intentionally NOT registered: confirmed dead weight in the real C++ driver too.
 --
--- inputs: input_ids (int array, real StyleTTS2 wraps with a SINGLE LEADING 0 token only -- caller's
--- responsibility), diffusion_steps (int, ADPM2Sampler's own num_steps), seed (int, seeds
+-- inputs: input_ids (int array, already wrapped -- real StyleTTS2 prepends a SINGLE LEADING 0 and
+-- appends nothing, which the phoneme table declares as `bos: 0, eos: -1` so the engine's own encode()
+-- applies it; a caller passing bare ids gets its first phoneme eaten), diffusion_steps (int,
+-- ADPM2Sampler's own num_steps), seed (int, seeds
 -- loom.seed_rng -- BOTH the diffusion sampler's own noise draws AND SineGen's rand_ini/noise draws are
 -- drawn from this one shared stream, in that order), plus the real model constants style_dim, d_model,
 -- hidden_per_dir, harmonic_num, upsample_scale, gen_istft_n_fft, gen_istft_hop, sigma_min, sigma_max,

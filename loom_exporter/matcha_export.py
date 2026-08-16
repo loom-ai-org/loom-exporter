@@ -442,8 +442,21 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
         defines the model. That is the exporter's job: turn a checkpoint plus its library into a file
         that needs neither.
 
-        Ids are positions in the list, which is what `matcha.text.text_to_sequence` uses them as. No
-        assembly is declared: this driver takes the ids as given.
+        Ids are positions in the list, which is what `matcha.text.text_to_sequence` uses them as.
+
+        **The blank between every phoneme is assembly, and it is not optional.** `intersperse(seq, 0)`
+        (`matcha/utils/utils.py:131`) is `[0, p1, 0, p2, 0, ..., pn, 0]`, and Matcha applies it on BOTH
+        sides of its own life -- `text_mel_datamodule.py:219` at training and `cli.py:51` at inference --
+        so the model has never once seen a bare sequence. Declared as `-1/-1/-1/False` until this
+        comment existed, on the reading that "this driver takes the ids as given"; what a caller
+        actually got was every phoneme at half its trained spacing, which the duration predictor
+        answers by dropping most of them.
+
+        The engine's own assembly is `[BOS, p1, blank, p2, blank, ..., pn, blank, EOS]`
+        (`phoneme_vocab.cpp:83`), so `bos: 0` plus a trailing blank per phoneme reproduces
+        `intersperse` exactly -- verified id-for-id against the clone rather than reasoned about. `eos`
+        stays -1 because the trailing 0 is already the last phoneme's blank; declaring one would append
+        a second.
         """
         load_matcha()
         from matcha.text.symbols import symbols
@@ -451,7 +464,7 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
         return {
             "symbols": list(symbols),
             "ids": list(range(len(symbols))),
-            "bos": -1, "eos": -1, "blank": -1, "interleave_blank": False,
+            "bos": 0, "eos": -1, "blank": 0, "interleave_blank": True,
         }
 
     def driver_components(self) -> List:
