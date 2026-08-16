@@ -42,6 +42,12 @@ GRAPHEME_INPUT = {"supertonic"}
 # (BACKLOG.md P4.12 follow-up). Removing a name here without fixing the family fails the last test.
 NO_SAMPLE_RATE_YET = {"matcha", "styletts2", "vits"}
 
+# The families whose driver DIVIDES BY a step count, so `n_steps` is required rather than optional and
+# an undeclared default is a door that raises out of Lua. Named rather than detected for the same reason
+# as above, and because the three do not share one marker: Matcha's and Supertonic's step counts come
+# from a `samplers()` spec, StyleTTS2's from a hand-written diffusion driver that no spec describes.
+NEEDS_STEPS = {"matcha", "styletts2", "supertonic"}
+
 
 def _tts_configs():
     """`{recognizer name: config instance}` for every registered text-to-speech family."""
@@ -94,6 +100,28 @@ class TestTTSTextDoor(unittest.TestCase):
                 self.assertTrue(rate and int(rate) > 0,
                                 "declares no sample rate, so every host that plays this guesses")
 
+    def test_a_family_whose_sampler_needs_a_step_count_declares_one(self):
+        """Supertonic shipped without this and its text door did not open at all: the high-level
+        `_infer` passes `n_steps` only when the caller named one or the contract declares one, so an
+        undeclared count reached Lua as nil and `infer` died dividing by it. Unlike the sample rate,
+        this one cannot be exempted while the family still works -- there is no wrong-but-audible
+        version of it, only a raise -- which is why it is a flat rule with no exemption list."""
+        for name in sorted(NEEDS_STEPS):
+            with self.subTest(model=name):
+                steps = self.configs[name].contract().get("tts.default_steps")
+                self.assertTrue(steps and int(steps) > 0,
+                                "this driver divides by n_steps, so a caller who names none gets a Lua "
+                                "error rather than audio -- declare the count the model's own inference "
+                                "entry point uses")
+
+    def test_a_family_that_needs_no_step_count_declares_none(self):
+        """The other half, so `NEEDS_STEPS` cannot be satisfied by declaring a count everywhere. Kokoro
+        and VITS run no sampler; a step count on either would be a number a host might pass to a driver
+        that has no use for it."""
+        for name in sorted(set(self.configs) - NEEDS_STEPS):
+            with self.subTest(model=name):
+                self.assertIsNone(self.configs[name].contract().get("tts.default_steps"))
+
     def test_the_exemption_list_holds_only_families_that_still_need_it(self):
         """The other half of the exemption, and the reason it is safe to have one: a family that gains a
         rate and is not removed from `NO_SAMPLE_RATE_YET` fails here, so the list cannot quietly outlive
@@ -103,8 +131,45 @@ class TestTTSTextDoor(unittest.TestCase):
         self.assertEqual(stale, [], "these declare a sample rate now -- drop them from NO_SAMPLE_RATE_YET")
 
 
+class TestEveryPhonemeFamilyDeclaresItsAssembly(unittest.TestCase):
+    """The rule the three per-family classes below are instances of.
+
+    All four phoneme families wrap or interleave, and all four shipped declaring `-1/-1/-1/False` at
+    some point -- Kokoro (P4.12), then StyleTTS2, then Matcha, each found the same way: a caller heard
+    a word go missing. The per-family classes pin what each one's assembly IS; this pins that having
+    one is the NORM, so the next family cannot inherit the default and look deliberate. `-1` four times
+    is what an undeclared table looks like, and no phoneme model in this set actually wants it.
+
+    Only VITS may answer `interleave_blank` without a wrap, and it is the one whose assembly came from
+    the checkpoint rather than from a library: Piper's `phoneme_id_map` states it.
+    """
+
+    def test_no_phoneme_family_declares_an_empty_assembly(self):
+        """`phoneme_table()` needs each family's own library, so this reads the DECLARATION SITE rather
+        than calling it -- the four constants are literals in the source, and a family that has stopped
+        writing them as literals is a family this rule should be rewritten for rather than one it should
+        silently pass."""
+        import inspect
+
+        from loom_exporter import kokoro_export, matcha_export, styletts2_export, vits_export
+
+        empty = '"bos": -1, "eos": -1, "blank": -1, "interleave_blank": False'
+        for name, module in sorted({"kokoro": kokoro_export, "matcha": matcha_export,
+                                    "styletts2": styletts2_export, "vits": vits_export}.items()):
+            with self.subTest(model=name):
+                self.assertNotIn(empty, inspect.getsource(module),
+                                 "this is the undeclared default, and every family that shipped with it "
+                                 "shipped audio with phonemes missing -- state the wrap or the "
+                                 "interleave the model's own inference path applies")
+
+
 class TestKokoroPhonemeAssembly(unittest.TestCase):
-    """Kokoro's edge wrap, the one piece of assembly no other family in the set has.
+    """Kokoro's edge wrap.
+
+    This docstring used to call it "the one piece of assembly no other family in the set has", and that
+    sentence is why StyleTTS2 shipped with `bos: -1` for another release: StyleTTS2 reads the SAME
+    178-symbol table and wraps too, just asymmetrically, and a rule written as one family's special case
+    never looked. `TestStyleTTS2PhonemeAssembly` below is the other half.
 
     `KModel.forward` is `input_ids = [[0, *input_ids, 0]]`. Not decoration: it is what the ALBERT encoder
     and the duration predictor were trained to see at the edges, and without it the last phoneme loses
@@ -137,3 +202,113 @@ class TestKokoroPhonemeAssembly(unittest.TestCase):
         applied here rather than in the driver -- so this is where that assumption is checked."""
         table = self._table({"h": 50, "ə": 83, "l": 54})
         self.assertNotIn(0, table["ids"])
+
+
+class TestStyleTTS2PhonemeAssembly(unittest.TestCase):
+    """StyleTTS2's edge wrap, which is Kokoro's minus the tail.
+
+    `Demo/Inference_LJSpeech.ipynb` is `tokens.insert(0, 0)` and no append, while `meldataset.py` wraps
+    both edges at training. The asymmetry is deliberate downstream: the driver's `pred_dur[-1] += 5` is
+    the repo's own compensation for the trailing pad it stops sending at inference, so `eos: 0` here
+    would lengthen the final phoneme twice.
+
+    Declared as `bos: -1` until this test existed, on the reasoning that the driver header called the
+    wrap "the caller's responsibility" -- true of a caller hand-building ids, false of the high-level
+    text door, which applies exactly what the table declares. The audible result was the first phoneme
+    landing at position 0 and being spent there: "hello world" synthesized as "llo world".
+
+    `phoneme_table()` reads the symbol list out of the STYLETTS2 CLONE rather than the checkpoint, and a
+    hermetic test may not have the clone (or torch, or kokoro) -- so the library is stubbed. What is
+    under test is the four assembly constants, which are the exporter's own statement and not the
+    clone's.
+    """
+
+    def _table(self, vocab):
+        import sys
+        import types
+        from unittest import mock
+
+        from loom_exporter import styletts2_export
+
+        text_utils = types.ModuleType("text_utils")
+        text_utils.TextCleaner = lambda: types.SimpleNamespace(word_index_dictionary=vocab)
+        with mock.patch.object(styletts2_export, "load_styletts2", lambda: None), \
+                mock.patch.dict(sys.modules, {"text_utils": text_utils}):
+            config = styletts2_export.TTSStyleTTS2ExportConfig(
+                architecture="loom-styletts2-mil", output_path="/tmp/does-not-matter.gguf",
+                checkpoint_path="/nonexistent")
+            return config.phoneme_table()
+
+    def test_the_pad_leads_and_nothing_trails(self):
+        table = self._table({"$": 0, "h": 50, "ɛ": 86, "l": 54})
+        self.assertEqual((table["bos"], table["eos"]), (0, -1))
+        self.assertFalse(table["interleave_blank"])
+
+    def test_the_symbols_survive_the_wrap_being_declared(self):
+        """The wrap is assembly, not vocabulary: declaring it must not remove `$` from the table, which
+        is a real id the engine's `decode()` skips by comparing against `bos_id` rather than by the
+        symbol being absent."""
+        table = self._table({"$": 0, "h": 50, "ɛ": 86, "l": 54})
+        self.assertEqual(table["symbols"][0], "$")
+        self.assertIn(0, table["ids"])
+
+
+class TestMatchaPhonemeAssembly(unittest.TestCase):
+    """Matcha's blank interleave, which is neither of the other two shapes.
+
+    `intersperse(seq, 0)` is `[0, p1, 0, p2, 0, ..., pn, 0]` -- a blank between every phoneme AND at
+    both ends -- applied at training (`text_mel_datamodule.py:219`) and at inference (`cli.py:51`)
+    alike. The engine builds `[BOS, p1, blank, ..., pn, blank, EOS]`, so a leading bos plus a
+    per-phoneme trailing blank is the same sequence and a declared `eos` would append a second
+    trailing 0.
+
+    Undeclared, the model gets every phoneme at half its trained spacing; the duration predictor
+    answers by collapsing most of them, which is heard as a clipped or half-swallowed sentence rather
+    than as an error.
+
+    The symbol list comes from the MATCHA CLONE, so it is stubbed here for the same reason StyleTTS2's
+    is -- what is under test is the four assembly constants, which are the exporter's statement.
+    """
+
+    def _table(self, symbols):
+        import sys
+        import types
+        from unittest import mock
+
+        from loom_exporter import matcha_export
+
+        pkg = types.ModuleType("matcha.text.symbols")
+        pkg.symbols = symbols
+        with mock.patch.object(matcha_export, "load_matcha", lambda: None), \
+                mock.patch.dict(sys.modules, {"matcha.text.symbols": pkg}):
+            config = matcha_export.TTSMatchaExportConfig(
+                architecture="loom-matcha-mil", output_path="/tmp/does-not-matter.gguf",
+                model_dir="/nonexistent")
+            return config.phoneme_table()
+
+    def test_a_blank_separates_every_phoneme_and_leads(self):
+        table = self._table(["_", "h", "ə", "l"])
+        self.assertEqual((table["bos"], table["eos"], table["blank"]), (0, -1, 0))
+        self.assertTrue(table["interleave_blank"])
+
+    def test_the_declaration_reproduces_interspersed_ids_exactly(self):
+        """The one that would have caught this: build what the engine's own assembly produces from the
+        declaration and compare it against `intersperse`, rather than asserting four constants that
+        look plausible. `phoneme_vocab.cpp:83` is the assembly being modelled."""
+        table = self._table(["_", "h", "ə", "l"])
+        body = [1, 2, 3, 1]
+
+        out = []
+        if table["bos"] >= 0:
+            out.append(table["bos"])
+        for i in body:
+            out.append(i)
+            if table["interleave_blank"] and table["blank"] >= 0:
+                out.append(table["blank"])
+        if table["eos"] >= 0:
+            out.append(table["eos"])
+
+        # matcha.utils.utils.intersperse(body, 0), inlined so the clone is not needed to state it.
+        expected = [0] * (len(body) * 2 + 1)
+        expected[1::2] = body
+        self.assertEqual(out, expected)
