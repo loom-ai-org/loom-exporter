@@ -10,7 +10,7 @@
 
     -- --- The voice: the caller's, or this export's default ---
     -- `ref_s` has always been an input and a different vector has always selected a different voice.
-    -- What changed is that omitting it now works: the checkpoint's own style travels in the GGUF as one
+    -- What changed is that omitting it now works: an upstream voice PACK travels in the GGUF as one
     -- tensor and `loom.get_weight` reads it back. Before that a published model could not speak at all
     -- without the original checkpoint repo, and a caller who passed nothing got a nil index here rather
     -- than an explanation. Same fix as Supertonic's (BACKLOG.md P4.6b).
@@ -19,9 +19,23 @@
     -- module and every module shares one GgufModel -- so which one is named does not matter beyond it
     -- existing in every Kokoro export, which this one does.
     --
-    -- Read ONCE, into a local: the slices below index it repeatedly and a get_weight per access would
-    -- marshal 256 floats out of the model each time.
-    local ref_s = inputs.ref_s or loom.get_weight("text_encoder_cnn", "loom.default_style.ref_s")
+    -- A PACK, not a vector, and the row is chosen HERE because the choice is length-dependent:
+    -- upstream's `KPipeline.__call__` is `pack[len(ps)-1]`, one style per phoneme count. `input_ids`
+    -- arrives wrapped (leading and trailing 0, see the header), so `len(ps)` is `T_text - 2` and the
+    -- 0-based row is `T_text - 3`; +1 again for Lua's 1-based slice. Clamped rather than trusted, so a
+    -- caller who passes unwrapped ids or a string past the pack's end gets the nearest real voice
+    -- instead of a nil index deep inside `array_slice`.
+    --
+    -- Read the ROW ONCE, into a local: the two slices below index it repeatedly and a get_weight per
+    -- access would marshal the whole pack out of the model each time.
+    local ref_s = inputs.ref_s
+    if not ref_s then
+        local pack = loom.get_weight("text_encoder_cnn", "loom.default_style.ref_s")
+        local rows = #pack / (2 * STYLE_DIM)
+        local row = T_text - 3
+        if row < 0 then row = 0 elseif row > rows - 1 then row = rows - 1 end
+        ref_s = array_slice(pack, row * 2 * STYLE_DIM + 1, 2 * STYLE_DIM)
+    end
 
     local s_decoder = array_slice(ref_s, 1, STYLE_DIM)
     local s_predictor = array_slice(ref_s, STYLE_DIM + 1, STYLE_DIM)
