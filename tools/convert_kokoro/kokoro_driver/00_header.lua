@@ -35,10 +35,14 @@
 -- (the six BiLSTMs as RecurrentPhases, the CNN/AdaLayerNorms/duration head/resblock stacks/1x1
 -- projections as ordinary phases), so the artifact is self-contained now.
 --
--- inputs: input_ids (int array, CustomAlbert's own vocabulary, caller wraps with leading/trailing 0 per
--- real KModel.forward's own convention), ref_s (2*STYLE_DIM floats: [1..STYLE_DIM]=decoder style,
+-- inputs: input_ids (int array, CustomAlbert's own vocabulary, WRAPPED with a leading and trailing 0
+-- per real KModel.forward's own convention -- `[0, *ids, 0]`. Through the text door the embedded
+-- phoneme vocabulary does that wrap, because it declares 0 as both bos and eos; a caller assembling ids
+-- himself does it himself, which is why this driver does not -- doing it here would double-wrap him),
+-- ref_s (2*STYLE_DIM floats: [1..STYLE_DIM]=decoder style,
 -- [STYLE_DIM+1..2*STYLE_DIM]=predictor style -- the GGUF declares STYLE_DIM as the `loom.style_dim`
--- hparam, which is how a host knows how long to make it), speed (float), seed (int, seeds
+-- hparam, which is how a host knows how long to make it; omitted, one row of this export's own voice
+-- pack is used, chosen by phoneme count), speed (float), seed (int, seeds
 -- loom.seed_rng -- SineGen's rand_ini/noise draws are the only stochastic step in this whole pipeline,
 -- SAME draw order as kokoro_driver.lua: uniform first then gaussian, against the ONE shared rng_
 -- stream).
