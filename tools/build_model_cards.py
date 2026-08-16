@@ -79,6 +79,20 @@ class ModelCard:
     # Free-text appended after the language tags, for cases the tag list alone misrepresents (e.g. a
     # repo whose `language:` key is a placeholder while its card claims many more).
     language_note: Optional[str] = None
+    # The waveform rate this model's audio comes out at, written into the card's `infer(...)` call as
+    # `sample_rate=`. TTS only.
+    #
+    # Hand-recorded here for the same reason as `base_repo` and `license_id`: THE CHECKPOINT DOES NOT
+    # CARRY IT. Kokoro's `config.json` has `istftnet`'s whole upsampling ladder and never says what rate
+    # it lands on; Piper's voice JSON does say (`audio.sample_rate`), and Matcha's is in the training
+    # config rather than the `.ckpt`. So this is a value a user is expected to KNOW FROM THE MODEL'S
+    # DOCUMENTATION and pass, and putting it in the snippet is what saves the next reader from
+    # discovering it by ear -- a rate cannot be recovered from a list of floats afterwards, and getting
+    # it wrong does not fail: 24 kHz played at 16 kHz is a slow voice, not an error.
+    #
+    # `loom-py` prefers what the GGUF itself declares and falls back to this argument, so passing it is
+    # correct whether or not the export got round to declaring one. Each value below carries its source.
+    sample_rate: Optional[int] = None
     # A short human title and one-line description for the card.
     title: str = ""
     summary: str = ""
@@ -207,13 +221,64 @@ CATALOG = [
         export_task="text-to-speech", export_model="kokoro", task_type="text-to-speech",
         base_repo="hexgrad/Kokoro-82M", license_id="apache-2.0", language=["en"],
         language_note="upstream's own `language:` tag is `en`; the model card additionally documents 8 languages / 54 voices",
+        # Documentation only: `config.json` declares `istftnet`'s upsample_rates/gen_istft_hop_size and
+        # never the rate they land on. 24 kHz is what upstream `KPipeline` yields and what the model
+        # card states, and is the exact value that fixed this model's audio (BACKLOG.md P4.12).
+        sample_rate=24000,
         title="Kokoro-82M", summary="hexgrad's Kokoro-82M TTS model, exported for loom.cpp. Takes phoneme ids, not text.",
+        usage_extra="""### Choosing a voice
+
+This file embeds one voice (`af_heart`) and uses it whenever no style is passed. All 54 upstream voice
+packs ship in this repo under `voices/`, copied unmodified:
+
+```python
+import torch
+from huggingface_hub import hf_hub_download
+
+path = hf_hub_download("loom-ai-org/kokoro-82m-loom", filename="voices/af_bella.pt")
+pack = torch.load(path, weights_only=True)          # (510, 1, 256) float32
+
+# A Kokoro voice is a PACK, not a vector: one 256-float style per phoneme count, and upstream picks the
+# row by the length of the phoneme string (`pack[len(ps)-1]`). That is why the phonemes are produced
+# here rather than inside `infer` -- the row and the ids come from the same string.
+phonemes = loom.phonemizers.phonemize("hello world")
+ref_s = pack[len(phonemes) - 1].flatten().tolist()  # 256 floats
+
+# A specific voice is a knob the high-level door does not name, so it rides through as a driver input.
+audio = model.text2speech.infer(tokens=model.tokenize(phonemes), ref_s=ref_s)
+audio.save("out.wav")
+```
+
+`ref_s` is the two 128-float halves back to back -- decoder style first, predictor style second, which is
+the order `KModel.forward` splits it in -- so a row of an upstream pack is already in the right layout
+and needs no rearranging. A different voice predicts different durations, so the waveform generally
+changes length as well as timbre.
+
+`torch` appears here only to read upstream's `.pt` format; loom-py itself has no runtime dependencies
+and takes any sequence of 256 floats, so a voice you have stored some other way works the same way.
+
+Which voice is which is upstream's own `VOICES.md`, copied into this repo: 8 languages, with a quality
+and training-duration grade per voice. Note that the phonemes have to match the voice's language, and
+the G2P above is the one you installed -- a Japanese voice needs Japanese phonemes to sound like
+anything.""",
+        extra_files=[
+            "`voices/*.pt` -- all 54 upstream voice packs, copied unmodified from\n"
+            "  [`hexgrad/Kokoro-82M`](https://huggingface.co/hexgrad/Kokoro-82M). `af_heart` is also\n"
+            "  embedded in the GGUF as the default, so these are only needed to select a different\n"
+            "  voice. See the usage example above.",
+            "`VOICES.md` -- upstream's own voice table (language, traits, quality grades), copied\n"
+            "  unmodified.",
+        ],
     ),
     ModelCard(
         slug="matcha-tts-ljspeech", checkpoint=Path("matcha_model/ckpt"),
         export_task="text-to-speech", export_model="matcha", task_type="text-to-speech",
         source_url="https://github.com/shivammehta25/Matcha-TTS", source_name="Matcha-TTS (LJSpeech checkpoint)",
         license_id="mit", language=["en"],
+        # Not in `matcha_ljspeech.ckpt` -- its `hyper_parameters` hold the model geometry and the mel
+        # statistics, no rate. From the training config the checkpoint was produced by,
+        # `Matcha-TTS/configs/data/ljspeech.yaml`: `sample_rate: 22050`.
+        sample_rate=22050,
         title="Matcha-TTS (LJSpeech)", summary="Matcha-TTS's LJSpeech flow-matching TTS checkpoint, exported for loom.cpp. Takes phoneme ids, not text.",
     ),
     ModelCard(
@@ -223,6 +288,9 @@ CATALOG = [
         base_repo="Supertone/supertonic-2", license_id="other",
         license_name="OpenRAIL-M", license_url="https://huggingface.co/Supertone/supertonic-2/blob/main/LICENSE",
         language=["en", "ko", "es", "pt", "fr"],
+        # The one TTS model here whose GGUF already declares its own rate, so this only restates it:
+        # `supertonic_export.DEC_SAMPLE_RATE`, the rate its `decoder` emits at.
+        sample_rate=44100,
         title="Supertonic 2",
         summary="Supertone's Supertonic 2 on-device TTS model, exported for loom.cpp. Encodes text "
                 "itself -- no external phonemiser needed.",
@@ -285,6 +353,10 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         language=["en"],
         language_note="upstream declares no `license:` tag; check https://huggingface.co/OpenVoiceOS/pipertts_en-GB_miro "
                        "directly before redistributing",
+        # The only one of the five that IS on disk, though not in the `.ckpt` this exports: the Piper
+        # voice's `miro_en-GB.onnx.json` declares `audio.sample_rate: 22050`. Per-VOICE rather than
+        # per-architecture -- another Piper voice may differ, so this belongs to this catalogue entry.
+        sample_rate=22050,
         title="Piper VITS en-GB (miro)", summary="OpenVoiceOS's Piper-compatible VITS en-GB \"miro\" voice, exported for loom.cpp. Takes phoneme ids, not text.",
     ),
     ModelCard(
@@ -295,6 +367,10 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         language_note="the HF repo carries no `license:`/`language:` tags; MIT per the upstream "
                        "GitHub repo's LICENSE (github.com/yl4579/StyleTTS2)",
         language=["en"],
+        # From the checkpoint's own `config.yml`: `preprocess_params.sr: 24000`. NOT the `slm.sr: 16000`
+        # a few lines above it in the same file -- that is the speech language model discriminator's
+        # input rate, used in training only, and it is the wrong number to reach for here.
+        sample_rate=24000,
         title="StyleTTS2 (LJSpeech)", summary="yl4579's StyleTTS2 LJSpeech checkpoint, exported for loom.cpp. Takes phoneme ids, not text.",
     ),
 ]
@@ -332,11 +408,15 @@ model = loom.Model.from_pretrained("{repo_id}")
 # {slug} is trained on phonemes. Its symbol table ships in the GGUF, so the only piece that is not in
 # the file is grapheme-to-phoneme -- a property of the language rather than of this checkpoint:
 #     pip install "loom-py-rt[phonemes]"
-audio = model.text2speech.infer("hello world")
+#
+# sample_rate={sample_rate}: this checkpoint does not carry its own rate, so it is a value you have to
+# know from the model's documentation and pass. It is used only if the GGUF declares none; a wrong rate
+# does not fail, it plays the voice at the wrong speed.
+audio = model.text2speech.infer("hello world", sample_rate={sample_rate})
 audio.save("out.wav")
 
 # Without that extra, or with your own G2P, pass phonemes instead:
-audio = model.text2speech.infer(phonemes=model.tokenize("h\u0259\u02c8lo\u028a"))
+audio = model.text2speech.infer(phonemes=model.tokenize("h\u0259\u02c8lo\u028a"), sample_rate={sample_rate})
 """,
     "text-to-speech-with-vocab": """import loom
 
@@ -344,7 +424,11 @@ model = loom.Model.from_pretrained("{repo_id}")
 
 # This model encodes text itself -- no phonemiser needed at all.
 print(model.tokenizer)                       # kind, vocabulary size, default language
-audio = model.text2speech.infer("hello world")
+
+# sample_rate={sample_rate}: a rate is not something a checkpoint necessarily carries, so it is a value
+# you have to know from the model's documentation and pass. It is used only if the GGUF declares none;
+# a wrong rate does not fail, it plays the voice at the wrong speed.
+audio = model.text2speech.infer("hello world", sample_rate={sample_rate})
 audio.save("out.wav")
 
 # That uses whatever voice the file itself defaults to. See below for choosing another.
@@ -378,6 +462,16 @@ def export_args(card: ModelCard) -> List[str]:
 
 
 def render_readme(card: ModelCard, gguf_name: str) -> str:
+    # A TTS snippet interpolates `sample_rate`, so an entry that never set one would render the literal
+    # `sample_rate=None` into a card telling readers to pass it -- a wrong example is worse than no
+    # example, and this is the only field where the value cannot be checked against anything on disk.
+    if card.task_type == "text-to-speech" and not card.sample_rate:
+        raise ValueError(
+            f"{card.slug}: no sample_rate. Every TTS card's usage snippet states one, because a rate is "
+            f"not something these checkpoints carry -- look it up in the model's documentation and "
+            f"record it on the catalogue entry, with where you got it."
+        )
+
     lang_lines = "".join(f"- {code}\n" for code in card.language)
     frontmatter = ["---", f"license: {card.license_id}"]
     if card.language:
@@ -444,7 +538,7 @@ pip install -U "loom-py-rt[hub]"
 ```
 
 ```python
-{USAGE_SNIPPETS[snippet_key(card)].format(repo_id=repo_id(card), slug=card.slug)}```
+{USAGE_SNIPPETS[snippet_key(card)].format(repo_id=repo_id(card), slug=card.slug, sample_rate=card.sample_rate)}```
 {usage_extra_section}
 ### The layer underneath
 
