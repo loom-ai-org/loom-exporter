@@ -543,6 +543,38 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
     # A DIRECTORY of `.lua` fragments -- Kokoro is peeled (P4.0.6/C.7). See `driver_components`.
     driver_script_path: Path = driver_dir("convert_kokoro", "kokoro_driver")
 
+    def contract(self) -> dict:
+        """The three facts this family's other members declare and this one never did.
+
+        `text.frontend = "phonemes"` rather than the `"vocab"` it fell through to. Kokoro HAS a
+        vocabulary -- `phoneme_table` below ships it -- but it maps PHONEMES, so a host still cannot go
+        from a sentence to ids without a G2P step outside the engine. Undeclared, `_resolve_ids` took
+        the `"vocab"` branch and encoded the caller's ENGLISH SPELLING against the phoneme table: every
+        letter that happens to also be an IPA symbol got an id, and the model dutifully read the
+        spelling aloud. It is nearly invisible on "hello world", whose letters and phonemes almost
+        coincide, and total on anything else -- whisper-small hears "the quick brown fox jumps over the
+        lazy dog" come back as "Take whichg brompho ymps avertelazidoh". VITS, Matcha and StyleTTS2 each
+        declare this; Kokoro was the fourth phoneme model and the only one that never did.
+
+        `sample_rate` because getting it wrong is SILENT -- 24 kHz audio played at 16 kHz is not an
+        error, it is a slow voice -- and because a file that declares nothing makes every caller guess.
+        Undeclared, `loom-py` warns and falls back to 16000, which is how a working export still sounds
+        wrong and sends the caller off trying rates one at a time.
+
+        The rate is NOT IN THE CHECKPOINT: `config.json` carries `istftnet`'s whole upsampling ladder
+        and never says what it lands on, so unlike every ASR family's rate there is nothing here to read
+        it off. `DEC_SAMPLE_RATE` is therefore a DOCUMENTED value, and carries its provenance.
+
+        `text.phoneme_alphabet` because the text door has to choose a G2P, and choosing it from a
+        default rather than from the file means the day loom registers a second alphabet, this model
+        silently gets the wrong one.
+        """
+        contract = super().contract()
+        contract["text.frontend"] = "phonemes"
+        contract["text.phoneme_alphabet"] = "ipa"
+        contract["sample_rate"] = int(DEC_SAMPLE_RATE)
+        return contract
+
     def backend_kwargs(self) -> dict:
         """...plus this export's default voice, so the artifact is usable on its own.
 
@@ -553,39 +585,66 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         same way: one style travels as a `driver_weights` tensor the driver reads with `loom.get_weight`
         when the caller passes none. Passing a different one is unchanged.
 
-        PROVENANCE, because it is not an upstream voice pack. This is the style vector in the
-        checkpoint's own `ref/` dump -- real style data (verified against the synthetic pattern the gate
-        uses, which it is not), from whichever voice produced those reference forwards. Naming it here
-        rather than shipping it as though it were `af_heart` is the honest version: a caller who wants a
-        specific upstream voice still passes it.
+        PROVENANCE: an UPSTREAM VOICE PACK, `voices/<DEFAULT_VOICE>.pt` beside the checkpoint. It used
+        to be the checkpoint's own `ref/` dump, described here as "real style data (verified against the
+        synthetic pattern the gate uses, which it is not)". That verification checked the wrong thing.
+        `ref_decoder_core_style.npy` and `ref_duration_style.npy` are written by
+        `reference_forward_kokoro_decoder_core.py` and `..._duration_predictor.py`, both of which build
+        their style as `rng.normal(scale=0.3, size=(style_dim,))` -- a DIFFERENT synthetic pattern from
+        the gate's, which is why a check aimed at the gate's passed. So every published Kokoro GGUF has
+        spoken in a random Gaussian "voice": not a wrong voice, not a bad voice, but noise, whose
+        waveform leaves [-1, 1] entirely (peak ~300 against a real voice's ~0.33) and which whisper-small
+        transcribes as `[MUSIC PLAYING]`. Measured, not inferred (BACKLOG.md P4.12).
+
+        The lesson is Supertonic's, which got this right by accident of ordering: its default is a real
+        `assets/voice_styles/F1.json` and is GATED by a frozen end-to-end waveform recorded with it, so
+        "call `infer` with no style" cannot silently become noise. Kokoro had no such gate, which is why
+        this survived a release, and it STILL HAS NO SUCH GATE -- what `_default_voice` below can check
+        is the pack's shape, not that its contents are a voice. What exists instead is one rung down:
+        `tests/ci/test_tts_text_door.py` pins the declarations, and the provenance is now an upstream
+        file named in `DEFAULT_VOICE` rather than a dump this export happened to find. An end-to-end
+        waveform gate like Supertonic's is the real answer and is not written yet.
         """
         kwargs = super().backend_kwargs()
-        style = self._default_voice()
-        if style is not None:
-            kwargs["driver_weights"] = {DEFAULT_STYLE_TENSOR: style}
+        pack = self._default_voice()
+        if pack is not None:
+            kwargs["driver_weights"] = {DEFAULT_STYLE_TENSOR: pack}
         else:
-            print(f"warning: no ref/ style vectors found under {self.model_dir}; this export will have "
-                  f"no default voice and `infer` will require `ref_s`")
+            print(f"warning: no voices/{DEFAULT_VOICE}.pt found under {self.model_dir}; this export "
+                  f"will have no default voice and `infer` will require `ref_s`. Fetch it with "
+                  f"`huggingface-cli download hexgrad/Kokoro-82M voices/{DEFAULT_VOICE}.pt`.")
         return kwargs
 
     def _default_voice(self):
-        """The two 128-float halves as one `ref_s`, or None when the checkpoint carries no dump.
+        """The whole `(510, 2*style_dim)` voice pack, row-major, or None when the checkpoint has none.
 
-        Concatenated in the order the driver slices them -- decoder half first, predictor second -- and
-        checked against `style_dim` rather than trusted: a vector of the wrong length would reach
+        THE WHOLE PACK rather than one row, because upstream's selection is length-dependent --
+        `KPipeline.__call__` uses `pack[len(ps)-1]` -- and the driver reproduces that indexing. Baking a
+        single row would mean picking a phoneme count at export time and being quietly off-voice for
+        every utterance of a different length; at 522 KB for a 510-row f32 pack, buying the exact
+        upstream rule is cheap enough that guessing is not worth defending.
+
+        Each row is the two 128-float halves already in the order the driver slices them -- `ref_s[:128]`
+        decoder, `ref_s[128:]` predictor, which is `KModel.forward_with_tokens`' own split -- so the pack
+        needs no reordering, only the shape check: a pack of the wrong width would reach
         `loom.get_weight`, come back flat and wrong, and fail deep inside the engine as a shape mismatch
         on an input the caller never passed.
         """
-        ref = Path(self.model_dir) / "ref"
-        decoder, predictor = ref / "ref_decoder_core_style.npy", ref / "ref_duration_style.npy"
-        if not (decoder.is_file() and predictor.is_file()):
+        path = Path(self.model_dir) / "voices" / f"{DEFAULT_VOICE}.pt"
+        if not path.is_file():
             return None
-        halves = [np.asarray(np.load(path), dtype=np.float32).reshape(-1) for path in (decoder, predictor)]
-        for path, half in zip((decoder, predictor), halves):
-            if half.size != self.style_dim:
-                raise ValueError(f"{path.name} has {half.size} floats, expected style_dim "
-                                 f"({self.style_dim}) -- `ref_s` is the two halves back to back.")
-        return np.concatenate(halves)
+        import torch
+
+        pack = np.asarray(torch.load(path, weights_only=True).squeeze(1).numpy(), dtype=np.float32)
+        if pack.ndim != 2 or pack.shape[1] != 2 * self.style_dim:
+            raise ValueError(f"{path.name} has shape {pack.shape}, expected (rows, {2 * self.style_dim}) "
+                             f"-- each row is `ref_s`, the two style_dim ({self.style_dim}) halves back "
+                             f"to back.")
+        if pack.shape[0] != VOICE_PACK_ROWS:
+            raise ValueError(f"{path.name} has {pack.shape[0]} rows, expected {VOICE_PACK_ROWS} -- the "
+                             f"driver indexes it by phoneme count, and a short pack would silently clamp "
+                             f"every longer utterance onto its last row rather than fail.")
+        return pack.reshape(-1)
 
     def phoneme_table(self) -> dict:
         """Kokoro's own `vocab`, straight off the checkpoint's config.json.
@@ -594,9 +653,21 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         gaps with a name no phonemizer can emit rather than leaving empty strings that would all collide
         on lookup.
 
-        No interleaved blank and no BOS/EOS pair: Kokoro's driver wraps the ids with a leading and
-        trailing 0 itself (its own header says so), which makes that assembly the driver's rather than
-        the vocabulary's. Declaring it here too would apply it twice.
+        A BOS/EOS PAIR, both id 0, and no interleaved blank. `KModel.forward` is
+        `input_ids = [[0, *input_ids, 0]]` -- that wrap is not decoration, it is what the ALBERT encoder
+        and the duration predictor were trained to see at the edges, and without it the final phoneme
+        loses its duration (whisper-small hears "hello world" as "Hello, worth").
+
+        This used to declare `bos: -1, eos: -1`, on the stated grounds that "Kokoro's driver wraps the
+        ids itself (its own header says so)". The header says the OPPOSITE -- "caller wraps with
+        leading/trailing 0" -- so the wrap was declared to be the other side's job by both sides and
+        performed by neither. It belongs to the vocabulary: `tokenize` is where a caller's phonemes
+        become this model's ids, and a caller who assembles ids himself and passes them to `infer`
+        already has the driver's header telling him to wrap. Doing it in the driver instead would
+        double-wrap exactly that caller.
+
+        Id 0 is unused by `vocab` (it is `$`, the pad symbol, which no phonemizer emits), so it is the
+        pad id in the same sense every other family's is.
         """
         import json
 
@@ -606,7 +677,7 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
         return {
             "symbols": symbols,
             "ids": [int(vocab[sym]) for sym in symbols],
-            "bos": -1, "eos": -1, "blank": -1, "interleave_blank": False,
+            "bos": 0, "eos": 0, "blank": -1, "interleave_blank": False,
         }
 
     def driver_input_aliases(self) -> dict:
@@ -811,6 +882,22 @@ def _build_kokoro(path: Path, output_path: str) -> TTSKokoroExportConfig:
 
 
 DEFAULT_STYLE_TENSOR = "loom.default_style.ref_s"
+
+# The voice this export falls back to when a caller supplies no `ref_s`, and the pack's own row count.
+# `af_heart` rather than any other of the upstream packs: it is Kokoro-82M's own documented default and
+# the one its model card demonstrates, so "call `infer` with no voice at all" sounds like the model
+# everyone has already heard. A DEFAULT, not a restriction -- `ref_s` remains an ordinary `infer` input
+# and overrides it, one row of any pack (BACKLOG.md P4.6b, and P4.12 for why this stopped being `ref/`).
+#
+# 510 is upstream's own bound: a pack is (510, 1, 256) and `KPipeline` refuses phoneme strings longer
+# than that. Checked rather than trusted, because the driver's row index is only meaningful against it.
+DEFAULT_VOICE = "af_heart"
+VOICE_PACK_ROWS = 510
+
+# The rate the waveform coming out of the iSTFTNet decoder is at. NOT in `config.json` -- Kokoro's
+# carries `istftnet`'s upsampling ladder but never the rate it lands on -- so it is stated here, once,
+# with its derivation: 24 kHz is what upstream `KPipeline` yields and what its model card documents.
+DEC_SAMPLE_RATE = 24000
 
 
 def register(registry) -> None:
