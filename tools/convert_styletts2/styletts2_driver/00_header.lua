@@ -40,8 +40,10 @@
 -- came from convert_styletts2_reused.py's per-topology GGUFs alongside; P4.0.7 traced those from the
 -- real checkpoint too, so the artifact is self-contained now.
 --
--- inputs: input_ids (int array, real StyleTTS2 wraps with a SINGLE LEADING 0 token only -- caller's
--- responsibility), diffusion_steps (int, ADPM2Sampler's own num_steps), seed (int, seeds loom.seed_rng --
+-- inputs: input_ids (int array, already wrapped -- real StyleTTS2 prepends a SINGLE LEADING 0 and
+-- appends nothing, which the phoneme table declares as `bos: 0, eos: -1` so the engine's own encode()
+-- applies it; a caller passing bare ids gets its first phoneme eaten, which is what this comment saying
+-- "caller's responsibility" cost), diffusion_steps (int, ADPM2Sampler's own num_steps), seed (int, seeds loom.seed_rng --
 -- BOTH the diffusion sampler's own noise draws AND SineGen's rand_ini/noise draws are drawn from this one
 -- shared stream, in that order, matching styletts2_driver.lua's own draw order EXACTLY so the two drivers
 -- stay bit-reproducible against each other given the same seed).

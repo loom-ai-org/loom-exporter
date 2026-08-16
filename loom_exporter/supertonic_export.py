@@ -685,6 +685,15 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         # it (the driver reads it as a local constant), so this is a second rendering of one fact rather
         # than a second authority for it.
         contract["sample_rate"] = int(DEC_SAMPLE_RATE)
+        # This driver's `infer` divides by `n_steps` at its third line, so a caller who names no step
+        # count does not get a default -- it gets `attempt to perform arithmetic on local 'n_steps' (a
+        # nil value)` out of Lua, which is what the text door did until this line existed. Undeclared is
+        # not neutral for a REQUIRED input: the high-level door passes `n_steps` only when the caller
+        # named one or the contract declares one, so silence here removes the door rather than defaulting
+        # it. 10 is the number the model's own inference entry points carry (`speech_generator.py`'s and
+        # `lightning.py`'s `n_steps: int = 10`) and what every Supertonic gate runs, so it is the value
+        # the export already agrees with elsewhere rather than a new opinion about the sampler.
+        contract["tts.default_steps"] = 10
         return contract
 
     def samplers(self) -> List[FlowMatchingSpec]:
