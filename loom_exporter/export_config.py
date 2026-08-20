@@ -64,6 +64,16 @@ class LoomExportConfig:
             "was registered under and the two cannot disagree. Empty when a config is built directly "
             "rather than through `main_export`, which `contract()` reads as 'declare nothing'."
         ),
+        "quantize": Unchecked(
+            "output dtype selection, set by `main_export` from `--quantize`. A property of the "
+            "REQUESTED export rather than a claim about the model, so there is no checkpoint fact to "
+            "cross-check it against. The name IS validated, just not here and not as a spec claim: "
+            "`main_export.validate_quantize` rejects anything `gguf.quants` cannot write, up front, "
+            "because the alternative is a KeyError inside the writer minutes into a trace. What the "
+            "value cannot promise is COVERAGE -- only a MUL_MAT's first operand is eligible, so a "
+            "convolutional model may honour this fully and shrink by nothing (see "
+            "tests/ci/test_quantize_export.py). The writer reports what it reached."
+        ),
     }
 
     def export(self) -> str:
@@ -101,6 +111,13 @@ class LoomExportConfig:
     # nothing.
     task: str = ""
 
+    # The quantization the CALLER asked for ("Q8_0", "F16", ...), or "" for none. Set on the instance by
+    # `main_export` from `--quantize`, exactly like `task` above and for the same reason: it is a
+    # property of the requested export rather than of the model, so no family declares it and no
+    # recognizer can supply it. Named to match the `quantize` dataclass field the causal-LM config
+    # already had, so setting it reaches that family's own plumbing unchanged.
+    quantize: str = ""
+
     def resolved_backend_kwargs(self) -> dict:
         """`backend_kwargs()` plus what EVERY export must carry, merged here so a family cannot drop it.
 
@@ -116,6 +133,16 @@ class LoomExportConfig:
         kwargs.setdefault("hparams", self.hparams())
         kwargs["contract"] = self.contract()
         kwargs["phoneme_table"] = self.phoneme_table()
+        # Quantization routes the same universal way, and it is the case that shows why the routing
+        # matters: the causal-LM config has carried a `quantize` field for a long time and passes it
+        # from `backend_kwargs` only under `Flattened`, so asking the modular profile for Q8_0 was
+        # accepted and silently ignored. Merged here it reaches every family, including the ones that
+        # override `backend_kwargs` without knowing this exists.
+        #
+        # Only when set, because the exporter falls back to $LOOM_QUANTIZE for an unset value and
+        # writing "" over that would break the environment door.
+        if self.quantize:
+            kwargs["quantize"] = self.quantize
         return kwargs
 
     def driver_input_aliases(self) -> dict:

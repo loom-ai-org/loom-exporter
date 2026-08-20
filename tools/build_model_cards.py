@@ -57,6 +57,15 @@ class ModelCard:
     # produces outside the engine, while a grapheme model (Supertonic) encodes text itself. Only read
     # for task_type == "text-to-speech"; the LM and ASR families all carry one.
     takes_text: bool = False
+    # Whether `speech2text.infer(..., language=...)` does anything on this model. Only read for
+    # task_type == "automatic-speech-recognition", and a per-model fact for the same reason
+    # `takes_text` is: it is not implied by the task, and it is not implied by how many languages the
+    # checkpoint was TRAINED on either. Whisper is windowed, so each window gets a prompt and a
+    # language token can go in it; every other ASR export here is dynamic-length and calls the driver
+    # with the waveform and its length alone, so no language argument can reach the model however
+    # multilingual it is. Putting `language=` in those cards taught a copy-paste that the engine now
+    # (correctly) warns about.
+    selects_language: bool = False
     # `--task`/`--model` for loom-export; empty means auto-detection resolves both.
     export_task: Optional[str] = None
     export_model: Optional[str] = None
@@ -158,6 +167,10 @@ CATALOG = [
     ModelCard(
         slug="whisper-small", checkpoint=Path("whisper-small"),
         task_type="automatic-speech-recognition",
+        # The only windowed ASR export here (`loom.n_samples` = 480000), so the only one whose decode
+        # has a prompt for a language token to go in. Verified against the file, not assumed from the
+        # 99 language tags below -- parakeet-tdt is multilingual too and takes no language argument.
+        selects_language=True,
         base_repo="openai/whisper-small", license_id="apache-2.0",
         language=["en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar",
                   "sv", "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu",
@@ -377,6 +390,19 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
 
 CATALOG_BY_SLUG = {m.slug: m for m in CATALOG}
 
+
+# Appears under the install block of every phoneme-input TTS card. Written to be read by someone who
+# has just installed the extra and is about to be disappointed by English: the bundled G2P is
+# rule-based, and English is one of the deep-orthography languages that cannot be reached that way.
+PHONEMIZER_NOTE = """
+**NOTE:** This is a work in progress. For now, in order to avoid license conflicts and keep
+dependencies at a minimum, we opted for orthography2ipa as our "swiss-knife" phonemizer. For
+deep-orthography languages like English, to get stressing rules and context-based phonemization, the
+phonemizer must register a reference lexicon (e.g., ipa-dict) to get highly accurate phonemization.
+Full quality can be achieved by phonemizing the text yourself using your engine of choice and feeding
+it to the model via the argument `phonemes` as in the example below.
+"""
+
 USAGE_SNIPPETS = {
     # The HIGH-LEVEL door for each task, because that is what a reader arriving from a model page
     # wants: one call, end to end, with the windowing/sampling/assembly a model needs already applied.
@@ -387,12 +413,30 @@ USAGE_SNIPPETS = {
 model = loom.Model.from_pretrained("{repo_id}")
 print(model.text2text.infer("The capital of France is", max_new_tokens=14))
 """,
+    # Two ASR snippets, for the same reason there are two TTS ones: `language=` is not a property of
+    # the task. `selects_language` below is what picks between them.
     "automatic-speech-recognition": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# Audio is a mono float list at 16 kHz. This model decodes in the one language it was trained for and
+# takes no `language=` argument -- passing one warns and is ignored, because nothing in its decode
+# could act on it.
+result = model.speech2text.infer(audio, timestamps=True)
+print(result.text)
+
+# It emits no timestamp tokens, so `segments` is one span covering the whole clip and
+# `result.timestamped` is False. Check that before treating a start/end as a boundary the model chose.
+for segment in result.segments:
+    print(segment.start, segment.end, segment.text)
+""",
+    "automatic-speech-recognition-multilingual": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
 
 # Audio is a mono float list at 16 kHz. Long files are windowed for you, and a model that emits
 # timestamps is seeked to where it closed its last segment rather than cut at a fixed stride.
+# Omit `language=` to let the model detect it; `task="translate"` renders the speech in English.
 result = model.speech2text.infer(audio, language="en", timestamps=True)
 print(result.text)
 for segment in result.segments:
@@ -406,17 +450,29 @@ for segment in result.segments:
 model = loom.Model.from_pretrained("{repo_id}")
 
 # {slug} is trained on phonemes. Its symbol table ships in the GGUF, so the only piece that is not in
-# the file is grapheme-to-phoneme -- a property of the language rather than of this checkpoint:
-#     pip install "loom-py-rt[phonemes]"
+# the file is grapheme-to-phoneme -- a property of the language rather than of this checkpoint, which
+# is why it is the `phonemes` extra above rather than part of the model.
+
+# THE FULL-QUALITY PATH: phonemes you produced yourself, with whatever G2P you trust. The symbol table
+# in the GGUF is what encodes them, so anything that emits IPA works.
+audio = model.text2speech.infer(phonemes="h\u0259\u02c8lo\u028a w\u02c8\u025c\u02d0ld", sample_rate={sample_rate})
+audio.save("out.wav")
+
+# THE BUILT-IN PATH: text straight in, phonemized by the bundled rule-based G2P. Good enough for
+# shallow orthographies; for English see the note above, and give it a lexicon so it has stress and
+# real vowels to work with -- "time" is /t\u026am/ without one.
 #
+# open-dict-data/ipa-dict (MIT) publishes ~65k-entry wordlists WITH stress for en_UK and en_US, in
+# almost the right shape: its IPA is wrapped in slashes and a rare entry carries two comma-separated
+# variants, both of which the loader rejects. One line converts a downloaded data/en_UK.txt:
+#     sed 's:/::g; s/\\t\\([^,]*\\),.*/\\t\\1/' en_UK.txt > en_UK.tsv
+loom.phonemizers.set_lexicon("en_UK.tsv")    # a path, an http(s):// URL, or hf://<repo>/<path>
+
 # sample_rate={sample_rate}: this checkpoint does not carry its own rate, so it is a value you have to
 # know from the model's documentation and pass. It is used only if the GGUF declares none; a wrong rate
 # does not fail, it plays the voice at the wrong speed.
 audio = model.text2speech.infer("hello world", sample_rate={sample_rate})
 audio.save("out.wav")
-
-# Without that extra, or with your own G2P, pass phonemes instead:
-audio = model.text2speech.infer(phonemes=model.tokenize("h\u0259\u02c8lo\u028a"), sample_rate={sample_rate})
 """,
     "text-to-speech-with-vocab": """import loom
 
@@ -445,6 +501,8 @@ def snippet_key(card: ModelCard) -> str:
     TTS, where whether the GGUF carries a vocabulary is a per-model fact -- see `takes_text`."""
     if card.task_type == "text-to-speech" and card.takes_text:
         return "text-to-speech-with-vocab"
+    if card.task_type == "automatic-speech-recognition" and card.selects_language:
+        return "automatic-speech-recognition-multilingual"
     return card.task_type
 
 
@@ -506,6 +564,16 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
     # Both land verbatim: `usage_extra` right after the snippet's closing fence, `extra_files` as
     # further bullets under the GGUF's own.
     usage_extra_section = f"\n{card.usage_extra}\n" if card.usage_extra else ""
+
+    # Phoneme-input TTS needs one more extra than everything else, and needs saying WHY. The phonemizer
+    # is optional (`loom-py-rt` declares no runtime dependencies on purpose), so a card that installs
+    # only `[hub]` and then calls the text door sends the reader to a LookupError; and a card that
+    # installs it without qualification implies the result is production-quality English, which
+    # rule-based transduction is not. `takes_text` is the discriminator, same as for the snippet:
+    # Supertonic encodes graphemes itself and needs none of this.
+    needs_phonemes = card.task_type == "text-to-speech" and not card.takes_text
+    install_extras = "hub,phonemes" if needs_phonemes else "hub"
+    phonemizer_note = PHONEMIZER_NOTE if needs_phonemes else ""
     extra_files_section = "".join(f"- {bullet}\n" for bullet in card.extra_files)
 
     body = f"""# {card.title}
@@ -534,9 +602,9 @@ loom.cpp's GGUF format.
 Run it with [loom-py]({LOOM_PY_URL}) -- `loom-py-rt` on PyPI:
 
 ```sh
-pip install -U "loom-py-rt[hub]"
+pip install -U "loom-py-rt[{install_extras}]"
 ```
-
+{phonemizer_note}
 ```python
 {USAGE_SNIPPETS[snippet_key(card)].format(repo_id=repo_id(card), slug=card.slug, sample_rate=card.sample_rate)}```
 {usage_extra_section}

@@ -12,17 +12,56 @@ task vocabulary `--task` accepts.
 import argparse
 from pathlib import Path
 
+import numpy as np
+
+#: One block-aligned F32 row, used only to ask `gguf.quants` which types it can actually write.
+_PROBE = np.zeros((1, 256), dtype=np.float32)
+
 from .registry import default_registry
 from .tasks import known_tasks
 
 
-def main_export(model_path: str, output_path: str, task: str = None, model: str = None) -> str:
+def quantize_choices() -> list:
+    """The GGML type names `--quantize` accepts, from the `gguf` package rather than a hardcoded list.
+
+    Restricted to the types this exporter can actually WRITE: `gguf.quants.quantize` implements a
+    subset of the enum, and offering a name it raises on turns a typo into a traceback halfway through
+    an export that has already spent minutes tracing.
+    """
+    from gguf import GGMLQuantizationType, quants
+
+    names = []
+    for qtype in GGMLQuantizationType:
+        try:
+            quants.quantize(_PROBE, qtype)
+        except Exception:
+            continue
+        names.append(qtype.name)
+    return names
+
+
+def validate_quantize(name: str) -> str:
+    """`name` uppercased and checked against `quantize_choices()`, or a ValueError that lists them."""
+    resolved = name.upper()
+    choices = quantize_choices()
+    if resolved not in choices:
+        raise ValueError(
+            f"unknown quantization {name!r}. This exporter can write: {', '.join(choices)}."
+        )
+    return resolved
+
+
+def main_export(model_path: str, output_path: str, task: str = None, model: str = None,
+                quantize: str = None) -> str:
     """Exports whatever `model_path` names to `output_path`. `task`/`model` are optional overrides --
     with neither, both axes are auto-detected; with `task` alone, detection is restricted to that task's
-    recognizers; `model` requires `task` (it names one specific recognizer within it). Returns
+    recognizers; `model` requires `task` (it names one specific recognizer within it). `quantize` names
+    a GGML type for the weights that are eligible for one; unset falls back to $LOOM_QUANTIZE. Returns
     `output_path`."""
     if model is not None and task is None:
         raise ValueError("--model requires --task (which family's recognizer to look up)")
+    if quantize:
+        quantize = validate_quantize(quantize)
 
     registry = default_registry()
     path = Path(model_path)
@@ -34,6 +73,12 @@ def main_export(model_path: str, output_path: str, task: str = None, model: str 
     # while no host offered a task-shaped door and stopped being right the moment one did. It is written
     # into the file as `loom.task` now (loom.cpp docs/HIGH-LEVEL-API.md §3).
     config.task = recognizer.task
+    # Same instance-attribute route as `task`, and for the same reason: this is a property of the
+    # REQUESTED export, so it arrives from the caller rather than from the recognizer or the checkpoint.
+    # `resolved_backend_kwargs` is what carries it to the backend, so every family gets it -- including
+    # the ones whose own `backend_kwargs` never learned about quantization.
+    if quantize:
+        config.quantize = quantize
     return config.export()
 
 
@@ -46,9 +91,16 @@ def main():
         help="Restrict/override task detection (the canonical vocabulary, see tasks.py)",
     )
     parser.add_argument("--model", default=None, help="Explicit model override within --task, e.g. 'qwen3'")
+    parser.add_argument(
+        "--quantize", default=None, type=str.upper, choices=quantize_choices(), metavar="TYPE",
+        help="Quantize eligible weights to this GGML type (e.g. Q8_0, F16). Default: $LOOM_QUANTIZE, "
+             "else none. Only weights ggml can read in that form are converted -- the export reports "
+             "the coverage it achieved, which for convolutional models is a fraction of the file.",
+    )
     args = parser.parse_args()
 
-    output_path = main_export(args.model_path, args.output, task=args.task, model=args.model)
+    output_path = main_export(args.model_path, args.output, task=args.task, model=args.model,
+                              quantize=args.quantize)
     print(f"SUCCESS! Exported to: {output_path}")
 
 
