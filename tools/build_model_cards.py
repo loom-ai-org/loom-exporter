@@ -408,7 +408,19 @@ model = loom.Model.from_pretrained("{repo_id}")
 # {slug} is trained on phonemes. Its symbol table ships in the GGUF, so the only piece that is not in
 # the file is grapheme-to-phoneme -- a property of the language rather than of this checkpoint:
 #     pip install "loom-py-rt[phonemes]"
+
+# ENGLISH NEEDS A LEXICON, and this line belongs BEFORE the first call rather than after it. The
+# bundled G2P transduces by rule, and English spelling does not yield to rules: "time" comes back as
+# /t\u026am/ ("teem"), "friend" as /f\u0279i\u02d0nd/, and stress marks are absent entirely. That is a property of
+# the language, not a setting -- no search or beam option changes it. An unlisted word still falls back
+# to the rules, so a lexicon is an overlay and its coverage is what decides quality.
 #
+# open-dict-data/ipa-dict (MIT) publishes ~65k-entry wordlists WITH stress for en_UK and en_US, in
+# almost the right shape: its IPA is wrapped in slashes and a rare entry carries two comma-separated
+# variants, both of which the loader rejects. One line converts a downloaded data/en_UK.txt:
+#     sed 's:/::g; s/\\t\\([^,]*\\),.*/\\t\\1/' en_UK.txt > en_UK.tsv
+loom.phonemizers.set_lexicon("en_UK.tsv")    # or an http(s):// URL, or hf://<repo>/<path>
+
 # sample_rate={sample_rate}: this checkpoint does not carry its own rate, so it is a value you have to
 # know from the model's documentation and pass. It is used only if the GGUF declares none; a wrong rate
 # does not fail, it plays the voice at the wrong speed.
