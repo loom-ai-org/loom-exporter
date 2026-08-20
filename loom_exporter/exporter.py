@@ -2645,6 +2645,13 @@ class LoomGGUFExporter:
             block_size, _ = GGML_QUANT_SIZES[qtype]
             quantizable = self._collect_mul_mat_weight_names()
         n_quantized = 0
+        # Bytes, not just tensor counts, because the count answers the wrong question. A convolutional
+        # model can report "44 tensor(s) quantized" and have shrunk by a fifth, since the weights that
+        # dominate it are conv kernels and those are not eligible -- see `_collect_mul_mat_weight_names`
+        # for why. Reporting what fraction of the file actually moved is what tells a caller that.
+        quantized_bytes_before = 0
+        quantized_bytes_after = 0
+        float_bytes_total = 0
 
         # Content-address weight payloads (BACKLOG.md P0.2): a split export can legitimately declare the
         # SAME weight under two different names (LFM2's tied embedding is both `prefix.module_weight` and
@@ -2683,9 +2690,13 @@ class LoomGGUFExporter:
                 from gguf import quants
                 array_to_write = quants.quantize(np.ascontiguousarray(array), qtype)
                 raw_dtype = qtype
+                quantized_bytes_before += array.nbytes
+                quantized_bytes_after += array_to_write.nbytes
             else:
                 array_to_write = array
                 raw_dtype = None
+            if array.dtype == np.float32:
+                float_bytes_total += array.nbytes
 
             # The dtype+shape tag guards against two same-bytes-different-meaning collisions a pure byte
             # hash would miss: an all-zero I32 array vs an all-zero F32 array of the same byte length,
@@ -2725,7 +2736,27 @@ class LoomGGUFExporter:
         w.write_tensors_to_file()
         w.close()
 
-        suffix = f", {n_quantized} tensor(s) quantized to {self.quantize}" if self.quantize else ""
+        suffix = ""
+        if self.quantize:
+            covered = 100.0 * quantized_bytes_before / float_bytes_total if float_bytes_total else 0.0
+            saved = quantized_bytes_before - quantized_bytes_after
+            suffix = (f", {n_quantized} tensor(s) quantized to {self.quantize} "
+                      f"({covered:.0f}% of float weight bytes, {saved / 1e6:.1f} MB saved)")
+            # A quantization that covered nothing is the failure mode this reporting exists for: the
+            # export succeeds, the file is byte-for-byte the size it was, and nothing said so. Only
+            # MUL_MAT *first* operands are eligible, and a convolutional model keeps its weights in
+            # conv kernels, which reach ggml as the mul_mat operand it requires to be F32
+            # (ggml-cpu.c's `GGML_ASSERT(src1->type == GGML_TYPE_F32)` inside
+            # ggml_compute_forward_mul_mat). So this is a real property of the model, not a bad
+            # argument, and it says which so nobody re-runs the export expecting a different number.
+            if n_quantized == 0:
+                print(f"WARNING: --quantize {self.quantize} matched NO weights in this model. Only a "
+                      f"MUL_MAT's first operand is eligible; this model's weights are convolution "
+                      f"kernels, which ggml requires as F32. The file is unchanged.")
+            elif covered < 50.0:
+                print(f"WARNING: --quantize {self.quantize} reached only {covered:.0f}% of this "
+                      f"model's float weight bytes. The rest are convolution kernels, which ggml "
+                      f"requires as F32 and which no quantization setting can convert.")
         if alias_names:
             suffix += f", {len(alias_names)} duplicate weight name(s) aliased instead of re-stored"
         print(f"wrote GGUF with driver_script and {len(self.topologies)} topologies to {self.output_path}{suffix}")
