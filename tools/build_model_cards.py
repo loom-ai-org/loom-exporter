@@ -390,6 +390,19 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
 
 CATALOG_BY_SLUG = {m.slug: m for m in CATALOG}
 
+
+# Appears under the install block of every phoneme-input TTS card. Written to be read by someone who
+# has just installed the extra and is about to be disappointed by English: the bundled G2P is
+# rule-based, and English is one of the deep-orthography languages that cannot be reached that way.
+PHONEMIZER_NOTE = """
+**NOTE:** This is a work in progress. For now, in order to avoid license conflicts and keep
+dependencies at a minimum, we opted for orthography2ipa as our "swiss-knife" phonemizer. For
+deep-orthography languages like English, to get stressing rules and context-based phonemization, the
+phonemizer must register a reference lexicon (e.g., ipa-dict) to get highly accurate phonemization.
+Full quality can be achieved by phonemizing the text yourself using your engine of choice and feeding
+it to the model via the argument `phonemes` as in the example below.
+"""
+
 USAGE_SNIPPETS = {
     # The HIGH-LEVEL door for each task, because that is what a reader arriving from a model page
     # wants: one call, end to end, with the windowing/sampling/assembly a model needs already applied.
@@ -437,29 +450,29 @@ for segment in result.segments:
 model = loom.Model.from_pretrained("{repo_id}")
 
 # {slug} is trained on phonemes. Its symbol table ships in the GGUF, so the only piece that is not in
-# the file is grapheme-to-phoneme -- a property of the language rather than of this checkpoint:
-#     pip install "loom-py-rt[phonemes]"
+# the file is grapheme-to-phoneme -- a property of the language rather than of this checkpoint, which
+# is why it is the `phonemes` extra above rather than part of the model.
 
-# ENGLISH NEEDS A LEXICON, and this line belongs BEFORE the first call rather than after it. The
-# bundled G2P transduces by rule, and English spelling does not yield to rules: "time" comes back as
-# /t\u026am/ ("teem"), "friend" as /f\u0279i\u02d0nd/, and stress marks are absent entirely. That is a property of
-# the language, not a setting -- no search or beam option changes it. An unlisted word still falls back
-# to the rules, so a lexicon is an overlay and its coverage is what decides quality.
+# THE FULL-QUALITY PATH: phonemes you produced yourself, with whatever G2P you trust. The symbol table
+# in the GGUF is what encodes them, so anything that emits IPA works.
+audio = model.text2speech.infer(phonemes="h\u0259\u02c8lo\u028a w\u02c8\u025c\u02d0ld", sample_rate={sample_rate})
+audio.save("out.wav")
+
+# THE BUILT-IN PATH: text straight in, phonemized by the bundled rule-based G2P. Good enough for
+# shallow orthographies; for English see the note above, and give it a lexicon so it has stress and
+# real vowels to work with -- "time" is /t\u026am/ without one.
 #
 # open-dict-data/ipa-dict (MIT) publishes ~65k-entry wordlists WITH stress for en_UK and en_US, in
 # almost the right shape: its IPA is wrapped in slashes and a rare entry carries two comma-separated
 # variants, both of which the loader rejects. One line converts a downloaded data/en_UK.txt:
 #     sed 's:/::g; s/\\t\\([^,]*\\),.*/\\t\\1/' en_UK.txt > en_UK.tsv
-loom.phonemizers.set_lexicon("en_UK.tsv")    # or an http(s):// URL, or hf://<repo>/<path>
+loom.phonemizers.set_lexicon("en_UK.tsv")    # a path, an http(s):// URL, or hf://<repo>/<path>
 
 # sample_rate={sample_rate}: this checkpoint does not carry its own rate, so it is a value you have to
 # know from the model's documentation and pass. It is used only if the GGUF declares none; a wrong rate
 # does not fail, it plays the voice at the wrong speed.
 audio = model.text2speech.infer("hello world", sample_rate={sample_rate})
 audio.save("out.wav")
-
-# Without that extra, or with your own G2P, pass phonemes instead:
-audio = model.text2speech.infer(phonemes=model.tokenize("h\u0259\u02c8lo\u028a"), sample_rate={sample_rate})
 """,
     "text-to-speech-with-vocab": """import loom
 
@@ -551,6 +564,16 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
     # Both land verbatim: `usage_extra` right after the snippet's closing fence, `extra_files` as
     # further bullets under the GGUF's own.
     usage_extra_section = f"\n{card.usage_extra}\n" if card.usage_extra else ""
+
+    # Phoneme-input TTS needs one more extra than everything else, and needs saying WHY. The phonemizer
+    # is optional (`loom-py-rt` declares no runtime dependencies on purpose), so a card that installs
+    # only `[hub]` and then calls the text door sends the reader to a LookupError; and a card that
+    # installs it without qualification implies the result is production-quality English, which
+    # rule-based transduction is not. `takes_text` is the discriminator, same as for the snippet:
+    # Supertonic encodes graphemes itself and needs none of this.
+    needs_phonemes = card.task_type == "text-to-speech" and not card.takes_text
+    install_extras = "hub,phonemes" if needs_phonemes else "hub"
+    phonemizer_note = PHONEMIZER_NOTE if needs_phonemes else ""
     extra_files_section = "".join(f"- {bullet}\n" for bullet in card.extra_files)
 
     body = f"""# {card.title}
@@ -579,9 +602,9 @@ loom.cpp's GGUF format.
 Run it with [loom-py]({LOOM_PY_URL}) -- `loom-py-rt` on PyPI:
 
 ```sh
-pip install -U "loom-py-rt[hub]"
+pip install -U "loom-py-rt[{install_extras}]"
 ```
-
+{phonemizer_note}
 ```python
 {USAGE_SNIPPETS[snippet_key(card)].format(repo_id=repo_id(card), slug=card.slug, sample_rate=card.sample_rate)}```
 {usage_extra_section}
