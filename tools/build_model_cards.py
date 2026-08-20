@@ -57,6 +57,15 @@ class ModelCard:
     # produces outside the engine, while a grapheme model (Supertonic) encodes text itself. Only read
     # for task_type == "text-to-speech"; the LM and ASR families all carry one.
     takes_text: bool = False
+    # Whether `speech2text.infer(..., language=...)` does anything on this model. Only read for
+    # task_type == "automatic-speech-recognition", and a per-model fact for the same reason
+    # `takes_text` is: it is not implied by the task, and it is not implied by how many languages the
+    # checkpoint was TRAINED on either. Whisper is windowed, so each window gets a prompt and a
+    # language token can go in it; every other ASR export here is dynamic-length and calls the driver
+    # with the waveform and its length alone, so no language argument can reach the model however
+    # multilingual it is. Putting `language=` in those cards taught a copy-paste that the engine now
+    # (correctly) warns about.
+    selects_language: bool = False
     # `--task`/`--model` for loom-export; empty means auto-detection resolves both.
     export_task: Optional[str] = None
     export_model: Optional[str] = None
@@ -158,6 +167,10 @@ CATALOG = [
     ModelCard(
         slug="whisper-small", checkpoint=Path("whisper-small"),
         task_type="automatic-speech-recognition",
+        # The only windowed ASR export here (`loom.n_samples` = 480000), so the only one whose decode
+        # has a prompt for a language token to go in. Verified against the file, not assumed from the
+        # 99 language tags below -- parakeet-tdt is multilingual too and takes no language argument.
+        selects_language=True,
         base_repo="openai/whisper-small", license_id="apache-2.0",
         language=["en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar",
                   "sv", "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu",
@@ -387,12 +400,30 @@ USAGE_SNIPPETS = {
 model = loom.Model.from_pretrained("{repo_id}")
 print(model.text2text.infer("The capital of France is", max_new_tokens=14))
 """,
+    # Two ASR snippets, for the same reason there are two TTS ones: `language=` is not a property of
+    # the task. `selects_language` below is what picks between them.
     "automatic-speech-recognition": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# Audio is a mono float list at 16 kHz. This model decodes in the one language it was trained for and
+# takes no `language=` argument -- passing one warns and is ignored, because nothing in its decode
+# could act on it.
+result = model.speech2text.infer(audio, timestamps=True)
+print(result.text)
+
+# It emits no timestamp tokens, so `segments` is one span covering the whole clip and
+# `result.timestamped` is False. Check that before treating a start/end as a boundary the model chose.
+for segment in result.segments:
+    print(segment.start, segment.end, segment.text)
+""",
+    "automatic-speech-recognition-multilingual": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
 
 # Audio is a mono float list at 16 kHz. Long files are windowed for you, and a model that emits
 # timestamps is seeked to where it closed its last segment rather than cut at a fixed stride.
+# Omit `language=` to let the model detect it; `task="translate"` renders the speech in English.
 result = model.speech2text.infer(audio, language="en", timestamps=True)
 print(result.text)
 for segment in result.segments:
@@ -457,6 +488,8 @@ def snippet_key(card: ModelCard) -> str:
     TTS, where whether the GGUF carries a vocabulary is a per-model fact -- see `takes_text`."""
     if card.task_type == "text-to-speech" and card.takes_text:
         return "text-to-speech-with-vocab"
+    if card.task_type == "automatic-speech-recognition" and card.selects_language:
+        return "automatic-speech-recognition-multilingual"
     return card.task_type
 
 
