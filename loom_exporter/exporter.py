@@ -2422,17 +2422,33 @@ class LoomGGUFExporter:
             "n_embd_conv": n_embd_conv,
         }
 
+    #: Ops whose FIRST input is a weight the engine can read in a packed (quantized or F16) form.
+    #:
+    #: MUL_MAT is the direct case -- `a` is the weight by loom's convention (op_mul_mat is a bare
+    #: ggml_mul_mat(a, b) wrap). The convolutions are the indirect one, and they were excluded until the
+    #: engine could take them: each lowers to im2col + mul_mat, and the kernel used to sit in the second
+    #: operand, which ggml asserts is F32. `primitives_conv.cpp` now places a non-F32 kernel in the
+    #: first operand instead, so a conv kernel is eligible on exactly the same terms as a matmul weight.
+    #:
+    #: CONV_TRANSPOSE_1D/2D are deliberately absent. They are native ggml ops rather than a composition
+    #: -- ggml_conv_transpose_1d dispatches on the kernel's own dtype and implements F16/F32 only, with
+    #: no mul_mat to reorder -- so declaring them here would produce a file ggml cannot compute.
+    #: Measured, that leaves 2.7-12.1 MB unquantized per TTS model, against the 59-245 MB the plain
+    #: convolutions account for.
+    PACKED_WEIGHT_FIRST_OPS = ("MUL_MAT", "CONV_1D", "CONV_2D", "CONV_1D_DW", "CONV_2D_DW", "SHORT_CONV")
+
     def _collect_mul_mat_weight_names(self) -> set:
-        """Every MUL_MAT node's *first* input, across all topologies -- the weight-first argument per
-        loom's convention (src/ops/primitives_basic.cpp's op_mul_mat is a bare ggml_mul_mat(a, b) wrap
-        with `a` as the weight). Mirrors tools/quantize/quantize_gguf_q8_0.py's topology-driven tensor
-        selection (proven end-to-end against a real quantized model, see BACKLOG.md's "quantized weight
-        support" milestone) rather than tensor-name pattern matching -- this exporter never emits
-        "repeat_for" blocks (unlike that script's GGUF-KV-driven input), so no expansion pass is needed."""
+        """Every eligible node's *first* input, across all topologies -- see `PACKED_WEIGHT_FIRST_OPS`
+        for which ops those are and why convolution transposes are not among them.
+
+        Mirrors tools/quantize/quantize_gguf_q8_0.py's topology-driven tensor selection (proven
+        end-to-end against a real quantized model, see BACKLOG.md's "quantized weight support"
+        milestone) rather than tensor-name pattern matching -- this exporter never emits "repeat_for"
+        blocks (unlike that script's GGUF-KV-driven input), so no expansion pass is needed."""
         names = set()
         for topo in self.topologies.values():
             for node in topo.get("nodes", []):
-                if node.get("op") == "MUL_MAT" and node.get("inputs"):
+                if node.get("op") in self.PACKED_WEIGHT_FIRST_OPS and node.get("inputs"):
                     names.add(node["inputs"][0])
         return names
 
@@ -2652,6 +2668,12 @@ class LoomGGUFExporter:
         quantized_bytes_before = 0
         quantized_bytes_after = 0
         float_bytes_total = 0
+        # Eligible BY OP but declined afterwards, and why. The two gates are genuinely different and
+        # reporting them as one sent a reader looking for a bug in the op list when the real answer was
+        # the tensor's shape: ggml lays quantization blocks along ne[0], which for a convolution kernel
+        # is the KERNEL WIDTH (1, 3, 5 ...) and never a multiple of 32. VITS is entirely this case --
+        # every conv kernel IS a first operand and not one of them is block-alignable.
+        n_declined_shape = 0
 
         # Content-address weight payloads (BACKLOG.md P0.2): a split export can legitimately declare the
         # SAME weight under two different names (LFM2's tied embedding is both `prefix.module_weight` and
@@ -2685,8 +2707,10 @@ class LoomGGUFExporter:
             # 1D tensors have negligible size benefit and real accuracy cost). Tensors whose last
             # (fastest-varying) dimension isn't block-aligned are left F32 rather than erroring, same
             # graceful behavior as the standalone quantize_gguf_q8_0.py POC.
-            if (qtype is not None and name in quantizable and array.ndim >= 2 and array.dtype == np.float32
-                    and array.shape[-1] % block_size == 0):
+            eligible_by_op = qtype is not None and name in quantizable and array.dtype == np.float32
+            if eligible_by_op and not (array.ndim >= 2 and array.shape[-1] % block_size == 0):
+                n_declined_shape += 1
+            if (eligible_by_op and array.ndim >= 2 and array.shape[-1] % block_size == 0):
                 from gguf import quants
                 array_to_write = quants.quantize(np.ascontiguousarray(array), qtype)
                 raw_dtype = qtype
@@ -2743,20 +2767,25 @@ class LoomGGUFExporter:
             suffix = (f", {n_quantized} tensor(s) quantized to {self.quantize} "
                       f"({covered:.0f}% of float weight bytes, {saved / 1e6:.1f} MB saved)")
             # A quantization that covered nothing is the failure mode this reporting exists for: the
-            # export succeeds, the file is byte-for-byte the size it was, and nothing said so. Only
-            # MUL_MAT *first* operands are eligible, and a convolutional model keeps its weights in
-            # conv kernels, which reach ggml as the mul_mat operand it requires to be F32
-            # (ggml-cpu.c's `GGML_ASSERT(src1->type == GGML_TYPE_F32)` inside
-            # ggml_compute_forward_mul_mat). So this is a real property of the model, not a bad
-            # argument, and it says which so nobody re-runs the export expecting a different number.
+            # export succeeds, the file is byte-for-byte the size it was, and nothing said so. What
+            # remains ineligible after `PACKED_WEIGHT_FIRST_OPS` gained the convolutions is a weight
+            # that is nobody's first operand -- an activation-by-activation matmul, an embedding
+            # reached only through GET_ROWS, a CONV_TRANSPOSE kernel (a native ggml op with no mul_mat
+            # to reorder), or a row whose fastest axis is not block-aligned.
+            shaped = ""
+            if n_declined_shape:
+                shaped = (f" {n_declined_shape} weight(s) WERE eligible by op and were declined for "
+                          f"shape: {self.quantize} blocks run along the tensor's fastest axis and need "
+                          f"a multiple of {block_size} there, which a convolution kernel (whose fastest "
+                          f"axis is the kernel width) is not. Those can still be exported as F16, whose "
+                          f"block size is 1.")
             if n_quantized == 0:
-                print(f"WARNING: --quantize {self.quantize} matched NO weights in this model. Only a "
-                      f"MUL_MAT's first operand is eligible; this model's weights are convolution "
-                      f"kernels, which ggml requires as F32. The file is unchanged.")
+                print(f"WARNING: --quantize {self.quantize} matched NO weights in this model, so the "
+                      f"file is unchanged.{shaped}")
             elif covered < 50.0:
                 print(f"WARNING: --quantize {self.quantize} reached only {covered:.0f}% of this "
-                      f"model's float weight bytes. The rest are convolution kernels, which ggml "
-                      f"requires as F32 and which no quantization setting can convert.")
+                      f"model's float weight bytes. The rest are weights ggml cannot read packed where "
+                      f"they sit -- transposed-convolution kernels and second matmul operands.{shaped}")
         if alias_names:
             suffix += f", {len(alias_names)} duplicate weight name(s) aliased instead of re-stored"
         print(f"wrote GGUF with driver_script and {len(self.topologies)} topologies to {self.output_path}{suffix}")

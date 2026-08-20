@@ -10,18 +10,20 @@ succeeded and the file was the size it had always been. That is the same rot `te
 guards for `hparams`, so it is routed through `resolved_backend_kwargs()` instead, where forgetting it
 is not expressible, and the first test below is what holds that.
 
-THE ELIGIBILITY. Only a MUL_MAT's FIRST operand can be quantized, and that is not an exporter policy
-that could be relaxed by choosing better weights -- it is ggml's. `ggml_compute_forward_mul_mat`
-asserts `src1->type == GGML_TYPE_F32` for the operand it converts, and loom's CONV_1D/CONV_2D
-(src/ops/primitives_conv.cpp) build `ggml_mul_mat(im2col, kernel)` with the KERNEL in that second
-slot. So a convolutional model's weights are unquantizable where they sit, and the second test pins
-that the selection really is first-operands-only rather than asserting the number it happens to
-produce today.
+THE ELIGIBILITY. A weight can only be packed where ggml can read a packed one: in a mul_mat's FIRST
+operand. `ggml_compute_forward_mul_mat` asserts `src1->type == GGML_TYPE_F32` for the operand it
+converts, so the second is F32 or nothing. Convolutions were excluded for exactly that reason -- they
+lower to im2col + mul_mat and the kernel sat in the second slot -- which is why quantizing a
+convolutional model changed nothing at all: conv kernels are 53-92% of the weight bytes in
+Kokoro/Matcha/StyleTTS2/Supertonic and 73% of VITS, whose Q8_0 export came out byte-identical to its
+F32 one. `primitives_conv.cpp` now puts a NON-F32 kernel in the first operand instead (F32 keeps the
+old formulation exactly, so no existing export changes), and the eligibility list follows it.
 
-Measured consequence, from the shipped files: conv kernels are 56-92% of the weight bytes in Kokoro,
-Matcha, StyleTTS2 and Supertonic, and 76% of VITS -- whose MUL_MATs are all activation-by-activation,
-leaving it with ZERO eligible weights and a Q8_0 export byte-identical to its F32 one. That is why
-the writer reports coverage and warns rather than printing SUCCESS over an unchanged file.
+The second test pins that the list tracks the ops the engine actually reformulated -- convolutions in,
+CONV_TRANSPOSE_1D/2D out. Those last two are native ggml ops implementing F16/F32 only, with no
+mul_mat to reorder, so declaring them eligible would produce a file ggml cannot compute. That is the
+one exclusion that is a correctness claim rather than a size trade-off, so it gets its own test.
+
 """
 import tempfile
 import unittest
@@ -103,10 +105,10 @@ class TestQuantizeNamesAreValidated(unittest.TestCase):
                 quants.quantize(np.zeros((1, 256), dtype=np.float32), GGMLQuantizationType[name])
 
 
-class TestOnlyFirstMulMatOperandsAreEligible(unittest.TestCase):
+class TestOnlyFirstOperandsAreEligible(unittest.TestCase):
     """The eligibility half, pinned against a model built to have one of each."""
 
-    def _export(self, quantize):
+    def _export(self, quantize, nodes, names):
         from gguf import GGUFReader
 
         from loom_exporter.exporter import LoomGGUFExporter
@@ -114,27 +116,51 @@ class TestOnlyFirstMulMatOperandsAreEligible(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = str(Path(tmp) / "q.gguf")
             exporter = LoomGGUFExporter(None, output_path=out, architecture="test", quantize=quantize)
-            # `mm_weight` is a MUL_MAT's first operand; `conv_kernel` is a CONV_1D's, which reaches
-            # ggml as mul_mat's SECOND operand and must stay F32; `mm_activation` is a MUL_MAT's
-            # second operand, i.e. a weight in the one slot ggml converts from F32.
-            exporter.topologies = {"t": {"nodes": [
-                {"op": "MUL_MAT", "inputs": ["mm_weight", "mm_activation"]},
-                {"op": "CONV_1D", "inputs": ["conv_kernel", "mm_activation"]},
-            ]}}
+            exporter.topologies = {"t": {"nodes": nodes}}
             # DISTINCT payloads per name: the writer content-addresses weights and aliases identical
-            # ones, so three copies of `ones` would collapse into one tensor and the assertions below
-            # would be about a tensor that is not there.
+            # ones, so equal arrays would collapse into one tensor and the assertions below would be
+            # about a tensor that is not there.
             exporter.weights = {name: np.full((4, 256), i + 1.0, dtype=np.float32)
-                                for i, name in enumerate(("mm_weight", "conv_kernel", "mm_activation"))}
+                                for i, name in enumerate(names)}
             exporter.write_gguf("-- driver")
             return {t.name: t.tensor_type.name for t in GGUFReader(out).tensors}
 
-    def test_the_mul_mat_weight_is_quantized_and_the_conv_kernel_is_not(self):
-        types = self._export("Q8_0")
+    def test_a_conv_kernel_is_eligible_and_a_second_operand_is_not(self):
+        """The change this file exists for. `conv_kernel` is a CONV_1D's first input, which the engine
+        now places in mul_mat's first operand when it is not F32; `mm_activation` is a second operand
+        in both nodes, which ggml requires as F32 whatever else changes."""
+        types = self._export("Q8_0", [
+            {"op": "MUL_MAT", "inputs": ["mm_weight", "mm_activation"]},
+            {"op": "CONV_1D", "inputs": ["conv_kernel", "mm_activation"]},
+        ], ("mm_weight", "conv_kernel", "mm_activation"))
         self.assertEqual(types["mm_weight"], "Q8_0")
-        self.assertEqual(types["conv_kernel"], "F32",
-                         "a conv kernel reaches ggml as mul_mat's src1, which it asserts is F32")
+        self.assertEqual(types["conv_kernel"], "Q8_0")
         self.assertEqual(types["mm_activation"], "F32", "second operands are never eligible")
 
+    def test_a_transposed_convolution_kernel_stays_f32(self):
+        """A correctness claim, not a size trade-off. ggml_conv_transpose_1d/2d are native ops that
+        dispatch on the kernel's own dtype and implement F16/F32 only -- there is no mul_mat in them to
+        reorder -- so a quantized kernel there would be a file the engine cannot compute."""
+        types = self._export("Q8_0", [
+            {"op": "CONV_TRANSPOSE_1D", "inputs": ["deconv_kernel", "act"]},
+            {"op": "CONV_TRANSPOSE_2D", "inputs": ["deconv_kernel_2d", "act"]},
+        ], ("deconv_kernel", "deconv_kernel_2d", "act"))
+        self.assertEqual(types["deconv_kernel"], "F32")
+        self.assertEqual(types["deconv_kernel_2d"], "F32")
+
+    def test_the_eligible_ops_are_the_ones_the_engine_reformulated(self):
+        """Keeps the list and the engine from drifting apart. Every name here is an op whose first
+        input `primitives_conv.cpp` (or op_mul_mat) puts in ggml's first operand; adding one the engine
+        has not reformulated writes a weight ggml will refuse at compute time, which is a crash rather
+        than a bad number."""
+        from loom_exporter.exporter import LoomGGUFExporter
+
+        self.assertEqual(
+            set(LoomGGUFExporter.PACKED_WEIGHT_FIRST_OPS),
+            {"MUL_MAT", "CONV_1D", "CONV_2D", "CONV_1D_DW", "CONV_2D_DW", "SHORT_CONV"},
+        )
+
     def test_requesting_none_leaves_everything_f32(self):
-        self.assertEqual(set(self._export(None).values()), {"F32"})
+        types = self._export(None, [{"op": "MUL_MAT", "inputs": ["mm_weight", "mm_activation"]}],
+                             ("mm_weight", "mm_activation"))
+        self.assertEqual(set(types.values()), {"F32"})
