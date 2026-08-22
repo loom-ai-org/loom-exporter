@@ -56,7 +56,10 @@ held to. It skips cleanly when the checkpoints are absent.
 | [`docs/LOOM_MIL_CONVERSION.md`](docs/LOOM_MIL_CONVERSION.md) | how a MIL program becomes engine primitives |
 | [`docs/BACKEND.md`](docs/BACKEND.md) | the working log of exporter findings |
 
-The project ledger lives with the engine, in [loom.cpp's `BACKLOG.md`](https://github.com/loom-ai-org/loom.cpp/blob/main/BACKLOG.md).
+The project's knowledge base lives with the engine, under [loom.cpp's `docs/`](https://github.com/loom-ai-org/loom.cpp/blob/main/docs) — open work in
+[`docs/backlog/active-index.md`](https://github.com/loom-ai-org/loom.cpp/blob/main/docs/backlog/active-index.md), decisions in [`docs/adrs/`](https://github.com/loom-ai-org/loom.cpp/blob/main/docs/adrs),
+lessons in [`docs/retros/`](https://github.com/loom-ai-org/loom.cpp/blob/main/docs/retros), and this repo's domain in
+[Epic-02](https://github.com/loom-ai-org/loom.cpp/blob/main/docs/epics/epic-02-mil-exporter-and-compiler.md).
 
 ## Licence
 
