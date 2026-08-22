@@ -381,7 +381,7 @@ class AlbertBertEncoderWrapper(torch.nn.Module):
     Deliberately does NOT apply the real code's own final `.transpose(-1,-2)`: a bare permute as a
     traced graph's own declared OUTPUT is a live, non-contiguous view that this exporter's raw
     contiguous byte copy would silently read in PRE-permute order (the exact bug export_vits_mil.py's
-    own StatsWrapper docstring found and worked around for VITS's `stats` output). Returns the natural
+    own TextWrapper docstring found and worked around for VITS's `stats` output). Returns the natural
     (T,512) time-major layout instead (ggml ne=[512,T], flat[t*512+c] -- kokoro_driver.lua's own
     "row_major" convention) -- kokoro_driver/ converts to per-timestep rows via
     `from_row_major`, no transpose needed on the Lua side either.
@@ -963,7 +963,7 @@ class _AdaLayerNormWrapper(torch.nn.Module):
         # `.contiguous()` is load-bearing, not cosmetic: the real forward ends in two transposes, and a
         # bare transpose as a traced graph's declared OUTPUT is a live non-contiguous GGML PERMUTE view
         # that `ggml_backend_tensor_get`'s raw byte copy silently ignores. Same hazard
-        # `vits_export.StatsWrapper` and `matcha_export`'s module docstring already document.
+        # `vits_export.TextWrapper` and `matcha_export`'s module docstring already document.
         return out.squeeze(0).contiguous()
 
 
