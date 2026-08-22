@@ -4,7 +4,9 @@
 -- expansion + deterministic Euler CFM sampling loop) and the same host/inputs/outputs contract as
 -- matcha_driver.lua -- only the internal tensor-layout bridging differs, see below.
 --
--- Layout note (differs from matcha_driver.lua): the bespoke "encoder_mu" topology emits `mu` C-fast
+-- Layout note (differs from matcha_driver.lua): the bespoke "encoder_mu" topology -- the bespoke
+-- conversion still splits the two heads; this driver's own "encoder" carries both since P4.15f --
+-- emits `mu` C-fast
 -- (ne=[n_feats,T], "rows_flat" convention -- T rows of n_feats contiguous floats each) because it's
 -- built via an explicit MUL_MAT against a [C,T]-convention `x`. Tracing the REAL TextEncoder module
 -- instead preserves its own native torch (1,n_feats,T) layout untouched, which is T-FAST (ne=[T,n_feats],
@@ -17,11 +19,12 @@
 -- loom.expand_by_duration (which expects the opposite, C-fast "rows_flat" convention) -- done with a
 -- direct nested-loop repeat below instead.
 --
--- Expects four modules pre-registered by the host: "encoder_mu", "encoder_logw", "decoder", "vocoder"
--- -- none use a KvCache. The MIL-traced "encoder_mu"/"encoder_logw" topologies take ONLY `tokens` (no
--- separate `positions`/`attn_mask` inputs -- RoPE positions and the all-ones attention mask are both
--- derived internally from the real traced module, not supplied by the host, unlike the bespoke
--- topologies' own explicit inputs).
+-- Expects three modules pre-registered by the host: "encoder", "decoder", "vocoder" -- none use a
+-- KvCache. `encoder` declares TWO outputs, `mu` and `logw`: it was two topologies until P4.15f, and
+-- each carried its own copy of the TextEncoder that the driver then ran twice on the same tokens. It
+-- takes ONLY `tokens` (no separate `positions`/`attn_mask` inputs -- RoPE positions and the all-ones
+-- attention mask are both derived internally from the real traced module, not supplied by the host,
+-- unlike the bespoke topologies' own explicit inputs).
 --
 -- inputs: tokens (int array, real n_vocab=178 Matcha-TTS vocabulary), n_steps (int, Euler sampler step
 -- count), seed (int, seeds loom.gaussian_array -- the ONLY stochastic point in this pipeline).

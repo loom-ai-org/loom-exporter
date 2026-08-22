@@ -31,8 +31,15 @@ from loom_exporter.driver_ir import (
 from loom_exporter.spec_protocol import LinkError
 
 
-def _topo(inputs=(), output="out"):
-    return {"version": 1, "inputs": [{"name": n} for n in inputs], "nodes": [], "output": output}
+def _topo(inputs=(), output="out", outputs=None):
+    """A topology stub. `outputs` (plural) declares a P2 multi-output topology, which the callers that
+    capture more than one value need -- `check_subgraph_calls` checks output arity against it."""
+    topo = {"version": 1, "inputs": [{"name": n} for n in inputs], "nodes": []}
+    if outputs is None:
+        topo["output"] = output
+    else:
+        topo["outputs"] = list(outputs)
+    return topo
 
 
 def _render(builder, ctx):
@@ -560,9 +567,9 @@ class TestTheAdoptedDriverIsActuallyChecked(unittest.TestCase):
                                        architecture="matcha")
         source = MultiPhaseDriverBuilder(peeled=config.driver_components()).render(
             DriverContext(
-                topologies={"encoder_mu": _topo(["tokens"]), "encoder_logw": _topo(["tokens"]),
+                topologies={"encoder": _topo(["tokens"], outputs=["mu", "logw"]),
                             "decoder": _topo(["z", "mu", "t"]), "vocoder": _topo(["mel"])},
-                axes={n: "n_tokens" for n in ("encoder_mu", "encoder_logw", "decoder", "vocoder")},
+                axes={n: "n_tokens" for n in ("encoder", "decoder", "vocoder")},
             ))
         RawLuaDriver(source=source, origin="rebuilt.lua").assert_round_trip()
 
@@ -725,9 +732,9 @@ class TestPeeledMatcha(unittest.TestCase):
 
     def _ctx(self):
         return DriverContext(
-            topologies={"encoder_mu": _topo(["tokens"]), "encoder_logw": _topo(["tokens"]),
+            topologies={"encoder": _topo(["tokens"], outputs=["mu", "logw"]),
                         "decoder": _topo(["z", "mu", "t"]), "vocoder": _topo(["mel"])},
-            axes={n: "n_tokens" for n in ("encoder_mu", "encoder_logw", "decoder", "vocoder")},
+            axes={n: "n_tokens" for n in ("encoder", "decoder", "vocoder")},
         )
 
     def _config(self):
@@ -759,7 +766,9 @@ class TestPeeledMatcha(unittest.TestCase):
         output arity, which a call site parsed out of raw text cannot."""
         script = MultiPhaseDriverBuilder(peeled=self._config().driver_components()).build(self._ctx())
         calls = [s for s in script.entry.body if isinstance(s, SubgraphCall)]
-        self.assertEqual([c.module for c in calls], ["encoder_mu", "encoder_logw", "vocoder"])
+        # `encoder` binds two values from one call since P4.15f -- the TextEncoder used to be traced,
+        # stored and run once per head.
+        self.assertEqual([c.module for c in calls], ["encoder", "vocoder"])
 
     def test_func_name_is_now_a_real_driver_symbol(self):
         """The gap FlowMatchingSpec's own Unchecked note predicted P4.0.6 would close: the sampler's

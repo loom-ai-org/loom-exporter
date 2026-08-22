@@ -5,7 +5,8 @@ by bert_encoder's plain Linear(768,512) -- but, UNLIKE reference_forward_kokoro_
 reference, deliberately WITHOUT the real code's final `.transpose(-1,-2)`. AlbertBertEncoderWrapper's own
 docstring (export_kokoro_mil.py) explains why: a bare permute as a traced graph's own declared output is a
 live, non-contiguous view this project's exporter reads in PRE-permute order (the exact bug
-export_vits_mil.py's StatsWrapper already found for VITS's `stats` output), so the MIL wrapper returns the
+export_vits_mil.py's StatsWrapper -- now vits_export.TextWrapper -- already found for VITS's
+`stats` output), so the MIL wrapper returns the
 natural (T,512) time-major layout instead and kokoro_driver/ does the transpose (as an index-order
 choice, not a real transpose) on the Lua side. This reference matches that convention: output is (T,512),
 NOT the (512,T) `reference_forward_kokoro_bert_encoder.py` produces.

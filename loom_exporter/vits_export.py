@@ -6,15 +6,21 @@ custom ggml primitives (CONV_FLOW_REVERSE, RESIDUAL_COUPLING_LAYER_REVERSE, DDS_
 ELEMENTWISE_AFFINE_REVERSE, REL_POS_ATTENTION_SHAW). See BACKLOG.md for the full trail of findings this
 module's own workarounds encode.
 
-Three phases, same split as the bespoke script (`GraphTopology` supports exactly one declared output per
-topology, and the duration predictor's own output determines the total output frame count -- a genuinely
-data-dependent value the host must compute BEFORE phase 2 can run):
-  - stats:        TextEncoder -> [m_p; logs_p] concatenated, T-fast (ne=[T, 2*inter_channels]).
-  - logw:         TextEncoder + StochasticDurationPredictor(reverse) -> duration logits, ne=[T].
+Two phases, and the split is the ONE the data forces: the duration predictor's own output determines
+the total output frame count, a data-dependent value the host must compute before the vocoder can be
+sized.
+  - text:         TextEncoder ONCE -> two outputs. `stats` = [m_p; logs_p] concatenated, T-fast
+                  (ne=[T, 2*inter_channels]); `logw` = StochasticDurationPredictor(reverse)'s duration
+                  logits, ne=[T].
   - flow_vocoder: ResidualCouplingBlock(reverse) + HiFi-GAN Generator -> waveform, ne=[n_samples].
                   Takes `z_p` [1, inter_channels, T'] as a declared input (T' = the host-computed frame
                   count from `logw`'s own output, via `generate_path`) -- same host-side glue
                   loom::VitsDriver already implements for the bespoke topology's own phase 2.
+
+**This was three phases until P4.15f**, with `stats` and `logw` as separate topologies each carrying
+its own copy of the TextEncoder -- 469 duplicated nodes and ~72 ms per synthesis. The reason recorded
+for the split ("`GraphTopology` supports exactly one declared output per topology") had been obsolete
+since P2. See `TextWrapper`.
 
 Two real, general (not VITS-specific) exporter bugs found and fixed getting this to trace/build/run at
 all (see BACKLOG.md for the full writeups):
@@ -119,8 +125,8 @@ PIPER_NOISE_SCALE_W = 0.8
 PIPER_LENGTH_SCALE = 1.0
 
 # `spec_channels`/`segment_size` are training-only (PosteriorEncoder's input width / random-slice
-# length) -- irrelevant to inference numerics, `enc_q` is never called in the reverse-mode path any of
-# these three wrappers trace. `spec_channels=513` is real, though (n_fft=1024 -> n_fft/2+1): the
+# length) -- irrelevant to inference numerics, `enc_q` is never called in the reverse-mode path either
+# of these wrappers traces. `spec_channels=513` is real, though (n_fft=1024 -> n_fft/2+1): the
 # checkpoint's own `enc_q.pre.weight` tensor shape pins it, needed for `load_state_dict(strict=True)`.
 
 
@@ -263,27 +269,27 @@ def _conv_flow_reverse_traceable(flow, x, x_mask, g):
     return torch.cat([x0, x1_out], 1) * x_mask
 
 
-class StatsWrapper(torch.nn.Module):
-    def __init__(self, enc):
-        super().__init__()
-        self.enc = enc
+class TextWrapper(torch.nn.Module):
+    """TextEncoder ONCE, feeding both heads: `stats` (= the projection) and `logw` (= the stochastic
+    duration predictor's reverse branch). Two outputs, one encoder.
 
-    def forward(self, tokens):
-        x_cond, x_mask = _text_encoder_forward(self.enc, tokens)
-        stats = self.enc.proj(x_cond) * x_mask  # [1, 2*out_channels, T]
-        # ggml ne=[T, 2*out_channels] (T-fast) -- deliberately NOT transposed to a channel-fast layout: a
-        # bare PERMUTE as the topology's own declared OUTPUT is a live, non-contiguous view
-        # (ggml_backend_tensor_get does a raw contiguous byte copy, which silently ignores a dangling
-        # permute's logical reordering and returns the PRE-permute byte order instead) -- confirmed
-        # empirically (a `.transpose(1,2)` here reported a channel-fast ne=[2*out_channels,T] while the
-        # actual read-out bytes stayed T-fast regardless). Keeping the natural (untransposed) trace
-        # output sidesteps this rather than depending on the exporter to insert a CONT after a permute
-        # that happens to be the graph's own final node.
-        return stats
+    **This used to be two wrappers and it cost ~72 ms per synthesis** (BACKLOG.md P4.15d/P4.15f). A
+    separate `StatsWrapper` and `LogwWrapper` each called `_text_encoder_forward`, so the exported GGUF
+    carried the whole TextEncoder twice and the engine ran it twice: 469 identical nodes, 36 of the
+    model's 153 convolutions, and 1.91x the arithmetic onnxruntime does at that scale. The file was
+    never the problem -- `logw`'s copies were already `loom.tensor_alias` entries pointing at `stats`'s
+    tensors -- only the compute.
 
+    The split's stated reason ("`GraphTopology` supports exactly one declared output per topology") was
+    stale: plural `"outputs"` has been parsed since P2 (`src/core/graph_topology.cpp`) and
+    `l_run_subgraph` has returned N outputs for as long. What the data dependency really forces is
+    `text | flow_vocoder` -- the host has to turn `logw` into a frame count before the vocoder can be
+    sized -- and that split is still here.
 
-class LogwWrapper(torch.nn.Module):
-    """Real StochasticDurationPredictor.forward's reverse branch (models.py:108-117; see BACKLOG.md's
+    Nothing about the arithmetic or the host's RNG draw order changes, which is what makes the merge
+    checkable: the synthesised waveform is bit-identical to the two-topology export's.
+
+    Real StochasticDurationPredictor.forward's reverse branch (models.py:108-117; see BACKLOG.md's
     "remove a useless vflow" note for the `flows[:-2]+[flows[-1]]` slicing this replicates), with the
     internal `z = torch.randn(...)` sampling replaced by an explicit `z_noise` graph input (host-
     supplied, ALREADY scaled by noise_scale_w -- matches reference_forward_vits.py's own convention of
@@ -296,6 +302,16 @@ class LogwWrapper(torch.nn.Module):
 
     def forward(self, tokens, z_noise):
         x_cond, x_mask = _text_encoder_forward(self.enc, tokens)
+
+        stats = self.enc.proj(x_cond) * x_mask  # [1, 2*out_channels, T]
+        # ggml ne=[T, 2*out_channels] (T-fast) -- deliberately NOT transposed to a channel-fast layout: a
+        # bare PERMUTE as the topology's own declared OUTPUT is a live, non-contiguous view
+        # (ggml_backend_tensor_get does a raw contiguous byte copy, which silently ignores a dangling
+        # permute's logical reordering and returns the PRE-permute byte order instead) -- confirmed
+        # empirically (a `.transpose(1,2)` here reported a channel-fast ne=[2*out_channels,T] while the
+        # actual read-out bytes stayed T-fast regardless). Keeping the natural (untransposed) trace
+        # output sidesteps this rather than depending on the exporter to insert a CONT after a permute
+        # that happens to be the graph's own final node.
 
         dp = self.dp
         h = torch.detach(x_cond)
@@ -315,7 +331,9 @@ class LogwWrapper(torch.nn.Module):
                 z = flow(z, x_mask, reverse=True)
 
         z0, _z1 = torch.split(z, [1, 1], 1)
-        return z0  # [1, 1, T] -> ggml ne=[T,1,1] == [T]
+        # `logw` is [1, 1, T] -> ggml ne=[T,1,1] == [T]. The order is the driver's: the call binds
+        # (stats, logw) in this order, and `SubgraphCallComponent.outputs` says so.
+        return stats, z0
 
 
 class FlowVocoderWrapper(torch.nn.Module):
@@ -338,9 +356,9 @@ class FlowVocoderWrapper(torch.nn.Module):
 
 @dataclass(kw_only=True)
 class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
-    """VITS's own three-phase split (stats/logw/flow_vocoder) -- see module docstring. `phases()` loads
-    the real checkpoint once per call, mirroring the original script's `main()` (load once, build all
-    three phases off the one loaded model instance).
+    """VITS's own two-phase split (text/flow_vocoder) -- see module docstring. `phases()` loads the real
+    checkpoint once per call, mirroring the original script's `main()` (load once, build both phases off
+    the one loaded model instance).
     """
 
     checkpoint_path: str
@@ -415,9 +433,10 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
         """VITS's driver, as components (P4.0.6/C.6).
 
         The first peeled family with **no sampler at all** -- VITS's stochastic duration predictor is
-        traced into the `logw` topology itself, and the only host-side randomness is two
-        `loom.gaussian_array` draws. So this is three `SubgraphCallComponent`s and four `LuaFragment`s,
-        and it needed no component the two flow-matching families had not already introduced.
+        traced into the `text` topology itself, and the only host-side randomness is two
+        `loom.gaussian_array` draws. So this is two `SubgraphCallComponent`s and four `LuaFragment`s,
+        and it needed no component the two flow-matching families had not already introduced. (Three
+        calls until P4.15f merged `stats` and `logw` into one two-output topology.)
 
         The three surviving Lua blocks are the generate_path frame expansion in its two halves plus the
         pre-scaled noise draw: genuine host control flow over a data-dependent frame count, which is
@@ -446,19 +465,19 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
                 "LENGTH_SCALE": PIPER_LENGTH_SCALE,
             }),
             LuaFragment(fragment / "01_lengths.lua", defines=("T",)),
-            SubgraphCallComponent(
-                topology="stats", outputs=("stats",), inputs={"tokens": token_ids}, length=seq_len,
-                note="--- Phase 1a: stats = TextEncoder -> [m_p;logs_p], T-fast: stats[c*T+t]\n"
-                     "    (0-based c/t). ---"),
+            # `z_noise` is drawn BEFORE the call now rather than between two calls -- it is sized from
+            # the token count alone, so moving it earlier leaves the RNG draw order untouched and the
+            # waveform bit-identical. That is what makes P4.15f's merge checkable.
             LuaFragment(fragment / "02_z_noise.lua", reads=("T", "NOISE_SCALE_W"),
                         defines=("z_noise",)),
             SubgraphCallComponent(
-                topology="logw", outputs=("logw",), length=seq_len,
+                topology="text", outputs=("stats", "logw"), length=seq_len,
                 inputs={"tokens": token_ids, "z_noise": Var("z_noise")},
-                note="--- Phase 1b: logw = TextEncoder + StochasticDurationPredictor(reverse) -> [T]\n"
-                     "    duration logits. z_noise is host-sampled and ALREADY scaled by\n"
-                     "    noise_scale_w (matching LogwWrapper's convention: the graph itself applies\n"
-                     "    no further noise_scale multiply). ---"),
+                note="--- Phase 1: TextEncoder ONCE -> both heads (BACKLOG.md P4.15f). stats =\n"
+                     "    [m_p;logs_p], T-fast: stats[c*T+t] (0-based c/t); logw = the stochastic\n"
+                     "    duration predictor's [T] logits. z_noise is host-sampled and ALREADY scaled\n"
+                     "    by noise_scale_w (matching TextWrapper's convention: the graph itself\n"
+                     "    applies no further noise_scale multiply). ---"),
             LuaFragment(fragment / "03_durations.lua", reads=("logw", "T", "LENGTH_SCALE"),
                         defines=("w_ceil", "y_length")),
             LuaFragment(fragment / "04_expand_z_p.lua",
@@ -482,7 +501,7 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
             "if it checked the stronger one."
         ),
         "dummy_t": Unchecked(
-            "the phoneme count the three phases are traced at. Every axis over it is declared dynamic "
+            "the phoneme count both phases are traced at. Every axis over it is declared dynamic "
             "(ct.RangeDim(1, 512)), so this number picks a concrete trace length and constrains nothing "
             "the checkpoint could disagree with."
         ),
@@ -505,14 +524,10 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
         dummy_z_noise = torch.randn(1, 2, self.dummy_t) * 0.8
         dummy_zp = torch.randn(1, HP["inter_channels"], 8) * 0.5
 
-        print("Tracing all three phases...")
+        print("Tracing both phases...")
         return [
             ExportPhase(
-                name="stats", wrapper=StatsWrapper(model.enc_p).eval(), dummy_inputs=(dummy_tokens,),
-                mil_inputs=[ct.TensorType(name="tokens", shape=(1, seq_dim), dtype=np.int32)],
-            ),
-            ExportPhase(
-                name="logw", wrapper=LogwWrapper(model.enc_p, model.dp).eval(),
+                name="text", wrapper=TextWrapper(model.enc_p, model.dp).eval(),
                 dummy_inputs=(dummy_tokens, dummy_z_noise),
                 mil_inputs=[
                     ct.TensorType(name="tokens", shape=(1, seq_dim), dtype=np.int32),
