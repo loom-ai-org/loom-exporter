@@ -101,15 +101,78 @@ class _WhisperEncoderWrapper(nn.Module):
         return self.encoder(self.mel(waveform)).last_hidden_state
 
 
-class _WhisperDecoderWrapper(nn.Module):
-    """`(tokens, position_ids, attention_mask, xa) -> logits`.
+class _CrossKvSlot(nn.Module):
+    """Stands in for a cross-attention `k_proj`/`v_proj` and returns a tensor handed in from outside.
 
-    The four inputs are not a free choice. `position_ids` and `attention_mask` are passed explicitly
-    for the reason `causal_lm_export._causal_mask` documents -- it is what keeps the token axis
-    genuinely dynamic under `torch.jit.trace` -- and both names are already in
+    The projection it replaces is a function of the ENCODER output alone, so its result is identical at
+    every decode step. Traced as-is it is recomputed per token: for whisper-small that is 24 matmuls of
+    [1500, 768] x [768, 768] every step, which measured **57.7% of the whole transcription** and made
+    `MUL_MAT 768x1500` run 684 times for an 11-second clip where the encoder itself needs 48.
+
+    Substituting the module rather than editing `WhisperAttention.forward` keeps this independent of how
+    transformers spells its attention this month, and the substitution is BIT-EXACT -- the same tensor
+    reaches the same consumer, computed once instead of N times.
+    """
+
+    def __init__(self, holder: list, key: int):
+        super().__init__()
+        # A plain list, deliberately not a buffer or submodule: it carries per-CALL tensors, and
+        # registering them would make them state of the traced module.
+        self._holder = holder
+        self._key = key
+
+    def forward(self, x):
+        return self._holder[self._key]
+
+
+class _WhisperCrossKvWrapper(nn.Module):
+    """`xa -> (k_0, v_0, k_1, v_1, ...)`, the cross-attention K/V for every decoder layer, once.
+
+    **Construct this BEFORE `_WhisperDecoderWrapper`.** It holds the projection modules directly, so
+    that the decoder wrapper may replace the `layer.encoder_attn.k_proj` attributes that used to reach
+    them without this phase losing the weights it exports. Built the other way round it would trace
+    `_CrossKvSlot`s and export nothing.
+
+    Interleaved k,v per layer rather than all-k-then-all-v so the driver's `index` arithmetic is
+    `2 * layer + 1` and reads as the pair it is.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.projs = nn.ModuleList()
+        for layer in model.model.decoder.layers:
+            self.projs.append(layer.encoder_attn.k_proj)
+            self.projs.append(layer.encoder_attn.v_proj)
+
+    def forward(self, xa):
+        return tuple(proj(xa) for proj in self.projs)
+
+
+def cross_kv_input_names(n_layers: int) -> tuple:
+    """`("xk_0", "xv_0", "xk_1", ...)` -- the decoder's per-layer cross-attention inputs, in the order
+    `_WhisperCrossKvWrapper` returns them, which is the order their `index` binding assumes."""
+    names = []
+    for i in range(n_layers):
+        names.append(f"xk_{i}")
+        names.append(f"xv_{i}")
+    return tuple(names)
+
+
+class _WhisperDecoderWrapper(nn.Module):
+    """`(tokens, position_ids, attention_mask, xk_0, xv_0, ...) -> logits`.
+
+    The first three inputs are not a free choice. `position_ids` and `attention_mask` are passed
+    explicitly for the reason `causal_lm_export._causal_mask` documents -- it is what keeps the token
+    axis genuinely dynamic under `torch.jit.trace` -- and both names are already in
     `driver_components.POSITION_INPUT_NAMES`/`CAUSAL_MASK_INPUT_NAMES`, so the driver fills them in from
-    `n_tokens`/`n_past` without this family declaring anything. `xa` is the encoder phase's output,
-    passed unchanged at every step.
+    `n_tokens`/`n_past` without this family declaring anything.
+
+    **The rest are the `cross_kv` phase's outputs, and they replaced a single `xa`.** This step used to
+    take the encoder output whole and project it to cross-attention K/V inside itself, every token --
+    24 matmuls of [1500, 768] x [768, 768] per step for whisper-small, measured at **57.7% of a whole
+    transcription**. They are a function of the encoder alone, so they are computed once by
+    `_WhisperCrossKvWrapper` and copied in backend-side. The copy is not free (~110 MB per step for
+    whisper-small) and is still an order of magnitude below recomputing them.
 
     `use_cache=False` is what makes the trace cache-free, which is the shape `fuse_loom_attention`
     matches; the cache appears at run time, in the engine, not in the graph.
@@ -119,11 +182,24 @@ class _WhisperDecoderWrapper(nn.Module):
         super().__init__()
         self.decoder = model.model.decoder
         self.proj_out = model.proj_out
+        # Every cross-attention projection becomes a slot fed from this call's arguments. See
+        # `_CrossKvSlot`: the tensors are the same, they are just no longer recomputed per token.
+        self._cross = [None] * (2 * len(self.decoder.layers))
+        for i, layer in enumerate(self.decoder.layers):
+            layer.encoder_attn.k_proj = _CrossKvSlot(self._cross, 2 * i)
+            layer.encoder_attn.v_proj = _CrossKvSlot(self._cross, 2 * i + 1)
 
-    def forward(self, tokens, position_ids, attention_mask, xa):
+    def forward(self, tokens, position_ids, attention_mask, *cross):
+        for i, tensor in enumerate(cross):
+            self._cross[i] = tensor
         hidden = self.decoder(
             input_ids=tokens, position_ids=position_ids, attention_mask=attention_mask,
-            encoder_hidden_states=xa, use_cache=False,
+            # `encoder_hidden_states` is what makes these blocks CROSS-attention
+            # (`is_cross_attention = key_value_states is not None`), and nothing downstream of that
+            # test reads it any more -- the projections that did are slots now. Passing `cross[0]`,
+            # which has the encoder output's exact shape, keeps the flag true without declaring a
+            # 4.6 MB input the graph would not otherwise use.
+            encoder_hidden_states=cross[0], use_cache=False,
         ).last_hidden_state
         return self.proj_out(hidden)
 
@@ -259,6 +335,10 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
     d_model: Optional[int] = field(default=None, init=False, repr=False)
     max_target_positions: Optional[int] = field(default=None, init=False, repr=False)
     decoder_bindings: tuple = field(default=(), init=False, repr=False)
+    # Like `decoder_bindings`: filled in by `phases()`, and defaulted so `components()` can be
+    # introspected without tracing anything (tests/ci/test_component_registry.py does exactly that).
+    n_text_layers: Optional[int] = field(default=None, init=False, repr=False)
+    cross_kv_names: tuple = field(default=(), init=False, repr=False)
     prompt_constants: dict = field(default_factory=dict, init=False, repr=False)
 
     __unchecked__ = {
@@ -290,6 +370,16 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
             "driver cannot disagree with the trace about the order or the names, and this family "
             "cannot drift from the causal-LM one about which names the driver fills in. "
             "PrefillDecodeLoop's own `inputs` link re-checks them against the emitted topology anyway."
+        ),
+        "n_text_layers": Unchecked(
+            "same -- `len(model.model.decoder.layers)`, read in phases(). It is a COUNT of exported "
+            "outputs rather than a claim about them: `cross_kv` emits two per decoder layer."
+        ),
+        "cross_kv_names": Unchecked(
+            "derived in phases() by `cross_kv_input_names(n_text_layers)`, which is also what orders "
+            "`_WhisperCrossKvWrapper`'s return tuple -- one function, so the decoder's input names, "
+            "the phase's output order and the driver's `index` arithmetic cannot disagree. "
+            "PrefillDecodeLoop's `inputs` link re-checks the names against the emitted topology."
         ),
         "prompt_constants": Unchecked(
             "READ off the checkpoint's own generation config in phases() (`decoder_start_token_id`, "
@@ -328,6 +418,10 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
         self.max_target_positions = int(cfg.max_target_positions)
         self.prompt_constants = decoder_prompt_constants(
             model.generation_config, self.n_audio_ctx, cfg.vocab_size, self.max_target_positions)
+        # Not from `decoder_prompt_constants`, which answers "which tokens does a prompt need" and has
+        # a cross-check contract to match. This is a shape: how many `cross_kv` outputs the driver has
+        # to bind, which is two per decoder layer.
+        self.prompt_constants["N_TEXT_LAYERS"] = len(model.model.decoder.layers)
         # The language and task tables by NAME, kept for `contract()`. The driver needs only the id
         # WINDOW (it detects with one restricted argmax over it), which is why `decoder_prompt_constants`
         # returns bounds; a host asked for `language="en"` needs the individual ids, and only the
@@ -349,15 +443,28 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
         # size-1 axis it is entitled to fold away.
         trace_tokens = 8
         token_axis = ct.RangeDim(1, self.max_target_positions)
+        self.n_text_layers = len(model.model.decoder.layers)
+        self.cross_kv_names = cross_kv_input_names(self.n_text_layers)
         decoder_inputs = [
             ct.TensorType(name="tokens", shape=(1, token_axis), dtype=np.int32),
             ct.TensorType(name="position_ids", shape=(1, token_axis), dtype=np.int32),
             ct.TensorType(name="attention_mask", shape=(1, 1, token_axis, token_axis), dtype=np.float32),
-            ct.TensorType(name="xa", shape=(1, self.n_audio_ctx, self.d_model), dtype=np.float32),
+        ] + [
+            # Fixed shape, every one of them: the encoder always emits `n_audio_ctx` frames, so nothing
+            # about the cross-attention K/V varies with the token axis. That is the whole reason they
+            # can be hoisted out of the step at all.
+            ct.TensorType(name=name, shape=(1, self.n_audio_ctx, self.d_model), dtype=np.float32)
+            for name in self.cross_kv_names
         ]
         self.decoder_bindings = tuple(
             (t.name, _binding_kind(t.name)) for t in decoder_inputs
         )
+
+        # ORDER IS LOAD-BEARING: `_WhisperCrossKvWrapper` captures the real projection modules, and
+        # `_WhisperDecoderWrapper.__init__` then replaces the attributes that reached them. Built the
+        # other way round the cross_kv phase would trace `_CrossKvSlot`s and export no weights at all.
+        cross_kv_wrapper = _WhisperCrossKvWrapper(model).eval()
+        decoder_wrapper = _WhisperDecoderWrapper(model).eval()
 
         return [
             ExportPhase(
@@ -370,14 +477,25 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
                 root_axis="n_samples",
             ),
             ExportPhase(
+                name="cross_kv",
+                wrapper=cross_kv_wrapper,
+                dummy_inputs=(torch.zeros(1, self.n_audio_ctx, self.d_model),),
+                mil_inputs=[ct.TensorType(name="xa", shape=(1, self.n_audio_ctx, self.d_model),
+                                          dtype=np.float32)],
+                # Nothing here varies with the token axis -- this phase never sees a token. It runs
+                # once per window, straight after the encoder, so its one axis is the encoder's frame
+                # count (fixed at `n_audio_ctx`; `axes.py` is the vocabulary this name comes from).
+                root_axis="n_enc_frames",
+            ),
+            ExportPhase(
                 name="decoder",
-                wrapper=_WhisperDecoderWrapper(model).eval(),
+                wrapper=decoder_wrapper,
                 dummy_inputs=(
                     torch.zeros((1, trace_tokens), dtype=torch.long),
                     torch.arange(trace_tokens).unsqueeze(0),
                     causal_mask(trace_tokens),
-                    torch.zeros(1, self.n_audio_ctx, self.d_model),
-                ),
+                ) + tuple(torch.zeros(1, self.n_audio_ctx, self.d_model)
+                          for _ in self.cross_kv_names),
                 mil_inputs=decoder_inputs,
                 root_axis=self.root_axis,
                 # The self-attention blocks become cached ATTENTION nodes; the cross-attention blocks do
@@ -385,9 +503,13 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
                 # `add(scores, mask)` that only a masked block has, and Whisper's cross-attention has no
                 # mask at all -- it attends over the whole encoder output, every step. A cache there
                 # would be wrong twice over: the K/V it would store are the encoder's, identical at
-                # every step and already fully computed, and `layer` indices are assigned in occurrence
-                # order, so a cached cross-attention block would consume cache slots the self-attention
-                # blocks address.
+                # every step, and `layer` indices are assigned in occurrence order, so a cached
+                # cross-attention block would consume cache slots the self-attention blocks address.
+                #
+                # "Identical at every step" used to be an argument for leaving them alone; it is the
+                # reason they left. They are now the `cross_kv` phase, run once per window and copied
+                # in -- what was wrong was not the absence of a CACHE but the presence of the
+                # PROJECTION, 24 [1500, 768] x [768, 768] matmuls per token, 57.7% of a transcription.
                 fuse_attention=True,
                 kv_cache_size=self.max_target_positions,
             ),
@@ -506,20 +628,35 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
                 note="Encoder: one fixed-shape pass over 30 s of audio -- mel frontend, conv stem, "
                      "transformer stack.",
             ),
+            SubgraphCallComponent(
+                topology="cross_kv",
+                # Retained like the encoder, and for a sharper version of the same reason: these are
+                # the tensors the decode loop reads at every step, and the whole point of the phase is
+                # that they are produced ONCE per window.
+                outputs=(),
+                retain=True,
+                inputs={"xa": OutputRef("encoder")},
+                axes={"n_enc_frames": Lit(self.n_audio_ctx), "n_past": Lit(0)},
+                note="Cross-attention K/V for every decoder layer, computed once from the encoder "
+                     "output instead of re-projected at every token.",
+            ),
             LuaFragment(
                 self.driver_script_path / "01_prompt.lua",
                 reads=("SOT", "LANG_LO", "LANG_HI", "TRANSCRIBE", "NO_TIMESTAMPS", "TS_LO", "TS_HI",
-                       "PREV_SOT", "MAX_PREV"),
-                defines=("_prompt", "_language", "_gen0", "_eos"),
+                       "PREV_SOT", "MAX_PREV", "N_TEXT_LAYERS"),
+                defines=("_prompt", "_language", "_gen0", "_eos", "_decoder_inputs"),
             ),
             PrefillDecodeLoop(
                 topology="decoder",
                 bindings=self.decoder_bindings,
                 inputs=tuple(name for name, _ in self.decoder_bindings),
-                # The encoder's output, held constant across every step. Everything else the loop needs
-                # it already computes: tokens from the previous step, positions and the causal mask from
-                # n_tokens/n_past.
-                bound={"xa": OutputRef("encoder")},
+                # The cross-attention K/V, held constant across every step -- `cross_kv` output
+                # `2 * layer + 1` is that layer's K and `+ 2` its V, which is the interleaving
+                # `_WhisperCrossKvWrapper` returns and `cross_kv_input_names` names. Everything else the
+                # loop needs it already computes: tokens from the previous step, positions and the
+                # causal mask from n_tokens/n_past.
+                bound={name: OutputRef("cross_kv", index=i + 1)
+                       for i, name in enumerate(self.cross_kv_names)},
                 # The prefix the fragment above built, not `inputs.tokens`: this driver owns its own
                 # prompt, so a caller passes audio and at most a language.
                 prompt=Var("_prompt"),
