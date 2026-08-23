@@ -5,7 +5,7 @@ side by side under one parent directory:
 
 | | |
 |---|---|
-| `loom.cpp` | the ggml engine that runs what this produces; holds `BACKLOG.md`, the shared ledger |
+| `loom.cpp` | the ggml engine that runs what this produces; holds `docs/`, the shared knowledge base |
 | `loom-exporter` | this repo — tracing, lowering, driver synthesis |
 | `loom-py` | Python bindings to the engine |
 
@@ -50,8 +50,15 @@ still runs.
 
 ## Conventions worth knowing before changing anything
 
-* **`BACKLOG.md` lives in loom.cpp** and is the ledger for all three repos. Code here references it by
-  item (`BACKLOG.md P4.3e`). Read the relevant entry first; add to it when you finish something.
+* **The knowledge base lives in `loom.cpp/docs/`** and covers all three repos, in four tiers: the
+  open-work hub (`docs/backlog/active-index.md`), domain epics (`docs/epics/`), decisions
+  (`docs/adrs/`) and lessons (`docs/retros/`). This repo's domain is **Epic-02**; its decisions are
+  **ADR-004** (MIL as the single export path), **ADR-005** (the config/registry API) and **ADR-006**
+  (model constants belong to the export).
+* **Code here cites items by `P`-number** (`P4.3e`). The numbers did not change when the old
+  9,000-line `BACKLOG.md` was split; that file is now a redirect carrying a map to every section's new
+  home. Read the relevant entry first; when you finish something, put its decision in an ADR, its
+  lesson in a retro, and remove it from the hub — the routing rules are in `loom.cpp/CLAUDE.md`.
 * **The catalogue is generated.** `docs/DRIVER-COMPONENTS.md` comes from the component declarations —
   run `python -m loom_exporter.component_registry` after adding one, or CI fails.
 * **A gate that cannot fail proves nothing.** The sweep has reported a false pass before, by measuring
