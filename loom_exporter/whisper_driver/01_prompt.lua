@@ -6,6 +6,26 @@
     -- Resolution order for the language, and it is the general rule for anything a model can infer
     -- about its own input: an explicit argument wins; absent, detect if this model can; otherwise fall
     -- back to the default, which here is "no language token", the only correct answer for `.en`.
+    -- One decoder call's inputs. The cross-attention K/V are `cross_kv`'s retained outputs, bound by
+    -- index -- output `2*layer + 1` is that layer's K and `+ 2` its V, the interleaving
+    -- `_WhisperCrossKvWrapper` returns. Built in a loop because there are two per layer and the count
+    -- is a property of the checkpoint; `PrefillDecodeLoop` binds the same names for the main loop.
+    --
+    -- These used to be one `xa = {from = 'encoder'}` and the graph projected it per step: 24 matmuls of
+    -- [1500, 768] x [768, 768] per token for whisper-small, 57.7% of a whole transcription.
+    local function _decoder_inputs(_toks, _n_past)
+        local _in = {
+            tokens = _toks,
+            position_ids = loom.range(_n_past, #_toks),
+            attention_mask = loom.causal_mask(#_toks, _n_past),
+        }
+        for _l = 0, N_TEXT_LAYERS - 1 do
+            _in["xk_" .. _l] = {from = 'cross_kv', index = 2 * _l + 1}
+            _in["xv_" .. _l] = {from = 'cross_kv', index = 2 * _l + 2}
+        end
+        return _in
+    end
+
     -- What the model has already produced before the decode loop starts. Empty unless the
     -- forced opening timestamp below fills it in.
     local _gen0 = {}
@@ -48,12 +68,8 @@
             -- It costs no extra encoder pass: `xa` is the encoder output already retained above. It
             -- writes KV cell 0, which the prefill below then overwrites with the identical K/V (same
             -- token SOT, same position 0) before attending to anything.
-            loom.run_subgraph_and_retain('decoder', {n_tokens = 1, n_past = 0}, {
-                tokens = { SOT },
-                position_ids = loom.range(0, 1),
-                attention_mask = loom.causal_mask(1, 0),
-                xa = {from = 'encoder'},
-            })
+            loom.run_subgraph_and_retain('decoder', {n_tokens = 1, n_past = 0},
+                                         _decoder_inputs({ SOT }, 0))
             _language = loom.argmax_row_range('decoder', 0, LANG_LO, LANG_HI)
         end
         table.insert(_prompt, _language)
@@ -78,12 +94,8 @@
         -- The prompt grows by the token the MODEL chose (in practice <|0.00|>, since a window's first
         -- segment starts at its own beginning), and the loop below re-prefills the whole thing -- the
         -- same overwrite-with-identical-K/V as the language detection above.
-        loom.run_subgraph_and_retain('decoder', {n_tokens = #_prompt, n_past = 0}, {
-            tokens = _prompt,
-            position_ids = loom.range(0, #_prompt),
-            attention_mask = loom.causal_mask(#_prompt, 0),
-            xa = {from = 'encoder'},
-        })
+        loom.run_subgraph_and_retain('decoder', {n_tokens = #_prompt, n_past = 0},
+                                     _decoder_inputs(_prompt, 0))
         local _first_ts = loom.argmax_row_range('decoder', #_prompt - 1, TS_LO, TS_HI)
         table.insert(_prompt, _first_ts)
         table.insert(_gen0, _first_ts)
