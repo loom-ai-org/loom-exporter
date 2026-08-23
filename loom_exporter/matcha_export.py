@@ -4,14 +4,19 @@
 hand-built bespoke topology `tools/convert_matcha/convert_matcha_*.py` constructs op-by-op via its own
 custom `TopologyBuilder` DSL.
 
-Four phases, same "GraphTopology supports exactly one declared output" split as the bespoke scripts:
-  - encoder_mu:    TextEncoder up through proj_m -> mu, ne=[T,n_feats] (T-fast, matches the real
-                   module's own native (1,C,T) torch layout directly -- see module docstring below for
-                   why this is a DIFFERENT convention than the bespoke topology's own mu output).
-  - encoder_logw:  TextEncoder (re-traced) up through proj_w -> logw, ne=[T].
+Three phases:
+  - encoder:       TextEncoder ONCE -> two outputs. `mu` (through proj_m) is ne=[T,n_feats] -- T-fast,
+                   matching the real module's own native (1,C,T) torch layout directly, see the layout
+                   note below for why that is a DIFFERENT convention than the bespoke topology's own mu
+                   output -- and `logw` (through proj_w) is ne=[T].
   - decoder:       Decoder U-Net (CFM estimator), one Euler velocity evaluation
                    `dphi_dt = estimator(z, mask=ones, mu, t, spks=None, cond=None)`.
   - vocoder:       HiFi-GAN v1 Generator, mel -> waveform.
+
+**This was four phases until P4.15f**, with `encoder_mu` and `encoder_logw` as separate topologies that
+re-traced the whole TextEncoder each -- a 642-node prefix the driver ran twice per synthesis. The split
+was inherited from the bespoke scripts along with its stated reason ("GraphTopology supports exactly one
+declared output"), which stopped being true at P2.
 
 Layout note (IMPORTANT, differs from the bespoke conversion): the bespoke TextEncoder topology
 (convert_matcha_text_encoder.py) emits `mu` C-fast (ne=[n_feats,T], "rows_flat" convention, T rows of
@@ -26,7 +31,7 @@ T-fast layout -- see `matcha_driver/`'s own comment for the resulting direct (no
 match the bespoke convention instead: a bare transpose as a topology's own final declared output is a
 live, non-contiguous GGML PERMUTE view once compiled (`ggml_backend_tensor_get` does a raw contiguous
 byte copy, silently ignoring it) -- same danger already documented in `vits_export.py`'s own
-`StatsWrapper`, sidestepped there (and here) by keeping the trace's natural, untransposed output.
+`TextWrapper`, sidestepped there (and here) by keeping the trace's natural, untransposed output.
 
 Trace-friendliness patches needed (same category of fix as VITS's/StyleTTS2's own):
   - `TextEncoder`'s real `sequence_mask(x_lengths, T)` (dynamic `T`, "torch.full doesn't accept a
@@ -208,7 +213,15 @@ def _text_encoder_forward_traceable(enc, tokens):
     return x, x_mask
 
 
-class MuWrapper(torch.nn.Module):
+class EncoderWrapper(torch.nn.Module):
+    """TextEncoder ONCE, feeding both heads: `mu` (proj_m) and `logw` (proj_w). Two outputs.
+
+    **This used to be `MuWrapper` and `LogwWrapper`** (BACKLOG.md P4.15f), each calling
+    `_text_encoder_forward_traceable` for itself, so `encoder_mu` and `encoder_logw` shared a 642-node
+    prefix -- 40 convolutions and 24 matmuls -- that the driver ran twice, back to back, on the same
+    tokens. VITS had the identical bug for the identical reason and is fixed the identical way; only
+    the sizes differ, because Matcha's vocoder dominates its arithmetic in a way VITS's does not.
+    """
     def __init__(self, enc):
         super().__init__()
         self.enc = enc
@@ -216,19 +229,11 @@ class MuWrapper(torch.nn.Module):
     def forward(self, tokens):
         x, x_mask = _text_encoder_forward_traceable(self.enc, tokens)
         mu = self.enc.proj_m(x) * x_mask  # (1, n_feats, T)
-        return mu.squeeze(0)  # (n_feats, T) -> ggml ne=[T,n_feats], T-fast (see module docstring)
-
-
-class LogwWrapper(torch.nn.Module):
-    def __init__(self, enc):
-        super().__init__()
-        self.enc = enc
-
-    def forward(self, tokens):
-        x, x_mask = _text_encoder_forward_traceable(self.enc, tokens)
         x_dp = torch.detach(x)
         logw = self.enc.proj_w(x_dp, x_mask)  # (1, 1, T)
-        return logw.reshape(-1)  # (T,) -> ggml ne=[T]
+        # mu: (n_feats, T) -> ggml ne=[T,n_feats], T-fast (see module docstring). logw: (T,) -> ne=[T].
+        # The order is the driver's -- the call binds (mu_x, logw) in this order.
+        return mu.squeeze(0), logw.reshape(-1)
 
 
 def _block1d_forward_nomask(block1d, x):
@@ -506,12 +511,11 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
             }),
             LuaFragment(fragment / "01_lengths.lua", defines=("t_text",)),
             SubgraphCallComponent(
-                topology="encoder_mu", outputs=("mu_x",), inputs={"tokens": tokens}, length=t_text,
-                note="--- TextEncoder: mu_x, T-fast (ne=[T_text,n_feats], flat[c*t_text+t]) ---"),
-            SubgraphCallComponent(
-                topology="encoder_logw", outputs=("logw",), inputs={"tokens": tokens}, length=t_text,
-                note="--- TextEncoder: logw (per-token log duration; channel count 1 makes T-fast and\n"
-                     "    C-fast layouts coincide, flat index = t directly) ---"),
+                topology="encoder", outputs=("mu_x", "logw"), inputs={"tokens": tokens}, length=t_text,
+                note="--- TextEncoder ONCE -> both heads (BACKLOG.md P4.15f). mu_x is T-fast\n"
+                     "    (ne=[T_text,n_feats], flat[c*t_text+t]); logw is the per-token log duration\n"
+                     "    (channel count 1 makes T-fast and C-fast layouts coincide, flat index = t\n"
+                     "    directly) ---"),
             LuaFragment(fragment / "02_durations.lua", reads=("logw", "t_text"),
                         defines=("durations", "t_mel")),
             LuaFragment(fragment / "03_expand_mu.lua",
@@ -560,12 +564,8 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
         seq_dim = ct.RangeDim(4, 512)
 
         print("Tracing TextEncoder (mu, logw)...")
-        mu_phase = ExportPhase(
-            name="encoder_mu", wrapper=MuWrapper(enc).eval(), dummy_inputs=(dummy_tokens,),
-            mil_inputs=[ct.TensorType(name="tokens", shape=(1, seq_dim), dtype=np.int32)],
-        )
-        logw_phase = ExportPhase(
-            name="encoder_logw", wrapper=LogwWrapper(enc).eval(), dummy_inputs=(dummy_tokens,),
+        encoder_phase = ExportPhase(
+            name="encoder", wrapper=EncoderWrapper(enc).eval(), dummy_inputs=(dummy_tokens,),
             mil_inputs=[ct.TensorType(name="tokens", shape=(1, seq_dim), dtype=np.int32)],
         )
 
@@ -596,7 +596,7 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
             mil_inputs=[ct.TensorType(name="mel", shape=(1, n_feats, voc_seq_dim), dtype=np.float32)],
         )
 
-        return [mu_phase, logw_phase, decoder_phase, vocoder_phase]
+        return [encoder_phase, decoder_phase, vocoder_phase]
 
     def samplers(self) -> List[FlowMatchingSpec]:
         # The Euler CFM sampling loop is the shared "N-step refinement over loop-carried state" family

@@ -2236,7 +2236,7 @@ class LoomGGUFExporter:
         entirely. The result builds, runs, and returns the *untransposed* data.
 
         The hazard was already known and, until now, only ever avoided: `matcha_export.py`'s module
-        docstring and `vits_export.StatsWrapper` both record deliberately NOT returning a transposed
+        docstring and `vits_export.TextWrapper` both record deliberately NOT returning a transposed
         output for exactly this reason, and every hand-built converter that needs one writes
         `PERMUTE + CONT` by hand (`topology_ops.py` does the same internally in several places). What
         forced the fix rather than another workaround is a topology whose consumer *requires* the
