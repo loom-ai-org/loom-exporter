@@ -135,17 +135,116 @@ class _WhisperCrossKvWrapper(nn.Module):
 
     Interleaved k,v per layer rather than all-k-then-all-v so the driver's `index` arithmetic is
     `2 * layer + 1` and reads as the pair it is.
+
+    **The V half leaves here already head-split and TRANSPOSED**, `[1, heads, head_dim, frames]`
+    rather than `[1, frames, d_model]`, and that asymmetry is the whole point of this class beyond
+    hoisting the projection. `scores @ V` is the one matmul in a decoder layer with `transpose_y=False`,
+    and `topology_ops._op_matmul_x_y` composes that as PERMUTE + CONT + MUL_MAT -- so the decoder's
+    graph was materialising a 4.6 MB transpose of V **every token, in every layer**: 12 nodes x 27
+    tokens for an 11-second clip, measured at **9.0% of a whole transcription and 47% of the decode
+    loop** at one thread. It is a loop-invariant transform of a graph input that this phase already
+    makes constant for the utterance, so it belongs on this side of the phase boundary, where it runs
+    12 times per utterance instead of 324.
+    
+    Doing it here is only half of it: the decoder still TRACES the chain, because HF's attention
+    reshapes and transposes whatever `v_proj` returns. `hoist_cross_v_transpose` deletes it from the
+    traced topology afterwards, and raises if it does not find exactly what this emits. The two are one
+    change and neither is correct alone.
     """
 
     def __init__(self, model):
         super().__init__()
+        cfg = model.config
+        self.n_heads = int(cfg.decoder_attention_heads)
+        self.head_dim = int(cfg.d_model) // self.n_heads
         self.projs = nn.ModuleList()
         for layer in model.model.decoder.layers:
             self.projs.append(layer.encoder_attn.k_proj)
             self.projs.append(layer.encoder_attn.v_proj)
 
     def forward(self, xa):
-        return tuple(proj(xa) for proj in self.projs)
+        out = []
+        for i, proj in enumerate(self.projs):
+            t = proj(xa)
+            if i % 2:
+                # The V half. `[b, frames, d_model] -> [b, heads, head_dim, frames]`: exactly the
+                # layout `ggml_mul_mat` needs as its A operand to contract `scores @ V` over frames,
+                # which is what the decoder was rebuilding per token. K is left alone -- `Q @ K^T` is
+                # `transpose_y=True`, which composes to a bare MUL_MAT over the natural layout.
+                b, frames, _ = t.shape
+                t = t.view(b, frames, self.n_heads, self.head_dim).permute(0, 2, 3, 1).contiguous()
+            out.append(t)
+        return tuple(out)
+
+
+def hoist_cross_v_transpose(topo: dict, n_layers: int) -> int:
+    """Delete the per-token transpose of each `xv_i` from the traced DECODER topology.
+
+    The other half of `_WhisperCrossKvWrapper`'s V transpose, and the reason that one is not enough on
+    its own: HF's attention reshapes and transposes whatever `v_proj` returns, so the trace still
+    contains the chain whatever shape reaches it. What arrives here, per layer, is
+
+        RESHAPE(xv_i)  ->  PERMUTE [0,2,1,3]  ->  PERMUTE [1,0,2,3]  ->  CONT  ->  MUL_MAT
+
+    where the first two are HF's `.view(b, -1, heads, head_dim).transpose(1, 2)` and the second two are
+    `topology_ops._op_matmul_x_y` composing `transpose_y=False`. With V arriving already in the layout
+    the CONT was producing, the whole chain is the identity and the MUL_MAT can read `xv_i` directly.
+
+    **This rewrites a traced graph, so it asserts every step and raises rather than skipping.** A
+    transformers release that spells the reshape differently, or a change to the matmul composition,
+    must break the export loudly here -- silently leaving the chain in place would cost only speed, but
+    silently rewriting a chain that is NOT this one would be a wrong answer, and whisper's gate compares
+    the encoder rather than the decoder ([Retro-006](tensor oracle, not token oracle) is the standing
+    warning: a wrong decoder still emits a plausible transcript).
+
+    Returns the number of layers rewritten, which the caller checks against `n_layers`.
+    """
+    nodes = topo["nodes"]
+    producer = {out: (i, n) for i, n in enumerate(nodes) for out in n["outputs"]}
+    consumers = {}
+    for i, n in enumerate(nodes):
+        for var in n["inputs"]:
+            consumers.setdefault(var, []).append(i)
+
+    def only_consumer(var, want_op, want_axes=None):
+        users = consumers.get(var, [])
+        if len(users) != 1:
+            raise ValueError(
+                f"whisper decoder: {var!r} has {len(users)} consumers, expected exactly 1 -- the "
+                f"cross-attention V chain cannot be hoisted without duplicating work. Nodes: "
+                f"{[nodes[i]['op'] for i in users]}")
+        node = nodes[users[0]]
+        if node["op"] != want_op:
+            raise ValueError(f"whisper decoder: expected {want_op} consuming {var!r}, found "
+                             f"{node['op']}")
+        if want_axes is not None and node.get("attrs", {}).get("axes") != want_axes:
+            raise ValueError(f"whisper decoder: expected {want_op}(axes={want_axes}) consuming "
+                             f"{var!r}, found axes={node.get('attrs', {}).get('axes')}")
+        return users[0], node
+
+    drop, rename = set(), {}
+    for layer in range(n_layers):
+        xv = f"xv_{layer}"
+        if xv not in consumers:
+            raise ValueError(f"whisper decoder: no node consumes {xv!r}; the cross-attention inputs "
+                             f"and the traced graph disagree")
+        i_reshape, reshape = only_consumer(xv, "RESHAPE")
+        i_perm1, perm1 = only_consumer(reshape["outputs"][0], "PERMUTE", [0, 2, 1, 3])
+        i_perm2, perm2 = only_consumer(perm1["outputs"][0], "PERMUTE", [1, 0, 2, 3])
+        i_cont, cont = only_consumer(perm2["outputs"][0], "CONT")
+        drop.update((i_reshape, i_perm1, i_perm2, i_cont))
+        # Everything downstream reads the CONT's output; it is now `xv_i` itself.
+        rename[cont["outputs"][0]] = xv
+
+    topo["nodes"] = [n for i, n in enumerate(nodes) if i not in drop]
+    for n in topo["nodes"]:
+        n["inputs"] = [rename.get(v, v) for v in n["inputs"]]
+    if isinstance(topo.get("output"), str):
+        topo["output"] = rename.get(topo["output"], topo["output"])
+    topo["outputs"] = [rename.get(v, v) for v in topo.get("outputs", [])] or topo.get("outputs")
+    if topo.get("outputs") is None:
+        topo.pop("outputs", None)
+    return n_layers
 
 
 def cross_kv_input_names(n_layers: int) -> tuple:
@@ -333,6 +432,7 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
     sample_rate: Optional[int] = field(default=None, init=False, repr=False)
     n_audio_ctx: Optional[int] = field(default=None, init=False, repr=False)
     d_model: Optional[int] = field(default=None, init=False, repr=False)
+    n_heads: Optional[int] = field(default=None, init=False, repr=False)
     max_target_positions: Optional[int] = field(default=None, init=False, repr=False)
     decoder_bindings: tuple = field(default=(), init=False, repr=False)
     # Like `decoder_bindings`: filled in by `phases()`, and defaulted so `components()` can be
@@ -361,6 +461,11 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
         "sample_rate": Unchecked("same -- the feature extractor's own `sampling_rate`"),
         "n_audio_ctx": Unchecked("same -- `config.max_source_positions`"),
         "d_model": Unchecked("same -- `config.d_model`"),
+        "n_heads": Unchecked(
+            "same -- `config.decoder_attention_heads`. Needed here rather than only inside the cross_kv "
+            "wrapper because the DECODER declares V's head-split shape, and both must derive it from "
+            "the one checkpoint field."
+        ),
         "max_target_positions": Unchecked("same -- `config.max_target_positions`, which is the KV "
                                           "cache capacity a decode loop can address"),
         "decoder_bindings": Unchecked(
@@ -415,6 +520,7 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
         self.sample_rate = int(extractor.sampling_rate)
         self.n_audio_ctx = int(cfg.max_source_positions)
         self.d_model = int(cfg.d_model)
+        self.n_heads = int(cfg.decoder_attention_heads)
         self.max_target_positions = int(cfg.max_target_positions)
         self.prompt_constants = decoder_prompt_constants(
             model.generation_config, self.n_audio_ctx, cfg.vocab_size, self.max_target_positions)
@@ -453,7 +559,14 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
             # Fixed shape, every one of them: the encoder always emits `n_audio_ctx` frames, so nothing
             # about the cross-attention K/V varies with the token axis. That is the whole reason they
             # can be hoisted out of the step at all.
-            ct.TensorType(name=name, shape=(1, self.n_audio_ctx, self.d_model), dtype=np.float32)
+            #
+            # **K and V do not have the same shape.** V arrives head-split and transposed, because that
+            # is the layout `scores @ V` needs and rebuilding it per token cost 47% of the decode loop
+            # -- see `_WhisperCrossKvWrapper`. The trace still contains the chain that would have built
+            # it (HF reshapes whatever `v_proj` returns, whatever shape reaches it); `topology_rewrite`
+            # below deletes it. Shapes here are what the DRIVER copies into, so they must be the shapes
+            # `cross_kv` emits, not the ones HF's code reads.
+            ct.TensorType(name=name, shape=self._cross_kv_shape(name), dtype=np.float32)
             for name in self.cross_kv_names
         ]
         self.decoder_bindings = tuple(
@@ -494,9 +607,13 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
                     torch.zeros((1, trace_tokens), dtype=torch.long),
                     torch.arange(trace_tokens).unsqueeze(0),
                     causal_mask(trace_tokens),
-                ) + tuple(torch.zeros(1, self.n_audio_ctx, self.d_model)
-                          for _ in self.cross_kv_names),
+                ) + tuple(torch.zeros(self._cross_kv_shape(name))
+                          for name in self.cross_kv_names),
                 mil_inputs=decoder_inputs,
+                # The other half of the V transpose. See `hoist_cross_v_transpose`: it deletes the
+                # chain HF's attention traces around each `xv_i`, and RAISES if that chain is not
+                # exactly the one `_WhisperCrossKvWrapper` was written against.
+                topology_rewrite=lambda topo: hoist_cross_v_transpose(topo, self.n_text_layers),
                 root_axis=self.root_axis,
                 # The self-attention blocks become cached ATTENTION nodes; the cross-attention blocks do
                 # not, and that is correct rather than a miss. `fuse_loom_attention` anchors on the
@@ -514,6 +631,17 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
                 kv_cache_size=self.max_target_positions,
             ),
         ]
+
+    def _cross_kv_shape(self, name: str) -> tuple:
+        """The shape `cross_kv` emits for one of its outputs, which is what the decoder declares.
+
+        K keeps the natural `[1, frames, d_model]`; V is `[1, heads, head_dim, frames]`. Keyed on the
+        NAME rather than on position so this cannot drift out of step with `cross_kv_input_names`, which
+        is the same list the driver's `index` arithmetic assumes.
+        """
+        if name.startswith("xv_"):
+            return (1, self.n_heads, self.d_model // self.n_heads, self.n_audio_ctx)
+        return (1, self.n_audio_ctx, self.d_model)
 
     def hparams(self) -> dict:
         """What a HOST must know to call this driver at all.

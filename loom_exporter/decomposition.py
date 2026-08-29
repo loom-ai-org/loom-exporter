@@ -288,6 +288,14 @@ class MultiPhase(Decomposition):
             )
             main_func = mil_prog.functions["main"]
             topo = exporter.generate_graph_topology(main_func, phase.name)
+            if phase.topology_rewrite is not None:
+                # See ExportPhase.topology_rewrite: the one thing a wrapper cannot express is a
+                # transform of a graph input that is invariant across the DRIVER's calls. A rewrite
+                # raises if its pattern is absent; nothing here checks it, because there is nothing
+                # here that knows what it was looking for.
+                before = len(topo["nodes"])
+                phase.topology_rewrite(topo)
+                print(f"  {phase.name}: topology rewrite removed {before - len(topo['nodes'])} node(s)")
             print(f"  {phase.name}: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights"
                   f"{_rss_note()}")
             phase_topologies[phase.name] = topo
