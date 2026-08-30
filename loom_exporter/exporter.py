@@ -2452,6 +2452,112 @@ class LoomGGUFExporter:
     #: convolutions account for.
     PACKED_WEIGHT_FIRST_OPS = ("MUL_MAT", "CONV_1D", "CONV_2D", "CONV_1D_DW", "CONV_2D_DW", "SHORT_CONV")
 
+    #: Convolutions whose kernel can be FOLDED to a 2-D `[IC*K, OC]` so its quantization blocks align.
+    #: The dense forms only -- see `_fold_conv_kernels_for_quantization` for why the depthwise ones and
+    #: SHORT_CONV are not here, which is a different reason from CONV_TRANSPOSE's above.
+    FOLDABLE_CONV_OPS = ("CONV_1D", "CONV_2D")
+
+    def _fold_conv_kernels_for_quantization(self, block_size: int) -> int:
+        """Rewrite every eligible conv kernel to `[IC*K, OC]` (ggml order) and hand the geometry back to
+        the node that lost it. Returns how many kernels were folded. Mutates `self.weights` and the
+        topology nodes, so it must run BEFORE either is serialized.
+
+        WHY IT EXISTS (P4.13). Two independent gates decide whether a weight is quantized, and clearing
+        the first bought nothing. `PACKED_WEIGHT_FIRST_OPS` fixed the OP gate: a conv kernel now sits in
+        mul_mat's first operand, which is the only one ggml can read packed. The SHAPE gate then
+        declined every single one of them, because ggml lays quantization blocks along ne[0] and a conv
+        kernel's ne[0] is the KERNEL WIDTH -- 1, 3, 5, 7 -- which no block size divides. Measured on
+        vits-piper-en-gb-miro: 132 conv nodes, 117 distinct kernels, **0 of them** block-alignable as
+        stored, and a Q8_0 export byte-identical to its F32 one.
+
+        The fold is the other half. `[K, IC, OC]` becomes `[IC*K, OC]` (and `[KW, KH, IC, OC]` becomes
+        `[IC*KH*KW, OC]`), which puts `IC*K` on ne[0] -- and IC is a channel count, so it is a multiple
+        of 32 essentially always. On the same VITS: **114 of 117**, which is 99.99% of the conv bytes
+        (the three stragglers are 1x1x192 pre-nets holding 768 bytes each). The file goes 81.5 MB ->
+        37.8 MB at Q8_0 and -> 30.4 MB at Q4_0, from 0 % coverage to 73 %.
+
+        WHY THE BYTES DO NOT MOVE. A C-order `(OC, IC, K)` array reshaped to `(OC, IC*K)` is the same
+        buffer read differently, and `ggml_reshape_2d(kernel, ne0*ne1, ne2)` -- what `op_conv_1d` did to
+        the kernel anyway, on every call, before handing it to the mul_mat -- is the identical
+        reinterpretation on the engine's side. The fold moves that reshape from run time to export time;
+        it does not permute anything, which is what makes it safe to do to a tensor and not just to a
+        view of one.
+
+        WHAT IT COSTS, AND WHAT PAYS IT BACK. The op loses the shape it recovered K and IC from, so the
+        node carries them instead: `kernel_k`/`kernel_ic` for CONV_1D, `kernel_kw`/`kernel_kh`/
+        `kernel_ic` for CONV_2D. OC survives as ne[1]. `folded_kernel_geometry` in
+        `src/ops/primitives_conv.cpp` reads them, and their PRESENCE is the signal -- not the tensor's
+        rank, which cannot distinguish a folded `[IC*K, OC]` from a declared `[K, IC]`.
+
+        FOUR THINGS IT DELIBERATELY DOES NOT FOLD.
+
+        * **Anything, unless the export is block-quantizing.** `block_size <= 1` (no `--quantize`, or
+          F16/BF16, whose block size is 1) returns immediately. An F32 or F16 file therefore keeps the
+          declared 3-D/4-D kernel and runs precisely the graph it ran before, bit for bit -- including
+          `ggml_conv_2d_direct`, the direct-conv lowering, which needs the spatial shape and is worth
+          4.7x on long-activation convolutions. A quantized kernel could never use that path anyway
+          (it takes an F32/F16 kernel), so the fold gives up nothing that was reachable.
+        * **A kernel that does not come out aligned.** Folding it would cost the geometry and gain
+          nothing; it stays 3-D and stays F32, and the export's warning still counts it.
+        * **The depthwise forms and SHORT_CONV.** Their mul_mat is BATCHED per channel over ne[2] rather
+          than being a single matrix product, so flattening ne[0..1] would turn a per-channel pairing
+          into a cross product -- a wrong answer, not a slower one. And it would not help: a depthwise
+          kernel is `[K, 1, C]`, so the fold puts K alone on ne[0] and K is 3.
+        * **A kernel any other node reads.** A weight that is also a MUL_MAT's operand, or any node's
+          second input, must keep the shape that consumer expects. The fold is skipped rather than
+          reconciled -- there is no shape that satisfies both.
+        """
+        if block_size <= 1:
+            return 0
+
+        # Every (op, input position) each weight name is read at, across every topology. The fold is
+        # legal only for a name whose ENTIRE use is "first input of a foldable convolution", so the
+        # question has to be asked of all topologies at once and not per node.
+        usage = {}
+        conv_nodes = []
+        for topo in self.topologies.values():
+            for node in topo.get("nodes", []):
+                for position, input_name in enumerate(node.get("inputs") or []):
+                    usage.setdefault(input_name, set()).add((node.get("op"), position))
+                if node.get("op") in self.FOLDABLE_CONV_OPS and node.get("inputs"):
+                    conv_nodes.append(node)
+
+        folded = {}
+        for node in conv_nodes:
+            op = node["op"]
+            name = node["inputs"][0]
+            rank = 4 if op == "CONV_2D" else 3
+            already = folded.get(name)
+            if already is None:
+                array = self.weights.get(name)
+                if array is None or not np.issubdtype(array.dtype, np.floating):
+                    continue
+                if array.ndim != rank:
+                    continue
+                if usage[name] != {(op, 0)}:
+                    continue
+                spatial = tuple(int(d) for d in array.shape[1:])   # (IC, K) or (IC, KH, KW)
+                fastest = int(np.prod(spatial))
+                if fastest % block_size:
+                    continue
+                self.weights[name] = array.reshape(int(array.shape[0]), fastest)
+                folded[name] = (op, spatial)
+            elif already[0] != op:
+                # Unreachable through the `usage` gate above, which already requires a single op --
+                # kept because the failure it would produce (an im2col sized by the wrong geometry) is
+                # silent, and this is the one place that fact is knowable.
+                raise ValueError(
+                    f"conv kernel {name!r} is folded for {already[0]} and also read by {op}"
+                )
+            spatial = folded[name][1]
+            attrs = node.setdefault("attrs", {})
+            attrs["kernel_ic"] = spatial[0]
+            if op == "CONV_2D":
+                attrs["kernel_kh"], attrs["kernel_kw"] = spatial[1], spatial[2]
+            else:
+                attrs["kernel_k"] = spatial[1]
+        return len(folded)
+
     def _collect_mul_mat_weight_names(self) -> set:
         """Every eligible node's *first* input, across all topologies -- see `PACKED_WEIGHT_FIRST_OPS`
         for which ops those are and why convolution transposes are not among them.
@@ -2602,6 +2708,21 @@ class LoomGGUFExporter:
                 )
             self.weights[name] = array
 
+        # Resolved here rather than beside the weight loop that uses it, because the FOLD below
+        # rewrites topology nodes and `self.weights` both, and the topologies are serialized into the
+        # file well before that loop runs. `quantizable` is unaffected by the fold either way -- it is
+        # read off node INPUTS, which the fold does not touch.
+        qtype = None
+        quantizable = set()
+        block_size = 1
+        n_folded = 0
+        if self.quantize:
+            from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
+            qtype = GGMLQuantizationType[self.quantize]
+            block_size, _ = GGML_QUANT_SIZES[qtype]
+            quantizable = self._collect_mul_mat_weight_names()
+            n_folded = self._fold_conv_kernels_for_quantization(block_size)
+
         arch = self.kwargs.get("architecture") or os.environ.get("LOOM_ARCH", "mil_model")
         w = GGUFWriter(self.output_path, f"loom-{arch}")
         w.add_string("loom.architecture", arch)
@@ -2708,14 +2829,6 @@ class LoomGGUFExporter:
         for submodule_name, topo in self.topologies.items():
             w.add_string(f"model.graph_topology.{submodule_name}", json.dumps(topo, cls=NumpyEncoder))
 
-        qtype = None
-        quantizable = set()
-        block_size = 1
-        if self.quantize:
-            from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
-            qtype = GGMLQuantizationType[self.quantize]
-            block_size, _ = GGML_QUANT_SIZES[qtype]
-            quantizable = self._collect_mul_mat_weight_names()
         n_quantized = 0
         # Bytes, not just tensor counts, because the count answers the wrong question. A convolutional
         # model can report "44 tensor(s) quantized" and have shrunk by a fifth, since the weights that
@@ -2727,8 +2840,14 @@ class LoomGGUFExporter:
         # Eligible BY OP but declined afterwards, and why. The two gates are genuinely different and
         # reporting them as one sent a reader looking for a bug in the op list when the real answer was
         # the tensor's shape: ggml lays quantization blocks along ne[0], which for a convolution kernel
-        # is the KERNEL WIDTH (1, 3, 5 ...) and never a multiple of 32. VITS is entirely this case --
-        # every conv kernel IS a first operand and not one of them is block-alignable.
+        # is the KERNEL WIDTH (1, 3, 5 ...) and never a multiple of 32.
+        #
+        # `_fold_conv_kernels_for_quantization` (P4.13) is what answers that for the DENSE convolutions,
+        # by folding their spatial axes into ne[0] before this loop runs -- VITS went from 0 of 117 conv
+        # kernels alignable to 114. What is still counted here is what the fold declines: the depthwise
+        # forms (whose batched mul_mat the fold would break), a kernel another node also reads, and a
+        # kernel that comes out unaligned anyway. Keep the two counts separate; merging them is what
+        # made the original cause unfindable.
         n_declined_shape = 0
 
         # Content-address weight payloads (BACKLOG.md P0.2): a split export can legitimately declare the
@@ -2822,6 +2941,8 @@ class LoomGGUFExporter:
             saved = quantized_bytes_before - quantized_bytes_after
             suffix = (f", {n_quantized} tensor(s) quantized to {self.quantize} "
                       f"({covered:.0f}% of float weight bytes, {saved / 1e6:.1f} MB saved)")
+            if n_folded:
+                suffix += f", {n_folded} conv kernel(s) folded to [IC*K, OC] to align their blocks"
             # A quantization that covered nothing is the failure mode this reporting exists for: the
             # export succeeds, the file is byte-for-byte the size it was, and nothing said so. What
             # remains ineligible after `PACKED_WEIGHT_FIRST_OPS` gained the convolutions is a weight
@@ -2832,9 +2953,11 @@ class LoomGGUFExporter:
             if n_declined_shape:
                 shaped = (f" {n_declined_shape} weight(s) WERE eligible by op and were declined for "
                           f"shape: {self.quantize} blocks run along the tensor's fastest axis and need "
-                          f"a multiple of {block_size} there, which a convolution kernel (whose fastest "
-                          f"axis is the kernel width) is not. Those can still be exported as F16, whose "
-                          f"block size is 1.")
+                          f"a multiple of {block_size} there. A DENSE convolution kernel is folded to "
+                          f"[IC*K, OC] first so that axis becomes IC*K, so what remains is a depthwise "
+                          f"kernel (where the fold would break a batched mul_mat), a kernel some other "
+                          f"node also reads, or one still unaligned after folding. Those can still be "
+                          f"exported as F16, whose block size is 1.")
             if n_quantized == 0:
                 print(f"WARNING: --quantize {self.quantize} matched NO weights in this model, so the "
                       f"file is unchanged.{shaped}")
