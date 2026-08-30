@@ -33,7 +33,10 @@ information at every step. The two exceptions are deliberate and documented at t
 returns rendered strings, because both feed JSON attributes directly and their existing number-vs-string
 distinction is part of what the engine reads back.
 """
+import math
+
 import numpy as np
+import sympy
 from coremltools.converters.mil.mil import Var
 
 from .shape_expr import as_expr, floor_div, has_dynamic_symbol, render, to_number
@@ -348,6 +351,32 @@ class ValueFacts:
         if op.op_type == "gather":
             # A real shape query, not a guess -- even when its answer is exactly `n_tokens`.
             return (self.gather_shape_value(v), False)
+        if op.op_type == "clip":
+            # `torch.clamp`, which is how a shape expression says "padded, but never by a negative
+            # amount". Resolved as sympy Max/Min so the bound survives into the emitted expression
+            # instead of being folded away at export time -- the engine's SymbolEnv evaluates both.
+            #
+            # A DERIVATION, not a guess: unlike `select` above (which picks a branch on an invariant
+            # about real inputs), this keeps the clamp and is therefore exact at every length. VITS's
+            # `_get_relative_embeddings` is what needed it -- `Max(n_tokens - (window_size+1), 0)` is
+            # precisely the "pad above the window, crop at or below it" case both of piper's own
+            # branches reduce to, and without it the exporter had to bake a static 2048-wide pad into
+            # the weights: 18.9 MB of zeros in a VITS export.
+            inner, guess = self._scalar_entry(op.inputs.get("x"), _seen)
+            if inner is None:
+                return (None, False)
+            # `torch.clamp(x, min=0)` reaches MIL as a clip with `beta` set to the float32 maximum
+            # rather than left unset -- a finite number, so `isfinite` is not the test. A bound at the
+            # representable limit is not a bound; emitting it would wrap every clamped shape in a
+            # `Min(3.4e38, ...)` the engine would have to evaluate to no purpose.
+            limit = float(np.finfo(np.float32).max)
+            alpha = static_scalar(op.inputs.get("alpha"))
+            beta = static_scalar(op.inputs.get("beta"))
+            if alpha is not None and math.isfinite(alpha) and alpha > -limit:
+                inner = sympy.Max(inner, as_expr(alpha))
+            if beta is not None and math.isfinite(beta) and beta < limit:
+                inner = sympy.Min(inner, as_expr(beta))
+            return (inner, guess)
         if op.op_type in _ARITH_OPS:
             x_e, x_guess = self._scalar_entry(op.inputs.get("x"), _seen)
             y_e, y_guess = self._scalar_entry(op.inputs.get("y"), _seen)

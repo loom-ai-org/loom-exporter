@@ -32,7 +32,7 @@ n = N_TOKENS
 
 # Everything symbol_env.cpp's tokenizer can encounter: identifiers, digits, the four operators,
 # parentheses, decimal points and spaces. Anything else (notably '**') means an unparseable attribute.
-_ALLOWED_CHARS = re.compile(r"^[A-Za-z0-9_+\-*/(). ]*$")
+_ALLOWED_CHARS = re.compile(r"^[A-Za-z0-9_+\-*/()., ]*$")   # ',' since Max()/Min() take two arguments
 
 EXPRESSIONS = [
     n,
@@ -52,6 +52,13 @@ EXPRESSIONS = [
     -n,
     floor_div(n * 512, 512),
     sympy.floor(n / 2) * 3,
+    # A clamped shape -- "padded, but never by a negative amount". VITS's relative-position table is
+    # the real one: `2*Max(n_tokens - 5, 0) + 9`, which is what let its 2048-wide static pad (18.9 MB
+    # of zeros in the export) become a dynamically-sized one.
+    sympy.Max(n - 5, 0),
+    2 * sympy.Max(n - 5, 0) + 9,
+    sympy.Min(n, 8),
+    sympy.Max(sympy.Min(n, 10) * 2, 7),
 ]
 
 
@@ -61,6 +68,17 @@ def test_render_round_trips_through_parse(expr):
     assert _ALLOWED_CHARS.match(text), f"{text!r} contains a character symbol_env.cpp cannot tokenize"
     assert "**" not in text
     assert sympy.simplify(parse(text) - expr) == 0
+
+
+def test_a_clamped_shape_matches_the_engine_at_both_sides_of_the_clamp():
+    """`Max` exists in the grammar for exactly one reason -- a pad that must not go negative -- so the
+    property worth pinning is that it is still right on the side where the clamp bites. VITS's window
+    is 4, so `2*Max(n-5, 0) + 9` is `2n-1` above the window and a flat 9 at or below it."""
+    expr = 2 * sympy.Max(n - 5, 0) + 9
+    text = render(expr)
+    assert _ALLOWED_CHARS.match(text)
+    for probe, expected in ((2, 9), (4, 9), (5, 9), (6, 11), (62, 123), (5002, 10003)):
+        assert float(parse(text).subs(n, probe)) == expected == float(expr.subs(n, probe))
 
 
 def test_render_matches_the_engines_arithmetic_at_concrete_lengths():
@@ -105,8 +123,12 @@ def test_floor_arguments_are_recombined_over_one_denominator():
 
 @pytest.mark.parametrize("expr", [
     sympy.ceiling(n / 3),
-    sympy.Max(n, 8),
-    sympy.Min(n, 8),
+    # Max/Min moved OUT of this list when symbol_env.cpp learned them -- a three-argument one is still
+    # inexpressible, because sympy's Max is n-ary and the engine's grammar is strictly binary, and
+    # folding one into nested pairs here would emit an expression nothing has ever evaluated. Three
+    # SYMBOLS, not literals: sympy folds `Max(n, 8, 12)` down to two arguments on construction, so a
+    # literal case would silently test the binary path instead.
+    sympy.Max(n, symbol("n_past"), symbol("n_kv")),
     n ** sympy.Rational(1, 3),
     sympy.Piecewise((n, n > 2), (1, True)),
     sympy.log(n),

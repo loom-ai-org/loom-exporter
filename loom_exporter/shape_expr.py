@@ -201,6 +201,20 @@ def _render(e):
         # floor than the engine needs to take.
         return f"floor({_wrap(sympy.together(e.args[0]), 0)})", _ATOM
 
+    if isinstance(e, (sympy.Max, sympy.Min)):
+        # A clamped shape -- "padded, but never by a negative amount". `symbol_env.cpp` evaluates
+        # `Max(a, b)`/`Min(a, b)` with exactly this spelling. Only the two-argument form is rendered:
+        # sympy's Max/Min are n-ary and the engine's grammar is not, and folding an n-ary one into
+        # nested pairs here would emit an expression nothing has ever evaluated. In practice a clamp
+        # from `torch.clamp` is always binary.
+        if len(e.args) != 2:
+            raise UnsupportedShapeExpression(
+                f"{type(e).__name__} with {len(e.args)} arguments has no equivalent in "
+                f"symbol_env.cpp's grammar, which takes exactly two: {e!r}"
+            )
+        name = "Max" if isinstance(e, sympy.Max) else "Min"
+        return f"{name}({_wrap(e.args[0], 0)}, {_wrap(e.args[1], 0)})", _ATOM
+
     if e.is_Pow:
         return _render_pow(e)
 
@@ -212,7 +226,7 @@ def _render(e):
 
     raise UnsupportedShapeExpression(
         f"{type(e).__name__} has no equivalent in symbol_env.cpp's grammar "
-        f"(+ - * /, unary minus, parentheses, identifiers, numbers, floor, sqrt): {e!r}"
+        f"(+ - * /, unary minus, parentheses, identifiers, numbers, floor, sqrt, Max, Min): {e!r}"
     )
 
 
@@ -348,6 +362,16 @@ class _Parser:
                 arg = self.parse_expr()
                 self.expect(")")
                 return sympy.floor(arg) if name == "floor" else sympy.sqrt(arg)
+            if name in ("Max", "max", "Min", "min"):
+                # Two arguments, matching symbol_env.cpp -- which is the point of this parser being
+                # hand-written: it accepts exactly what the engine accepts, so a string that parses
+                # here is one the engine can read.
+                self.expect("(")
+                a = self.parse_expr()
+                self.expect(",")
+                b = self.parse_expr()
+                self.expect(")")
+                return sympy.Max(a, b) if name in ("Max", "max") else sympy.Min(a, b)
             return symbol(name)
         return self.parse_number()
 
