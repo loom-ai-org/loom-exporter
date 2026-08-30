@@ -214,11 +214,38 @@ class LMCausalModelExportConfig(LoomExportConfig):
             return None
         return [int(window) if t == "sliding_attention" else 0 for t in layer_types]
 
+    def hparams(self) -> dict:
+        """The checkpoint's own sampling defaults (P4.24), as the three knobs the engine implements.
+
+        Host-facing by `hparams()`'s own test: `GenerateOptions` lets a caller override any of them, and
+        "what does this checkpoint decode with when the caller says nothing" is a question only the file
+        can answer. Read rather than claimed -- `read_sampling_defaults` is `generation_config.json`,
+        normalized, and a checkpoint that declares `do_sample: false` (or nothing at all) gets
+        `temperature = 0.0`, which is the engine's spelling of greedy.
+        """
+        from .bpe_tokenizer_export import read_sampling_defaults
+
+        return {f"sampling.{k}": v for k, v in read_sampling_defaults(self.model_dir).items()}
+
     def backend_kwargs(self) -> dict:
+        from .bpe_tokenizer_export import read_eos_token_ids, read_sampling_defaults
+
         kwargs = dict(
             tokenizer_dir=self.tokenizer_dir or self.model_dir,
             tokenizer_pre=self.tokenizer_pre,
             hparams=self.hparams(),
+            # P4.23, both from the checkpoint rather than from the tokenizer config. The eos SET is
+            # what an instruction-tuned turn ends on -- gemma-3-270m-it's `[1, 106]`, where 106 is
+            # `<end_of_turn>` and 1 is the base model's `<eos>` -- and the chat template is what puts
+            # the model inside a turn in the first place. Neither is useful without the other: a
+            # correct template still runs to `max_new_tokens` without the second eos, and a second eos
+            # is never emitted by a model that was never given a turn to end.
+            eos_token_ids=read_eos_token_ids(self.model_dir),
+            chat_template=True,
+            # P4.24. The same three numbers `hparams()` writes for the HOST, handed to the DRIVER as
+            # its `or`-fallbacks -- one attribute set, rendered twice, which is the arrangement
+            # `hparams()`'s own docstring already names for a number both sides need.
+            sampling_defaults=read_sampling_defaults(self.model_dir),
         )
         # Only the flattened form declares these: `flat_namespace` writes every weight under one flat
         # name, which is right for a single-topology export and wrong for the modular path, whose
