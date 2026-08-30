@@ -1436,6 +1436,17 @@ class LoomGGUFExporter:
             self.apply_ctc_greedy_export(bindings, input_names, n_tokens_expr)
             return
 
+        # The checkpoint's own decode facts, from the family's `backend_kwargs` (P4.23/P4.24). Both are
+        # absent for every family that does not generate text, and absent is what emits the driver Lua
+        # that was emitted before either existed.
+        #
+        # `eos_token_ids` is the FULL set: the first is what `tokenizer.ggml.eos_token_id` also holds
+        # and what the host passes as `inputs.eos_token`, the rest are `extra_eos_tokens` -- the ids an
+        # instruction-tuned turn actually ends on. A loop that knows only the first runs to
+        # `max_new_tokens` on every utterance, which is the runaway half of P4.23.
+        eos_ids = list(self.kwargs.get("eos_token_ids") or [])
+        sampling = self.kwargs.get("sampling_defaults")
+
         cached = self._topology_uses_kv_cache(self.topologies["main_topology"])
         decode = None
         if cached:
@@ -1446,7 +1457,10 @@ class LoomGGUFExporter:
                       f"its own history. Exporting infer (prefill) only.")
             else:
                 decode = PrefillDecodeLoop(topology="main_topology", bindings=bindings,
-                                           inputs=input_names, mask_windows=self.mask_windows)
+                                           inputs=input_names, mask_windows=self.mask_windows,
+                                           default_eos_token=eos_ids[0] if eos_ids else -1,
+                                           extra_eos_tokens=tuple(eos_ids[1:]),
+                                           sampling=sampling)
         # Retain and reduce by name for KV-cached topologies -- the causal LMs, whose vocab is what
         # makes the Lua marshalling cap reachable at all (BACKLOG.md P4.0.14). Every other family keeps
         # returning its tensor, so no ASR/TTS driver text moves. One `cached` for both halves: which
@@ -1459,7 +1473,8 @@ class LoomGGUFExporter:
                                  retained=cached),
             epilogue=ArgmaxEpilogue(out_var="_mono_out", shape_var="_mono_shape",
                                     n_tokens=n_tokens_expr,
-                                    retained_module="main_topology" if cached else None),
+                                    retained_module="main_topology" if cached else None,
+                                    sampling=sampling if cached else None),
             decode=decode,
         ).build(self._driver_context())
 
@@ -2477,6 +2492,40 @@ class LoomGGUFExporter:
         for name in dead:
             del self.weights[name]
 
+    def _write_chat_template(self, w, tokenizer_dir: str):
+        """The checkpoint's chat template as assembleable role tags (P4.23, ADR-018), or nothing.
+
+        Nothing is a real outcome and not a failure: a base model has no template, and a template whose
+        renders do not decompose is one the engine must not pretend to reproduce. Either way the model
+        exports with no chat door rather than a wrong one, and the reason is printed.
+        """
+        from transformers import AutoTokenizer
+
+        from .chat_template_export import (derive_chat_template, strip_duplicate_bos,
+                                            verify_chat_template, write_chat_template)
+
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+        parts = derive_chat_template(tokenizer)
+        if not parts:
+            print(f"  no chat template: {parts.unsupported or 'the checkpoint declares none'}")
+            return
+        # BEFORE verification, because the doubled BOS it removes is invisible in the rendered text and
+        # only the id comparison catches it -- see strip_duplicate_bos.
+        strip_duplicate_bos(parts, tokenizer_dir)
+        problems = verify_chat_template(tokenizer, parts)
+        if problems:
+            raise ValueError(
+                "the chat template decomposed but does not reproduce apply_chat_template:\n  "
+                + "\n  ".join(problems)
+                + "\nThis is a bug in chat_template_export.py's differencing, not in the checkpoint -- "
+                  "a template that cannot be decomposed at all is rejected by derive_chat_template and "
+                  "never reaches here."
+            )
+        for role, why in parts.unsupported.items():
+            print(f"  chat template: no '{role}' role -- {why}")
+        print(f"  chat template: roles {parts.roles}")
+        write_chat_template(w, parts)
+
     def _write_tokenizer(self, w, tokenizer_dir: str):
         """Dispatches to the right vocab writer for `tokenizer_dir`'s real HF tokenizer family, auto-
         detecting both the family ("bpe"/"wordpiece"/"sentencepiece_proto") and, for "bpe", the
@@ -2500,7 +2549,14 @@ class LoomGGUFExporter:
             if pre_type is None:
                 from transformers import AutoTokenizer
                 pre_type = detect_loom_pre_type(AutoTokenizer.from_pretrained(tokenizer_dir))
-            write_bpe_vocab(w, tokenizer_dir, pre_type=pre_type)
+            write_bpe_vocab(w, tokenizer_dir, pre_type=pre_type,
+                             eos_token_ids=self.kwargs.get("eos_token_ids"))
+            # P4.23. Declared by the family rather than attempted for every BPE tokenizer: a chat
+            # template is a property of a model that HOLDS a conversation, and Whisper's tokenizer
+            # directory is a BPE one too. The causal-LM family is the only one that sets it today, and
+            # the speech-LM families carry their prompt structure as `prompt_constants` instead.
+            if self.kwargs.get("chat_template"):
+                self._write_chat_template(w, tokenizer_dir)
         elif family == "wordpiece":
             from .wordpiece_tokenizer_export import write_wordpiece_vocab
             write_wordpiece_vocab(w, tokenizer_dir)

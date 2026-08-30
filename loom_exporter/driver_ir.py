@@ -267,6 +267,36 @@ class RetainedArgmax(RetainedRead):
 
 
 @dataclasses.dataclass
+class RetainedSample(RetainedRead):
+    """`loom.sample_row('norm', (#input_ids - 1), {temperature = ..., top_k = ..., top_p = ...})` --
+    one token drawn from one row of a module's RETAINED first output (P4.24).
+
+    `RetainedArgmax` with a distribution instead of a maximum, and the same reduction underneath: the
+    binding is DEFINED to be `argmax_row` when the options are greedy (`temperature <= 0` or
+    `top_k == 1`), so the two spellings cannot disagree about which token wins. It stays a separate IR
+    node rather than a flag on `RetainedArgmax` because the emitted call has a third argument and every
+    non-causal-LM family must keep emitting the two-argument one byte for byte.
+
+    `options` are IR expressions, not literals, because they are a CALLER's knobs with the checkpoint's
+    own values as fallbacks -- `inputs.temperature or 0.0`, which is how `max_new_tokens` and
+    `eos_token` already reach the same loop.
+    """
+    module: str
+    row: Expr
+    options: dict  # str -> Expr
+
+    def reads(self) -> list[str]:
+        out = list(self.row.reads())
+        for value in self.options.values():
+            out.extend(value.reads())
+        return out
+
+    def render(self) -> str:
+        opts = ", ".join(f"{k} = {v.render()}" for k, v in self.options.items())
+        return f"loom.sample_row('{self.module}', {self.row.render()}, {{{opts}}})"
+
+
+@dataclasses.dataclass
 class RetainedArgmaxRows(RetainedRead):
     """`loom.argmax_rows('main_topology')` -- one class id per ROW of a module's retained first output
     (BACKLOG.md P4.0.17).

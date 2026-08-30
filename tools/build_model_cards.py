@@ -66,6 +66,18 @@ class ModelCard:
     # multilingual it is. Putting `language=` in those cards taught a copy-paste that the engine now
     # (correctly) warns about.
     selects_language: bool = False
+    # Whether this checkpoint is instruction-tuned AND its chat template survived export (P4.23), i.e.
+    # whether the GGUF carries `tokenizer.chat_template.*` and `model.text2text.chat(...)` works.
+    # Only read for task_type == "text-generation", and a per-model fact for the same reason
+    # `takes_text` is: it is not implied by the task. A base model has no template at all, and an
+    # instruction-tuned one whose template does not reduce to role tags exports without it.
+    #
+    # **This is why the card snippet changed.** Every text-generation card used to show
+    # `text2text.infer("The capital of France is", max_new_tokens=14)`, which on an IT model returns
+    # ' Paris.\n\nThe capital of France is Paris.\n\nThe capital of' -- the model continuing in the
+    # prompt's own format because nothing put it inside a turn. The card demonstrated the defect to
+    # anyone who pasted it.
+    chat: bool = False
     # `--task`/`--model` for loom-export; empty means auto-detection resolves both.
     export_task: Optional[str] = None
     export_model: Optional[str] = None
@@ -135,6 +147,7 @@ CATALOG = [
     ModelCard(
         slug="lfm2-350m-monolithic", checkpoint=Path("lfm2-350m"),
         export_task="text-generation", export_model="lfm2-monolithic", task_type="text-generation",
+        chat=True,
         base_repo="LiquidAI/LFM2-350M", license_id="other",
         license_name="LFM Open License v1.0", license_url="https://huggingface.co/LiquidAI/LFM2-350M/blob/main/LICENSE",
         language=["en", "ar", "zh", "fr", "de", "ja", "ko", "es"],
@@ -144,6 +157,7 @@ CATALOG = [
     ModelCard(
         slug="lfm2-350m-modular", checkpoint=Path("lfm2-350m"),
         export_task="text-generation", export_model="lfm2-modular", task_type="text-generation",
+        chat=True,
         base_repo="LiquidAI/LFM2-350M", license_id="other",
         license_name="LFM Open License v1.0", license_url="https://huggingface.co/LiquidAI/LFM2-350M/blob/main/LICENSE",
         language=["en", "ar", "zh", "fr", "de", "ja", "ko", "es"],
@@ -153,12 +167,14 @@ CATALOG = [
     ModelCard(
         slug="smollm2-360m-instruct", checkpoint=Path("smollm2-360m-it"),
         task_type="text-generation",
+        chat=True,
         base_repo="HuggingFaceTB/SmolLM2-360M-Instruct", license_id="apache-2.0", language=["en"],
         title="SmolLM2-360M-Instruct", summary="HuggingFaceTB's SmolLM2 360M instruct-tuned LM, exported for loom.cpp.",
     ),
     ModelCard(
         slug="gemma-3-270m-it", checkpoint=Path("gemma-3-270m-it"),
         task_type="text-generation",
+        chat=True,
         base_repo="google/gemma-3-270m-it", license_id="other",
         license_name="Gemma license", license_url="https://ai.google.dev/gemma/terms",
         language=[], language_note="trained on 140+ languages per the upstream model card; no ISO tag list published",
@@ -413,6 +429,18 @@ USAGE_SNIPPETS = {
 model = loom.Model.from_pretrained("{repo_id}")
 print(model.text2text.infer("The capital of France is", max_new_tokens=14))
 """,
+    # The instruction-tuned door. `chat` applies the checkpoint's OWN chat template -- carried in the
+    # GGUF as role tags and assembled by the engine -- so the model is asked a question inside a turn
+    # rather than handed a prefix to continue. Decoding follows the checkpoint's own
+    # `generation_config.json`; `temperature=0.0` is how you ask for greedy instead.
+    "text-generation-chat": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+print(model.text2text.chat("Who discovered Brazil?", max_new_tokens=256))
+
+# The same model, one turn at a time, and with the decode rule named rather than inherited:
+print(model.chat([("user", "Name one river in Brazil.")], temperature=0.0))
+""",
     # Two ASR snippets, for the same reason there are two TTS ones: `language=` is not a property of
     # the task. `selects_language` below is what picks between them.
     "automatic-speech-recognition": """import loom
@@ -499,6 +527,8 @@ def repo_id(card: ModelCard) -> str:
 def snippet_key(card: ModelCard) -> str:
     """Which `USAGE_SNIPPETS` entry this model's card gets. The task decides it for every family except
     TTS, where whether the GGUF carries a vocabulary is a per-model fact -- see `takes_text`."""
+    if card.task_type == "text-generation" and card.chat:
+        return "text-generation-chat"
     if card.task_type == "text-to-speech" and card.takes_text:
         return "text-to-speech-with-vocab"
     if card.task_type == "automatic-speech-recognition" and card.selects_language:
