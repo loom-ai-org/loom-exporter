@@ -94,6 +94,7 @@ def load_piper() -> None:
     SynthesizerTrn = _SynthesizerTrn
 
     # In the order they were applied at module scope.
+    _install_length_carrier(MultiHeadAttention)
     MultiHeadAttention._get_relative_embeddings = _get_relative_embeddings_traceable
     MultiHeadAttention._relative_position_to_absolute_position = _relative_position_to_absolute_position_traceable
     MultiHeadAttention._absolute_position_to_relative_position = _absolute_position_to_relative_position_traceable
@@ -137,21 +138,91 @@ PIPER_LENGTH_SCALE = 1.0
 # each needs a trace-friendly replacement. Verified bit-identical to the real piper code across lengths
 # both above and below window_size+1 (both of the real code's own branches) via a standalone pure-eager
 # equivalence check before ever tracing anything.
-_REL_EMB_MAX_PAD = 2048  # generous static bound; must be >= (real per-call T) - window_size - 1
+# THE PAD IS DYNAMIC, AND IT USED TO BE A 2048-WIDE CONSTANT. Read this before "simplifying" the
+# carrier below back out.
+#
+# The obvious trace-friendly answer to the rank restriction above is to pad by a generous STATIC amount
+# and slice dynamically, and that is what this did: `F.pad(table, (0,0, 2048,2048, 0,0))`. It is exact,
+# and it cost **18.9 MB of a 30.6 MB quantized VITS file** -- twelve `[96, 4105]` constants that are
+# **99.78% zeros** (864 real values out of 394080 each), because the pad was constant-folded into the
+# weight at trace time. Measured while closing P4.13, and larger than everything that item won. Nothing
+# downstream could recover it either: the tables are a VIEW's source, and only a mul_mat's FIRST operand
+# is eligible for quantization, so the export's own coverage line counted 18.9 MB of zeros in its
+# denominator and could never move them.
+#
+# So the pad is built as CONCAT of dynamically-sized zero blocks instead -- the same trick
+# `_dynamic_zero_pad_last` below uses for the sibling problem, and legal for the same reason: the rank
+# restriction is on `pad`, not on `cat` or on slicing.
+#
+# THE ONE THING THAT MADE IT AWKWARD, AND WHY THERE IS A CARRIER. Those helpers build their zero block
+# from a slice of `x` itself, which needs `x` to be at least as wide as the block. Here `x` is the
+# learned table -- `2*window_size+1` = **9** columns -- and the block needed is `length - 5`, which for
+# any real utterance is far wider. So the zeros have to come from something whose extent already scales
+# with the sequence length, and `_get_relative_embeddings` is handed `length` as a scalar and no tensor
+# at all. `_install_length_carrier` is what puts one in reach.
+
+def _install_length_carrier(cls):
+    """Wraps `MultiHeadAttention.attention` so `_get_relative_embeddings_traceable` can reach a tensor
+    whose last axis IS the sequence length.
+
+    A wrapper rather than a transcription on purpose: every other patch in this file replaces a method
+    body and therefore has to be kept in step with piper's, and this one needs exactly one fact from
+    that body -- that `attention` is handed `key` shaped `[b, d, t_s]`, before its own view/transpose.
+    Wrapping keeps the rest of the method upstream's.
+
+    Idempotent, because `_ensure_piper_imported` may run more than once per process and wrapping a
+    wrapper would nest a carrier assignment inside another one -- harmless but confusing in a trace.
+    """
+    if getattr(cls.attention, "_loom_wrapped", False):
+        return
+    inner = cls.attention
+
+    def attention(self, query, key, value, mask=None):
+        # `key` is [b, d, t_s] here. Only its SHAPE is used, and only ever through a `* 0.0`.
+        self._loom_len_carrier = key
+        return inner(self, query, key, value, mask)
+
+    attention._loom_wrapped = True
+    cls.attention = attention
 
 
 def _get_relative_embeddings_traceable(self, relative_embeddings, length):
-    """Pads the FIXED-size learned table by a generous STATIC amount unconditionally, then dynamically
-    SLICES out the real window (dynamic slicing is well-supported; only dynamic PAD AMOUNTS are the
-    problem). The real code's window in the table's OWN (pre-pad) coordinates is always
+    """The real `_get_relative_embeddings`, with the pad built from CONCAT instead of `F.pad`.
+
+    The real code's window in the table's OWN (pre-pad) coordinates is always
     `[window_size+1-length, window_size+length)` regardless of whether length is above or below
-    window_size+1 (both of the real code's branches reduce to this same formula) -- so padding to any
-    sufficiently large fixed bound first and slicing with an offset is exact, not an approximation, for
-    every length up to that bound.
+    window_size+1 -- both of its branches reduce to that -- so "pad by `max(length-(window+1), 0)` on
+    each side, then slice at `pad + (window+1) - length`" is exact for every length, in both branches,
+    and is what this computes. Above the window it is a pad and the slice is the whole thing; at or
+    below it the pad is empty and the slice is a crop of the table.
+
+    Unlike the 2048-wide static pad it replaces, the padded table is now only ever ~`2*length` rows,
+    so it costs ~48 KB at a real T=62 instead of 1.5 MB, at run time as well as on disk -- and there is
+    no longer a maximum length at all. The old bound was ~2053 phonemes, enforced (loudly, by the
+    engine's own VIEW bounds check) but real: this now synthesises 5000 tokens, which that could not.
     """
     window_size = self.window_size
-    pad = _REL_EMB_MAX_PAD
-    padded = F.pad(relative_embeddings, (0, 0, pad, pad, 0, 0))  # static amount -> any rank is fine
+    channels = relative_embeddings.shape[-1]
+    # `+ 1` so the block is never EMPTY, which is the one thing the old static pad got for free.
+    # `Max(length - (window_size+1), 0)` is 0 at `length <= window_size`, and a zero-width block makes
+    # a zero-width VIEW, which the engine rejects outright ("non-positive dimension in resolved
+    # shape") -- so a single-phoneme utterance, which used to work, stopped. One extra zero row on each
+    # side costs nothing and keeps both of the real code's branches exact, because `start` is measured
+    # from the pad and moves with it: above the window the slice starts at row 1 instead of row 0, and
+    # at or below it the crop shifts by the same one row. Checked against the real piper code at
+    # lengths 2, 4, 6 and 62.
+    pad = length - (window_size + 1)
+    pad = torch.clamp(pad, min=0) if torch.is_tensor(pad) else max(pad, 0)
+    pad = pad + 1
+
+    # [1, C, pad] of zeros, from a tensor whose last axis is the sequence length. `channels` is
+    # k_channels and the carrier's middle axis is the full hidden width (n_heads * k_channels), so the
+    # channel slice is always in range; `pad` is at most `length - 5`, so the length slice is too.
+    carrier = self._loom_len_carrier
+    zeros = carrier[:1, :channels, :pad] * 0.0
+
+    table = relative_embeddings.transpose(1, 2)                       # [1, C, 2w+1]
+    padded = torch.cat([zeros, table, zeros], dim=-1).transpose(1, 2)  # [1, 2w+1+2*pad, C]
     start = pad + (window_size + 1) - length
     end = start + 2 * length - 1
     return padded[:, start:end]

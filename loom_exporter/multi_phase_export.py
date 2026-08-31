@@ -18,7 +18,7 @@ family (11) ever needs its own abstract tier.
 """
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import coremltools as ct
 import numpy as np
@@ -60,6 +60,18 @@ class ExportPhase:
     # The cache capacity in tokens, required when `fuse_attention` is set and meaningless otherwise --
     # `LoomGGUFExporter._kv_cache_geometry` raises naming it if a fused export does not supply one.
     kv_cache_size: Optional[int] = None
+    # An optional rewrite of this phase's emitted topology, run once, after the trace and before the
+    # topology is handed to the writer. It exists for the one thing a wrapper CANNOT express: a
+    # transform of a graph INPUT that is invariant across the calls the driver makes, and which the
+    # traced framework code therefore re-materialises every call. Whisper's cross-attention V is the
+    # case that forced it -- 4.6 MB transposed per token per layer, of a tensor the `cross_kv` phase
+    # already made constant for the utterance.
+    #
+    # A hook here rather than a general pass in `passes.py` because "invariant across calls" is a fact
+    # about the DRIVER's loop, which no pass over one traced function can see. The contract is that a
+    # rewrite raises rather than silently declining: it is editing a traced graph, and the failure mode
+    # of a pattern that has quietly stopped matching must not be a wrong answer.
+    topology_rewrite: Optional[Callable[[dict], None]] = None
 
     __links__ = {
         # A typo'd axis name is a perfectly good dict key: `_sub_symbol` substitutes it happily and the
@@ -112,6 +124,12 @@ class ExportPhase:
             "a shorter context than the architecture allows is legitimate, the same argument "
             "LMCausalModelExportConfig.max_seq_len records. A fused phase that omits it entirely does "
             "raise, but from the backend, which is where the fused nodes exist to be counted."
+        ),
+        "topology_rewrite": Unchecked(
+            "a callable that edits this phase's emitted topology. There is no declaration to check it "
+            "against -- what it does is defined on the graph it is handed, which does not exist until "
+            "after the trace. The check that matters is the rewrite's own: it raises if the pattern it "
+            "expects is not there, which is a stronger statement than any link here could make."
         ),
     }
 

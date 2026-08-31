@@ -25,6 +25,7 @@ mul_mat to reorder, so declaring them eligible would produce a file ggml cannot 
 one exclusion that is a correctness claim rather than a size trade-off, so it gets its own test.
 
 """
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -164,3 +165,125 @@ class TestOnlyFirstOperandsAreEligible(unittest.TestCase):
         types = self._export(None, [{"op": "MUL_MAT", "inputs": ["mm_weight", "mm_activation"]}],
                              ("mm_weight", "mm_activation"))
         self.assertEqual(set(types.values()), {"F32"})
+
+
+class TestConvKernelsAreFoldedSoTheirBlocksAlign(unittest.TestCase):
+    """The SHAPE half (P4.13), which is what makes the op half above actually pay.
+
+    Clearing the op gate on its own changed nothing measurable: a conv kernel is stored `[K, IC, OC]`,
+    ggml lays quantization blocks along ne[0], and ne[0] is the KERNEL WIDTH -- 1, 3, 5 -- which no
+    block size divides. Every conv kernel in VITS cleared the op gate and every one of them was then
+    declined for shape, which is why its Q8_0 export came out byte-identical to its F32 one.
+
+    `_fold_conv_kernels_for_quantization` folds the spatial axes into ne[0], so ne[0] becomes `IC*K` --
+    a channel count, and therefore a multiple of 32 essentially always. The bytes do not move (a C-order
+    `(OC, IC, K)` reshaped to `(OC, IC*K)` is the same buffer, and it is the reshape `op_conv_1d`
+    performed on every call anyway); what moves is the geometry, which the node now carries as attrs.
+    """
+
+    def _export(self, quantize, nodes, weights):
+        from gguf import GGUFReader
+
+        from loom_exporter.exporter import LoomGGUFExporter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "q.gguf")
+            exporter = LoomGGUFExporter(None, output_path=out, architecture="test", quantize=quantize)
+            exporter.topologies = {"t": {"nodes": nodes}}
+            exporter.weights = dict(weights)
+            exporter.write_gguf("-- driver")
+            reader = GGUFReader(out)
+            # GGUFReader reports shapes in ggml ne order, which is numpy's reversed -- so a folded
+            # `(OC, IC*K)` array reads back as `[IC*K, OC]`, exactly what the engine sees.
+            tensors = {t.name: (t.tensor_type.name, [int(d) for d in t.shape]) for t in reader.tensors}
+            field = reader.fields["model.graph_topology.t"]
+            topo = json.loads(str(bytes(field.parts[field.data[0]]), "utf-8"))
+            return tensors, {n["inputs"][0]: n.get("attrs", {}) for n in topo["nodes"]}
+
+    @staticmethod
+    def _distinct(shape, seed):
+        """Distinct payloads per weight: the writer content-addresses and aliases identical ones, so
+        equal arrays would collapse into one tensor and the assertions would be about a tensor that is
+        not there."""
+        return (np.arange(int(np.prod(shape)), dtype=np.float32) + seed).reshape(shape)
+
+    def test_a_dense_conv_kernel_is_folded_and_carries_its_geometry(self):
+        """The item itself. `(OC, IC, K)` -> `(OC, IC*K)`, `(OC, IC, KH, KW)` -> `(OC, IC*KH*KW)`, and
+        the geometry the fold erased comes back on the node. OC is deliberately NOT among the attrs --
+        it survives as ne[1], and a second spelling of it is a second thing to keep in step."""
+        tensors, attrs = self._export("Q4_0", [
+            {"op": "CONV_1D", "inputs": ["k1", "act"], "attrs": {"s0": 1, "p0": 1, "d0": 1}},
+            {"op": "CONV_2D", "inputs": ["k2", "act"], "attrs": {"s0": 1, "s1": 1}},
+        ], {"k1": self._distinct((8, 32, 3), 1.0),
+            "k2": self._distinct((8, 32, 3, 3), 2.0),
+            "act": self._distinct((4, 256), 3.0)})
+
+        self.assertEqual(tensors["k1"], ("Q4_0", [96, 8]))
+        self.assertEqual(attrs["k1"], {"s0": 1, "p0": 1, "d0": 1, "kernel_ic": 32, "kernel_k": 3})
+        self.assertEqual(tensors["k2"], ("Q4_0", [288, 8]))
+        self.assertEqual(attrs["k2"],
+                         {"s0": 1, "s1": 1, "kernel_ic": 32, "kernel_kh": 3, "kernel_kw": 3})
+
+    def test_the_fold_is_a_reinterpretation_and_not_a_permutation(self):
+        """What makes the fold safe to do to a stored tensor rather than to a view of one. Exported at
+        F16 so the bytes survive the round trip exactly (block size 1 means no fold, so this is the
+        DECLARED layout) and compared against the flattened array element for element."""
+        from gguf import GGUFReader
+
+        from loom_exporter.exporter import LoomGGUFExporter
+
+        kernel = self._distinct((8, 32, 3), 1.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "f.gguf")
+            exporter = LoomGGUFExporter(None, output_path=out, architecture="test", quantize=None)
+            exporter.topologies = {"t": {"nodes": [{"op": "CONV_1D", "inputs": ["k1", "act"]}]}}
+            exporter.weights = {"k1": kernel, "act": self._distinct((4, 8), 9.0)}
+            exporter.write_gguf("-- driver")
+            stored = {t.name: t for t in GGUFReader(out).tensors}["k1"]
+        self.assertEqual([int(d) for d in stored.shape], [3, 32, 8], "no --quantize, so no fold")
+        np.testing.assert_array_equal(np.array(stored.data).reshape(-1), kernel.reshape(-1))
+        # And the folded shape is that same flat sequence read two axes at a time instead of three.
+        np.testing.assert_array_equal(kernel.reshape(8, 96).reshape(-1), kernel.reshape(-1))
+
+    def test_f16_does_not_fold_because_it_has_nothing_to_gain(self):
+        """Block size 1 aligns everything already, and the declared 3-D shape is what
+        `ggml_conv_2d_direct` -- the direct-conv lowering, worth 4.7x on long-activation convolutions --
+        reads its geometry from. Folding here would cost that for nothing."""
+        tensors, attrs = self._export("F16", [
+            {"op": "CONV_1D", "inputs": ["k1", "act"], "attrs": {"s0": 1}},
+        ], {"k1": self._distinct((8, 32, 3), 1.0), "act": self._distinct((4, 256), 3.0)})
+        self.assertEqual(tensors["k1"], ("F16", [3, 32, 8]))
+        self.assertNotIn("kernel_k", attrs["k1"])
+
+    def test_a_depthwise_kernel_is_never_folded(self):
+        """Not a size trade-off, a correctness one. CONV_1D_DW/CONV_2D_DW/SHORT_CONV lower to a mul_mat
+        BATCHED over ne[2] -- each channel's patch matrix against that same channel's kernel slice --
+        so folding ne[0..1] would turn a per-channel pairing into a cross product, which is a wrong
+        answer rather than a slower one. It would not even pay: a depthwise kernel is `[K, 1, C]`, so
+        the fold puts K alone on ne[0] and K is 3."""
+        tensors, attrs = self._export("Q8_0", [
+            {"op": "CONV_1D_DW", "inputs": ["dw", "act"], "attrs": {"s0": 1}},
+        ], {"dw": self._distinct((64, 1, 3), 1.0), "act": self._distinct((4, 256), 3.0)})
+        self.assertEqual(tensors["dw"], ("F32", [3, 1, 64]))
+        self.assertNotIn("kernel_k", attrs["dw"])
+
+    def test_a_kernel_another_node_also_reads_is_left_alone(self):
+        """There is no shape that satisfies both consumers, so the fold declines rather than
+        reconciles -- and the weight stays F32 rather than being written in a layout the other node
+        would read wrongly."""
+        tensors, attrs = self._export("Q8_0", [
+            {"op": "CONV_1D", "inputs": ["shared", "act"], "attrs": {"s0": 1}},
+            {"op": "MUL_MAT", "inputs": ["shared", "act"]},
+        ], {"shared": self._distinct((8, 32, 3), 1.0), "act": self._distinct((4, 256), 3.0)})
+        self.assertEqual(tensors["shared"], ("F32", [3, 32, 8]))
+        self.assertNotIn("kernel_k", attrs["shared"])
+
+    def test_a_kernel_still_unaligned_after_folding_keeps_its_declared_shape(self):
+        """`IC*K` is a multiple of 32 essentially always, but not on VITS's three `[1, 1, 192]`
+        duration-predictor pre-nets. Folding those would cost the geometry and gain nothing, so they
+        stay 3-D and stay F32 -- and stay counted in the export's own declined-for-shape line."""
+        tensors, attrs = self._export("Q8_0", [
+            {"op": "CONV_1D", "inputs": ["tiny", "act"], "attrs": {"s0": 1}},
+        ], {"tiny": self._distinct((192, 1, 1), 1.0), "act": self._distinct((4, 256), 3.0)})
+        self.assertEqual(tensors["tiny"], ("F32", [1, 1, 192]))
+        self.assertNotIn("kernel_k", attrs["tiny"])
