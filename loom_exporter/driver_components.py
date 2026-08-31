@@ -44,6 +44,7 @@ from typing import List, Optional, Tuple
 from .driver_ir import (
     ArrayLit, Argmax, Assign, BinOp, Break, Call, CallStmt, FieldAccess, If, Index, IndexAssign, Len,
     Lit, Local, LocalDecl, NumericFor, OutputRef, RawBlock, RetainedArgmax, RetainedArgmaxRows,
+    RetainedSample,
     Return, SubgraphCall, TableLit, Var, While,
 )
 from .driver_ir import Function as IRFunction
@@ -311,6 +312,32 @@ class ModularChain(DriverComponent):
         ]
 
 
+# The knobs a `RetainedSample` reads, and the checkpoint's own value for each (P4.24). `None` means the
+# family declares no sampling at all, which emits `RetainedArgmax` and therefore the exact Lua every
+# family emitted before this existed -- so no ASR, TTS or CTC driver text moves, and every recorded gate
+# snapshot for them stays byte-identical.
+#
+# Greedy is `temperature = 0.0` rather than a separate flag, because ONE number deciding it is what
+# makes `loom.sample_row` and `loom.argmax_row` incapable of disagreeing: the binding takes the argmax
+# path itself at that value. A causal LM always declares this, even when its checkpoint is greedy, so a
+# caller can still pass `temperature` and have it mean something.
+SAMPLING_KNOBS = ("temperature", "top_k", "top_p")
+
+
+def _sampling_options(sampling: Optional[dict]):
+    """`{knob: inputs.<knob> or <checkpoint default>}` as IR, the same `or`-fallback shape
+    `max_new_tokens` and `eos_token` already use in the loop below."""
+    return {knob: BinOp("or", FieldAccess("inputs", knob), Lit(sampling[knob]))
+            for knob in SAMPLING_KNOBS}
+
+
+def _next_token_read(sampling: Optional[dict], module: str, row):
+    """The reduction one decode step makes: sampled when the family declared knobs, argmax otherwise."""
+    if sampling is None:
+        return RetainedArgmax(module, row)
+    return RetainedSample(module, row, _sampling_options(sampling))
+
+
 @dataclass
 class ArgmaxEpilogue(DriverComponent):
     """Returns the next token rather than the raw logits array.
@@ -334,6 +361,10 @@ class ArgmaxEpilogue(DriverComponent):
     # When set, the row is read out of this module's retained output rather than out of a Lua table, and
     # `out_var`/`shape_var` are unused because the producing call bound no locals at all.
     retained_module: Optional[str] = None
+    # The checkpoint's own sampling defaults, or None for argmax (P4.24). See `SAMPLING_KNOBS`. Only the
+    # retained form can be sampled: the Lua-table form exists for a driver that already holds the row,
+    # and the whole point of the reduction being engine-side is that a causal LM's row never is.
+    sampling: Optional[dict] = None
 
     __links__ = {
         "retained_module": WhenSet(TopologyName()),
@@ -344,6 +375,9 @@ class ArgmaxEpilogue(DriverComponent):
                              "cross-component symbol read is answerable and nowhere else"),
         "shape_var": Unchecked("same -- the shape local the calling component captured"),
         "n_tokens": Unchecked("the driver_ir expression for the active row; see DriverInputs.n_tokens"),
+        "sampling": Unchecked("READ off the checkpoint's own generation_config.json by the family that "
+                              "binds it (bpe_tokenizer_export.read_sampling_defaults). The one thing a "
+                              "link could compare it against is that same file"),
     }
 
     def emit(self, ctx: DriverContext) -> List:
@@ -354,7 +388,7 @@ class ArgmaxEpilogue(DriverComponent):
             # reducible fails in the bridge naming the module rather than silently returning it. That
             # the module really did retain is checked at export time by
             # driver_ir.check_subgraph_calls, which is the only checker that knows what a module is.
-            return [Return([RetainedArgmax(self.retained_module, row)])]
+            return [Return([_next_token_read(self.sampling, self.retained_module, row)])]
         return [If(
             cond=BinOp("==", Call("type", [Var(self.out_var)]), Lit("table")),
             then=[Return([Call("loom.argmax_row",
@@ -472,6 +506,8 @@ class PrefillDecodeLoop(DriverComponent):
     # `max_new_tokens` on every utterance. Empty for every family with a single eos, which emits
     # exactly the Lua it emitted before this field existed.
     extra_eos_tokens: Tuple[int, ...] = ()
+    # The checkpoint's own sampling defaults, or None for argmax (P4.24). See `SAMPLING_KNOBS`.
+    sampling: Optional[dict] = None
     # {input name: sliding-window width} for the masks that are banded rather than full-causal
     # (BACKLOG.md P4.0.11a). Empty for every model that has no windowed attention, which is every model
     # on this roadmap but Gemma 3 -- and an absent entry means "full causal", so the emitted call is
@@ -573,6 +609,8 @@ class PrefillDecodeLoop(DriverComponent):
         ),
         "extra_eos_tokens": Unchecked("same -- the remaining ids the checkpoint's generation config "
                                       "lists, read rather than claimed"),
+        "sampling": Unchecked("same -- the checkpoint's own generation_config.json sampling knobs, "
+                              "read by bpe_tokenizer_export.read_sampling_defaults rather than claimed"),
         "generated_var": Unchecked("a local this component binds; reads of it are inside its own loop "
                                    "and are checked by driver_ir.validate over the assembled function"),
         "step_var": Unchecked("same"),
@@ -671,8 +709,8 @@ class PrefillDecodeLoop(DriverComponent):
                 # output is read; a second, fused spelling of the same reduction is what P4.0.14
                 # retired.
                 *self._step_body(ctx),
-                Local(next_var, RetainedArgmax(logits_module,
-                                               BinOp("-", Var(self.n_tokens_var), Lit(1)))),
+                Local(next_var, _next_token_read(self.sampling, logits_module,
+                                                 BinOp("-", Var(self.n_tokens_var), Lit(1)))),
                 CallStmt(Call("table.insert", [Var(self.generated_var), Var(next_var)])),
                 Assign(self.n_past_var, BinOp("+", Var(self.n_past_var), Var(self.n_tokens_var))),
                 If(cond=BinOp(">=", Len(self.generated_var), Var(max_new)), then=[Break()]),
