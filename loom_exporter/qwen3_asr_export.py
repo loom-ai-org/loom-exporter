@@ -362,11 +362,28 @@ class ASRQwen3SpeechLMExportConfig(BaseSpeechLMExportConfig):
         # bound into the loop itself, since it is the loop that compares against them.
         eos_ids = model.generation_config.eos_token_id
         eos_ids = [int(e) for e in (eos_ids if isinstance(eos_ids, (list, tuple)) else [eos_ids])]
+        # WHERE THE TRANSCRIPT ACTUALLY STARTS. This checkpoint does not answer with a transcript: it
+        # answers with its own detected language, then `<asr_text>`, then the words -- so an
+        # untrimmed driver returned `language English<asr_text>This is a test...` where every other
+        # ASR export returned a clean transcript. The preamble is real model output ("language" and
+        # "English" are ordinary text tokens it chose to emit), not a detokenizer artefact, so
+        # nothing downstream could have removed it without knowing this format.
+        #
+        # READ off the tokenizer rather than written here as 151704, for the same reason the prompt
+        # above is rendered rather than transcribed: a vocabulary change moves the constant instead
+        # of silently disagreeing with it. `convert_tokens_to_ids` returns the unk id for a token a
+        # checkpoint does not have, so this is checked rather than trusted -- a sibling model without
+        # the marker gets None and its driver trims nothing.
+        marker = processor.tokenizer.convert_tokens_to_ids("<asr_text>")
+        if marker is None or marker == processor.tokenizer.unk_token_id:
+            marker = None
+
         return {
             "EOS": eos_ids[0],
             "EOS_EXTRA": tuple(eos_ids[1:]),
             "AUDIO_PREFIX": prefix,
             "AUDIO_SUFFIX": suffix,
+            "TRANSCRIPT_AFTER": marker,
         }
 
 
