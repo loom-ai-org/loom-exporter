@@ -768,5 +768,10 @@ class BaseSpeechLMExportConfig(BaseMultiPhaseModelExportConfig):
                 # wrong.
                 default_eos_token=self.prompt_constants.get("EOS", -1),
                 extra_eos_tokens=tuple(self.prompt_constants.get("EOS_EXTRA", ())),
+                # A family member whose answer carries a preamble names the token the transcript
+                # starts after; absent for one whose generated ids ARE the answer, which is Granite --
+                # and Granite comes back clean, which is what says this is per-CHECKPOINT rather than
+                # a property of family 3. `.get` for the same reason the two above use it.
+                transcript_after_token=self.prompt_constants.get("TRANSCRIPT_AFTER"),
             ),
         ]

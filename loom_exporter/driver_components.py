@@ -555,6 +555,26 @@ class PrefillDecodeLoop(DriverComponent):
     # loop's first iteration is simply the last segment.
     initial_n_past: object = None
 
+    # The id of a marker token after which the REAL output begins, or None when everything the loop
+    # generated is the answer -- which is every family but one.
+    #
+    # Qwen3-ASR does not answer with a transcript. It answers with its own detected language, then a
+    # `<asr_text>` marker (id 151704, a USER_DEFINED token in its vocabulary), then the transcript --
+    # so `result.text` came back as `language English<asr_text>This is a test...` while every other
+    # ASR export returned a clean transcript. The preamble is real model output, not a detokenizer
+    # artefact: "language" and "English" are ordinary text tokens the model chose to emit.
+    #
+    # HERE RATHER THAN IN THE ENGINE, because it is one model's output FORMAT. `loom::audio::transcribe`
+    # does handle Whisper's timestamp tokens, but only through metadata the file DECLARES -- the export
+    # states the scheme and the engine acts generically. Teaching transcribe.cpp about `<asr_text>`
+    # would be the engine learning a checkpoint, which ADR-003 puts in the exporter. The driver already
+    # carries this family's prompt constants for the same reason.
+    #
+    # Nothing is stripped when the marker never appears: a generation that hit `max_new_tokens` before
+    # emitting it would otherwise return EMPTY, turning a truncated transcript into a silent one. A
+    # partial answer is worth more than nothing, and the caller can see it is partial.
+    transcript_after_token: Optional[int] = None
+
     # Locals this component binds. Prefixed so they cannot collide with a traced input's own safe_name.
     generated_var: str = "_gen"
     step_var: str = "_step_tokens"
@@ -611,6 +631,11 @@ class PrefillDecodeLoop(DriverComponent):
                                       "lists, read rather than claimed"),
         "sampling": Unchecked("same -- the checkpoint's own generation_config.json sampling knobs, "
                               "read by bpe_tokenizer_export.read_sampling_defaults rather than claimed"),
+        "transcript_after_token": Unchecked(
+            "a token id READ off the checkpoint's own tokenizer by the family that binds it, exactly "
+            "like default_eos_token. The one thing a link could compare it against is that same "
+            "vocabulary, which is where the value came from."
+        ),
         "generated_var": Unchecked("a local this component binds; reads of it are inside its own loop "
                                    "and are checked by driver_ir.validate over the assembled function"),
         "step_var": Unchecked("same"),
@@ -722,7 +747,33 @@ class PrefillDecodeLoop(DriverComponent):
                 Assign(self.step_var, ArrayLit([Var(next_var)])),
                 Assign(self.n_tokens_var, Lit(1)),
             ]),
+            *self._trim_preamble(),
             Return([Var(self.generated_var)]),
+        ]
+
+    def _trim_preamble(self) -> List:
+        """Drop everything up to and including `transcript_after_token`, if it was emitted.
+
+        Emitted only for a family that sets the field, so every other driver is byte-identical to
+        what it was before this existed.
+        """
+        if self.transcript_after_token is None:
+            return []
+        kept, seen, i = "_kept", "_seen", "_i"
+        return [
+            Local(kept, ArrayLit([])),
+            Local(seen, Lit(False)),
+            NumericFor(var=i, start=Lit(1), stop=Len(self.generated_var), body=[
+                If(cond=Var(seen),
+                   then=[CallStmt(Call("table.insert",
+                                       [Var(kept), Index(Var(self.generated_var), Var(i))]))],
+                   else_=[If(cond=BinOp("==", Index(Var(self.generated_var), Var(i)),
+                                        Lit(self.transcript_after_token)),
+                             then=[Assign(seen, Lit(True))])]),
+            ]),
+            # Only when the marker was actually seen -- see `transcript_after_token`: a truncated
+            # generation keeps its partial answer rather than being emptied.
+            If(cond=Var(seen), then=[Assign(self.generated_var, Var(kept))]),
         ]
 
 
