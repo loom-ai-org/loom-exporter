@@ -99,6 +99,19 @@ TASKS: Dict[str, TaskSpec] = {
             base_config="multi_phase_export:BaseMultiPhaseModelExportConfig",
         ),
         TaskSpec(
+            name="text-to-codes",
+            summary=(
+                "RESERVED, no family yet. An AR language model that emits NEURAL CODEC TOKENS rather "
+                "than text -- EXPORT-ROADMAP.md's family 10 (parler, dia, csm, orpheus, qwen3-tts, "
+                "~20 models). Its output is what `audio-codec` decodes, so the two compose: "
+                "`text2codes` then `codes2speech`. Reserved for the same reason `audio-codec` was "
+                "before family 11 claimed it -- a name declared before it is needed is what stops the "
+                "family that arrives from inventing a competing one."
+            ),
+            base_config=None,
+            reserved=True,
+        ),
+        TaskSpec(
             name="token-classification",
             summary=(
                 "Text-in/one-class-per-token-out. A bidirectional encoder plus a linear head, traced as "
@@ -110,12 +123,12 @@ TASKS: Dict[str, TaskSpec] = {
         TaskSpec(
             name="audio-codec",
             summary=(
-                "RESERVED, no family yet. Neural audio codec encode/decode (EnCodec, DAC, SNAC, Mimi) -- "
-                "discrete-token-in/waveform-out, which is a different contract from text-to-speech and "
-                "is what family 10's AR codec-token models decode through. Claimed by P5's family 11."
+                "Neural audio codec DECODE (DAC, and the EnCodec/SNAC/Mimi shapes behind it) -- "
+                "codes-in/waveform-out, which is a different contract from text-to-speech and is what "
+                "family 10's AR codec-token models decode through. Claimed by P5's family 11; the "
+                "encode direction is a different pair and has no family."
             ),
-            base_config=None,
-            reserved=True,
+            base_config="audio_codec_export:AudioCodecExportConfig",
         ),
     )
 }

@@ -199,6 +199,7 @@ _FAMILY_MODULES = (
     "supertonic_export",
     "vits_export",
     "token_classification_export",
+    "audio_codec_export",
 )
 
 

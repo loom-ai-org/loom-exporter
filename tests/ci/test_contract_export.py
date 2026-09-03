@@ -56,12 +56,12 @@ class TestContractDefaults(unittest.TestCase):
         self.assertEqual(config.contract()["output.kind"], "audio")
 
     def test_an_unclaimed_task_still_declares_its_name(self):
-        """`audio-codec` is reserved with no family behind it. A future task this table has never heard
+        """`text-to-codes` is reserved with no family behind it. A future task this table has never heard
         of must still write `loom.task` -- a host that does not recognise the name can say so, where a
         host handed nothing cannot tell that from an old export."""
         config = LoomExportConfig(architecture="x", output_path="/tmp/x.gguf", decomposition=None)
-        config.task = "audio-codec"
-        self.assertEqual(config.contract(), {"task": "audio-codec"})
+        config.task = "text-to-codes"
+        self.assertEqual(config.contract(), {"task": "text-to-codes"})
 
 
 class TestTaskReachesTheConfig(unittest.TestCase):

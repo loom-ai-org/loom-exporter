@@ -526,10 +526,10 @@ def test_tts_recognizers_reject_the_other_families_paths(tmp_path):
 
 # -- TaskRegistry itself, independent of any real family -----------------------------------------------
 
-# A toy family, registered under the one canonical task no real family claims yet (`audio-codec`, whose
+# A toy family, registered under the one canonical task no real family claims yet (`text-to-codes`, whose
 # base is therefore just `LoomExportConfig`). This keeps these tests independent of any real family while
 # still going through P4.0.4's vocabulary and config-class checks, which is what a real caller does.
-TOY_TASK = "audio-codec"
+TOY_TASK = "text-to-codes"
 
 
 @dataclass(kw_only=True)
@@ -719,10 +719,10 @@ def test_every_recognizer_naming_one_concrete_model_is_specific():
 
 # -- the task vocabulary itself (P4.0.4) ---------------------------------------------------------------
 
-def test_the_vocabulary_is_the_five_canonical_names():
+def test_the_vocabulary_is_the_six_canonical_names():
     assert known_tasks() == [
-        "audio-codec", "automatic-speech-recognition", "text-generation", "text-to-speech",
-        "token-classification",
+        "audio-codec", "automatic-speech-recognition", "text-generation", "text-to-codes",
+        "text-to-speech", "token-classification",
     ]
 
 
@@ -734,30 +734,39 @@ def test_every_declared_base_config_resolves_and_is_a_loom_export_config():
         assert isinstance(base, type) and issubclass(base, LoomExportConfig), name
 
 
-def test_audio_codec_is_reserved_and_unclaimed():
-    """Decision 3: the name is declared now so family 11 does not invent a competing one, but no family
-    registers against it until it exists."""
+def test_a_reserved_name_is_claimed_by_the_family_that_arrives():
+    """`audio-codec` was reserved for family 11 and is now ITS task, which is the reservation
+    mechanism working rather than the exception to it. `text-to-codes` takes its place as the
+    declared-but-unclaimed one, for family 10 -- the two compose, and naming the second before it
+    exists is what stops it inventing a competing spelling."""
     from loom_exporter.registry import default_registry
+    from loom_exporter.audio_codec_export import AudioCodecExportConfig
 
-    assert task_spec("audio-codec").reserved
-    assert task_spec("audio-codec").base_config_class() is LoomExportConfig
-    assert "audio-codec" not in default_registry()._entries
+    assert not task_spec("audio-codec").reserved
+    assert task_spec("audio-codec").base_config_class() is AudioCodecExportConfig
+    assert "audio-codec" in default_registry()._entries
+
+    assert task_spec("text-to-codes").reserved
+    assert task_spec("text-to-codes").base_config_class() is LoomExportConfig
+    assert "text-to-codes" not in default_registry()._entries
 
 
 def test_a_declared_but_unclaimed_task_says_so_rather_than_unknown():
-    """`--task audio-codec` is a valid argparse choice but has no family, and that is a different error
-    from a typo -- conflating them sends the caller looking for a misspelling that isn't there."""
+    """`--task text-to-codes` is a valid argparse choice but has no family, and that is a different
+    error from a typo -- conflating them sends the caller looking for a misspelling that isn't there."""
     from loom_exporter.registry import default_registry
 
     registry = default_registry()
     with pytest.raises(ValueError, match="declared but no family is registered against it yet"):
-        registry.get("audio-codec", "whatever")
+        registry.get("text-to-codes", "whatever")
     with pytest.raises(ValueError, match="declared but no family is registered against it yet"):
-        registry.detect(Path("/nonexistent"), task="audio-codec")
+        registry.detect(Path("/nonexistent"), task="text-to-codes")
 
 
-def test_only_audio_codec_is_reserved():
-    assert [n for n in known_tasks() if task_spec(n).reserved] == ["audio-codec"]
+def test_exactly_one_task_is_reserved():
+    """One at a time, deliberately: a reserved name is a promise about the NEXT family, and a list of
+    them is a roadmap pretending to be a vocabulary."""
+    assert [n for n in known_tasks() if task_spec(n).reserved] == ["text-to-codes"]
 
 
 def test_get_returns_the_named_recognizer():
@@ -805,7 +814,7 @@ def test_every_registered_task_is_canonical():
     registry = default_registry()
     assert set(registry._entries) <= set(known_tasks())
     assert sorted(registry._entries) == [
-        "automatic-speech-recognition", "text-generation", "text-to-speech",
+        "audio-codec", "automatic-speech-recognition", "text-generation", "text-to-speech",
         "token-classification",
     ]
 
