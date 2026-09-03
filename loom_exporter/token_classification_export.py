@@ -15,33 +15,43 @@ head (P4.0.17), and one class per *token* is the same reduction over the same te
 difference is that a CTC head then collapses repeats and drops a blank and this one does not, which is
 `TokenLabelsEpilogue` against `CtcGreedyEpilogue`, one component.
 
-Three things about the trace are worth stating, because each is a place where the obvious version bakes
-the sequence length into the graph and only diverges past the traced length:
+**THE WORK IN THIS FAMILY IS TRACING, NOT ARCHITECTURE**, and the one rule that covers all of it is:
+*every tensor the model needs must be derived from an input, never computed from `.shape[1]`.* Each
+place `transformers` breaks that rule is silently harmless at the traced length and only diverges past
+it, which is what makes them worth naming individually:
 
-* **The attention mask is not an input, and not built.** One unpadded sequence needs no mask at all --
-  the mask exists to hide padding, and this family's door hands the model exactly the tokens the caller
-  wrote. That matters because every route `transformers` takes to *build* one ends in an `expand` to a
-  Python-level `seq_length`: `_prepare_4d_attention_mask_for_sdpa` expands to `tgt_len` and, under
-  `torch.jit.trace`, `torch.all(mask == 1)`'s early-out is skipped (`is_tracing` is true), so even an
-  all-ones mask produces a baked `[1, 1, 128, 128]` constant. `get_extended_attention_mask` is
-  neutralised on the base model instead, which leaves the encoder's `attention_mask=None` path -- full
-  bidirectional attention, no mask tensor anywhere in the MIL program. Verified: the exported graph's
-  only dynamic symbol is the token axis, and its output is `(1, is0, num_labels)`.
-* **`token_type_ids` is derived from `tokens`, not defaulted.** `BertModel`'s own default is
-  `self.embeddings.token_type_ids[:, :seq_length]`, a buffer slice at the traced length. `tokens * 0`
+* **The attention mask is derived from `tokens`, not built by the model.** `torch.ones_like(tokens)` --
+  a real, all-ones padding mask, because this family's door hands the model exactly the tokens the
+  caller wrote and there is no padding to hide. Passing one is what stops the model building its own:
+  BERT would `torch.ones(input_shape)` at the traced length, and DistilBERT does the same inline. The
+  2-D shape is load-bearing too. It reaches `ModuleUtilsMixin.get_extended_attention_mask`, which for
+  an encoder is `mask[:, None, None, :]` and `(1 - x) * finfo.min` -- pure arithmetic on the input
+  tensor. The route it must NOT take is the sdpa one: `_prepare_4d_attention_mask_for_sdpa` expands to
+  a Python-level `tgt_len`, and under `torch.jit.trace` its `torch.all(mask == 1)` early-out is skipped
+  (`is_tracing` is true), so even an all-ones mask becomes a baked `[1, 1, 128, 128]` constant. That is
+  why `load_model` asks for `attn_implementation="eager"`.
+* **`token_type_ids` is `tokens * 0`, where the model takes one at all.** `BertModel`'s own default is
+  `self.embeddings.token_type_ids[:, :seq_length]`, a buffer slice at the traced length; `tokens * 0`
   is the same tensor of zeros -- single-segment input, which is what a token classifier takes -- built
-  from an input whose length is genuinely dynamic.
-* **`position_ids` is passed explicitly**, for the same reason the causal-LM family passes
-  `cache_position` (see `causal_lm_export._causal_mask`'s comment): letting the model derive it
-  internally reads `.shape[1]` at trace time. It costs the caller nothing -- `position_ids` is already
-  in `driver_components.POSITION_INPUT_NAMES`, so the synthesized driver fills it in with
-  `loom.range(0, n_tokens)`.
+  from an input whose length is dynamic. DistilBERT has no token-type embedding and no such argument,
+  which is read off its `forward` signature rather than off its name.
+* **`position_ids` is an input, delivered one of two ways.** Where the model accepts the argument
+  (BERT, RoBERTa, ELECTRA) it is passed, for the same reason the causal-LM family passes
+  `cache_position`. Where it does not (DistilBERT, whose `Embeddings.forward` reads
+  `self.position_ids[:, :seq_length]` -- a buffer slice whose own comment says it "helps when tracing",
+  which is true of a fixed-shape export and exactly wrong here), a forward pre-hook on the
+  position-embedding table substitutes the caller's ids for the ones the model computed. **Both routes
+  produce the same two graph inputs and the same driver**, which is the point: the difference is
+  absorbed here rather than reaching the artifact.
 
-The head itself is `AutoModelForTokenClassification`'s, whatever it is: this family names no
-architecture and no submodule attribute. `base_model` is HF's own accessor for the encoder underneath
-the head, so the one patch above applies to BERT, RoBERTa, XLM-R, ELECTRA and DeBERTa alike without a
-per-model table.
+Everything else is `AutoModelForTokenClassification`'s, whatever it is. This family names no
+architecture: `base_model` is HF's own accessor for the encoder underneath a task head, and which
+arguments that encoder takes is read from its signature. Verified on two structurally different
+checkpoints -- BERT (token-type embeddings, `position_ids` argument, `.encoder`) and DistilBERT (none
+of the three) -- which is what the "modular-export generality is unproven" item in the backlog asks of
+a template and this one now has.
 """
+import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,23 +67,80 @@ from .export_config import LoomExportConfig
 from .spec_protocol import Unchecked
 
 
+def _accepts(fn, name: str) -> bool:
+    """Whether `fn` declares a parameter called `name`.
+
+    The whole of this family's per-architecture branching, and it is a question about the model rather
+    than about its name -- which is what lets one wrapper cover BERT and DistilBERT without a table
+    mapping `model_type` to a call signature.
+    """
+    return name in inspect.signature(fn).parameters
+
+
+class _PositionHolder:
+    """The caller's `position_ids`, for a model that has no argument to receive them through.
+
+    A plain attribute rather than a buffer or a closure variable, and it works under
+    `torch.jit.trace` for the reason tracing works at all: the trace follows the DATA, not the module
+    boundaries, so a tensor built in `_TokenClassifierWrapper.forward` and read inside a submodule's
+    pre-hook is one connected graph. It is per-wrapper state, so two exports cannot see each other's.
+    """
+
+    positions = None
+
+
 class _TokenClassifierWrapper(torch.nn.Module):
     """Reduces any `AutoModelForTokenClassification` to `(tokens, position_ids) -> logits`.
 
-    The `get_extended_attention_mask` override is the whole of the surgery and it is a *removal*: it
-    returns `None`, so the encoder runs its no-mask path. See the module docstring for why building the
-    mask -- even an all-ones one -- is what bakes the traced length in. It is set on the instance rather
-    than on the class so nothing outside this export is affected.
+    The constructor asks the encoder two questions and answers a third; see the module docstring for
+    why each of them is a place the traced length would otherwise be baked in. Nothing here is keyed on
+    an architecture name.
     """
 
     def __init__(self, model):
         super().__init__()
         self.model = model
-        model.base_model.get_extended_attention_mask = lambda mask, shape, *args, **kwargs: None
+        base = model.base_model
+        self._takes_position_ids = _accepts(base.forward, "position_ids")
+        self._takes_token_type_ids = _accepts(base.forward, "token_type_ids")
+        self._holder = _PositionHolder()
+        if not self._takes_position_ids:
+            self._redirect_position_lookup(base)
+
+    def _redirect_position_lookup(self, base) -> None:
+        """Feed the caller's ids to the position-embedding table, whatever the model computed.
+
+        A forward pre-hook returning a replacement argument tuple, rather than a rewritten
+        `Embeddings.forward`: the hook is four lines and reimplementing the embeddings would be a copy
+        of one family's arithmetic that has to be kept in step with it. The ids the model computed
+        become a dead constant and are pruned with every other dead node.
+
+        Raises rather than exporting when the table cannot be found: a model with no `position_ids`
+        argument AND no position table is one whose positions come from somewhere this has not seen, and
+        guessing would produce a graph that is wrong only past the traced length -- the exact failure
+        this whole path exists to prevent.
+        """
+        table = getattr(getattr(base, "embeddings", None), "position_embeddings", None)
+        if table is None:
+            raise ValueError(
+                f"{type(base).__name__}.forward takes no `position_ids`, so its positions are computed "
+                f"internally from the traced sequence length -- and it has no "
+                f"`embeddings.position_embeddings` table to redirect, which is how that is worked "
+                f"around for DistilBERT. Exporting it would bake the traced length into the graph. "
+                f"Add the seam this model does have to `_redirect_position_lookup`."
+            )
+        table.register_forward_pre_hook(lambda module, args: (self._holder.positions,))
 
     def forward(self, tokens, position_ids):
-        return self.model(input_ids=tokens, position_ids=position_ids,
-                          token_type_ids=tokens * 0).logits
+        # Set unconditionally, so the one attribute is live whether or not a hook reads it -- a value
+        # assigned only on the branch that needs it is a `None` waiting for the next model shape.
+        self._holder.positions = position_ids.unsqueeze(0)
+        kwargs = {}
+        if self._takes_position_ids:
+            kwargs["position_ids"] = position_ids
+        if self._takes_token_type_ids:
+            kwargs["token_type_ids"] = tokens * 0
+        return self.model(input_ids=tokens, attention_mask=torch.ones_like(tokens), **kwargs).logits
 
 
 @dataclass(kw_only=True)
@@ -147,12 +214,14 @@ class TokenClassificationExportConfig(LoomExportConfig):
 
     def load_model(self):
         print(f"Loading token classifier from {self.model_dir}...")
-        # `attn_implementation="eager"` rather than the default: `BertModel.forward` routes a 2-D mask
-        # through `_prepare_4d_attention_mask_for_sdpa` *before* consulting
-        # `get_extended_attention_mask`, so the sdpa path would rebuild the baked mask the wrapper
-        # exists to avoid. Eager reaches the override, and the arithmetic is identical -- what differs
-        # is which MIL ops it lowers to (matmul/softmax/matmul rather than one fused primitive), and
-        # this family fuses nothing anyway.
+        # `attn_implementation="eager"` rather than the default, and it is load-bearing rather than
+        # conservative: `BertModel.forward` routes a 2-D mask through
+        # `_prepare_4d_attention_mask_for_sdpa`, which expands to a Python-level `tgt_len` and whose
+        # all-ones early-out is skipped under tracing -- so the sdpa path bakes the traced length even
+        # for the all-ones mask this family passes. Eager reaches `get_extended_attention_mask`
+        # instead, which is arithmetic on the input tensor. The numbers are identical either way; what
+        # differs is which MIL ops it lowers to (matmul/softmax/matmul rather than one fused
+        # primitive), and this family fuses nothing anyway.
         model = AutoModelForTokenClassification.from_pretrained(
             self.model_dir, dtype=torch.float32, attn_implementation="eager").eval()
         self._resolved_architecture = self.architecture or getattr(model.config, "model_type", None)

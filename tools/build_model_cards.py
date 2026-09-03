@@ -131,7 +131,7 @@ class ModelCard:
     extra_files: List[str] = field(default_factory=list)
 
 
-# The 17 models the exporter can produce today (BACKLOG.md's implementation-sequence table, P4/P5).
+# The 18 models the exporter can produce today (BACKLOG.md's implementation-sequence table, P4/P5).
 # Per-model invocations are [[loom-engine-model-sweep-recipe]]; license/language were read off each
 # checkpoint's own upstream README.md (see this repo's `/home/flavio/Dev/models/*/README.md` where one
 # was downloaded alongside the weights) or, where the checkpoint itself carries no README, off the
@@ -402,6 +402,28 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         sample_rate=24000,
         title="StyleTTS2 (LJSpeech)", summary="yl4579's StyleTTS2 LJSpeech checkpoint, exported for loom.cpp. Takes phoneme ids, not text.",
     ),
+    ModelCard(
+        slug="distilbert-ner", checkpoint=Path("distilbert-ner"),
+        task_type="token-classification",
+        base_repo="dslim/distilbert-NER", license_id="apache-2.0", language=["en"],
+        title="DistilBERT-NER",
+        summary="dslim's DistilBERT fine-tuned on CoNLL-2003 for named-entity recognition, exported "
+                "for loom.cpp. Family 12: text in, one class per token out.",
+        limitations=(
+            "Trained on CoNLL-2003, which is **newswire from 1996-1997** -- entity names that did not "
+            "exist then, and text that does not read like a news wire, are outside what it saw. It "
+            "recognises four types (`PER`, `ORG`, `LOC`, `MISC`) and nothing else, and it is **cased**: "
+            "lowercasing your input before passing it costs real accuracy, because capitalisation is "
+            "most of what a NER model has to go on.\n\n"
+            "The labels line up with the tokenizer's PIECES, not with your words. A word the "
+            "vocabulary splits gets one label per piece, and they can disagree -- deciding which one "
+            "wins is the caller's rule, which is why the export hands back the pieces alongside the "
+            "labels rather than a list of words.\n\n"
+            "The export takes one sequence at a time and no padding, so there is no batch dimension "
+            "to fill and no attention mask to pass. Sequences are capped at 512 tokens by the "
+            "checkpoint's own learned position table."
+        ),
+    ),
 ]
 
 CATALOG_BY_SLUG = {m.slug: m for m in CATALOG}
@@ -501,6 +523,32 @@ loom.phonemizers.set_lexicon("en_UK.tsv")    # a path, an http(s):// URL, or hf:
 # does not fail, it plays the voice at the wrong speed.
 audio = model.text2speech.infer("hello world", sample_rate={sample_rate})
 audio.save("out.wav")
+""",
+    # The fourth door, and the first non-audio one. Fixed text rather than a placeholder, for the same
+    # reason every TTS card says "hello world": the release gate reads the card's OWN output back and
+    # grades it, so the sentence has to be one an expectation can be written against.
+    "token-classification": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+result = model.text2class.infer("My name is Wolfgang and I live in Berlin")
+print(result.text)
+# My/O name/O is/O Wolfgang/B-PER and/O I/O live/O in/O Berlin/B-LOC
+
+# The labels come back beside the PIECES the tokenizer produced, not the words you wrote -- a
+# WordPiece encode splits unknown and long words, so "Wolfgang" may be one piece here and three in
+# another sentence. Joining them back into words is a rule only you can make, which is why both
+# halves are handed over rather than one.
+for token in result:
+    print(token.piece, token.label)
+
+# Every class this checkpoint can choose between, in the order its ids run:
+print(result.labels)
+
+# The framing tokens the encode adds ([CLS] and [SEP]) are dropped for you, on the ids the file
+# declares rather than on their spelling. Ask for the raw alignment if you want them:
+raw = model.text2class.infer("My name is Wolfgang and I live in Berlin", strip_special=False)
+print(len(raw), "rows including [CLS] and [SEP], against", len(result), "without")
 """,
     "text-to-speech-with-vocab": """import loom
 

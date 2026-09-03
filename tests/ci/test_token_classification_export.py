@@ -42,6 +42,15 @@ def test_a_token_classifier_directory_is_claimed(tmp_path):
     assert _is_hf_token_classifier(path)
 
 
+def test_a_second_architecture_is_claimed_by_the_same_recognizer(tmp_path):
+    """One generic recognizer, not one per family: `*ForTokenClassification` is the checkpoint's own
+    statement of which `AutoModelFor*` class it loads through, and that is the whole claim."""
+    path = _hf_dir(tmp_path, "dner", {"model_type": "distilbert",
+                                      "architectures": ["DistilBertForTokenClassification"]})
+    assert _is_hf_token_classifier(path)
+    assert default_registry().detect(path).name == "hf-token-classifier"
+
+
 def test_the_architecture_half_is_load_bearing(tmp_path):
     """`model_type` alone is not enough, and this is the check that keeps this family from claiming
     every other family's checkpoints -- `TaskRegistry.detect` runs every recognizer against every path,
@@ -122,22 +131,46 @@ def test_the_driver_builder_is_named_by_the_family(tmp_path):
 
 # -- the real trace ------------------------------------------------------------------------------
 
-def _tiny_checkpoint(tmp_path: Path, max_position_embeddings: int = 64) -> Path:
-    """A real, randomly-initialised `BertForTokenClassification`, small enough to trace in a unit test.
+_LABELS = {"id2label": {0: "O", 1: "B-PER", 2: "I-PER"},
+           "label2id": {"O": 0, "B-PER": 1, "I-PER": 2}}
+
+
+def _tiny_bert(max_position_embeddings: int):
+    from transformers import BertConfig, BertForTokenClassification
+
+    return BertForTokenClassification(BertConfig(
+        vocab_size=64, hidden_size=32, num_hidden_layers=2, num_attention_heads=2,
+        intermediate_size=64, max_position_embeddings=max_position_embeddings, **_LABELS))
+
+
+def _tiny_distilbert(max_position_embeddings: int):
+    """DistilBERT is in this file because it is structurally different in the THREE ways this family
+    has to absorb, not because it is a second name: no token-type embeddings, no `position_ids`
+    argument (its `Embeddings.forward` slices a registered buffer at the traced length instead), and
+    `.transformer` where BERT has `.encoder`. A template that only ever saw BERT would pass every test
+    above and fail on the first of these."""
+    from transformers import DistilBertConfig, DistilBertForTokenClassification
+
+    return DistilBertForTokenClassification(DistilBertConfig(
+        vocab_size=64, dim=32, n_layers=2, n_heads=2, hidden_dim=64,
+        max_position_embeddings=max_position_embeddings, **_LABELS))
+
+
+ARCHITECTURES = {"bert": _tiny_bert, "distilbert": _tiny_distilbert}
+
+
+def _tiny_checkpoint(tmp_path: Path, max_position_embeddings: int = 64,
+                     architecture: str = "bert") -> Path:
+    """A real, randomly-initialised token classifier, small enough to trace in a unit test.
 
     Real rather than mocked because what is under test is the interaction with `transformers`' own
     forward pass -- a stub would have none of the mask/`token_type_ids`/`position_ids` machinery this
     family exists to route around, so it could not fail.
     """
     torch = pytest.importorskip("torch")
-    from transformers import BertConfig, BertForTokenClassification
 
-    config = BertConfig(vocab_size=64, hidden_size=32, num_hidden_layers=2, num_attention_heads=2,
-                        intermediate_size=64, max_position_embeddings=max_position_embeddings,
-                        id2label={0: "O", 1: "B-PER", 2: "I-PER"},
-                        label2id={"O": 0, "B-PER": 1, "I-PER": 2})
-    model = BertForTokenClassification(config)
-    out = tmp_path / "tiny-ner"
+    model = ARCHITECTURES[architecture](max_position_embeddings)
+    out = tmp_path / f"tiny-{architecture}-ner"
     model.save_pretrained(out)
     # A `vocab.txt` and a `special_tokens_map.json`, which is the CLASSIC BERT layout -- no
     # `tokenizer.json`, because several of this family's real checkpoints predate the fast tokenizer
@@ -173,19 +206,21 @@ def _export(checkpoint: Path, out: Path, **kwargs) -> dict:
     }
 
 
-def test_a_tiny_token_classifier_exports_with_a_dynamic_token_axis(tmp_path):
+@pytest.mark.parametrize("architecture", sorted(ARCHITECTURES))
+def test_a_tiny_token_classifier_exports_with_a_dynamic_token_axis(tmp_path, architecture):
     pytest.importorskip("coremltools")
-    checkpoint = _tiny_checkpoint(tmp_path)
+    checkpoint = _tiny_checkpoint(tmp_path, architecture=architecture)
     exported = _export(checkpoint, tmp_path / "tiny.gguf", seq_len=8)
 
     # THE ASSERTION THIS FILE EXISTS FOR. Both declared inputs carry the symbolic token axis, not the
     # 8 the trace ran at -- a literal here is the baked length, and it is invisible at seq_len=8.
+    #
+    # The SAME two inputs for both architectures, which is the claim that matters more than either of
+    # them: DistilBERT reaches them through a pre-hook on its position table and BERT through a plain
+    # kwarg, and the artifact cannot tell. A third input, or a missing `position_ids`, would mean the
+    # difference had leaked out of the exporter and into the file.
     shapes = {inp["name"]: inp["shape"] for inp in exported["topology"]["inputs"]}
-    assert shapes["tokens"] == ["n_tokens", "1"]
-    assert shapes["position_ids"] == ["n_tokens"]
-    # And no mask input at all: a single unpadded sequence needs none, and every route transformers
-    # takes to build one bakes the length (see the module docstring).
-    assert "attention_mask" not in shapes
+    assert shapes == {"tokens": ["n_tokens", "1"], "position_ids": ["n_tokens"]}
 
     assert exported["task"] == "token-classification"
     assert exported["output_kind"] == "class"
@@ -202,7 +237,8 @@ def test_a_tiny_token_classifier_exports_with_a_dynamic_token_axis(tmp_path):
     assert exported["cls_id"] == 2 and exported["sep_id"] == 3
 
 
-def test_the_traced_length_does_not_reach_the_graph(tmp_path):
+@pytest.mark.parametrize("architecture", sorted(ARCHITECTURES))
+def test_the_traced_length_does_not_reach_the_graph(tmp_path, architecture):
     """The same checkpoint at two trace lengths must produce the same topology.
 
     A weaker version of this test -- export once, check it runs -- passes against a graph with the
@@ -210,7 +246,7 @@ def test_the_traced_length_does_not_reach_the_graph(tmp_path):
     only difference is `seq_len` is what turns that into a real check.
     """
     pytest.importorskip("coremltools")
-    checkpoint = _tiny_checkpoint(tmp_path)
+    checkpoint = _tiny_checkpoint(tmp_path, architecture=architecture)
     at_8 = _export(checkpoint, tmp_path / "a.gguf", seq_len=8)
     at_32 = _export(checkpoint, tmp_path / "b.gguf", seq_len=32)
     assert at_8["topology"] == at_32["topology"]
