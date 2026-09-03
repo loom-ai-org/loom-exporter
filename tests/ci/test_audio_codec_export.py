@@ -38,12 +38,44 @@ def test_a_dac_directory_is_claimed(tmp_path):
     assert _is_dac(_hf_dir(tmp_path, "dac", {"model_type": "dac"}))
 
 
+def test_encodec_is_recognized_and_refuses_with_its_reasons(tmp_path):
+    """The second leaf is DETECTED but not exportable, and detection is what makes that sayable.
+
+    Without the recognizer an EnCodec directory would be "no family recognizes this checkpoint",
+    which is the wrong answer: this family recognizes it fine and cannot yet trace it. The two
+    blockers are real and specific (coremltools' dynamic-pad limitation and a 2-layer LSTM over the
+    time axis), so the message names them rather than saying "unsupported".
+    """
+    from loom_exporter.audio_codec_export import CodecFamily
+
+    path = _hf_dir(tmp_path, "enc", {"model_type": "encodec"})
+    assert default_registry().detect(path).name == "encodec"
+    with pytest.raises(NotImplementedError, match="Dynamic padding"):
+        CodecFamily.ENCODEC.load(str(path))
+    with pytest.raises(NotImplementedError, match="LSTM"):
+        CodecFamily.ENCODEC.load(str(path))
+
+
+def test_encodecs_geometry_and_decode_are_already_written(tmp_path):
+    """The half that IS done, pinned so it does not rot while the blockers are open: EnCodec's config
+    spellings differ from DAC's in every field but `codebook_size`, and that mapping is what a future
+    unblocking builds on."""
+    from loom_exporter.audio_codec_export import CodecFamily
+
+    class _EncodecConfig:
+        num_quantizers, codebook_size, sampling_rate, hop_length = 4, 2048, 32000, 640
+
+    assert CodecFamily.ENCODEC.geometry(_EncodecConfig()) == {
+        "n_codebooks": 4, "codebook_size": 2048, "sample_rate": 32000, "hop_length": 640,
+    }
+
+
 def test_another_codec_is_not_claimed_by_dacs_recognizer(tmp_path):
     """Specific rather than generic, unlike family 12's single recognizer. There is no
     `AutoModelForAudioCodec`: `EncodecModel`, `MimiModel` and SNAC's own package are unrelated classes
     with different `decode` signatures, so a recognizer that claimed them would claim checkpoints this
     wrapper cannot drive."""
-    assert not _is_dac(_hf_dir(tmp_path, "enc", {"model_type": "encodec"}))
+    assert not _is_dac(_hf_dir(tmp_path, "enc2", {"model_type": "encodec"}))
     assert not _is_dac(_hf_dir(tmp_path, "mimi", {"model_type": "mimi"}))
     assert not _is_dac(tmp_path / "nothing-here")
 
