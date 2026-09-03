@@ -2737,8 +2737,8 @@ class LoomGGUFExporter:
                                            Path(tokenizer_dir) / "spiece.model") if p.exists())
             write_sentencepiece_vocab(w, proto_path.read_bytes())
         elif family == "byte":
-            from .byt5_tokenizer_export import write_byt5_vocab
-            write_byt5_vocab(w, tokenizer_dir)
+            from .byt5_tokenizer_export import write_byte_vocab
+            write_byte_vocab(w, tokenizer_dir)
         else:
             raise NotImplementedError(f"_write_tokenizer: no vocab writer for tokenizer family {family!r}")
 
