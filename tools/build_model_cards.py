@@ -50,7 +50,11 @@ class ModelCard:
     # supertonic fork) live outside it and are given absolute paths directly -- see
     # [[loom-engine-model-sweep-recipe]] for why.
     checkpoint: Path
-    # "text-generation" | "automatic-speech-recognition" | "text-to-speech" -- picks the usage snippet.
+    # A canonical task name from `loom_exporter.tasks` -- it picks the usage snippet AND becomes the
+    # card's `pipeline_tag`. Deliberately the SAME vocabulary the export declares rather than a
+    # card-local list: a card whose pipeline tag disagreed with the file's own `loom.task` would be
+    # documenting a different model from the one beside it. `snippet_key` is where a task with more
+    # than one shape resolves that.
     task_type: str
     # Whether this model's GGUF carries a vocabulary, for the TTS models where that is not implied by
     # the task: the phoneme-input families (Kokoro, Matcha, VITS, StyleTTS2) take ids a phonemiser
@@ -131,7 +135,7 @@ class ModelCard:
     extra_files: List[str] = field(default_factory=list)
 
 
-# The 18 models the exporter can produce today (BACKLOG.md's implementation-sequence table, P4/P5).
+# The 19 models the exporter can produce today (BACKLOG.md's implementation-sequence table, P4/P5).
 # Per-model invocations are [[loom-engine-model-sweep-recipe]]; license/language were read off each
 # checkpoint's own upstream README.md (see this repo's `/home/flavio/Dev/models/*/README.md` where one
 # was downloaded alongside the weights) or, where the checkpoint itself carries no README, off the
@@ -403,6 +407,34 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         title="StyleTTS2 (LJSpeech)", summary="yl4579's StyleTTS2 LJSpeech checkpoint, exported for loom.cpp. Takes phoneme ids, not text.",
     ),
     ModelCard(
+        slug="dac-44khz", checkpoint=Path("dac-44khz"),
+        task_type="audio-codec",
+        base_repo="descript/dac_44khz", license_id="mit", language=[],
+        # The HF repo publishes NO `license:` tag and its README is an unfilled template, so the tag
+        # here comes from the upstream project -- github.com/descriptinc/descript-audio-codec, whose
+        # LICENSE is MIT and whose README says so of the WEIGHTS specifically ("Weights are released
+        # as part of this repo under MIT license"), which is the claim that matters for a re-upload.
+        # Same shape of gap, and same resolution, as StyleTTS2's entry above.
+        language_note="a codec, not a language model: it carries no vocabulary and no language. "
+                       "The upstream HF repo carries no `license:` tag; MIT is from the project's own "
+                       "LICENSE and its README's explicit statement about the weights.",
+        title="DAC 44.1 kHz (decoder)",
+        summary="Descript Audio Codec at 44.1 kHz, decode half, exported for loom.cpp. Family 11: "
+                "codec tokens in, a waveform out.",
+        limitations=(
+            "**This is the DECODE half only.** `encode` is audio-in/codes-out -- a different contract "
+            "with a different modality pair -- and no model that decodes through this codec ever calls "
+            "it, so exporting it would be weight in the file for a door nothing opens. To go the other "
+            "way, use the upstream checkpoint.\n\n"
+            "It takes **9 code streams per frame at 86.13 frames per second**, and one frame decodes "
+            "to 512 samples. Codes from a different codec -- or from DAC at a different sample rate -- "
+            "are integers in the right range and produce noise rather than an error.\n\n"
+            "**It does not undo a delay pattern.** An AR model that emits these codes typically offsets "
+            "stream *k* by *k* steps; realigning them is a property of that model, not of the codec, so "
+            "feed it aligned codes."
+        ),
+    ),
+    ModelCard(
         slug="distilbert-ner", checkpoint=Path("distilbert-ner"),
         task_type="token-classification",
         base_repo="dslim/distilbert-NER", license_id="apache-2.0", language=["en"],
@@ -550,6 +582,34 @@ print(result.labels)
 raw = model.text2class.infer("My name is Wolfgang and I live in Berlin", strip_special=False)
 print(len(raw), "rows including [CLS] and [SEP], against", len(result), "without")
 """,
+    # A codec DECODER, which is the one card here whose input a reader cannot type. Codes come from
+    # an encoder or from an AR codec-token LM, so the snippet demonstrates the GEOMETRY -- how many
+    # streams, how wide, how many frames to a second -- and decodes a run of them. The numbers it
+    # prints are what the release gate grades, and they are the exact thing that was silently wrong in
+    # the first working export of this family: a decoder that returns one frame's worth of audio for
+    # any input produces a plausible file and the wrong length.
+    "audio-codec": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# The geometry a caller needs, declared by the file rather than looked up in a paper:
+n_codebooks = model.hparam("codec.n_codebooks")       # code streams per frame
+codebook_size = model.hparam("codec.codebook_size")   # valid id range per stream
+frame_rate = model.hparam("codec.frame_rate", "f32")  # codes per second
+print(n_codebooks, codebook_size, frame_rate, model.contract["sample_rate"])
+
+# Codes are FRAME-MAJOR: all `n_codebooks` codes for frame 0, then frame 1, and so on. This file
+# is the DECODE half -- real codes come from the matching encoder, or an AR model that emits them.
+frames = round(frame_rate)                            # one second of audio
+codes = [[0] * n_codebooks for _ in range(frames)]
+audio = model.codes2speech.infer(codes)
+print(len(audio), "samples at", audio.sample_rate, "Hz =", round(audio.duration, 3), "s")
+audio.save("out.wav")
+
+# A flat list works too, and is what a driver that emitted the codes hands over. One that is not a
+# whole number of frames is refused rather than reinterpreted at a different width.
+audio = model.codes2speech.infer([0] * (frames * n_codebooks))
+""",
     "text-to-speech-with-vocab": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
@@ -566,6 +626,29 @@ audio.save("out.wav")
 # That uses whatever voice the file itself defaults to. See below for choosing another.
 """,
 }
+
+
+#: The only placeholders a usage snippet may carry. Substituted by name rather than through
+#: `str.format`, which was the previous mechanism and is wrong for this content: a snippet is PYTHON,
+#: and Python has braces. The first card to write `{n_codebooks}` inside an explanatory comment
+#: crashed the build with `KeyError: 'n_codebooks'`, and the first one to show a dict or a set literal
+#: would have done the same. Targeted replacement cannot: an unknown brace is just text.
+SNIPPET_PLACEHOLDERS = ("repo_id", "slug", "sample_rate")
+
+
+def render_snippet(text: str, **values) -> str:
+    """One usage snippet with its placeholders filled in.
+
+    Raises on a placeholder this table does not know rather than leaving it in the published card:
+    a card that shipped a literal `{voice}` would be telling a reader to type it.
+    """
+    unknown = set(values) - set(SNIPPET_PLACEHOLDERS)
+    if unknown:
+        raise ValueError(f"unknown snippet placeholder(s) {sorted(unknown)}; "
+                         f"add them to SNIPPET_PLACEHOLDERS if they are real")
+    for key in SNIPPET_PLACEHOLDERS:
+        text = text.replace("{" + key + "}", str(values.get(key, "")))
+    return text
 
 
 def repo_id(card: ModelCard) -> str:
@@ -684,7 +767,7 @@ pip install -U "loom-py-rt[{install_extras}]"
 ```
 {phonemizer_note}
 ```python
-{USAGE_SNIPPETS[snippet_key(card)].format(repo_id=repo_id(card), slug=card.slug, sample_rate=card.sample_rate)}```
+{render_snippet(USAGE_SNIPPETS[snippet_key(card)], repo_id=repo_id(card), slug=card.slug, sample_rate=card.sample_rate)}```
 {usage_extra_section}
 ### The layer underneath
 
