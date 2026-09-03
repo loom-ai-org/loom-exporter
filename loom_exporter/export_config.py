@@ -214,6 +214,10 @@ class LoomExportConfig:
             # ship the WordPiece vocabulary that encodes it, so a host can offer a text door with no
             # step happening outside the engine.
             "token-classification": ("text", "class"),
+            # `audio_codes` rather than `token_ids`, and ADR-020 is the argument: the latter folds
+            # onto "text" in `ModelContract::interface_side`, so a codec would declare itself
+            # `text2speech` and be offered a text door it has no vocabulary for.
+            "audio-codec": ("audio_codes", "audio"),
         }.get(self.task)
         if pair is None:
             return {"task": self.task}

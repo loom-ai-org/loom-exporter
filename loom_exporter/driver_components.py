@@ -904,6 +904,30 @@ class TokenLabelsBuilder(DriverBuilder):
 
 
 @dataclass
+class CodecDecodeBuilder(DriverBuilder):
+    """One traced graph over the codes, and the output IS the answer -- family 11's shape.
+
+    The fourth builder over the same two leading components, and the first whose epilogue REDUCES
+    NOTHING. A causal LM argmaxes one row, a CTC head reduces every row and collapses, a token
+    classifier reduces every row and does not -- a codec decoder returns a waveform, which is already
+    what the caller wants. `ArgmaxEpilogue` applied here would argmax the audio.
+    """
+
+    inputs: DriverInputs
+    call: MonolithicCall
+    # Quoted: `DriverReturn` is declared with the peeled multi-phase components, several hundred lines
+    # below, and it belongs there -- it is the component every peeled TTS driver ends on. Reusing it
+    # rather than adding a fourth epilogue is the point, since "hand back what came out" is one job.
+    epilogue: "DriverReturn"
+
+    __links__ = {name: NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN)
+                 for name in ("inputs", "call", "epilogue")}
+
+    def components(self):
+        return [self.inputs, self.call, self.epilogue]
+
+
+@dataclass
 class ModularChainBuilder(DriverBuilder):
     """Independently-traced submodules chained prefix -> [aux] -> layers -> suffix, then the same
     argmax epilogue. Shares two of its three components with `PrefillArgmaxBuilder`."""
@@ -940,6 +964,11 @@ SYNTHESIZED_BUILDERS = {
     # what turns P4.0.17's exception into a rule. A token classifier is a `Flattened` export exactly
     # like Qwen3 and shares none of its host-side shape either.
     "TokenLabels": TokenLabelsBuilder,
+    # And the third by orchestration. Three of the five builders are now keyed this way, which has
+    # stopped being an exception to `Decomposition.driver_builder`'s premise and become the more
+    # common case: what a host does with a flattened graph's one output is simply not implied by how
+    # the graph was decomposed.
+    "CodecDecode": CodecDecodeBuilder,
 }
 
 

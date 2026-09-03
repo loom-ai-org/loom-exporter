@@ -18,7 +18,7 @@ from .driver_components import (
     CALLER, CAUSAL_MASK_INPUT_NAMES, HOST_COMPUTED_INPUT_NAMES, MASK, POSITION,
     POSITION_INPUT_NAMES, SYNTHESIZED_BUILDERS, ArgmaxEpilogue, ChainStage, CtcGreedyEpilogue,
     DriverInputs, ModularChain,
-    MonolithicCall, PrefillDecodeLoop, TokenLabelsEpilogue,
+    DriverReturn, MonolithicCall, PrefillDecodeLoop, TokenLabelsEpilogue,
 )
 from .passes import apply_loom_mil_passes
 from .shape_expr import (
@@ -720,22 +720,36 @@ class LoomGGUFExporter:
             end_mask = static_array(op.inputs.get("end_mask"))
             end_mask = [] if end_mask is None else list(end_mask)
             squeeze_mask = [] if squeeze_mask is None else list(squeeze_mask)
+            # A SQUEEZING slice is handled by mapping the axis, not by giving up. `begin`/`end`/
+            # `stride` and both masks are indexed by INPUT axis, while `torch_axis` counts output
+            # axes -- so a slice that drops an axis shifts every axis after it, and using the output
+            # index against the input-indexed arrays reads the wrong entry.
+            #
+            # Family 11 is what needed this, and it needed it on the most ordinary indexing expression
+            # in the file: an RVQ decode is `audio_codes[:, i, :]` per codebook, which drops the
+            # codebook axis. Before this, the walk bailed here and the dynamic length came back as a
+            # LITERAL 1 -- so every transposed convolution downstream was cropped to
+            # `(1 - 1) * stride + kernel - pad`, the export ran, and the model returned one frame's
+            # worth of audio for any input. Nothing raised at any point (BACKLOG.md P5 family 11).
+            surviving = [j for j in range(len(begins) if begins is not None else 0)
+                         if not (j < len(squeeze_mask) and bool(squeeze_mask[j]))]
+            src_axis = surviving[torch_axis] if torch_axis < len(surviving) else None
             if (x_var is not None and begins is not None and ends is not None
-                    and not any(bool(s) for s in squeeze_mask)
-                    and torch_axis < len(begins) and torch_axis < len(ends)
-                    and (strides is None or int(strides[torch_axis]) == 1)):
-                in_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
+                    and src_axis is not None
+                    and src_axis < len(begins) and src_axis < len(ends)
+                    and (strides is None or int(strides[src_axis]) == 1)):
+                in_expr = self._infer_dynamic_dim_expr(x_var, src_axis, _seen)
                 if in_expr is not None:
-                    masked_begin = torch_axis < len(begin_mask) and bool(begin_mask[torch_axis])
-                    masked_end = torch_axis < len(end_mask) and bool(end_mask[torch_axis])
-                    begin = as_expr(0) if masked_begin else as_expr(int(begins[torch_axis]))
-                    end = in_expr if masked_end else as_expr(int(ends[torch_axis]))
+                    masked_begin = src_axis < len(begin_mask) and bool(begin_mask[src_axis])
+                    masked_end = src_axis < len(end_mask) and bool(end_mask[src_axis])
+                    begin = as_expr(0) if masked_begin else as_expr(int(begins[src_axis]))
+                    end = in_expr if masked_end else as_expr(int(ends[src_axis]))
                     # MIL keeps torch's negative-index convention: measured back from this axis's own
                     # length, which here is symbolic rather than known.
-                    if not masked_begin and int(begins[torch_axis]) < 0:
-                        begin = in_expr + int(begins[torch_axis])
-                    if not masked_end and int(ends[torch_axis]) < 0:
-                        end = in_expr + int(ends[torch_axis])
+                    if not masked_begin and int(begins[src_axis]) < 0:
+                        begin = in_expr + int(begins[src_axis])
+                    if not masked_end and int(ends[src_axis]) < 0:
+                        end = in_expr + int(ends[src_axis])
                     return end - begin
 
         if op.op_type == "linear":
@@ -1444,6 +1458,11 @@ class LoomGGUFExporter:
             self.apply_token_labels_export(bindings, input_names, n_tokens_expr)
             return
 
+        # And family 11's, which reduces nothing at all: a codec decoder's output is the waveform.
+        if self.kwargs.get("driver_builder") == "CodecDecode":
+            self.apply_codec_decode_export(bindings, input_names, n_tokens_expr)
+            return
+
         # The checkpoint's own decode facts, from the family's `backend_kwargs` (P4.23/P4.24). Both are
         # absent for every family that does not generate text, and absent is what emits the driver Lua
         # that was emitted before either existed.
@@ -1484,6 +1503,21 @@ class LoomGGUFExporter:
                                     retained_module="main_topology" if cached else None,
                                     sampling=sampling if cached else None),
             decode=decode,
+        ).build(self._driver_context())
+
+    def apply_codec_decode_export(self, bindings, input_names, n_tokens_expr):
+        """The codec-decoder driver: one forward pass over the codes, and hand back what came out.
+
+        NOT retained, unlike the other two orchestration-keyed paths. Retaining exists so a reduction
+        can happen engine-side and the tensor never becomes a Lua table -- but here the tensor IS the
+        return value, so it has to cross the boundary either way, and retaining would only add a
+        second call to fetch it.
+        """
+        self.driver_script = SYNTHESIZED_BUILDERS["CodecDecode"](
+            inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr),
+            call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr,
+                                 retained=False),
+            epilogue=DriverReturn(values=("_mono_out",)),
         ).build(self._driver_context())
 
     def apply_token_labels_export(self, bindings, input_names, n_tokens_expr):

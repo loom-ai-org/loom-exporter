@@ -98,6 +98,10 @@ MODELS = [
     # second checkpoint the template is held to, not as a second name -- an artifact difference
     # between these two rows is how a change that quietly re-specialises the family shows up.
     ("distilbert-ner", "distilbert-ner", []),
+    # Family 11 (P5): the first codec decoder, and the first export whose ROOT AXIS is a codec-frame
+    # count rather than tokens or samples. Swept because its failure mode is invisible in a snapshot
+    # that only checks the export ran -- see tests/ci/test_audio_codec_export.py.
+    ("dac-44khz", "dac-44khz", []),
     # Qwen3-ASR needs transformers >= 5.13 and the rest of the sweep needs <= 4.57, so it cannot run
     # in the same interpreter as its neighbours here. It is swept from the other environment; see
     # docs/EXPORT-PREPARATION.md.

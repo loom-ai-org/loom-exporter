@@ -70,8 +70,8 @@ differs is entirely what the host does with the one output. The family names its
 
 | component | class | emits | links | unchecked | used by |
 |---|---|---|---|---|---|
-| `driver_inputs` | `DriverInputs` | statements | 0 | 3 | conformer-ctc, hf-causal-lm, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3 |
-| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, hf-causal-lm, hf-token-classifier, lfm2-monolithic, qwen3 |
+| `driver_inputs` | `DriverInputs` | statements | 0 | 3 | conformer-ctc, dac, hf-causal-lm, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3 |
+| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, dac, hf-causal-lm, hf-token-classifier, lfm2-monolithic, qwen3 |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
 | `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 15 | granite-speech, hf-causal-lm, lfm2-monolithic, qwen3, qwen3-asr, whisper |
 | `waveform_valid_length` | `WaveformValidLength` | statements | 0 | 5 | granite-speech, qwen3-asr |
@@ -84,14 +84,14 @@ differs is entirely what the host does with the one output. The family names its
 | `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper |
 | `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 7 | matcha, supertonic |
-| `driver_return` | `DriverReturn` | statements | 0 | 1 | kokoro, matcha, styletts2, supertonic, vits |
+| `driver_return` | `DriverReturn` | statements | 0 | 1 | dac, kokoro, matcha, styletts2, supertonic, vits |
 | `lua_library` | `LuaLibrary` | prelude | 1 | 0 | kokoro, matcha, styletts2, vits |
 
 ### `driver_inputs` — `DriverInputs`
 
 Binds every name the topologies below are called with: read from the caller's `inputs` table, or computed host-side (`cache_position` via loom.range, `attention_mask` via loom.causal_mask).
 
-*Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3.
+*Emits:* statements. *Used by:* conformer-ctc, dac, hf-causal-lm, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -99,7 +99,7 @@ Binds every name the topologies below are called with: read from the caller's `i
 
 The single `run_subgraph` call a flattened export's driver makes, capturing the output's shape alongside its data so the epilogue knows the vocab size -- or, for a KV-cached topology, retaining the output engine-side and binding nothing, so the logits never become a Lua table at all.
 
-*Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, hf-token-classifier, lfm2-monolithic, qwen3.
+*Emits:* statements. *Used by:* conformer-ctc, dac, hf-causal-lm, hf-token-classifier, lfm2-monolithic, qwen3.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
@@ -222,7 +222,7 @@ A `FlowMatchingSpec`'s generated Euler-CFM sampler function, plus the line that 
 
 What the entry function hands back to the host.
 
-*Emits:* statements. *Used by:* kokoro, matcha, styletts2, supertonic, vits.
+*Emits:* statements. *Used by:* dac, kokoro, matcha, styletts2, supertonic, vits.
 
 * nothing — every field is `__unchecked__`, with its reason
 
