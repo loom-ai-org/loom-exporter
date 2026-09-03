@@ -18,7 +18,7 @@ from .driver_components import (
     CALLER, CAUSAL_MASK_INPUT_NAMES, HOST_COMPUTED_INPUT_NAMES, MASK, POSITION,
     POSITION_INPUT_NAMES, SYNTHESIZED_BUILDERS, ArgmaxEpilogue, ChainStage, CtcGreedyEpilogue,
     DriverInputs, ModularChain,
-    MonolithicCall, PrefillDecodeLoop,
+    MonolithicCall, PrefillDecodeLoop, TokenLabelsEpilogue,
 )
 from .passes import apply_loom_mil_passes
 from .shape_expr import (
@@ -1436,6 +1436,14 @@ class LoomGGUFExporter:
             self.apply_ctc_greedy_export(bindings, input_names, n_tokens_expr)
             return
 
+        # And the token classifier's (P5, family 12), which is the same single forward pass reduced a
+        # third way: every row, no collapse. Named by the family through `backend_kwargs()` for the
+        # reason the CTC branch above is -- both are `Flattened` exports whose orchestration the
+        # decomposition does not determine.
+        if self.kwargs.get("driver_builder") == "TokenLabels":
+            self.apply_token_labels_export(bindings, input_names, n_tokens_expr)
+            return
+
         # The checkpoint's own decode facts, from the family's `backend_kwargs` (P4.23/P4.24). Both are
         # absent for every family that does not generate text, and absent is what emits the driver Lua
         # that was emitted before either existed.
@@ -1476,6 +1484,25 @@ class LoomGGUFExporter:
                                     retained_module="main_topology" if cached else None,
                                     sampling=sampling if cached else None),
             decode=decode,
+        ).build(self._driver_context())
+
+    def apply_token_labels_export(self, bindings, input_names, n_tokens_expr):
+        """The token-classifier driver: one forward pass over the sentence, then one label per token.
+
+        Takes the same three precomputed pieces `apply_ctc_greedy_export` does, and for the same
+        reason: the declared-input bindings and the root-axis expression are properties of the traced
+        graph, and three paths that each recomputed them could disagree about them.
+
+        Unlike the CTC branch there is nothing to validate here. That branch needs a blank id only the
+        checkpoint knows; this one needs no constant at all, which is what makes family 12 the smallest
+        template on the roadmap -- the label NAMES are metadata a host reads (`loom.labels`), not
+        something the driver has to hold.
+        """
+        self.driver_script = SYNTHESIZED_BUILDERS["TokenLabels"](
+            inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr),
+            call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr,
+                                 retained=True),
+            epilogue=TokenLabelsEpilogue(retained_module="main_topology"),
         ).build(self._driver_context())
 
     def apply_ctc_greedy_export(self, bindings, input_names, n_tokens_expr):

@@ -99,6 +99,15 @@ TASKS: Dict[str, TaskSpec] = {
             base_config="multi_phase_export:BaseMultiPhaseModelExportConfig",
         ),
         TaskSpec(
+            name="token-classification",
+            summary=(
+                "Text-in/one-class-per-token-out. A bidirectional encoder plus a linear head, traced as "
+                "one graph; the driver reduces every row rather than one of them. Punctuation "
+                "restoration, truecasing, NER -- EXPORT-ROADMAP.md's family 12."
+            ),
+            base_config="token_classification_export:TokenClassificationExportConfig",
+        ),
+        TaskSpec(
             name="audio-codec",
             summary=(
                 "RESERVED, no family yet. Neural audio codec encode/decode (EnCodec, DAC, SNAC, Mimi) -- "

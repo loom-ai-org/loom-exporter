@@ -294,7 +294,7 @@ not enough to cost a template, which is P4's job per family.
 | 9b | **Mel-spectrogram TTS + HiFi-GAN** *(new — was "one-offs")* | fastpitch (non-AR), speecht5 (AR), bananamind-tts (Tacotron-lite) | 3 | 3 | duration/pitch predictor or AR mel loop; vocoder already exported inside 7/8 | not started |
 | 10 | **AR LM + neural codec TTS** | orpheus+SNAC, outetts+WavTokenizer, qwen3-tts ×4, moss-tts ×2, miotts, omnivoice, csm, dia, bark, zonos+dac, indextts, parler, vibevoice-tts ×2, lfm2-audio-tts | 16 | ~20 | **the codec decoder (family 11)** + a delay/RQ token-emission driver | LM half done; codec decoders are the missing piece |
 | 11 | **Neural audio codecs / vocoders** (decode side) | DAC, dacvae, SNAC, WavTokenizer, MioCodec, mimo-tokenizer, omnivoice-tokenizer, cosyvoice3-s3tok, qwen3-tts-tokenizer, tada-codec, tada-encoder | 11 | ~11 | — (it *is* the connector for 10) | HiFi-GAN/iSTFT done inside 7/8/9; RVQ/FSQ not started |
-| 12 | **BERT-family token classifiers** | fireredpunc, fullstop-punc, punctuate-all, pcs (4 heads), bert-base | 4 | 5 | — (one linear head) | not started — smallest possible template |
+| 12 | **BERT-family token classifiers** | fireredpunc, fullstop-punc, punctuate-all, pcs (4 heads), bert-base | 4 | 5 | — (one linear head) | **done** (P5, 2026-09-03): `token_classification_export.py`, ONE generic recognizer claiming any `*ForTokenClassification` directory. It cost no engine primitive and one driver component (`token_labels_epilogue` = `ctc_greedy_epilogue` minus the collapse); the connector really was nothing. Verified on `dslim/bert-base-NER` against transformers on the TENSOR: max \|Δ\| 1.24e-05 across 138 tokens. The one thing that was not free is a tracing decision — a single unpadded sequence exports with no attention mask at all, because every route transformers takes to build one bakes the traced length (loom.cpp ADR-019) |
 | 13 | **Small classifiers / embedders / VAD / LID** | titanet, ecapa-tdnn-lid, cosyvoice3-campplus, silero-vad, silero-lid, marblenet-vad, firered-vad (DFSMN), pyannote-seg, whisper-vad, crepe, cld3, glotlid, lstm-truecaser | 13 | ~13 | — (single forward, argmax) | not started — bigger than estimated |
 | 14 | **Music / audio analysis CNN-RNNs** | beat-this, btc, tabcnn, piano-transcription, mel-band-roformer, htdemucs | 6 | ~6 | — | not started |
 | — | **genuine one-offs** | audioseal (watermark), beatrice (VC), sidon (restoration) | 3 | 3 | — | — |
@@ -319,7 +319,14 @@ Ordering proposal, by coverage-per-effort (revised by the corrections above):
    `inputs_embeds`, and what the composition actually turns on is that a KV-cached decoder makes a
    segmented prefill identical to a concatenated one.
 4. **BERT token classifiers** (family 12) — trivially small, and it proves the registry works for a
-   non-audio task.
+   non-audio task. **DONE (P5, 2026-09-03).** Both halves held: the template is ~290 lines with no
+   engine work, and `loom.task = "token-classification"` / `loom.output.kind = "class"` is the first
+   export to exercise the contract's non-audio half end to end, which turned loom-py's `Text2Class`
+   from a planned interface into an answered one. Two findings worth carrying to family 11: the
+   reduction a "new" family needs may already exist under another family's name (`loom.argmax_rows`
+   was built for Conformer-CTC), and the real work in a non-audio family is TRACING rather than
+   architecture — three separate things in transformers' BERT forward bake the sequence length, and
+   each is silently harmless at the length it was traced at.
 5. **Codec decoders** (family 11) — unlocks family 10's back half (~20 models), and 11 is itself ~11
    models, so it pays twice.
 6. **CNN+CTC** (family 4) and **SANM** (family 5) — both are family-1-shaped once the encoder template

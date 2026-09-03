@@ -88,6 +88,11 @@ MODELS = [
     ("supertonic", "$LOOM_SUPERTONIC_ROOT/assets/pt",
      ["--task", "text-to-speech", "--model", "supertonic"]),
     ("vits", "$LOOM_VITS_CHECKPOINT", ["--task", "text-to-speech", "--model", "vits"]),
+    # Family 12 (P5): the first non-audio task in the sweep, and the smallest export in it. Reached
+    # through the generic `hf-token-classifier` fallback, so it needs no `--model` -- which is itself
+    # part of what is being swept, since a second family claiming a `*ForTokenClassification` directory
+    # would show up here as an ambiguity rather than as a wrong export.
+    ("bert-ner", "bert-base-ner", []),
     # Qwen3-ASR needs transformers >= 5.13 and the rest of the sweep needs <= 4.57, so it cannot run
     # in the same interpreter as its neighbours here. It is swept from the other environment; see
     # docs/EXPORT-PREPARATION.md.

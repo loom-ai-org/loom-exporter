@@ -250,5 +250,12 @@ def detect_vocab_family(tokenizer_dir: str) -> str:
         tokenizer_class = json.loads(config_path.read_text()).get("tokenizer_class")
         if tokenizer_class == "ByT5Tokenizer":
             return "byte"
+    # The classic BERT layout: `vocab.txt` and nothing else. Older checkpoints predate the fast
+    # tokenizer entirely (dslim/bert-base-NER ships `vocab.txt` + a three-key `tokenizer_config.json`),
+    # and family 12's members are mostly of that vintage. Checked LAST, after every other marker, so a
+    # SentencePiece or BPE directory that also happens to carry a `vocab.txt` still resolves to what it
+    # really is -- this branch only fires when nothing else identified the directory.
+    if (tok_dir / "vocab.txt").exists():
+        return "wordpiece"
     raise NotImplementedError(f"no recognized tokenizer file (tokenizer.json/tokenizer.model/spiece.model/"
-                               f"a ByT5Tokenizer tokenizer_config.json) found in {tokenizer_dir}")
+                               f"vocab.txt/a ByT5Tokenizer tokenizer_config.json) found in {tokenizer_dir}")
