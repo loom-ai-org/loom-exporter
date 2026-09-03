@@ -209,6 +209,11 @@ class LoomExportConfig:
             # Supertonic encodes graphemes itself and overrides this. The distinction is per-model and is
             # exactly what a host needs in order to know whether it can offer a text door at all.
             "text-to-speech": ("phoneme_ids", "audio"),
+            # The first non-audio pair, and the first `class` output: one label per input token
+            # (EXPORT-ROADMAP.md family 12). `text` rather than `token_ids` because these checkpoints
+            # ship the WordPiece vocabulary that encodes it, so a host can offer a text door with no
+            # step happening outside the engine.
+            "token-classification": ("text", "class"),
         }.get(self.task)
         if pair is None:
             return {"task": self.task}

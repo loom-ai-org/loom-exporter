@@ -27,18 +27,65 @@ from pathlib import Path
 from gguf import GGUFWriter
 
 
+# The five roles a BERT-family tokenizer names, as the `tokenizer_config.json` /
+# `special_tokens_map.json` keys that hold them. One list, because both files spell them identically
+# and the only difference is which one a given checkpoint bothered to write.
+_SPECIAL_TOKEN_KEYS = ("unk_token", "cls_token", "sep_token", "pad_token", "mask_token")
+
+
+def _read_vocab_txt(tok_dir: Path, specials: dict) -> tuple[dict, list]:
+    """`vocab.txt` as the same `(vocab, added_tokens)` pair a `tokenizer.json` yields.
+
+    THE CLASSIC BERT LAYOUT, and family 12 is where it stops being a curiosity: these checkpoints are
+    mostly older than the Rust fast tokenizer, so several ship `vocab.txt` and no `tokenizer.json` at
+    all (dslim/bert-base-NER, whose `tokenizer_config.json` is three keys long). Converting one through
+    `AutoTokenizer` first would work and is what a reader would otherwise have to be told to do; it
+    also makes the exported vocabulary depend on the transformers version that did the converting,
+    which is exactly the kind of unwritten preparation step this repo has paid for before.
+
+    `vocab.txt` is one piece per line, id = line number, and nothing else -- no `added_tokens`, no
+    `special` flags. The specials are recovered from the checkpoint's own `special_tokens_map.json` /
+    `tokenizer_config.json` and re-declared here in the `added_tokens` shape, because that flag is what
+    the `phantom()` transform below keys on: a `[CLS]` that is not marked special gets a U+2581
+    prepended and stops matching anything.
+    """
+    pieces = (tok_dir / "vocab.txt").read_text(encoding="utf-8").split("\n")
+    # A trailing newline is a file convention, not a vocabulary entry -- but an EMPTY LINE in the
+    # middle is a real (if odd) piece, so only the last one is dropped and only when empty.
+    if pieces and pieces[-1] == "":
+        pieces.pop()
+    vocab = {piece: idx for idx, piece in enumerate(pieces)}
+    added = [{"content": piece, "id": vocab[piece], "special": True}
+             for piece in dict.fromkeys(specials.values()) if piece in vocab]
+    return vocab, added
+
+
 def write_wordpiece_vocab(writer: GGUFWriter, tokenizer_dir: str) -> None:
     tok_dir = Path(tokenizer_dir)
-    tokenizer_json = json.loads((tok_dir / "tokenizer.json").read_text())
     config_path = tok_dir / "tokenizer_config.json"
     config = json.loads(config_path.read_text()) if config_path.exists() else {}
 
-    model = tokenizer_json["model"]
-    if model["type"] != "WordPiece":
-        raise ValueError(f"write_wordpiece_vocab: expected a WordPiece tokenizer.json model, got {model['type']!r}")
+    # The special-token names, from whichever file this checkpoint wrote them in. `tokenizer_config`
+    # wins where both name a role; `special_tokens_map.json` is the one an older checkpoint has, and
+    # without it `_token_id` below returns -1 for every role and the file goes out with no CLS/SEP at
+    # all -- which a WordPiece encode cannot recover from and nothing would report.
+    map_path = tok_dir / "special_tokens_map.json"
+    specials = json.loads(map_path.read_text()) if map_path.exists() else {}
+    specials = {key: (config.get(key) or specials.get(key)) for key in _SPECIAL_TOKEN_KEYS}
+    specials = {key: (value["content"] if isinstance(value, dict) else value)
+                for key, value in specials.items() if value}
 
-    vocab: dict[str, int] = model["vocab"]
-    added_tokens: list[dict] = tokenizer_json.get("added_tokens", [])
+    tokenizer_json_path = tok_dir / "tokenizer.json"
+    if tokenizer_json_path.exists():
+        tokenizer_json = json.loads(tokenizer_json_path.read_text())
+        model = tokenizer_json["model"]
+        if model["type"] != "WordPiece":
+            raise ValueError(f"write_wordpiece_vocab: expected a WordPiece tokenizer.json model, got {model['type']!r}")
+        vocab: dict[str, int] = model["vocab"]
+        added_tokens: list[dict] = tokenizer_json.get("added_tokens", [])
+    else:
+        tokenizer_json = {}
+        vocab, added_tokens = _read_vocab_txt(tok_dir, specials)
     max_id = max([*vocab.values(), *(t["id"] for t in added_tokens)], default=-1)
     raw_tokens = [""] * (max_id + 1)
     is_special = [False] * (max_id + 1)
@@ -62,10 +109,9 @@ def write_wordpiece_vocab(writer: GGUFWriter, tokenizer_dir: str) -> None:
             tokens.append("▁" + piece)
 
     def _token_id(key: str) -> int:
-        value = config.get(key)
-        if value is None:
+        piece = specials.get(key)
+        if piece is None:
             return -1
-        piece = value["content"] if isinstance(value, dict) else value
         for t in added_tokens:
             if t["content"] == piece:
                 return t["id"]

@@ -198,6 +198,7 @@ _FAMILY_MODULES = (
     "styletts2_export",
     "supertonic_export",
     "vits_export",
+    "token_classification_export",
 )
 
 

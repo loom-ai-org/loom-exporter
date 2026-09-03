@@ -47,13 +47,22 @@ check links -> emit -> driver_ir.validate() -> check_subgraph_calls() -> DriverS
 and, since D.1, looks each component up in the registry as it emits — so a component that ships in a
 driver but appears in no catalogue fails the export rather than the review.
 
-Three builders exist:
+Five builders exist. The first three below share `driver_inputs` + `monolithic_call` and differ only in
+the reduction at the end, which is the honest statement of how those families relate — a new family that
+is one forward pass costs one epilogue.
 
 | builder | shape | models |
 |---|---|---|
-| `PrefillArgmaxBuilder` | one traced graph, run once over the prompt, argmax the last row | qwen3, lfm2-monolithic, conformer-ctc, parakeet-tdt, parakeet-rnnt, any HF causal LM |
+| `PrefillArgmaxBuilder` | one traced graph, run once over the prompt, argmax the last row | qwen3, lfm2-monolithic, parakeet-tdt, parakeet-rnnt, any HF causal LM |
+| `CtcGreedyBuilder` | the same forward pass, then per-frame argmax, collapse duplicates, drop the blank | conformer-ctc |
+| `TokenLabelsBuilder` | the same forward pass, then one class per row, no collapse | any HF token classifier |
 | `ModularChainBuilder` | prefix → [aux] → layer_0..N → suffix_0..M, then the same argmax | lfm2-modular |
 | `MultiPhaseDriverBuilder` | a family's own component list (peeled), or one hand-written `.lua` adopted whole | kokoro, matcha, vits, styletts2, supertonic |
+
+The last two are keyed by *orchestration* rather than by decomposition, and that is a finding rather
+than a shortcut (P4.0.17, extended by P5): both are `Flattened` exports exactly like Qwen3, and what
+differs is entirely what the host does with the one output. The family names its builder through
+`synthesized_builder_key()`.
 
 ## 2. The components
 
@@ -61,13 +70,14 @@ Three builders exist:
 
 | component | class | emits | links | unchecked | used by |
 |---|---|---|---|---|---|
-| `driver_inputs` | `DriverInputs` | statements | 0 | 3 | conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
-| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, hf-causal-lm, lfm2-monolithic, qwen3 |
+| `driver_inputs` | `DriverInputs` | statements | 0 | 3 | conformer-ctc, hf-causal-lm, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3 |
+| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, hf-causal-lm, hf-token-classifier, lfm2-monolithic, qwen3 |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
 | `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 15 | granite-speech, hf-causal-lm, lfm2-monolithic, qwen3, qwen3-asr, whisper |
 | `waveform_valid_length` | `WaveformValidLength` | statements | 0 | 5 | granite-speech, qwen3-asr |
 | `prompt_segments` | `PromptSegments` | statements | 2 | 5 | granite-speech, qwen3-asr |
 | `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | conformer-ctc |
+| `token_labels_epilogue` | `TokenLabelsEpilogue` | statements | 1 | 0 | hf-token-classifier |
 | `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 4 | hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
 | `export_constants` | `ExportConstants` | statements | 0 | 1 | gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
@@ -81,7 +91,7 @@ Three builders exist:
 
 Binds every name the topologies below are called with: read from the caller's `inputs` table, or computed host-side (`cache_position` via loom.range, `attention_mask` via loom.causal_mask).
 
-*Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3.
+*Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -89,7 +99,7 @@ Binds every name the topologies below are called with: read from the caller's `i
 
 The single `run_subgraph` call a flattened export's driver makes, capturing the output's shape alongside its data so the epilogue knows the vocab size -- or, for a KV-cached topology, retaining the output engine-side and binding nothing, so the logits never become a Lua table at all.
 
-*Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, lfm2-monolithic, qwen3.
+*Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, hf-token-classifier, lfm2-monolithic, qwen3.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
@@ -135,6 +145,14 @@ A prompt made of alternating text and non-text pieces -- family 3's audio embedd
 Greedy CTC decode: per-frame argmax over the retained logits, then collapse consecutive duplicates and drop the blank. `argmax_epilogue`'s ASR counterpart -- the same single forward pass, but a reduction over EVERY row returning a sequence, rather than over one row returning a token.
 
 *Emits:* statements. *Used by:* conformer-ctc.
+
+* `retained_module` — TopologyName
+
+### `token_labels_epilogue` — `TokenLabelsEpilogue`
+
+One class id per ROW of the retained output, in row order -- family 12's whole orchestration. `ctc_greedy_epilogue` without the collapse, and the absence is the point: here the alignment between row i and token i IS the answer, so consecutive duplicates are two tokens' labels rather than one repeated.
+
+*Emits:* statements. *Used by:* hf-token-classifier.
 
 * `retained_module` — TopologyName
 
