@@ -93,6 +93,11 @@ MODELS = [
     # part of what is being swept, since a second family claiming a `*ForTokenClassification` directory
     # would show up here as an ambiguity rather than as a wrong export.
     ("bert-ner", "bert-base-ner", []),
+    # The same family through a structurally different encoder: no token-type embeddings, no
+    # `position_ids` argument, `.transformer` where BERT has `.encoder`. It is in the sweep as the
+    # second checkpoint the template is held to, not as a second name -- an artifact difference
+    # between these two rows is how a change that quietly re-specialises the family shows up.
+    ("distilbert-ner", "distilbert-ner", []),
     # Qwen3-ASR needs transformers >= 5.13 and the rest of the sweep needs <= 4.57, so it cannot run
     # in the same interpreter as its neighbours here. It is swept from the other environment; see
     # docs/EXPORT-PREPARATION.md.
