@@ -55,13 +55,30 @@ class TestContractDefaults(unittest.TestCase):
         self.assertEqual(config.contract()["input.kind"], "phoneme_ids")
         self.assertEqual(config.contract()["output.kind"], "audio")
 
-    def test_an_unclaimed_task_still_declares_its_name(self):
-        """`text-to-codes` is reserved with no family behind it. A future task this table has never heard
-        of must still write `loom.task` -- a host that does not recognise the name can say so, where a
-        host handed nothing cannot tell that from an old export."""
+    def test_a_task_with_no_modality_pair_still_declares_its_name(self):
+        """A task this table has never heard of must still write `loom.task` -- a host that does not
+        recognise the name can say so, where a host handed nothing cannot tell that from an old export.
+
+        Exercised with a name that is not in the vocabulary at all, because **every canonical task now
+        has a pair**: this used to use `text-to-codes` while it was reserved, and family 10 claiming it
+        left the branch with no real example. A synthetic name keeps the branch covered without waiting
+        for the vocabulary to grow one."""
         config = LoomExportConfig(architecture="x", output_path="/tmp/x.gguf", decomposition=None)
-        config.task = "text-to-codes"
-        self.assertEqual(config.contract(), {"task": "text-to-codes"})
+        config.task = "some-future-task"
+        self.assertEqual(config.contract(), {"task": "some-future-task"})
+
+    def test_every_canonical_task_declares_a_modality_pair(self):
+        """The other half, and the reason the test above had to change: a canonical name reaching the
+        `pair is None` branch would ship a file saying what it is FOR without saying what it maps
+        BETWEEN, which is half a contract and reads to a host exactly like an old export."""
+        from loom_exporter.tasks import known_tasks
+
+        for task in known_tasks():
+            config = LoomExportConfig(architecture="x", output_path="/tmp/x.gguf", decomposition=None)
+            config.task = task
+            contract = config.contract()
+            self.assertIn("input.kind", contract, f"{task} declares no modality pair")
+            self.assertIn("output.kind", contract, f"{task} declares no modality pair")
 
 
 class TestTaskReachesTheConfig(unittest.TestCase):
