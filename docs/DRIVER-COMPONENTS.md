@@ -79,12 +79,12 @@ differs is entirely what the host does with the one output. The family names its
 | `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | conformer-ctc |
 | `token_labels_epilogue` | `TokenLabelsEpilogue` | statements | 1 | 0 | hf-token-classifier |
 | `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 4 | hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
-| `export_constants` | `ExportConstants` | statements | 0 | 1 | gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper |
+| `export_constants` | `ExportConstants` | statements | 0 | 1 | dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
-| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper |
-| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper |
+| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper |
+| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 7 | matcha, supertonic |
-| `driver_return` | `DriverReturn` | statements | 0 | 1 | dac, encodec, kokoro, matcha, styletts2, supertonic, vits |
+| `driver_return` | `DriverReturn` | statements | 0 | 1 | dac, dia, encodec, kokoro, matcha, styletts2, supertonic, vits |
 | `lua_library` | `LuaLibrary` | prelude | 1 | 0 | kokoro, matcha, styletts2, vits |
 
 ### `driver_inputs` — `DriverInputs`
@@ -168,7 +168,7 @@ Returns the next token rather than the raw logits: argmax over the active row, r
 
 Values only the checkpoint knows (a blank id, a duration set, a hidden width), bound as ordinary locals so every read of them is checked by driver_ir.validate -- rather than interpolated into hand-written Lua through a marker, where a misspelled read is a silent nil (BACKLOG.md P4.0.18).
 
-*Emits:* statements. *Used by:* gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper.
+*Emits:* statements. *Used by:* dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -190,7 +190,7 @@ A hand-written `.lua` adopted whole -- prelude, one verbatim body block, postlud
 
 One hand-written block of a peeled driver, kept as its own `.lua` file, declaring what it reads and defines (and, since D.2, which topologies its computed call sites drive).
 
-*Emits:* prelude, statements. *Used by:* gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper.
+*Emits:* prelude, statements. *Used by:* dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper.
 
 * `drives` — ConfigDerived(needs=[])
   <br>*says:* {label} has computed call site(s) {detail} that no `drives` declaration covers, so the topologies they run are checked by nothing.
@@ -205,7 +205,7 @@ One hand-written block of a peeled driver, kept as its own `.lua` file, declarin
 
 One `loom.run_subgraph` as IR rather than text, so `check_subgraph_calls` covers its output arity too -- what a peel buys structurally.
 
-*Emits:* statements. *Used by:* gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper.
+*Emits:* statements. *Used by:* dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, vits, whisper.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
@@ -222,7 +222,7 @@ A `FlowMatchingSpec`'s generated Euler-CFM sampler function, plus the line that 
 
 What the entry function hands back to the host.
 
-*Emits:* statements. *Used by:* dac, encodec, kokoro, matcha, styletts2, supertonic, vits.
+*Emits:* statements. *Used by:* dac, dia, encodec, kokoro, matcha, styletts2, supertonic, vits.
 
 * nothing — every field is `__unchecked__`, with its reason
 

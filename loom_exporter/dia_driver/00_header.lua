@@ -1,0 +1,22 @@
+-- Dia: a byte-level text encoder run once, then a KV-cached cross-attention decode loop that emits
+-- NINE codec tokens per step.
+--
+-- Three traced topologies (dia_export.py): `encoder` turns the caller's bytes into one hidden frame
+-- each; `cross_kv` projects those frames into every decoder layer's cross-attention K/V, once per
+-- utterance; `decoder` is one cached step, called at n_tokens = 1 throughout (its prompt is a single
+-- all-BOS frame, so there is no multi-token prefill to amortise).
+--
+-- inputs: tokens (byte ids from this model's own vocabulary), and one optional -- max_new_tokens.
+--
+-- Returns a FLAT, frame-major array of codec tokens: N_CHANNELS values per frame, delay already
+-- undone, ready to hand to a codec decoder (`descript/dac_44khz`, which family 11 exported). It is
+-- NOT audio -- this model's output kind is `audio_codes`, and what turns codes into a waveform is a
+-- second file. See ADR-020.
+--
+-- The two things here that are Dia's rather than generic, both of them index arithmetic over the
+-- checkpoint's own `delay_pattern`:
+--   * channel k may not speak until step delay[k] has passed, so until then its prediction is
+--     replaced by BOS (`DiaProcessor.apply_delay_mask`);
+--   * audio frame t's channel k was emitted at row t + delay[k], so the rows are gathered back into
+--     frames before returning (`DiaProcessor.build_indices(revert=True)`).
+-- Neither is anything the engine knows about, which is the point.

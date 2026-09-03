@@ -218,6 +218,11 @@ class LoomExportConfig:
             # onto "text" in `ModelContract::interface_side`, so a codec would declare itself
             # `text2speech` and be offered a text door it has no vocabulary for.
             "audio-codec": ("audio_codes", "audio"),
+            # The producing half of the pair `audio-codec` consumes, and the reason both spellings
+            # exist: this file carries the byte vocabulary that encodes the sentence, so its input is
+            # `text`, and what comes out is what a codec GGUF decodes rather than a waveform. A host
+            # chaining the two matches this `output.kind` against that one's `input.kind`.
+            "text-to-codes": ("text", "audio_codes"),
         }.get(self.task)
         if pair is None:
             return {"task": self.task}

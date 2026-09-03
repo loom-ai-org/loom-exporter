@@ -101,15 +101,19 @@ TASKS: Dict[str, TaskSpec] = {
         TaskSpec(
             name="text-to-codes",
             summary=(
-                "RESERVED, no family yet. An AR language model that emits NEURAL CODEC TOKENS rather "
-                "than text -- EXPORT-ROADMAP.md's family 10 (parler, dia, csm, orpheus, qwen3-tts, "
-                "~20 models). Its output is what `audio-codec` decodes, so the two compose: "
-                "`text2codes` then `codes2speech`. Reserved for the same reason `audio-codec` was "
-                "before family 11 claimed it -- a name declared before it is needed is what stops the "
-                "family that arrives from inventing a competing one."
+                "An AR language model that emits NEURAL CODEC TOKENS rather than text -- "
+                "EXPORT-ROADMAP.md's family 10 (parler, dia, csm, orpheus, qwen3-tts, ~20 models). Its "
+                "output is what `audio-codec` decodes, so the two compose: `text2codes` then "
+                "`codes2speech`. Claimed by Dia, which was reserved here before it existed -- a name "
+                "declared before it is needed is what stops the family that arrives from inventing a "
+                "competing one, and this is that name being collected."
             ),
-            base_config=None,
-            reserved=True,
+            # The same base every multi-phase family registers under, and for the same reason: this is
+            # N independently traced topologies assembled into one GGUF plus a driver that orchestrates
+            # them. A family-10 leaf whose LM half is ONE traced graph -- no separate encoder to hoist
+            # cross-attention out of -- would be the first thing to widen this, and it should widen it
+            # by argument rather than by convenience.
+            base_config="multi_phase_export:BaseMultiPhaseModelExportConfig",
         ),
         TaskSpec(
             name="token-classification",
