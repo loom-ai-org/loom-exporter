@@ -82,6 +82,13 @@ class ModelCard:
     # prompt's own format because nothing put it inside a turn. The card demonstrated the defect to
     # anyone who pasted it.
     chat: bool = False
+    # Whether this token classifier's classes are punctuation MARKS rather than entity TAGS. Only read
+    # for task_type == "token-classification", and a per-model fact for the same reason `takes_text` is:
+    # both models return one label per token through one door, and what a reader does with the labels is
+    # not the same job. A NER card reconstructs SPANS (`B-PER I-PER` is one person); a punctuation card
+    # reconstructs a SENTENCE, inserting each word's mark after its last piece. Showing the NER snippet
+    # on a punctuation model would print `hello/, o/,` and explain nothing.
+    restores_punctuation: bool = False
     # `--task`/`--model` for loom-export; empty means auto-detection resolves both.
     export_task: Optional[str] = None
     export_model: Optional[str] = None
@@ -495,6 +502,35 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
             "checkpoint's own learned position table."
         ),
     ),
+    ModelCard(
+        slug="fullstop-punc", checkpoint=Path("fullstop-punc"),
+        task_type="token-classification", restores_punctuation=True,
+        base_repo="oliverguhr/fullstop-punctuation-multilang-large", license_id="mit",
+        language=["en", "de", "fr", "it"],
+        title="FullStop Punctuation (multilingual)",
+        summary="oliverguhr's XLM-RoBERTa-large fine-tuned on Europarl for punctuation restoration, "
+                "exported for loom.cpp. Family 12: text in, one class per token out -- here the class "
+                "is the mark that follows the token.",
+        limitations=(
+            "Trained on **Europarl**, which is parliamentary proceedings: formal, complete sentences "
+            "in a register that is not chat, not code and not casual speech. It restores six classes "
+            "and nothing else (`.`, `,`, `?`, `-`, `:`, and `0` for no mark), so it will not give you "
+            "semicolons, quotation marks or apostrophes, and it does not capitalise -- truecasing is a "
+            "different head. The upstream card evaluates **en, de, fr, it**; the underlying encoder is "
+            "trained on 100 languages and the model will answer for all of them, at an accuracy nobody "
+            "has measured.\n\n"
+            "Feed it text with the punctuation already **removed**. Given punctuated input it still "
+            "labels every token and you get marks on top of marks.\n\n"
+            "The labels line up with the tokenizer's PIECES, not with your words -- a SentencePiece "
+            "vocabulary splits `wolfgang` into three -- and the mark you want is the one on a word's "
+            "LAST piece. The usage snippet above does that walk; the export hands back the pieces "
+            "alongside the labels rather than guessing at the rule for you.\n\n"
+            "The export takes one sequence at a time and no padding, so there is no batch dimension to "
+            "fill and no attention mask to pass. Sequences are capped at **512** tokens: this "
+            "checkpoint's position table has 514 rows and its first two are reserved, which is a "
+            "property of the RoBERTa family rather than an off-by-two."
+        ),
+    ),
 ]
 
 CATALOG_BY_SLUG = {m.slug: m for m in CATALOG}
@@ -624,6 +660,45 @@ print(result.labels)
 raw = model.text2class.infer("My name is Wolfgang and I live in Berlin", strip_special=False)
 print(len(raw), "rows including [CLS] and [SEP], against", len(result), "without")
 """,
+    # The same door on a checkpoint whose classes are punctuation MARKS rather than entity TAGS, and
+    # the first card in this set whose model is not English-only or WordPiece. Its sentence is fixed for
+    # the reason every other one is -- the release gate reads the card's own output back and grades it --
+    # and it is deliberately the same sentence the NER card labels, so the two cards demonstrate two
+    # readings of one identical call.
+    "token-classification-punctuation": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+result = model.text2class.infer("hello my name is wolfgang and i live in berlin do you know it")
+print(result.text)
+# hell/, o/, my/0 name/0 is/0 ... berlin/. do/0 you/0 know/0 it/?
+
+# Every class this checkpoint can choose between, in the order its ids run. "0" is "no mark here",
+# which is most tokens in most sentences:
+print(result.labels)
+# ['0', '.', ',', '?', '-', ':']
+
+# Restoring the text is the point of this model, and the rule is one line long: a mark belongs to the
+# WORD, so it is the label on the word's LAST piece. A piece starts a new word when decoding it
+# together with the piece before puts a space between them -- which is what the vocabulary knows and
+# the piece text alone does not.
+restored = ""
+for i, token in enumerate(result):
+    following = result[i + 1] if i + 1 < len(result) else None
+    restored += token.piece
+    if following is None or " " in model.detokenize([token.token, following.token]):
+        if token.label != "0":
+            restored += token.label
+        restored += " "
+print(restored.strip())
+# hello, my name is wolfgang and i live in berlin. do you know it?
+
+# The framing tokens the encode adds (<s> and </s>) are dropped for you, on the ids the file declares
+# rather than on their spelling. Ask for the raw alignment if you want them:
+raw = model.text2class.infer("hello my name is wolfgang and i live in berlin do you know it",
+                             strip_special=False)
+print(len(raw), "rows including <s> and </s>, against", len(result), "without")
+""",
     # A codec DECODER, which is the one card here whose input a reader cannot type. Codes come from
     # an encoder or from an AR codec-token LM, so the snippet demonstrates the GEOMETRY -- how many
     # streams, how wide, how many frames to a second -- and decodes a run of them. The numbers it
@@ -745,6 +820,8 @@ def snippet_key(card: ModelCard) -> str:
         return "text-to-speech-with-vocab"
     if card.task_type == "automatic-speech-recognition" and card.selects_language:
         return "automatic-speech-recognition-multilingual"
+    if card.task_type == "token-classification" and card.restores_punctuation:
+        return "token-classification-punctuation"
     return card.task_type
 
 

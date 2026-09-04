@@ -12,8 +12,12 @@ Two independent responsibilities:
    this project's exporter is architecture-agnostic (any `AutoModelForCausalLM`), so there's no per-arch
    class to hang that dispatch off of; sniffing the tokenizer's own declared type directly is the natural
    generic-exporter equivalent. "Unigram" only resolves to "sentencepiece_proto" if a sibling
-   tokenizer.model/spiece.model SentencePiece protobuf exists -- loom's Vocab (C++) needs the real
-   protobuf for precompiled_charsmap, a tokenizer.json-only Unigram model isn't supported yet. ByT5-family
+   SentencePiece protobuf exists under one of the three names checkpoints spell it with -- loom's Vocab
+   (C++) needs the real protobuf for precompiled_charsmap, a tokenizer.json-only Unigram model isn't
+   supported yet. `sentencepiece.bpe.model` is the fairseq-derived family's name for it (XLM-R and
+   everything converted from a fairseq checkpoint) and is a MISNOMER -- those files are Unigram models,
+   not BPE ones, which `write_sentencepiece_vocab` reads off `trainer_spec.model_type` rather than off
+   the filename. ByT5-family
    tokenizers ("byte") have no tokenizer.json/tokenizer.model at all (no Rust "fast" backend exists for
    them) -- detected instead via tokenizer_config.json's own `tokenizer_class=="ByT5Tokenizer"` field.
 
@@ -227,6 +231,12 @@ def detect_loom_pre_type(tokenizer, *, fallback: str = "qwen2") -> str:
 _BYTE_TOKENIZER_CLASSES = frozenset({"ByT5Tokenizer", "DiaTokenizer"})
 
 
+#: The names a checkpoint may ship its SentencePiece protobuf under. `tokenizer.model` is T5's and
+#: LLaMA's, `spiece.model` is ALBERT/XLNet's, and `sentencepiece.bpe.model` is the fairseq-derived
+#: family's -- one file, three conventions, and nothing inside distinguishes them.
+_SPM_PROTO_NAMES = ("tokenizer.model", "spiece.model", "sentencepiece.bpe.model")
+
+
 def detect_vocab_family(tokenizer_dir: str) -> str:
     """Returns "bpe" / "wordpiece" / "sentencepiece_proto" / "byte". See module docstring."""
     tok_dir = Path(tokenizer_dir)
@@ -238,15 +248,15 @@ def detect_vocab_family(tokenizer_dir: str) -> str:
         if model_type == "WordPiece":
             return "wordpiece"
         if model_type == "Unigram":
-            if not any((tok_dir / n).exists() for n in ("tokenizer.model", "spiece.model")):
+            if not any((tok_dir / n).exists() for n in _SPM_PROTO_NAMES):
                 raise NotImplementedError(
-                    "tokenizer.json model.type=='Unigram' but no sibling tokenizer.model/spiece.model "
-                    "SentencePiece protobuf found -- loom's Unigram support (loom::Vocab) needs the real "
+                    "tokenizer.json model.type=='Unigram' but no sibling "
+                    f"{'/'.join(_SPM_PROTO_NAMES)} SentencePiece protobuf found -- loom's Unigram support (loom::Vocab) needs the real "
                     "protobuf for precompiled_charsmap; a tokenizer.json-only Unigram model is not "
                     "supported yet (see EXPORT-BACKLOG.md item 4)")
             return "sentencepiece_proto"
         raise NotImplementedError(f"tokenizer.json model.type={model_type!r} has no loom vocab-writer yet")
-    if any((tok_dir / n).exists() for n in ("tokenizer.model", "spiece.model")):
+    if any((tok_dir / n).exists() for n in _SPM_PROTO_NAMES):
         return "sentencepiece_proto"
     # ByT5-family tokenizers (e.g. google/byt5-small) have NO tokenizer.json/tokenizer.model at all --
     # ByT5Tokenizer has no Rust "fast" backend, so no fast-tokenizer file is ever distributed for it. The
