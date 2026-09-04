@@ -111,6 +111,21 @@ class TestTokenizerDetect(unittest.TestCase):
             (Path(d) / "tokenizer.model").write_bytes(b"")
             self.assertEqual(td.detect_vocab_family(d), "sentencepiece_proto")
 
+    def test_detect_vocab_family_unigram_under_fairseqs_name_for_the_proto(self):
+        """`sentencepiece.bpe.model` is XLM-R's name for the same file, and it is a MISNOMER -- those
+        protobufs are Unigram models. Missing the name is not a wrong answer but a `NotImplementedError`
+        on a checkpoint the engine can run, which is how family 12's third checkpoint first failed
+        (P5)."""
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "tokenizer.json").write_text(json.dumps({"model": {"type": "Unigram"}}))
+            (Path(d) / "sentencepiece.bpe.model").write_bytes(b"")
+            self.assertEqual(td.detect_vocab_family(d), "sentencepiece_proto")
+
+    def test_detect_vocab_family_bare_fairseq_proto(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "sentencepiece.bpe.model").write_bytes(b"")
+            self.assertEqual(td.detect_vocab_family(d), "sentencepiece_proto")
+
     def test_detect_vocab_family_byt5(self):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "tokenizer_config.json").write_text(json.dumps({"tokenizer_class": "ByT5Tokenizer"}))

@@ -2732,10 +2732,16 @@ class LoomGGUFExporter:
             # Every entry point that imports loom_exporter (export_hf_causal_lm.py,
             # export_lfm2_*.py) inserts tools/ itself (not its parent) onto sys.path, so convert_nemo/ is
             # importable as a top-level package the same way loom_exporter is -- not "tools.convert_nemo".
-            from .spm_tokenizer_export import write_sentencepiece_vocab
-            proto_path = next(p for p in (Path(tokenizer_dir) / "tokenizer.model",
-                                           Path(tokenizer_dir) / "spiece.model") if p.exists())
-            write_sentencepiece_vocab(w, proto_path.read_bytes())
+            from .spm_tokenizer_export import read_hf_id_layout, write_sentencepiece_vocab
+            from .tokenizer_detect import _SPM_PROTO_NAMES
+            proto_path = next(Path(tokenizer_dir) / name for name in _SPM_PROTO_NAMES
+                              if (Path(tokenizer_dir) / name).exists())
+            # The protobuf says what the pieces ARE; a `tokenizer.json` beside it, where one exists,
+            # says what their IDS are, and for the fairseq-derived family those disagree -- see
+            # spm_tokenizer_export's module docstring. A directory without one reads None here and
+            # writes exactly the file it wrote before, which is every NeMo caller.
+            write_sentencepiece_vocab(w, proto_path.read_bytes(),
+                                       hf_ids=read_hf_id_layout(tokenizer_dir))
         elif family == "byte":
             from .byt5_tokenizer_export import write_byte_vocab
             write_byte_vocab(w, tokenizer_dir)
