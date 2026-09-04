@@ -408,7 +408,7 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
     ),
     ModelCard(
         slug="dac-44khz", checkpoint=Path("dac-44khz"),
-        task_type="audio-codec",
+        task_type="text-to-audio",
         base_repo="descript/dac_44khz", license_id="mit", language=[],
         # The HF repo publishes NO `license:` tag and its README is an unfilled template, so the tag
         # here comes from the upstream project -- github.com/descriptinc/descript-audio-codec, whose
@@ -436,7 +436,7 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
     ),
     ModelCard(
         slug="dia-1.6b", checkpoint=Path("dia-1.6b"),
-        task_type="text-to-codes",
+        task_type="text-to-speech",
         base_repo="nari-labs/Dia-1.6B", license_id="apache-2.0", language=["en"],
         title="Dia-1.6B",
         summary="Nari Labs' Dia-1.6B dialogue TTS model, exported for loom.cpp. Family 10: text in, "
