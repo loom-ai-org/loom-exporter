@@ -4,21 +4,88 @@
     -- `declared_axes`). It is the second symbol this topology resolves; `n_tokens` is the first.
     local _n_enc = #inputs.tokens
 
-    -- One decoder call's inputs. The cross-attention K/V are `cross_kv`'s retained outputs, bound by
-    -- index -- output `2*layer + 1` is that layer's K and `+ 2` its V, the interleaving
+    -- One decoder call's inputs. The cross-attention K/V are a `cross_kv` module's retained outputs,
+    -- bound by index -- output `2*layer + 1` is that layer's K and `+ 2` its V, the interleaving
     -- `_DiaCrossKvWrapper` returns and `cross_kv_input_names` names. Built in a loop because there are
     -- two per layer and the count is a property of the checkpoint.
-    local function _decoder_inputs(_frame, _n_past)
+    --
+    -- `_kv` names WHICH cross_kv module, because classifier-free guidance has two: the conditional
+    -- projection of the caller's text and the unconditional projection of an all-zero prompt. Every
+    -- other input is shared -- the two streams are fed the same codes at the same positions, exactly
+    -- as `transformers` batches them.
+    local function _decoder_inputs(_frame, _n_past, _kv)
         local _in = {
             codes = _frame,
             position_ids = loom.range(_n_past, 1),
             attention_mask = loom.causal_mask(1, _n_past),
         }
         for _l = 0, N_LAYERS - 1 do
-            _in["xk_" .. _l] = {from = 'cross_kv', index = 2 * _l + 1}
-            _in["xv_" .. _l] = {from = 'cross_kv', index = 2 * _l + 2}
+            _in["xk_" .. _l] = {from = _kv, index = 2 * _l + 1}
+            _in["xv_" .. _l] = {from = _kv, index = 2 * _l + 2}
         end
         return _in
+    end
+
+    -- The decoding knobs: the caller's, else the checkpoint's own, which the export read out of its
+    -- `generation_config.json`. `temperature = 0` is greedy and is what a caller passes to reproduce
+    -- a reference exactly; this checkpoint's own default is 1.8, so the two are genuinely different
+    -- models of what "run this file" means and the file's answer is the default.
+    -- **A sampling driver needs a seed, and this is the only place a caller can set one.** Without
+    -- it the same sentence gives different audio every call with no way to reproduce either, which is
+    -- the state every other TTS driver here already refuses to be in. Named only -- an unseeded call
+    -- keeps whatever stream the bridge is on, so a caller who wants variety simply does not pass one.
+    if inputs.seed then loom.seed_rng(inputs.seed) end
+
+    local _temperature = inputs.temperature or TEMPERATURE
+    local _top_k = inputs.top_k or TOP_K
+    local _top_p = inputs.top_p or TOP_P
+
+    -- **Classifier-free guidance, and the arithmetic of the scale is Dia's.** Its own processor
+    -- combines as `cond + g * (cond - uncond)`, centred on the CONDITIONAL logits, where the general
+    -- form `loom.sample_row` implements is centred on the unconditional ones. The two are the same
+    -- family: `cond + g*(cond - uncond)` is `uncond + (g + 1)*(cond - uncond)`. So the file declares
+    -- the checkpoint's `g` and the `+ 1` happens here, next to the model whose convention it is.
+    --
+    -- `g <= 1` means off, which is `transformers`' own condition for not installing the processor at
+    -- all -- and off is a real mode rather than a degenerate one, because it halves the work.
+    local _guidance = inputs.guidance_scale or GUIDANCE_SCALE
+    local _use_cfg = _guidance > 1.0
+
+    -- The unconditional half: the same encoder over an all-zero prompt of the same length, projected
+    -- into its own cross-attention K/V. `torch.zeros_like(inputs)` is exactly what
+    -- `DiaGenerationMixin._prepare_model_inputs` builds, and the LENGTH matching matters -- both
+    -- streams' cross-attention is over `n_enc_frames` frames, so a shorter unconditional prompt would
+    -- be a different axis rather than a weaker condition.
+    --
+    -- It runs through the SAME encoder module, which is safe for the one reason worth stating: the
+    -- encoder's retained output is consumed by `cross_kv` immediately and never read again, so the
+    -- second pass overwriting the first costs nothing. The cross-attention K/V are the opposite --
+    -- they are read at every step for the rest of the generation -- which is why THOSE are two
+    -- modules and this is one.
+    local _uncond_kv = nil
+    if _use_cfg then
+        local _blank = {}
+        for _i = 1, _n_enc do _blank[_i] = 0 end
+        loom.run_subgraph_and_retain('encoder', {n_tokens = _n_enc, n_past = 0}, {tokens = _blank})
+        loom.run_subgraph_and_retain('cross_kv_uncond', {n_enc_frames = _n_enc, n_past = 0},
+                                      {xa = {from = 'encoder'}})
+        _uncond_kv = 'cross_kv_uncond'
+    end
+
+    -- Everything `loom.sample_row` needs that does not change from step to step. `guidance.top_k` is
+    -- NOT `top_k`: it is `DiaClassifierFreeGuidanceLogitsProcessor`'s `guidance_top_k`, which uses the
+    -- GUIDED logits to pick a shortlist and then draws from the CONDITIONAL ones restricted to it.
+    -- `transformers` passes `generation_config.top_k` into that slot, so the same number lands in two
+    -- roles, and both are spelled here rather than one being assumed from the other.
+    local function _sample_opts(_lo, _hi, _greedy)
+        local _o = {lo = _lo, hi = _hi,
+                    temperature = _greedy and 0.0 or _temperature,
+                    top_k = _greedy and 0 or _top_k,
+                    top_p = _greedy and 1.0 or _top_p}
+        if _use_cfg then
+            _o.guidance = {module = 'decoder_uncond', scale = _guidance + 1.0, top_k = _top_k}
+        end
+        return _o
     end
 
     -- The DELAYED sequence, flat and frame-major: N_CHANNELS entries per row. Row 0 is the all-BOS
@@ -55,27 +122,41 @@
     local _max_frames = inputs.max_new_tokens or (MAX_CODES - 1 - MAX_DELAY)
 
     while true do
-        loom.run_subgraph_and_retain('decoder',
-                                     {n_tokens = 1, n_past = _n_past, n_enc_frames = _n_enc},
-                                     _decoder_inputs(_step, _n_past))
+        local _axes = {n_tokens = 1, n_past = _n_past, n_enc_frames = _n_enc}
+        loom.run_subgraph_and_retain('decoder', _axes, _decoder_inputs(_step, _n_past, 'cross_kv'))
+        if _use_cfg then
+            -- The same codes, the same positions, its own KV cache (`kv_cache_scope: "private"` on
+            -- the emitted topology) and the unconditional cross-attention. Second, so that the
+            -- conditional module's retained output is the one `sample_row` names below.
+            loom.run_subgraph_and_retain('decoder_uncond', _axes,
+                                         _decoder_inputs(_step, _n_past, _uncond_kv))
+        end
         _n_past = _n_past + 1
 
-        -- **A RESTRICTED argmax per channel, not one `loom.argmax_rows` over all nine.** The decoder
-        -- graph slices its own last row before the head (`_DiaDecoderWrapper`), so its output is
-        -- [1028, 9] -- nine rows the unrestricted reduction would happily take whole-row argmaxes of.
-        -- That would be wrong: this model's four highest ids are control tokens (eos/pad/bos and one
-        -- unused), and `DiaEOSChannelFilterLogitsProcessor` bans them per channel rather than globally.
-        -- Only channel 0 may say EOS; no channel may say PAD or BOS. So the window is [0, EOS] for
-        -- channel 0 and [0, EOS) for the rest, which is exactly `loom.argmax_row_range` -- the same
-        -- restricted reduction whisper_driver uses to detect a language, and no new engine primitive.
+        -- **A RESTRICTED draw per channel, not one reduction over all nine.** The decoder graph
+        -- slices its own last row before the head (`_DiaDecoderWrapper`), so its output is [1028, 9] --
+        -- nine rows an unrestricted reduction would happily take whole-row answers from. That would be
+        -- wrong: this model's four highest ids are control tokens (eos/pad/bos and one unused), and
+        -- `DiaEOSChannelFilterLogitsProcessor` bans them per channel rather than globally. Only
+        -- channel 0 may say EOS; no channel may say PAD or BOS. So the window is [0, EOS] for channel
+        -- 0 and [0, EOS) for the rest.
         --
-        -- The processor's other two clauses (force EOS when it is already the top logit, suppress it
-        -- when it is not) are no-ops under a greedy argmax: both describe how SAMPLING must treat a
-        -- token the argmax has already decided about. They become live the day this loop samples.
+        -- **Channel 0 takes two calls, and that is the processor's other two clauses becoming live.**
+        -- They read: force EOS when it is already the highest logit, suppress it when it is not --
+        -- both no-ops under an argmax, which had already decided the same question, and both real
+        -- under sampling, where an EOS that is merely likely would otherwise end the utterance early
+        -- and one that is certain could still be missed. Spelled here as: ask which of [0, EOS] wins
+        -- (temperature 0, which is that same argmax), and if it is EOS take it, otherwise draw from
+        -- [0, EOS) with EOS excluded. That is exactly the two clauses, without needing the engine to
+        -- express `-inf`.
         local _next = {}
-        _next[1] = loom.argmax_row_range('decoder', 0, 0, EOS + 1)
+        if loom.sample_row('decoder', 0, _sample_opts(0, EOS + 1, true)) == EOS then
+            _next[1] = EOS
+        else
+            _next[1] = loom.sample_row('decoder', 0, _sample_opts(0, EOS, false))
+        end
         for _c = 2, N_CHANNELS do
-            _next[_c] = loom.argmax_row_range('decoder', _c - 1, 0, EOS)
+            _next[_c] = loom.sample_row('decoder', _c - 1, _sample_opts(0, EOS, false))
         end
 
         -- The delay scaffold. A channel that has not reached its own offset yet is not predicting an

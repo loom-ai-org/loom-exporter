@@ -72,6 +72,21 @@ class ExportPhase:
     # rewrite raises rather than silently declining: it is editing a traced graph, and the failure mode
     # of a pattern that has quietly stopped matching must not be a wrong answer.
     topology_rewrite: Optional[Callable[[dict], None]] = None
+    # Additional names this same topology is emitted under, each as an INDEPENDENT STREAM: its own
+    # retained output buffer and, where the topology is cached, its own KV cache
+    # (`kv_cache_scope: "private"`, which the engine reads off the emitted JSON).
+    #
+    # **A stream, not a copy.** Family 10 is why it exists: classifier-free guidance runs one decoder
+    # twice per step, on the conditional input and on the unconditional one, over two histories that
+    # must not see each other -- and the phases feeding it (the cross-attention K/V) have to be two as
+    # well, or the second run overwrites the first's retained output before the next step reads it.
+    # Nothing in a graph can say which of those a second module is, because two modules running one
+    # topology are two streams when a driver runs them side by side and two phases when it runs them
+    # in sequence. So the export says so, here, once.
+    #
+    # The weights are NOT duplicated: an alias is the same JSON under a second key, and its nodes name
+    # the tensors this phase already wrote.
+    extra_streams: tuple = ()
 
     __links__ = {
         # A typo'd axis name is a perfectly good dict key: `_sub_symbol` substitutes it happily and the
@@ -112,6 +127,12 @@ class ExportPhase:
             "duplicate that while reading as if it checked something ct.convert does not."
         ),
         "mil_inputs": Unchecked("same: ct.convert is the authority on these, not this declaration."),
+        "extra_streams": Unchecked(
+            "names for additional streams of this same topology, like `name` itself: they do not refer "
+            "to anything, they CREATE the references a driver's run_subgraph calls resolve against. A "
+            "name nothing runs is a topology nobody reads, which `check_subgraph_calls` sees from the "
+            "other direction -- a driver naming a module the export did not emit."
+        ),
         "fuse_attention": Unchecked(
             "a request, not a claim about the model -- and deliberately not checked against whether the "
             "pattern then matched. `fuse_loom_attention` leaves anything it does not recognise exactly "

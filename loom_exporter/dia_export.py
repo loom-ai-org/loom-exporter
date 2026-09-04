@@ -55,6 +55,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from .bpe_tokenizer_export import read_sampling_defaults
 from .decomposition import Decomposition, MultiPhase
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .spec_protocol import Unchecked
@@ -310,6 +311,10 @@ class TextToCodesDiaExportConfig(BaseMultiPhaseModelExportConfig):
     decoder_bindings: tuple = field(default=(), init=False, repr=False)
     cross_kv_names: tuple = field(default=(), init=False, repr=False)
     audio_tokens: dict = field(default_factory=dict, init=False, repr=False)
+    # `generation_config.json`'s own `guidance_scale`, under Dia's own centring -- see `hparams()`.
+    # 1.0 is "no guidance", which is what a checkpoint that does not name one means.
+    guidance_scale: float = field(default=1.0, init=False, repr=False)
+    sampling_defaults: dict = field(default_factory=dict, init=False, repr=False)
 
     __unchecked__ = {
         "model_dir": Unchecked(
@@ -371,6 +376,16 @@ class TextToCodesDiaExportConfig(BaseMultiPhaseModelExportConfig):
             "`pad_token_id`), never declared -- they are the scaffold the delay pattern is built out "
             "of, and the checkpoint is the only authority on them."
         ),
+        "sampling_defaults": Unchecked(
+            "READ off generation_config.json in phases(), through the same `read_sampling_defaults` "
+            "every sampling family uses. There is no second authority on what a checkpoint asked to "
+            "be decoded with, and a declaration here could only restate the file or contradict it."
+        ),
+        "guidance_scale": Unchecked(
+            "same: the checkpoint's own generation config, verbatim and under its own centring. The "
+            "conversion to the engine's form is one `+ 1` in the driver, where the convention it "
+            "belongs to is."
+        ),
     }
 
     def prepare_environment(self) -> None:
@@ -412,6 +427,13 @@ class TextToCodesDiaExportConfig(BaseMultiPhaseModelExportConfig):
             "EOS": int(cfg.eos_token_id),
             "PAD": int(cfg.pad_token_id),
         }
+        self.sampling_defaults = read_sampling_defaults(self.model_dir)
+        # `generation_config.json` rather than the model config: guidance is a DECODING knob, and the
+        # generation config is where this checkpoint states the ones it was published with. Read
+        # through `GenerationConfig` so a checkpoint that spells it only in the model config (as some
+        # do) still reaches this, and defaulted to 1.0 -- the value that means "no guidance" both here
+        # and in `transformers`, where the processor is not installed at all below it.
+        self.guidance_scale = float(getattr(model.generation_config, "guidance_scale", None) or 1.0)
 
         # The delay pattern indexes channels, and the driver walks it as one array per frame. A
         # checkpoint whose pattern and channel count disagreed would produce a realignment that reads
@@ -493,6 +515,13 @@ class TextToCodesDiaExportConfig(BaseMultiPhaseModelExportConfig):
                 # comes from `axes.py`, where Kokoro declared it for the structurally identical job:
                 # the encoder-output length a downstream phase consumes.
                 root_axis="n_enc_frames",
+                # The unconditional stream's cross-attention K/V. Classifier-free guidance runs the
+                # encoder twice -- over the caller's bytes and over an all-zero prompt of the same
+                # length, which is `_prepare_model_inputs`' `torch.zeros_like(inputs)` -- and BOTH
+                # results have to survive the whole generation, because the decode loop reads them at
+                # every step. One module cannot hold two: the second run's retained output overwrites
+                # the first's before the next step reads it.
+                extra_streams=("cross_kv_uncond",),
             ),
             ExportPhase(
                 name="decoder",
@@ -516,6 +545,13 @@ class TextToCodesDiaExportConfig(BaseMultiPhaseModelExportConfig):
                 # block has, and this cross-attention has no mask at all.
                 fuse_attention=True,
                 kv_cache_size=self.max_position_embeddings,
+                # The unconditional decode stream, with its OWN KV cache. It is fed the same codes and
+                # the same positions as the conditional one -- `transformers` batches them, and the
+                # decoder input ids are shared -- and differs only in which cross-attention K/V it
+                # reads. Sharing one cache would make each step's second run overwrite the cell the
+                # first just wrote and then attend to a mixture of the two histories, which produces
+                # plausible tokens and raises nothing.
+                extra_streams=("decoder_uncond",),
             ),
         ]
 
@@ -530,12 +566,27 @@ class TextToCodesDiaExportConfig(BaseMultiPhaseModelExportConfig):
         """
         if self.n_channels is None:
             return {}   # built without a checkpoint, e.g. by component_registry.usage()
-        return {
+        hparams = {
             "codec.n_codebooks": self.n_channels,
             "codec.codebook_size": self.n_codebook_vocab,
             "n_text_ctx": self.max_text_len,
             "n_codes_ctx": self.max_position_embeddings,
         }
+        # **The checkpoint's own decoding defaults, declared rather than chosen.** This one asks to be
+        # sampled -- `do_sample: true, temperature 1.8, top_k 50, top_p 0.9` -- and to be run with
+        # classifier-free guidance at 3.0, and an export that dropped those would ship a model whose
+        # audio is not what its authors published. `read_sampling_defaults` is the same reader
+        # `causal_lm_export` uses, so a checkpoint declaring `do_sample: false` gets `temperature 0.0`,
+        # which is the engine's spelling of greedy, here as there.
+        hparams.update({f"sampling.{k}": v for k, v in read_sampling_defaults(self.model_dir).items()})
+        # Guidance is Dia's own knob and not one of the three above, so it is read here. **The number
+        # is the CHECKPOINT's, under the checkpoint's own convention** -- Dia centres its combination
+        # on the conditional logits (`cond + g * (cond - uncond)`) where the general form centres on
+        # the unconditional one, so the driver, not this, is where the `+1` happens. Declaring a
+        # converted number would make `model.hparam("sampling.guidance_scale")` disagree with
+        # `generation_config.json` for no one's benefit.
+        hparams["sampling.guidance_scale"] = self.guidance_scale
+        return hparams
 
     def contract(self) -> dict:
         """The task's pair, plus what a host needs to hand the codes on to a codec.
@@ -584,6 +635,13 @@ class TextToCodesDiaExportConfig(BaseMultiPhaseModelExportConfig):
                 "EOS": self.audio_tokens.get("EOS", 0),
                 "PAD": self.audio_tokens.get("PAD", 0),
                 "MAX_CODES": self.max_position_embeddings,
+                # The checkpoint's own decoding defaults, handed to the driver as its `or`-fallbacks --
+                # the same numbers `hparams()` writes for the HOST, rendered twice from one attribute
+                # set, which is the arrangement `causal_lm_export` already uses for exactly this.
+                "TEMPERATURE": self.sampling_defaults.get("temperature", 0.0),
+                "TOP_K": self.sampling_defaults.get("top_k", 0),
+                "TOP_P": self.sampling_defaults.get("top_p", 1.0),
+                "GUIDANCE_SCALE": self.guidance_scale,
             }),
             SubgraphCallComponent(
                 topology="encoder",
@@ -610,7 +668,7 @@ class TextToCodesDiaExportConfig(BaseMultiPhaseModelExportConfig):
             LuaFragment(
                 self.driver_script_path / "01_decode.lua",
                 reads=("N_CHANNELS", "N_LAYERS", "DELAY_PATTERN", "MAX_DELAY", "BOS", "EOS", "PAD",
-                       "MAX_CODES"),
+                       "MAX_CODES", "TEMPERATURE", "TOP_K", "TOP_P", "GUIDANCE_SCALE"),
                 defines=("_codes",),
             ),
             DriverReturn(values=("_codes",)),
