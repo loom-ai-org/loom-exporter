@@ -394,6 +394,11 @@ _NOT_SPECS = {
     "driver_builder.DriverScript": "a build RESULT (the emitted prelude chunks and entry function), "
                                    "checked by driver_ir.validate/check_subgraph_calls at the moment "
                                    "DriverBuilder.build produces it rather than by a declaration",
+    "spm_tokenizer_export.HfIdLayout": "a READ of a checkpoint's own tokenizer.json -- every field is "
+                                       "transcribed from that file, so there is no second authority "
+                                       "to check one against. It is the authority, and what it is the "
+                                       "authority ON (which id a piece has) is precisely what the "
+                                       "SentencePiece protobuf beside it cannot say",
 }
 
 # Modules the scan is allowed to fail to import. Both are standalone scripts that re-run `dialect.py`'s

@@ -98,6 +98,12 @@ MODELS = [
     # second checkpoint the template is held to, not as a second name -- an artifact difference
     # between these two rows is how a change that quietly re-specialises the family shows up.
     ("distilbert-ner", "distilbert-ner", []),
+    # The third, and the first whose TOKENIZER is the new thing rather than the encoder: XLM-R, a
+    # SentencePiece Unigram vocabulary whose ids are NOT the protobuf's piece order (P5). The two rows
+    # above are both WordPiece with a CoNLL-03 head, so this is the row that fails if
+    # `spm_tokenizer_export`'s id authority stops being read -- and the only row in the sweep whose
+    # position table numbers from 2, which the artifact records as an `add` the other two fold away.
+    ("fullstop-punc", "fullstop-punc", []),
     # Family 11 (P5): the first codec decoder, and the first export whose ROOT AXIS is a codec-frame
     # count rather than tokens or samples. Swept because its failure mode is invisible in a snapshot
     # that only checks the export ran -- see tests/ci/test_audio_codec_export.py.
