@@ -299,6 +299,10 @@ class MultiPhase(Decomposition):
             print(f"  {phase.name}: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights"
                   f"{_rss_note()}")
             phase_topologies[phase.name] = topo
+            # See ExportPhase.extra_streams. A second stream of one topology, declared so the engine
+            # gives it its own KV cache and its own retained output rather than sharing this one's.
+            for alias in phase.extra_streams:
+                phase_topologies[alias] = dict(topo, kv_cache_scope="private")
             named_weights.append((phase.name, exporter.weights))
             # The cache geometry of whatever this phase fused, so the output exporter can still write
             # it: that exporter has no program of its own, and until P5.0's first reduction this was

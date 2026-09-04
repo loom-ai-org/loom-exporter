@@ -6,7 +6,19 @@
 -- utterance; `decoder` is one cached step, called at n_tokens = 1 throughout (its prompt is a single
 -- all-BOS frame, so there is no multi-token prefill to amortise).
 --
--- inputs: tokens (byte ids from this model's own vocabulary), and one optional -- max_new_tokens.
+-- Under classifier-free guidance there are FIVE modules, not three: `cross_kv_uncond` and
+-- `decoder_uncond` are the same two topologies as independent STREAMS, each with its own retained
+-- output and, for the decoder, its own KV cache. `transformers` gets the same thing by batching the
+-- conditional and unconditional inputs together; this engine's cache is single-sequence, so the
+-- second stream is a second module rather than a second batch row. See ExportPhase.extra_streams.
+--
+-- inputs: tokens (byte ids from this model's own vocabulary), and six optional knobs --
+-- max_new_tokens (a count of AUDIO FRAMES, not decoder rows), temperature, top_k, top_p,
+-- guidance_scale and seed. The four decoding knobs default to what this checkpoint's own
+-- `generation_config.json` declares, which for Dia is sampling at 1.8/50/0.9 with classifier-free
+-- guidance at 3.0 -- so `infer{tokens = ...}` is the model as published, and `temperature = 0` with
+-- `guidance_scale = 1` is the greedy, guidance-free decode a reference comparison uses. `seed` makes
+-- a sampled generation reproducible; without one the same sentence gives different audio every call.
 --
 -- Returns a FLAT, frame-major array of codec tokens: N_CHANNELS values per frame, delay already
 -- undone, ready to hand to a codec decoder (`descript/dac_44khz`, which family 11 exported). It is

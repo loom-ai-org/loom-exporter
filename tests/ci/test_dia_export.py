@@ -210,6 +210,11 @@ def _export(checkpoint: Path, out: Path, **kwargs) -> dict:
         "input_kind": reader.fields["loom.input.kind"].contents(),
         "output_kind": reader.fields["loom.output.kind"].contents(),
         "byte_offset": reader.fields["tokenizer.ggml.byte_offset"].contents(),
+        "cross_kv_uncond": json.loads(
+            reader.fields["model.graph_topology.cross_kv_uncond"].contents()),
+        "decoder_uncond": json.loads(reader.fields["model.graph_topology.decoder_uncond"].contents()),
+        "sampling": {k[len("loom.sampling."):]: reader.fields[k].contents()
+                     for k in reader.fields if k.startswith("loom.sampling.")},
     }
 
 
@@ -240,9 +245,10 @@ def test_the_head_emits_one_row_per_channel_and_nothing_else(tmp_path):
     assert isinstance(exported["decoder"]["output"], str)
     assert exported["n_codebooks"] == 3
     assert exported["input_kind"] == "text" and exported["output_kind"] == "audio_codes"
-    # The restricted per-channel argmax, not one whole-row reduction: this model's top ids are control
+    # The restricted per-channel draw, not one whole-row reduction: this model's top ids are control
     # tokens and only channel 0 may say EOS.
-    assert "loom.argmax_row_range('decoder', 0, 0, EOS + 1)" in exported["driver"]
+    assert "_sample_opts(0, EOS, false)" in exported["driver"]
+    assert "_sample_opts(0, EOS + 1, true)" in exported["driver"]
     assert "loom.argmax_rows('decoder')" not in exported["driver"]
 
 
@@ -266,3 +272,91 @@ def test_the_traced_lengths_do_not_reach_the_graph(tmp_path):
     assert short["cross_kv"] == long["cross_kv"]
     assert short["decoder"] == long["decoder"]
     assert short["driver"] == long["driver"]
+
+
+def test_the_unconditional_stream_is_its_own_module_with_its_own_cache(tmp_path):
+    """CLASSIFIER-FREE GUIDANCE IS TWO STREAMS, AND SHARING EITHER PIECE IS A SILENT WRONG ANSWER.
+
+    `transformers` runs the two by batching them; this engine's KV cache is single-sequence, so the
+    unconditional run is a second MODULE. Two things have to be true of it and neither is visible in a
+    graph:
+
+    * the decoder's second stream declares `kv_cache_scope: "private"`, or each step's second run
+      overwrites the cell the first just wrote and then attends to a mixture of the two histories --
+      which produces plausible codes and raises nothing;
+    * the cross-attention K/V are TWO modules as well, because both are read at every step for the
+      whole generation, so one module cannot hold the conditional and unconditional projections at
+      once.
+
+    The two aliases are the same graph, which is the other half of the claim: an alias is a stream,
+    not a second export, and it duplicates no weights.
+    """
+    pytest.importorskip("coremltools")
+    exported = _export(_tiny_dia(tmp_path), tmp_path / "tiny.gguf")
+
+    assert exported["decoder_uncond"]["kv_cache_scope"] == "private"
+    assert "kv_cache_scope" not in exported["decoder"], (
+        "the conditional stream takes the session's shared cache -- saying nothing is how a topology "
+        "asks for that, and every file exported before this key does"
+    )
+    # Same graph, and compared node for node rather than by node count: an alias that had been
+    # regenerated instead of copied could differ in a weight name and still have the same length.
+    assert exported["decoder_uncond"]["nodes"] == exported["decoder"]["nodes"]
+    assert exported["cross_kv_uncond"]["nodes"] == exported["cross_kv"]["nodes"]
+
+    # And the driver actually drives them.
+    assert "loom.run_subgraph_and_retain('decoder_uncond'" in exported["driver"]
+    assert "cross_kv_uncond" in exported["driver"]
+
+
+def test_the_checkpoints_own_decoding_defaults_are_declared(tmp_path):
+    """A model card that shipped greedy, guidance-free audio would not be this checkpoint.
+
+    Dia declares `do_sample: true, temperature 1.8, top_k 50, top_p 0.9` and `guidance_scale 3.0`, and
+    an export that dropped them would produce a file whose default output is not what its authors
+    published. Both halves are checked: the HOST-facing hparams, and the driver's own fallbacks --
+    they are one attribute set rendered twice, and the failure worth catching is them disagreeing.
+
+    **The guidance scale is declared under the CHECKPOINT's convention, unconverted.** Dia centres its
+    combination on the conditional logits and the engine's primitive centres on the unconditional
+    ones, which differ by one; the driver adds the one. Declaring the converted number here would make
+    `model.hparam("sampling.guidance_scale")` disagree with `generation_config.json`.
+    """
+    pytest.importorskip("coremltools")
+    checkpoint = _tiny_dia(tmp_path)
+    (checkpoint / "generation_config.json").write_text(json.dumps({
+        "do_sample": True, "temperature": 1.8, "top_k": 50, "top_p": 0.9, "guidance_scale": 3.0,
+        "bos_token_id": 30, "eos_token_id": 28, "pad_token_id": 29,
+    }))
+    exported = _export(checkpoint, tmp_path / "tiny.gguf")
+
+    assert exported["sampling"]["temperature"] == pytest.approx(1.8)
+    assert exported["sampling"]["top_k"] == 50
+    assert exported["sampling"]["top_p"] == pytest.approx(0.9)
+    assert exported["sampling"]["guidance_scale"] == pytest.approx(3.0)
+    driver = exported["driver"]
+    assert "local TEMPERATURE = 1.8" in driver
+    assert "local TOP_K = 50" in driver
+    assert "local GUIDANCE_SCALE = 3.0" in driver
+    # The `+ 1`, in the driver and nowhere else.
+    assert "scale = _guidance + 1.0" in driver
+
+
+def test_a_checkpoint_that_asks_for_greedy_gets_greedy(tmp_path):
+    """`do_sample: false` is `temperature = 0.0`, the engine's own spelling of greedy, and no
+    guidance -- the same normalization `causal_lm_export` uses, so a family cannot drift from it.
+
+    Worth its own row because the two knobs come from different readers: the three sampling numbers
+    from `read_sampling_defaults`, the guidance scale from the generation config directly. A
+    checkpoint that declared neither must get a driver that decodes deterministically, which is what
+    every reference comparison in the gate suite depends on being expressible.
+    """
+    pytest.importorskip("coremltools")
+    checkpoint = _tiny_dia(tmp_path)
+    (checkpoint / "generation_config.json").write_text(json.dumps({
+        "do_sample": False, "bos_token_id": 30, "eos_token_id": 28, "pad_token_id": 29,
+    }))
+    exported = _export(checkpoint, tmp_path / "tiny.gguf")
+    assert exported["sampling"]["temperature"] == pytest.approx(0.0)
+    assert exported["sampling"]["guidance_scale"] == pytest.approx(1.0)
+    assert "local GUIDANCE_SCALE = 1.0" in exported["driver"]
