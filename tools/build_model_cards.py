@@ -585,7 +585,10 @@ audio.save("out.wav")
 #
 # open-dict-data/ipa-dict (MIT) publishes ~65k-entry wordlists WITH stress for en_UK and en_US, in
 # almost the right shape: its IPA is wrapped in slashes and a rare entry carries two comma-separated
-# variants, both of which the loader rejects. One line converts a downloaded data/en_UK.txt:
+# variants, both of which the loader rejects. Take the RAW file: a github.com/.../blob/... URL serves
+# an HTML PAGE, and the sed below will turn that into a .tsv that parses to zero entries -- which is
+# indistinguishable from no lexicon at all except for the warning `set_lexicon` raises. Two lines:
+#     curl -LO https://raw.githubusercontent.com/open-dict-data/ipa-dict/master/data/en_UK.txt
 #     sed 's:/::g; s/\\t\\([^,]*\\),.*/\\t\\1/' en_UK.txt > en_UK.tsv
 loom.phonemizers.set_lexicon("en_UK.tsv")    # a path, an http(s):// URL, or hf://<repo>/<path>
 
