@@ -88,6 +88,28 @@ MODELS = [
     ("supertonic", "$LOOM_SUPERTONIC_ROOT/assets/pt",
      ["--task", "text-to-speech", "--model", "supertonic"]),
     ("vits", "$LOOM_VITS_CHECKPOINT", ["--task", "text-to-speech", "--model", "vits"]),
+    # Family 12 (P5): the first non-audio task in the sweep, and the smallest export in it. Reached
+    # through the generic `hf-token-classifier` fallback, so it needs no `--model` -- which is itself
+    # part of what is being swept, since a second family claiming a `*ForTokenClassification` directory
+    # would show up here as an ambiguity rather than as a wrong export.
+    ("bert-ner", "bert-base-ner", []),
+    # The same family through a structurally different encoder: no token-type embeddings, no
+    # `position_ids` argument, `.transformer` where BERT has `.encoder`. It is in the sweep as the
+    # second checkpoint the template is held to, not as a second name -- an artifact difference
+    # between these two rows is how a change that quietly re-specialises the family shows up.
+    ("distilbert-ner", "distilbert-ner", []),
+    # Family 11 (P5): the first codec decoder, and the first export whose ROOT AXIS is a codec-frame
+    # count rather than tokens or samples. Swept because its failure mode is invisible in a snapshot
+    # that only checks the export ran -- see tests/ci/test_audio_codec_export.py.
+    ("dac-44khz", "dac-44khz", []),
+    # Family 10 (P5): the other half of that pair, and the sweep's largest export by an order of
+    # magnitude -- 6.4 GB and ~12 minutes. It is here rather than left out for its cost because it is
+    # the only row whose artifact contains an ALIASED topology: `cross_kv_uncond` and `decoder_uncond`
+    # are the same graphs under second names, and the one with a KV cache declares
+    # `kv_cache_scope: "private"` (loom.cpp ADR-023). A change that stopped emitting either, or
+    # emitted them without that key, is a silent wrong answer under classifier-free guidance and is
+    # invisible everywhere else in this file.
+    ("dia-1.6b", "dia-1.6b", []),
     # Qwen3-ASR needs transformers >= 5.13 and the rest of the sweep needs <= 4.57, so it cannot run
     # in the same interpreter as its neighbours here. It is swept from the other environment; see
     # docs/EXPORT-PREPARATION.md.

@@ -131,7 +131,7 @@ def _entries() -> Tuple[ComponentEntry, ...]:
         FlowMatchingSampler,
         LuaFragment, ModularChain,
         MonolithicCall, PrefillDecodeLoop, PromptSegments, RawLuaDriver, SubgraphCallComponent,
-        WaveformValidLength,
+        TokenLabelsEpilogue, WaveformValidLength,
     )
     from .lua_library import LuaLibrary
 
@@ -192,6 +192,13 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "duplicates and drop the blank. `argmax_epilogue`'s ASR counterpart -- the same single "
             "forward pass, but a reduction over EVERY row returning a sequence, rather than over one "
             "row returning a token.",
+        ),
+        ComponentEntry(
+            "token_labels_epilogue", TokenLabelsEpilogue, (STATEMENTS,),
+            "One class id per ROW of the retained output, in row order -- family 12's whole "
+            "orchestration. `ctc_greedy_epilogue` without the collapse, and the absence is the point: "
+            "here the alignment between row i and token i IS the answer, so consecutive duplicates are "
+            "two tokens' labels rather than one repeated.",
         ),
         ComponentEntry(
             "argmax_epilogue", ArgmaxEpilogue, (STATEMENTS,),

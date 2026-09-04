@@ -2,9 +2,16 @@
 """Quantizes a loom GGUF's matmul-weight tensors to Q8_0, copying every other KV/tensor through
 byte-identical.
 
-Which tensors count as "matmul weights" is derived from the model's own embedded topology JSON --
-recursively walking every node (expanding "repeat_for" blocks using the GGUF's own "loom.n_layer" KV) and
-collecting each MUL_MAT node's *first* input, the weight-first argument per loom's convention (confirmed
+Which tensors count as "matmul weights" is derived from the model's own embedded topology JSON -- from
+EVERY topology the file declares, not just one: a multi-phase export writes `model.graph_topology.<name>`
+per phase (Whisper's three, Dia's five) and a single-phase one writes a bare `model.graph_topology`, and
+a quantizer that read only the second left every weight of the first families untouched while reporting
+success. The names are unioned, which is also what makes an aliased topology free -- two modules running
+one graph name the same tensors.
+
+Within each, this recursively walks every node (expanding "repeat_for" blocks using the GGUF's own
+"loom.n_layer" KV) and collects each MUL_MAT node's *first* input, the weight-first argument per loom's
+convention (confirmed
 in src/ops/primitives_attention.cpp's ATTENTION doc-comment and src/ops/primitives_basic.cpp's op_mul_mat,
 a bare ggml_mul_mat(a, b) wrap where ggml_mul_mat computes b @ a.T with `a` as the weight) -- NOT tensor-
 name pattern matching. See BACKLOG.md's "quantized weight support" milestone for why: a name-based
@@ -83,9 +90,20 @@ def main() -> None:
     reader = GGUFReader(str(in_path))
 
     arch = reader.get_field("general.architecture").contents()
-    n_layer = reader.get_field("loom.n_layer").contents()
-    topology = json.loads(reader.get_field("model.graph_topology").contents())
-    quantizable = collect_mul_mat_weight_names(topology["nodes"], n_layer)
+    # `loom.n_layer` is what `repeat_for: "$n_layer"` expands to. A model with no repeated block does
+    # not declare it, and 0 is the right answer there: the walk simply never enters a repeat.
+    n_layer_field = reader.get_field("loom.n_layer")
+    n_layer = n_layer_field.contents() if n_layer_field is not None else 0
+    topology_keys = [k for k in reader.fields
+                     if k == "model.graph_topology" or k.startswith("model.graph_topology.")]
+    if not topology_keys:
+        print(f"{in_path} declares no graph topology, so there is nothing to derive the weight set "
+              f"from", file=sys.stderr)
+        sys.exit(1)
+    quantizable = set()
+    for key in topology_keys:
+        topology = json.loads(reader.get_field(key).contents())
+        quantizable |= collect_mul_mat_weight_names(topology["nodes"], n_layer)
 
     writer = GGUFWriter(str(out_path), arch)
     copy_kv(reader, writer)
@@ -118,8 +136,9 @@ def main() -> None:
     writer.write_tensors_to_file()
     writer.close()
 
-    print(f"wrote {out_path}: {n_quantized} tensors -> Q8_0, {n_skipped_unaligned} MUL_MAT weights left "
-          f"F32 (not block-aligned to {Q8_0_BLOCK_SIZE}), {n_passthrough} other tensors left F32")
+    print(f"wrote {out_path}: {n_quantized} tensors -> Q8_0 from {len(topology_keys)} topolog(ies), "
+          f"{n_skipped_unaligned} MUL_MAT weights left F32 (not block-aligned to {Q8_0_BLOCK_SIZE}), "
+          f"{n_passthrough} other tensors left F32")
 
 
 if __name__ == "__main__":

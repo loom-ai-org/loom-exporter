@@ -221,6 +221,12 @@ def detect_loom_pre_type(tokenizer, *, fallback: str = "qwen2") -> str:
     return loom_pre
 
 
+#: The `tokenizer_class` values that mean "raw UTF-8 bytes", which is the whole of the on-disk marker
+#: for this family -- neither ships a tokenizer.json. What differs between them is constants, and
+#: `byt5_tokenizer_export.write_byte_vocab` reads them off the config rather than assuming ByT5's.
+_BYTE_TOKENIZER_CLASSES = frozenset({"ByT5Tokenizer", "DiaTokenizer"})
+
+
 def detect_vocab_family(tokenizer_dir: str) -> str:
     """Returns "bpe" / "wordpiece" / "sentencepiece_proto" / "byte". See module docstring."""
     tok_dir = Path(tokenizer_dir)
@@ -248,7 +254,19 @@ def detect_vocab_family(tokenizer_dir: str) -> str:
     config_path = tok_dir / "tokenizer_config.json"
     if config_path.exists():
         tokenizer_class = json.loads(config_path.read_text()).get("tokenizer_class")
-        if tokenizer_class == "ByT5Tokenizer":
+        # Two families share this branch, and the second is why the writer takes the class name rather
+        # than assuming ByT5's constants: `DiaTokenizer` is the same raw-UTF-8-byte scheme at a
+        # different offset, with no eos, and with two speaker tags INSIDE its byte range. It ships no
+        # fast-tokenizer file either, for the same reason.
+        if tokenizer_class in _BYTE_TOKENIZER_CLASSES:
             return "byte"
+    # The classic BERT layout: `vocab.txt` and nothing else. Older checkpoints predate the fast
+    # tokenizer entirely (dslim/bert-base-NER ships `vocab.txt` + a three-key `tokenizer_config.json`),
+    # and family 12's members are mostly of that vintage. Checked LAST, after every other marker, so a
+    # SentencePiece or BPE directory that also happens to carry a `vocab.txt` still resolves to what it
+    # really is -- this branch only fires when nothing else identified the directory.
+    if (tok_dir / "vocab.txt").exists():
+        return "wordpiece"
     raise NotImplementedError(f"no recognized tokenizer file (tokenizer.json/tokenizer.model/spiece.model/"
-                               f"a ByT5Tokenizer tokenizer_config.json) found in {tokenizer_dir}")
+                               f"vocab.txt/a {'/'.join(sorted(_BYTE_TOKENIZER_CLASSES))} "
+                               f"tokenizer_config.json) found in {tokenizer_dir}")

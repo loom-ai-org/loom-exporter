@@ -526,10 +526,16 @@ def test_tts_recognizers_reject_the_other_families_paths(tmp_path):
 
 # -- TaskRegistry itself, independent of any real family -----------------------------------------------
 
-# A toy family, registered under the one canonical task no real family claims yet (`audio-codec`, whose
-# base is therefore just `LoomExportConfig`). This keeps these tests independent of any real family while
-# still going through P4.0.4's vocabulary and config-class checks, which is what a real caller does.
-TOY_TASK = "audio-codec"
+# A toy family, registered into a FRESH `TaskRegistry` under a canonical task whose base is just
+# `LoomExportConfig` -- which keeps these tests independent of any real family while still going
+# through P4.0.4's vocabulary and config-class checks, as a real caller does.
+#
+# This used to be `text-to-codes` on the stronger ground that no real family claimed it. Family 10
+# claimed it, and the weaker property is the one that actually mattered: the registry under test is
+# built empty, so what the DEFAULT registry holds for this name is irrelevant. What must still hold is
+# that the task's base class does not reject `_ToyConfig`, and `automatic-speech-recognition` is the
+# task whose base is deliberately the root -- see `tasks.py`, which argues that at length.
+TOY_TASK = "automatic-speech-recognition"
 
 
 @dataclass(kw_only=True)
@@ -719,9 +725,10 @@ def test_every_recognizer_naming_one_concrete_model_is_specific():
 
 # -- the task vocabulary itself (P4.0.4) ---------------------------------------------------------------
 
-def test_the_vocabulary_is_the_four_canonical_names():
+def test_the_vocabulary_is_the_six_canonical_names():
     assert known_tasks() == [
-        "audio-codec", "automatic-speech-recognition", "text-generation", "text-to-speech",
+        "audio-codec", "automatic-speech-recognition", "text-generation", "text-to-codes",
+        "text-to-speech", "token-classification",
     ]
 
 
@@ -733,30 +740,52 @@ def test_every_declared_base_config_resolves_and_is_a_loom_export_config():
         assert isinstance(base, type) and issubclass(base, LoomExportConfig), name
 
 
-def test_audio_codec_is_reserved_and_unclaimed():
-    """Decision 3: the name is declared now so family 11 does not invent a competing one, but no family
-    registers against it until it exists."""
-    from loom_exporter.registry import default_registry
+def test_both_reserved_names_were_claimed_by_the_families_that_arrived():
+    """The reservation mechanism has now run its full course TWICE, which is it working rather than
+    the exception to it.
 
-    assert task_spec("audio-codec").reserved
-    assert task_spec("audio-codec").base_config_class() is LoomExportConfig
-    assert "audio-codec" not in default_registry()._entries
+    `audio-codec` was declared before family 11 existed and is now its task; `text-to-codes` was
+    declared before family 10 existed and is now Dia's. The two compose -- `text2codes` then
+    `codes2speech` -- and naming the second before it existed is precisely what stopped the family
+    that arrived from inventing a competing spelling for the thing the first one consumes."""
+    from loom_exporter.registry import default_registry
+    from loom_exporter.audio_codec_export import AudioCodecExportConfig
+    from loom_exporter.multi_phase_export import BaseMultiPhaseModelExportConfig
+
+    entries = default_registry()._entries
+    assert not task_spec("audio-codec").reserved
+    assert task_spec("audio-codec").base_config_class() is AudioCodecExportConfig
+    assert "audio-codec" in entries
+
+    assert not task_spec("text-to-codes").reserved
+    assert task_spec("text-to-codes").base_config_class() is BaseMultiPhaseModelExportConfig
+    assert "text-to-codes" in entries
 
 
 def test_a_declared_but_unclaimed_task_says_so_rather_than_unknown():
-    """`--task audio-codec` is a valid argparse choice but has no family, and that is a different error
-    from a typo -- conflating them sends the caller looking for a misspelling that isn't there."""
-    from loom_exporter.registry import default_registry
+    """A task name in the vocabulary with no family behind it is a different error from a typo --
+    conflating them sends the caller looking for a misspelling that isn't there.
 
-    registry = default_registry()
+    Exercised against an EMPTY registry rather than the default one, because no canonical name is
+    currently unclaimed. That is the honest way to keep this path covered: the branch is a property of
+    `TaskRegistry`, not of which names happen to be spoken for this month."""
+    registry = TaskRegistry()
     with pytest.raises(ValueError, match="declared but no family is registered against it yet"):
         registry.get("audio-codec", "whatever")
     with pytest.raises(ValueError, match="declared but no family is registered against it yet"):
         registry.detect(Path("/nonexistent"), task="audio-codec")
 
 
-def test_only_audio_codec_is_reserved():
-    assert [n for n in known_tasks() if task_spec(n).reserved] == ["audio-codec"]
+def test_no_task_is_reserved_today():
+    """One at a time, deliberately -- and right now, none.
+
+    A reserved name is a promise about the NEXT family, and a list of them is a roadmap pretending to
+    be a vocabulary. Both promises have been kept (`audio-codec` by family 11, `text-to-codes` by
+    family 10), and the families actually next in line -- a second codec decoder, CNN+CTC and SANM
+    encoders -- all fit tasks that already exist. So there is nothing to reserve, and reserving
+    something anyway to keep this count at one would be the roadmap-as-vocabulary this guards against.
+    """
+    assert [n for n in known_tasks() if task_spec(n).reserved] == []
 
 
 def test_get_returns_the_named_recognizer():
@@ -804,7 +833,8 @@ def test_every_registered_task_is_canonical():
     registry = default_registry()
     assert set(registry._entries) <= set(known_tasks())
     assert sorted(registry._entries) == [
-        "automatic-speech-recognition", "text-generation", "text-to-speech",
+        "audio-codec", "automatic-speech-recognition", "text-generation", "text-to-codes",
+        "text-to-speech", "token-classification",
     ]
 
 

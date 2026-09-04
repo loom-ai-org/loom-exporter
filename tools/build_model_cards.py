@@ -50,7 +50,11 @@ class ModelCard:
     # supertonic fork) live outside it and are given absolute paths directly -- see
     # [[loom-engine-model-sweep-recipe]] for why.
     checkpoint: Path
-    # "text-generation" | "automatic-speech-recognition" | "text-to-speech" -- picks the usage snippet.
+    # A canonical task name from `loom_exporter.tasks` -- it picks the usage snippet AND becomes the
+    # card's `pipeline_tag`. Deliberately the SAME vocabulary the export declares rather than a
+    # card-local list: a card whose pipeline tag disagreed with the file's own `loom.task` would be
+    # documenting a different model from the one beside it. `snippet_key` is where a task with more
+    # than one shape resolves that.
     task_type: str
     # Whether this model's GGUF carries a vocabulary, for the TTS models where that is not implied by
     # the task: the phoneme-input families (Kokoro, Matcha, VITS, StyleTTS2) take ids a phonemiser
@@ -81,6 +85,19 @@ class ModelCard:
     # `--task`/`--model` for loom-export; empty means auto-detection resolves both.
     export_task: Optional[str] = None
     export_model: Optional[str] = None
+    # `--quantize` for loom-export, e.g. "Q8_0". Empty means F32, which is what every entry here was
+    # and still is bar one.
+    #
+    # **A per-model decision, not a policy**, and Dia is what forced it: at F32 that model is 6.4 GB,
+    # which is not a thing to publish for a 1.6 B checkpoint when Q8_0 is 1.8 GB. Everything smaller
+    # stays F32 deliberately -- these are reference artifacts as much as downloads, the gate compares
+    # them byte-for-byte against what the exporter produces, and quantization would put a lossy step
+    # between the two for no benefit at 300 MB. It also does nothing at all for the convolutional TTS
+    # families, whose kernels are most of their bytes and were only made packable recently.
+    #
+    # The eligible weights are derived from the topologies rather than from tensor names
+    # (`_collect_mul_mat_weight_names`), so this needs no per-model list of what to skip.
+    export_quantize: Optional[str] = None
     # Which venv's interpreter can import this model's loader. "piper" covers everything except
     # qwen3-asr, which needs "ovos" (transformers >= 5.13). See [[env-python-venvs-export]].
     venv: str = "piper"
@@ -131,7 +148,7 @@ class ModelCard:
     extra_files: List[str] = field(default_factory=list)
 
 
-# The 17 models the exporter can produce today (BACKLOG.md's implementation-sequence table, P4/P5).
+# The 19 models the exporter can produce today (BACKLOG.md's implementation-sequence table, P4/P5).
 # Per-model invocations are [[loom-engine-model-sweep-recipe]]; license/language were read off each
 # checkpoint's own upstream README.md (see this repo's `/home/flavio/Dev/models/*/README.md` where one
 # was downloaded alongside the weights) or, where the checkpoint itself carries no README, off the
@@ -402,6 +419,97 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         sample_rate=24000,
         title="StyleTTS2 (LJSpeech)", summary="yl4579's StyleTTS2 LJSpeech checkpoint, exported for loom.cpp. Takes phoneme ids, not text.",
     ),
+    ModelCard(
+        slug="dac-44khz", checkpoint=Path("dac-44khz"),
+        task_type="audio-codec",
+        base_repo="descript/dac_44khz", license_id="mit", language=[],
+        # The HF repo publishes NO `license:` tag and its README is an unfilled template, so the tag
+        # here comes from the upstream project -- github.com/descriptinc/descript-audio-codec, whose
+        # LICENSE is MIT and whose README says so of the WEIGHTS specifically ("Weights are released
+        # as part of this repo under MIT license"), which is the claim that matters for a re-upload.
+        # Same shape of gap, and same resolution, as StyleTTS2's entry above.
+        language_note="a codec, not a language model: it carries no vocabulary and no language. "
+                       "The upstream HF repo carries no `license:` tag; MIT is from the project's own "
+                       "LICENSE and its README's explicit statement about the weights.",
+        title="DAC 44.1 kHz (decoder)",
+        summary="Descript Audio Codec at 44.1 kHz, decode half, exported for loom.cpp. Family 11: "
+                "codec tokens in, a waveform out.",
+        limitations=(
+            "**This is the DECODE half only.** `encode` is audio-in/codes-out -- a different contract "
+            "with a different modality pair -- and no model that decodes through this codec ever calls "
+            "it, so exporting it would be weight in the file for a door nothing opens. To go the other "
+            "way, use the upstream checkpoint.\n\n"
+            "It takes **9 code streams per frame at 86.13 frames per second**, and one frame decodes "
+            "to 512 samples. Codes from a different codec -- or from DAC at a different sample rate -- "
+            "are integers in the right range and produce noise rather than an error.\n\n"
+            "**It does not undo a delay pattern.** An AR model that emits these codes typically offsets "
+            "stream *k* by *k* steps; realigning them is a property of that model, not of the codec, so "
+            "feed it aligned codes."
+        ),
+    ),
+    ModelCard(
+        slug="dia-1.6b", checkpoint=Path("dia-1.6b"),
+        task_type="text-to-codes",
+        # **Q8_0, and it is the only quantized entry here.** At F32 this export is 6.4 GB; the
+        # eligible weights are 253 of its 344 tensors and packing them brings it to 1.8 GB, which is
+        # the difference between a model people download and one they do not. See `export_quantize`
+        # for why nothing else in this catalogue is quantized.
+        export_quantize="Q8_0",
+        base_repo="nari-labs/Dia-1.6B", license_id="apache-2.0", language=["en"],
+        title="Dia-1.6B",
+        summary="Nari Labs' Dia-1.6B dialogue TTS model, exported for loom.cpp. Family 10: text in, "
+                "neural-codec tokens out -- pair it with `dac-44khz-loom` for audio.",
+        limitations=(
+            "**This model does not produce audio.** It emits nine streams of DAC codec tokens, and a "
+            "codec turns those into a waveform -- [`dac-44khz-loom`](https://huggingface.co/loom-ai-org/dac-44khz-loom), "
+            "which is the codec this checkpoint was trained against. They stay separate because one "
+            "codec serves many models like this one, and because the codes are the useful "
+            "intermediate. The usage snippet above is the whole of the joining.\n\n"
+            "**It samples, and it is high-variance.** The export declares this checkpoint's own "
+            "decoding -- `temperature 1.8`, `top_k 50`, `top_p 0.9`, and classifier-free guidance at "
+            "`3.0` -- so two runs of the same sentence give two different takes. Some of them are not "
+            "the sentence: on the snippet's own text, one seed in four gave it back verbatim, one "
+            "gave laughter and two gave near-silence. That is the model rather than the export "
+            "(`transformers` behaves identically), which is why the snippet names a seed. **Expect "
+            "to try several.**\n\n"
+            "Guidance costs a second decoder pass at every step, so generation is about twice the "
+            "work of a comparable LM. Pass `guidance_scale=1.0` to turn it off -- faster, and worse.\n\n"
+            "`max_new_tokens` counts **audio frames** at 86.13 per second, not decoder steps: the two "
+            "differ by this family's delay pattern, which the driver applies and undoes for you. "
+            "Reaching the cap forces a clean ending rather than truncating, so a budget that is too "
+            "small gives you a complete, shorter utterance.\n\n"
+            "**Speaker tags are part of the text.** `[S1]` and `[S2]` are tokens this checkpoint was "
+            "trained on and are what make it a dialogue model; text without one is out of "
+            "distribution. Non-verbal cues like `(laughs)` work the same way. Voices are not "
+            "selectable -- without an audio prompt the model picks one, and the seed is what decides "
+            "it.\n\n"
+            "Weights are `Q8_0`. The published F32 export is 6.4 GB and byte-identical decoding "
+            "against `transformers` was verified on that one; quantization moves the logits slightly, "
+            "which for a sampler means a different take rather than a worse one."
+        ),
+    ),
+    ModelCard(
+        slug="distilbert-ner", checkpoint=Path("distilbert-ner"),
+        task_type="token-classification",
+        base_repo="dslim/distilbert-NER", license_id="apache-2.0", language=["en"],
+        title="DistilBERT-NER",
+        summary="dslim's DistilBERT fine-tuned on CoNLL-2003 for named-entity recognition, exported "
+                "for loom.cpp. Family 12: text in, one class per token out.",
+        limitations=(
+            "Trained on CoNLL-2003, which is **newswire from 1996-1997** -- entity names that did not "
+            "exist then, and text that does not read like a news wire, are outside what it saw. It "
+            "recognises four types (`PER`, `ORG`, `LOC`, `MISC`) and nothing else, and it is **cased**: "
+            "lowercasing your input before passing it costs real accuracy, because capitalisation is "
+            "most of what a NER model has to go on.\n\n"
+            "The labels line up with the tokenizer's PIECES, not with your words. A word the "
+            "vocabulary splits gets one label per piece, and they can disagree -- deciding which one "
+            "wins is the caller's rule, which is why the export hands back the pieces alongside the "
+            "labels rather than a list of words.\n\n"
+            "The export takes one sequence at a time and no padding, so there is no batch dimension "
+            "to fill and no attention mask to pass. Sequences are capped at 512 tokens by the "
+            "checkpoint's own learned position table."
+        ),
+    ),
 ]
 
 CATALOG_BY_SLUG = {m.slug: m for m in CATALOG}
@@ -502,6 +610,99 @@ loom.phonemizers.set_lexicon("en_UK.tsv")    # a path, an http(s):// URL, or hf:
 audio = model.text2speech.infer("hello world", sample_rate={sample_rate})
 audio.save("out.wav")
 """,
+    # The fourth door, and the first non-audio one. Fixed text rather than a placeholder, for the same
+    # reason every TTS card says "hello world": the release gate reads the card's OWN output back and
+    # grades it, so the sentence has to be one an expectation can be written against.
+    "token-classification": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+result = model.text2class.infer("My name is Wolfgang and I live in Berlin")
+print(result.text)
+# My/O name/O is/O Wolfgang/B-PER and/O I/O live/O in/O Berlin/B-LOC
+
+# The labels come back beside the PIECES the tokenizer produced, not the words you wrote -- a
+# WordPiece encode splits unknown and long words, so "Wolfgang" may be one piece here and three in
+# another sentence. Joining them back into words is a rule only you can make, which is why both
+# halves are handed over rather than one.
+for token in result:
+    print(token.piece, token.label)
+
+# Every class this checkpoint can choose between, in the order its ids run:
+print(result.labels)
+
+# The framing tokens the encode adds ([CLS] and [SEP]) are dropped for you, on the ids the file
+# declares rather than on their spelling. Ask for the raw alignment if you want them:
+raw = model.text2class.infer("My name is Wolfgang and I live in Berlin", strip_special=False)
+print(len(raw), "rows including [CLS] and [SEP], against", len(result), "without")
+""",
+    # A codec DECODER, which is the one card here whose input a reader cannot type. Codes come from
+    # an encoder or from an AR codec-token LM, so the snippet demonstrates the GEOMETRY -- how many
+    # streams, how wide, how many frames to a second -- and decodes a run of them. The numbers it
+    # prints are what the release gate grades, and they are the exact thing that was silently wrong in
+    # the first working export of this family: a decoder that returns one frame's worth of audio for
+    # any input produces a plausible file and the wrong length.
+    "audio-codec": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# The geometry a caller needs, declared by the file rather than looked up in a paper:
+n_codebooks = model.hparam("codec.n_codebooks")       # code streams per frame
+codebook_size = model.hparam("codec.codebook_size")   # valid id range per stream
+frame_rate = model.hparam("codec.frame_rate", "f32")  # codes per second
+print(n_codebooks, codebook_size, frame_rate, model.contract["sample_rate"])
+
+# Codes are FRAME-MAJOR: all `n_codebooks` codes for frame 0, then frame 1, and so on. This file
+# is the DECODE half -- real codes come from the matching encoder, or an AR model that emits them.
+frames = round(frame_rate)                            # one second of audio
+codes = [[0] * n_codebooks for _ in range(frames)]
+audio = model.codes2speech.infer(codes)
+print(len(audio), "samples at", audio.sample_rate, "Hz =", round(audio.duration, 3), "s")
+audio.save("out.wav")
+
+# A flat list works too, and is what a driver that emitted the codes hands over. One that is not a
+# whole number of frames is refused rather than reinterpreted at a different width.
+audio = model.codes2speech.infer([0] * (frames * n_codebooks))
+""",
+    # An AR codec-token LM, which is the one card here whose model does not produce its own output
+    # kind: it emits codec TOKENS and a second file turns them into audio (loom.cpp ADR-022). So the
+    # snippet is the only one that loads two models, and the chaining -- two calls and the array
+    # between them -- is the thing it exists to show.
+    #
+    # **The seed is in the snippet, and it is not decoration.** This checkpoint declares
+    # `do_sample: true` at temperature 1.8 with classifier-free guidance, which is genuinely
+    # high-variance: of four seeds tried on this sentence, one gave it back verbatim, one gave
+    # laughter and two gave near-silence, and `transformers` behaves the same way (loom.cpp
+    # Retro-032). A card that drew an unseeded sample would look like a broken model to whoever ran
+    # it next.
+    "text-to-codes": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# What comes back is codec TOKENS, not audio -- frame-major, one row per frame, `n_codebooks` wide.
+# `max_new_tokens` counts AUDIO FRAMES rather than decoder steps.
+codes = model.text2codes.infer(
+    "[S1] Hey, can you shut down the computer, my friend?",
+    max_new_tokens=260, seed=1234,
+)
+print(len(codes), "frames x", len(codes[0]), "codebooks")
+
+# The second half of the pair, in a repo of its own: one codec serves many models like this one, and
+# the codes are worth having on their own -- cache them, edit them, decode them somewhere else.
+codec = loom.Model.from_pretrained("loom-ai-org/dac-44khz-loom")
+audio = codec.codes2speech.infer(codes)
+print(len(audio), "samples at", audio.sample_rate, "Hz =", round(audio.duration, 2), "s")
+audio.save("out.wav")
+
+# Nothing goes between those two calls. Both files declare the width of a frame, so a pair that does
+# not fit says so instead of producing audio of the wrong duration:
+print(model.hparam("codec.n_codebooks"), "==", codec.hparam("codec.n_codebooks"))
+
+# This model SAMPLES by default, at the settings its own generation config declares. `seed=` above is
+# what makes a result reproducible; drop it for a different take, or decode greedily for the same
+# answer every time -- greedy is much flatter, and not what this checkpoint was tuned for.
+print(model.hparam("sampling.temperature", "f32"), model.hparam("sampling.guidance_scale", "f32"))
+""",
     "text-to-speech-with-vocab": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
@@ -518,6 +719,29 @@ audio.save("out.wav")
 # That uses whatever voice the file itself defaults to. See below for choosing another.
 """,
 }
+
+
+#: The only placeholders a usage snippet may carry. Substituted by name rather than through
+#: `str.format`, which was the previous mechanism and is wrong for this content: a snippet is PYTHON,
+#: and Python has braces. The first card to write `{n_codebooks}` inside an explanatory comment
+#: crashed the build with `KeyError: 'n_codebooks'`, and the first one to show a dict or a set literal
+#: would have done the same. Targeted replacement cannot: an unknown brace is just text.
+SNIPPET_PLACEHOLDERS = ("repo_id", "slug", "sample_rate")
+
+
+def render_snippet(text: str, **values) -> str:
+    """One usage snippet with its placeholders filled in.
+
+    Raises on a placeholder this table does not know rather than leaving it in the published card:
+    a card that shipped a literal `{voice}` would be telling a reader to type it.
+    """
+    unknown = set(values) - set(SNIPPET_PLACEHOLDERS)
+    if unknown:
+        raise ValueError(f"unknown snippet placeholder(s) {sorted(unknown)}; "
+                         f"add them to SNIPPET_PLACEHOLDERS if they are real")
+    for key in SNIPPET_PLACEHOLDERS:
+        text = text.replace("{" + key + "}", str(values.get(key, "")))
+    return text
 
 
 def repo_id(card: ModelCard) -> str:
@@ -546,6 +770,8 @@ def export_args(card: ModelCard) -> List[str]:
         args += ["--task", card.export_task]
     if card.export_model:
         args += ["--model", card.export_model]
+    if card.export_quantize:
+        args += ["--quantize", card.export_quantize]
     return args
 
 
@@ -605,6 +831,11 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
     install_extras = "hub,phonemes" if needs_phonemes else "hub"
     phonemizer_note = PHONEMIZER_NOTE if needs_phonemes else ""
     extra_files_section = "".join(f"- {bullet}\n" for bullet in card.extra_files)
+    # Named in the Files list rather than left to be discovered from the byte count: a quantized
+    # export is not the same artifact as the F32 one, and a reader comparing this against their own
+    # export needs to know which they are looking at.
+    dtype_note = (f", weights quantized to `{card.export_quantize}`" if card.export_quantize
+                  else "")
 
     body = f"""# {card.title}
 
@@ -636,7 +867,7 @@ pip install -U "loom-py-rt[{install_extras}]"
 ```
 {phonemizer_note}
 ```python
-{USAGE_SNIPPETS[snippet_key(card)].format(repo_id=repo_id(card), slug=card.slug, sample_rate=card.sample_rate)}```
+{render_snippet(USAGE_SNIPPETS[snippet_key(card)], repo_id=repo_id(card), slug=card.slug, sample_rate=card.sample_rate)}```
 {usage_extra_section}
 ### The layer underneath
 
@@ -651,7 +882,7 @@ accepts for this model, and is the authority on it. See [loom-py]({LOOM_PY_URL})
 {limitations_section}
 ## Files
 
-- `{gguf_name}` -- the model, exported with loom-exporter.
+- `{gguf_name}` -- the model, exported with loom-exporter{dtype_note}.
 {extra_files_section}"""
     return "\n".join(frontmatter) + body
 
@@ -660,7 +891,8 @@ def do_export(card: ModelCard, checkpoint: Path, out_gguf: Path) -> None:
     from loom_exporter.main_export import main_export
 
     out_gguf.parent.mkdir(parents=True, exist_ok=True)
-    main_export(str(checkpoint), str(out_gguf), task=card.export_task, model=card.export_model)
+    main_export(str(checkpoint), str(out_gguf), task=card.export_task, model=card.export_model,
+                quantize=card.export_quantize)
 
 
 def build_one(card: ModelCard, models_root: Path, output_dir: Path, readme_only: bool) -> None:
