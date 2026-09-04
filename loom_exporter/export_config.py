@@ -209,6 +209,20 @@ class LoomExportConfig:
             # Supertonic encodes graphemes itself and overrides this. The distinction is per-model and is
             # exactly what a host needs in order to know whether it can offer a text door at all.
             "text-to-speech": ("phoneme_ids", "audio"),
+            # The first non-audio pair, and the first `class` output: one label per input token
+            # (EXPORT-ROADMAP.md family 12). `text` rather than `token_ids` because these checkpoints
+            # ship the WordPiece vocabulary that encodes it, so a host can offer a text door with no
+            # step happening outside the engine.
+            "token-classification": ("text", "class"),
+            # `audio_codes` rather than `token_ids`, and ADR-020 is the argument: the latter folds
+            # onto "text" in `ModelContract::interface_side`, so a codec would declare itself
+            # `text2speech` and be offered a text door it has no vocabulary for.
+            "audio-codec": ("audio_codes", "audio"),
+            # The producing half of the pair `audio-codec` consumes, and the reason both spellings
+            # exist: this file carries the byte vocabulary that encodes the sentence, so its input is
+            # `text`, and what comes out is what a codec GGUF decodes rather than a waveform. A host
+            # chaining the two matches this `output.kind` against that one's `input.kind`.
+            "text-to-codes": ("text", "audio_codes"),
         }.get(self.task)
         if pair is None:
             return {"task": self.task}

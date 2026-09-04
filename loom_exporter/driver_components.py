@@ -472,6 +472,33 @@ class CtcGreedyEpilogue(DriverComponent):
 
 
 @dataclass
+class TokenLabelsEpilogue(DriverComponent):
+    """One class id per ROW of the model's output, in row order and nothing else (P5, family 12).
+
+    The whole component, and that is the finding rather than a shortcut: `loom.argmax_rows` already
+    existed for Conformer-CTC's frame-wise head, and a token classifier wants the identical reduction
+    over the identical `[n_classes, n_rows]` tensor. What a CTC head then does -- collapse consecutive
+    duplicates and drop the blank -- is exactly what a token classifier must NOT do, because the
+    alignment between row `i` and token `i` IS the answer here, and `[O, O, B-PER, B-PER]` is four
+    tokens' labels rather than one repeated. So this is a sibling of `CtcGreedyEpilogue` rather than a
+    mode of it, and the two differ by the loop that is absent.
+
+    Retained like both of its siblings: the reduction is engine-side, so the logits never become a Lua
+    table. That matters less here than for a 262144-wide vocab (a label set is single digits wide), but
+    an epilogue that marshalled would be the only one that did, for no gain.
+    """
+
+    retained_module: str = "main_topology"
+
+    __links__ = {
+        "retained_module": TopologyName(),
+    }
+
+    def emit(self, ctx: DriverContext) -> List:
+        return [Return([RetainedArgmaxRows(self.retained_module)])]
+
+
+@dataclass
 class PrefillDecodeLoop(DriverComponent):
     """The generation loop `infer_with_past` is: prefill the prompt, then decode one token at a time
     against the KV cache, until `max_new_tokens` or `eos_token` (KV-CACHE.md 3.3).
@@ -856,6 +883,51 @@ class CtcGreedyBuilder(DriverBuilder):
 
 
 @dataclass
+class TokenLabelsBuilder(DriverBuilder):
+    """One traced graph over the whole sentence, then one label per token -- family 12's shape.
+
+    The third builder over the same two leading components, which is what "the smallest possible
+    template" means concretely: `DriverInputs` and `MonolithicCall` are shared with both of the others
+    and the family's entire orchestration is which reduction runs at the end. A new family that is one
+    forward pass costs one epilogue.
+    """
+
+    inputs: DriverInputs
+    call: MonolithicCall
+    epilogue: TokenLabelsEpilogue
+
+    __links__ = {name: NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN)
+                 for name in ("inputs", "call", "epilogue")}
+
+    def components(self):
+        return [self.inputs, self.call, self.epilogue]
+
+
+@dataclass
+class CodecDecodeBuilder(DriverBuilder):
+    """One traced graph over the codes, and the output IS the answer -- family 11's shape.
+
+    The fourth builder over the same two leading components, and the first whose epilogue REDUCES
+    NOTHING. A causal LM argmaxes one row, a CTC head reduces every row and collapses, a token
+    classifier reduces every row and does not -- a codec decoder returns a waveform, which is already
+    what the caller wants. `ArgmaxEpilogue` applied here would argmax the audio.
+    """
+
+    inputs: DriverInputs
+    call: MonolithicCall
+    # Quoted: `DriverReturn` is declared with the peeled multi-phase components, several hundred lines
+    # below, and it belongs there -- it is the component every peeled TTS driver ends on. Reusing it
+    # rather than adding a fourth epilogue is the point, since "hand back what came out" is one job.
+    epilogue: "DriverReturn"
+
+    __links__ = {name: NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN)
+                 for name in ("inputs", "call", "epilogue")}
+
+    def components(self):
+        return [self.inputs, self.call, self.epilogue]
+
+
+@dataclass
 class ModularChainBuilder(DriverBuilder):
     """Independently-traced submodules chained prefix -> [aux] -> layers -> suffix, then the same
     argmax epilogue. Shares two of its three components with `PrefillArgmaxBuilder`."""
@@ -888,6 +960,15 @@ SYNTHESIZED_BUILDERS = {
     # through `backend_kwargs()`, so the request travels with the family that has it rather than being
     # inferred from a topology.
     "CtcGreedy": CtcGreedyBuilder,
+    # Keyed by orchestration for the same reason, and it is the second family to need that -- which is
+    # what turns P4.0.17's exception into a rule. A token classifier is a `Flattened` export exactly
+    # like Qwen3 and shares none of its host-side shape either.
+    "TokenLabels": TokenLabelsBuilder,
+    # And the third by orchestration. Three of the five builders are now keyed this way, which has
+    # stopped being an exception to `Decomposition.driver_builder`'s premise and become the more
+    # common case: what a host does with a flattened graph's one output is simply not implied by how
+    # the graph was decomposed.
+    "CodecDecode": CodecDecodeBuilder,
 }
 
 

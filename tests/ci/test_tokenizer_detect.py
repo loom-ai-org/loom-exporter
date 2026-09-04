@@ -116,6 +116,20 @@ class TestTokenizerDetect(unittest.TestCase):
             (Path(d) / "tokenizer_config.json").write_text(json.dumps({"tokenizer_class": "ByT5Tokenizer"}))
             self.assertEqual(td.detect_vocab_family(d), "byte")
 
+    def test_detect_vocab_family_bare_vocab_txt(self):
+        """The classic BERT layout, which several of family 12's checkpoints still ship (P5)."""
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "vocab.txt").write_text("[PAD]\n[UNK]\nhello\n")
+            self.assertEqual(td.detect_vocab_family(d), "wordpiece")
+
+    def test_a_vocab_txt_beside_a_real_marker_does_not_win(self):
+        """Checked LAST, after every other marker, so a SentencePiece directory that also carries a
+        `vocab.txt` -- several do -- still resolves to what it really is."""
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "vocab.txt").write_text("[PAD]\n")
+            (Path(d) / "tokenizer.model").write_bytes(b"")
+            self.assertEqual(td.detect_vocab_family(d), "sentencepiece_proto")
+
     def test_detect_vocab_family_nothing_found_raises(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(NotImplementedError):

@@ -1,0 +1,34 @@
+-- Dia: a byte-level text encoder run once, then a KV-cached cross-attention decode loop that emits
+-- NINE codec tokens per step.
+--
+-- Three traced topologies (dia_export.py): `encoder` turns the caller's bytes into one hidden frame
+-- each; `cross_kv` projects those frames into every decoder layer's cross-attention K/V, once per
+-- utterance; `decoder` is one cached step, called at n_tokens = 1 throughout (its prompt is a single
+-- all-BOS frame, so there is no multi-token prefill to amortise).
+--
+-- Under classifier-free guidance there are FIVE modules, not three: `cross_kv_uncond` and
+-- `decoder_uncond` are the same two topologies as independent STREAMS, each with its own retained
+-- output and, for the decoder, its own KV cache. `transformers` gets the same thing by batching the
+-- conditional and unconditional inputs together; this engine's cache is single-sequence, so the
+-- second stream is a second module rather than a second batch row. See ExportPhase.extra_streams.
+--
+-- inputs: tokens (byte ids from this model's own vocabulary), and six optional knobs --
+-- max_new_tokens (a count of AUDIO FRAMES, not decoder rows), temperature, top_k, top_p,
+-- guidance_scale and seed. The four decoding knobs default to what this checkpoint's own
+-- `generation_config.json` declares, which for Dia is sampling at 1.8/50/0.9 with classifier-free
+-- guidance at 3.0 -- so `infer{tokens = ...}` is the model as published, and `temperature = 0` with
+-- `guidance_scale = 1` is the greedy, guidance-free decode a reference comparison uses. `seed` makes
+-- a sampled generation reproducible; without one the same sentence gives different audio every call.
+--
+-- Returns a FLAT, frame-major array of codec tokens: N_CHANNELS values per frame, delay already
+-- undone, ready to hand to a codec decoder (`descript/dac_44khz`, which family 11 exported). It is
+-- NOT audio -- this model's output kind is `audio_codes`, and what turns codes into a waveform is a
+-- second file. See ADR-020.
+--
+-- The two things here that are Dia's rather than generic, both of them index arithmetic over the
+-- checkpoint's own `delay_pattern`:
+--   * channel k may not speak until step delay[k] has passed, so until then its prediction is
+--     replaced by BOS (`DiaProcessor.apply_delay_mask`);
+--   * audio frame t's channel k was emitted at row t + delay[k], so the rows are gathered back into
+--     frames before returning (`DiaProcessor.build_indices(revert=True)`).
+-- Neither is anything the engine knows about, which is the point.
