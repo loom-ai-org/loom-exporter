@@ -85,19 +85,6 @@ class ModelCard:
     # `--task`/`--model` for loom-export; empty means auto-detection resolves both.
     export_task: Optional[str] = None
     export_model: Optional[str] = None
-    # `--quantize` for loom-export, e.g. "Q8_0". Empty means F32, which is what every entry here was
-    # and still is bar one.
-    #
-    # **A per-model decision, not a policy**, and Dia is what forced it: at F32 that model is 6.4 GB,
-    # which is not a thing to publish for a 1.6 B checkpoint when Q8_0 is 1.8 GB. Everything smaller
-    # stays F32 deliberately -- these are reference artifacts as much as downloads, the gate compares
-    # them byte-for-byte against what the exporter produces, and quantization would put a lossy step
-    # between the two for no benefit at 300 MB. It also does nothing at all for the convolutional TTS
-    # families, whose kernels are most of their bytes and were only made packable recently.
-    #
-    # The eligible weights are derived from the topologies rather than from tensor names
-    # (`_collect_mul_mat_weight_names`), so this needs no per-model list of what to skip.
-    export_quantize: Optional[str] = None
     # Which venv's interpreter can import this model's loader. "piper" covers everything except
     # qwen3-asr, which needs "ovos" (transformers >= 5.13). See [[env-python-venvs-export]].
     venv: str = "piper"
@@ -450,11 +437,6 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
     ModelCard(
         slug="dia-1.6b", checkpoint=Path("dia-1.6b"),
         task_type="text-to-codes",
-        # **Q8_0, and it is the only quantized entry here.** At F32 this export is 6.4 GB; the
-        # eligible weights are 253 of its 344 tensors and packing them brings it to 1.8 GB, which is
-        # the difference between a model people download and one they do not. See `export_quantize`
-        # for why nothing else in this catalogue is quantized.
-        export_quantize="Q8_0",
         base_repo="nari-labs/Dia-1.6B", license_id="apache-2.0", language=["en"],
         title="Dia-1.6B",
         summary="Nari Labs' Dia-1.6B dialogue TTS model, exported for loom.cpp. Family 10: text in, "
@@ -483,9 +465,12 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
             "distribution. Non-verbal cues like `(laughs)` work the same way. Voices are not "
             "selectable -- without an audio prompt the model picks one, and the seed is what decides "
             "it.\n\n"
-            "Weights are `Q8_0`. The published F32 export is 6.4 GB and byte-identical decoding "
-            "against `transformers` was verified on that one; quantization moves the logits slightly, "
-            "which for a sampler means a different take rather than a worse one."
+            "**It is a big download**: 6.4 GB, F32, like every other model in this collection. These "
+            "are reference exports as much as they are downloads, and one lossy artifact among "
+            "seventeen faithful ones is a difference nothing in the file would tell you about. "
+            "`loom-export --quantize Q8_0` on the upstream checkpoint packs the eligible weights to "
+            "about 1.8 GB if you would rather have that -- it moves the logits slightly, which for a "
+            "sampler means a different take rather than a worse one."
         ),
     ),
     ModelCard(
@@ -770,8 +755,6 @@ def export_args(card: ModelCard) -> List[str]:
         args += ["--task", card.export_task]
     if card.export_model:
         args += ["--model", card.export_model]
-    if card.export_quantize:
-        args += ["--quantize", card.export_quantize]
     return args
 
 
@@ -834,8 +817,6 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
     # Named in the Files list rather than left to be discovered from the byte count: a quantized
     # export is not the same artifact as the F32 one, and a reader comparing this against their own
     # export needs to know which they are looking at.
-    dtype_note = (f", weights quantized to `{card.export_quantize}`" if card.export_quantize
-                  else "")
 
     body = f"""# {card.title}
 
@@ -882,7 +863,7 @@ accepts for this model, and is the authority on it. See [loom-py]({LOOM_PY_URL})
 {limitations_section}
 ## Files
 
-- `{gguf_name}` -- the model, exported with loom-exporter{dtype_note}.
+- `{gguf_name}` -- the model, exported with loom-exporter.
 {extra_files_section}"""
     return "\n".join(frontmatter) + body
 
@@ -891,8 +872,7 @@ def do_export(card: ModelCard, checkpoint: Path, out_gguf: Path) -> None:
     from loom_exporter.main_export import main_export
 
     out_gguf.parent.mkdir(parents=True, exist_ok=True)
-    main_export(str(checkpoint), str(out_gguf), task=card.export_task, model=card.export_model,
-                quantize=card.export_quantize)
+    main_export(str(checkpoint), str(out_gguf), task=card.export_task, model=card.export_model)
 
 
 def build_one(card: ModelCard, models_root: Path, output_dir: Path, readme_only: bool) -> None:
