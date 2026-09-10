@@ -2767,8 +2767,18 @@ class LoomGGUFExporter:
             # says what their IDS are, and for the fairseq-derived family those disagree -- see
             # spm_tokenizer_export's module docstring. A directory without one reads None here and
             # writes exactly the file it wrote before, which is every NeMo caller.
+            # The framing kwargs are FORWARDED rather than left to `hf_ids` alone. A `tokenizer.json`
+            # post-processor names the framing where there is one -- T5's does, which is why the flags
+            # are a no-op for `flan-t5-small` -- and a checkpoint that ships only the protobuf records
+            # its framing nowhere at all. `write_sentencepiece_vocab` has taken these arguments since
+            # the ALBERT/XLNet gap was closed and no caller could reach them through here, which is
+            # the "a hook honoured by one path out of two" failure this file warns about elsewhere.
             write_sentencepiece_vocab(w, proto_path.read_bytes(),
-                                       hf_ids=read_hf_id_layout(tokenizer_dir))
+                                       hf_ids=read_hf_id_layout(tokenizer_dir),
+                                       bos_token_id=self.kwargs.get("bos_token_id"),
+                                       eos_token_id=self.kwargs.get("eos_token_id"),
+                                       add_bos_token=bool(self.kwargs.get("add_bos_token")),
+                                       add_eos_token=bool(self.kwargs.get("add_eos_token")))
         elif family == "sentencepiece_json":
             # The same Unigram vocabulary, from a checkpoint that ships no protobuf at all -- pieces
             # and scores out of `model.vocab`, types out of `added_tokens[].special`, and the charsmap
