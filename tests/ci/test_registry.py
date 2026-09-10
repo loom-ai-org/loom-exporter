@@ -725,10 +725,10 @@ def test_every_recognizer_naming_one_concrete_model_is_specific():
 
 # -- the task vocabulary itself (P4.0.4) ---------------------------------------------------------------
 
-def test_the_vocabulary_is_the_six_canonical_names():
+def test_the_vocabulary_is_the_seven_canonical_names():
     assert known_tasks() == [
         "audio-codec", "automatic-speech-recognition", "text-generation", "text-to-codes",
-        "text-to-speech", "token-classification",
+        "text-to-speech", "text2text-generation", "token-classification",
     ]
 
 
@@ -834,7 +834,7 @@ def test_every_registered_task_is_canonical():
     assert set(registry._entries) <= set(known_tasks())
     assert sorted(registry._entries) == [
         "audio-codec", "automatic-speech-recognition", "text-generation", "text-to-codes",
-        "text-to-speech", "token-classification",
+        "text-to-speech", "text2text-generation", "token-classification",
     ]
 
 

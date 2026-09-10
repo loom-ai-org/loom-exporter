@@ -125,6 +125,21 @@ TASKS: Dict[str, TaskSpec] = {
             base_config="token_classification_export:TokenClassificationExportConfig",
         ),
         TaskSpec(
+            name="text2text-generation",
+            summary=(
+                "Text-in/text-out through an ENCODER-DECODER: the source is read once by a "
+                "bidirectional encoder and the answer is generated against its output -- "
+                "EXPORT-ROADMAP.md's family 6 (T5/flan-T5, and the translation encoder-decoders "
+                "behind it). Distinct from `text-generation`, which is one causal stack continuing "
+                "its own prompt: the two share a modality pair and share no export shape, and "
+                "`optimum` draws the same line under the same name."
+            ),
+            # The same base every multi-phase family registers under, and for the same reason: this is
+            # N independently traced topologies (encoder / cross_kv / decoder) assembled into one GGUF
+            # plus a driver that orchestrates them.
+            base_config="multi_phase_export:BaseMultiPhaseModelExportConfig",
+        ),
+        TaskSpec(
             name="audio-codec",
             summary=(
                 "Neural audio codec DECODE (DAC, and the EnCodec/SNAC/Mimi shapes behind it) -- "

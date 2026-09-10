@@ -116,6 +116,12 @@ MODELS = [
     # emitted them without that key, is a silent wrong answer under classifier-free guidance and is
     # invisible everywhere else in this file.
     ("dia-1.6b", "dia-1.6b", []),
+    # Family 6 (P5): the first text ENCODER-DECODER, and the only row whose mask input carries a head
+    # axis -- T5's relative attention bias and its causal mask are one `[n_kv, n_tokens, n_head]`
+    # tensor, so `_retype_fused_mask_input` has to widen the key axis without flattening the rest. It
+    # is also the only row with two `sentencepiece_proto` vocabularies' worth of distance from the
+    # fairseq layout: T5 is the checkpoint family that proto id order was always right for.
+    ("flan-t5-small", "flan-t5-small", []),
     # Qwen3-ASR needs transformers >= 5.13 and the rest of the sweep needs <= 4.57, so it cannot run
     # in the same interpreter as its neighbours here. It is swept from the other environment; see
     # docs/EXPORT-PREPARATION.md.
