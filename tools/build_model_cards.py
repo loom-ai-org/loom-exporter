@@ -481,6 +481,38 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         ),
     ),
     ModelCard(
+        slug="flan-t5-small", checkpoint=Path("flan-t5-small"),
+        task_type="text2text-generation",
+        base_repo="google/flan-t5-small", license_id="apache-2.0",
+        # As upstream declares them. The list is the flan collection's, not this checkpoint's measured
+        # competence -- see the limitations below, which say so.
+        language=["en", "fr", "ro", "de", "multilingual"],
+        title="FLAN-T5 Small",
+        summary="Google's instruction-tuned T5-small, exported for loom.cpp. Family 6: text in, text "
+                "out, through an encoder read once and a KV-cached decoder that cross-attends to it -- "
+                "the first encoder-decoder TEXT model and the first SentencePiece Unigram vocabulary "
+                "in this collection.",
+        limitations=(
+            "**It is 80M parameters, and it answers like it.** flan-t5-small is the smallest member of "
+            "the flan collection: it follows an instruction's SHAPE reliably and is often wrong about "
+            "the content. Asked for the capital of France it says `london`, and `transformers` says the "
+            "same thing on the same checkpoint -- that is the model, not the export. Use it to try the "
+            "interface, and step up to `flan-t5-base` or larger for answers you intend to keep.\n\n"
+            "**The instruction is part of the text.** There is no chat template and no system turn; "
+            "prompts look like `translate English to German: ...` or `Answer the following question. "
+            "...`, which is how the checkpoint was tuned. A bare sentence with no instruction is out of "
+            "distribution and usually comes back as a fragment of itself.\n\n"
+            "**Greedy, not beam search.** The upstream `config.json` names 4 beams for its translation "
+            "and summarization presets. The export decodes one token at a time from the argmax (or from "
+            "the sampler, if you pass `temperature=`), so translations here are the greedy path through "
+            "the same model rather than what the published presets would give.\n\n"
+            "Sequences are capped at 512 tokens on each side. T5 has no learned position table, so "
+            "nothing in the file stops a longer source -- but its relative-position buckets saturate at "
+            "128 tokens of distance and the KV cache is built at 512, which is the length this export "
+            "is honest about."
+        ),
+    ),
+    ModelCard(
         slug="distilbert-ner", checkpoint=Path("distilbert-ner"),
         task_type="token-classification",
         base_repo="dslim/distilbert-NER", license_id="apache-2.0", language=["en"],
@@ -668,6 +700,26 @@ audio.save("out.wav")
     # The fourth door, and the first non-audio one. Fixed text rather than a placeholder, for the same
     # reason every TTS card says "hello world": the release gate reads the card's OWN output back and
     # grades it, so the sentence has to be one an expectation can be written against.
+    # The encoder-decoder text door (family 6). Deliberately the SAME `text2text` interface the causal
+    # LMs use: a host asking for text and getting text back should not have to know whether one stack
+    # or two produced it, which is what the shared modality pair in `contract()` says.
+    #
+    # The snippet's prompt carries the INSTRUCTION, because that is how a flan checkpoint is asked --
+    # there is no chat template and no system turn, and a bare sentence is out of distribution.
+    "text2text-generation": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# The instruction is part of the text -- this is an instruction-TUNED encoder-decoder, not a chat
+# model, and it has no template to apply.
+print(model.text2text.infer(
+    "translate English to German: The weather today is cold and rainy in the north.",
+    max_new_tokens=32))
+
+# The same door, on the other tasks this checkpoint was tuned for:
+print(model.text2text.infer("Answer the following question. What is the capital of France?"))
+print(model.text2text.infer("summarize: " + open("article.txt").read(), max_new_tokens=64))
+""",
     "token-classification": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
