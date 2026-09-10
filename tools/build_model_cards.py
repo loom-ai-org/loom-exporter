@@ -56,6 +56,17 @@ class ModelCard:
     # documenting a different model from the one beside it. `snippet_key` is where a task with more
     # than one shape resolves that.
     task_type: str
+    # The `pipeline_tag:` written into the card's frontmatter, when it is NOT the task name.
+    #
+    # **This exists because `task_type` was doing two jobs and they came apart.** It picks the usage
+    # snippet and drives `render_readme`'s TTS checks, AND it used to be published verbatim as the
+    # HuggingFace pipeline tag -- but the Hub only accepts tags from its own closed list, and two of
+    # this project's canonical task names are not on it (`audio-codec`, `text-to-codes`). Editing
+    # `task_type` to satisfy the Hub therefore silently re-pointed the snippet lookup: `dac-44khz`
+    # went to a key that does not exist (KeyError at render) and `dia-1.6b` to the text-to-speech
+    # snippet, which would have published `model.text2speech.infer(...)` for a model whose only door
+    # is `text2codes`. Both are fixed by giving the Hub its own field.
+    pipeline_tag: Optional[str] = None
     # Whether this model's GGUF carries a vocabulary, for the TTS models where that is not implied by
     # the task: the phoneme-input families (Kokoro, Matcha, VITS, StyleTTS2) take ids a phonemiser
     # produces outside the engine, while a grapheme model (Supertonic) encodes text itself. Only read
@@ -415,7 +426,7 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
     ),
     ModelCard(
         slug="dac-44khz", checkpoint=Path("dac-44khz"),
-        task_type="text-to-audio",
+        task_type="audio-codec", pipeline_tag="text-to-audio",
         base_repo="descript/dac_44khz", license_id="mit", language=[],
         # The HF repo publishes NO `license:` tag and its README is an unfilled template, so the tag
         # here comes from the upstream project -- github.com/descriptinc/descript-audio-codec, whose
@@ -443,7 +454,7 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
     ),
     ModelCard(
         slug="dia-1.6b", checkpoint=Path("dia-1.6b"),
-        task_type="text-to-speech",
+        task_type="text-to-codes", pipeline_tag="text-to-speech",
         base_repo="nari-labs/Dia-1.6B", license_id="apache-2.0", language=["en"],
         title="Dia-1.6B",
         summary="Nari Labs' Dia-1.6B dialogue TTS model, exported for loom.cpp. Family 10: text in, "
@@ -942,7 +953,8 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
         frontmatter += ["language:", lang_lines.rstrip("\n")]
     if card.base_repo:
         frontmatter += [f"base_model:", f"- {card.base_repo}"]
-    frontmatter += [f"pipeline_tag: {card.task_type}", "library_name: loom-py-rt", "---", ""]
+    frontmatter += [f"pipeline_tag: {card.pipeline_tag or card.task_type}",
+                    "library_name: loom-py-rt", "---", ""]
 
     if card.base_repo:
         source_line = f"[`{card.base_repo}`](https://huggingface.co/{card.base_repo})"
