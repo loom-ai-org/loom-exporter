@@ -576,35 +576,6 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
             "checkpoint's own learned position table."
         ),
     ),
-    ModelCard(
-        slug="fullstop-punc", checkpoint=Path("fullstop-punc"),
-        task_type="token-classification", restores_punctuation=True,
-        base_repo="oliverguhr/fullstop-punctuation-multilang-large", license_id="mit",
-        language=["en", "de", "fr", "it"],
-        title="FullStop Punctuation (multilingual)",
-        summary="oliverguhr's XLM-RoBERTa-large fine-tuned on Europarl for punctuation restoration, "
-                "exported for loom.cpp. Family 12: text in, one class per token out -- here the class "
-                "is the mark that follows the token.",
-        limitations=(
-            "Trained on **Europarl**, which is parliamentary proceedings: formal, complete sentences "
-            "in a register that is not chat, not code and not casual speech. It restores six classes "
-            "and nothing else (`.`, `,`, `?`, `-`, `:`, and `0` for no mark), so it will not give you "
-            "semicolons, quotation marks or apostrophes, and it does not capitalise -- truecasing is a "
-            "different head. The upstream card evaluates **en, de, fr, it**; the underlying encoder is "
-            "trained on 100 languages and the model will answer for all of them, at an accuracy nobody "
-            "has measured.\n\n"
-            "Feed it text with the punctuation already **removed**. Given punctuated input it still "
-            "labels every token and you get marks on top of marks.\n\n"
-            "The labels line up with the tokenizer's PIECES, not with your words -- a SentencePiece "
-            "vocabulary splits `wolfgang` into three -- and the mark you want is the one on a word's "
-            "LAST piece. The usage snippet above does that walk; the export hands back the pieces "
-            "alongside the labels rather than guessing at the rule for you.\n\n"
-            "The export takes one sequence at a time and no padding, so there is no batch dimension to "
-            "fill and no attention mask to pass. Sequences are capped at **512** tokens: this "
-            "checkpoint's position table has 514 rows and its first two are reserved, which is a "
-            "property of the RoBERTa family rather than an off-by-two."
-        ),
-    ),
 ]
 
 CATALOG_BY_SLUG = {m.slug: m for m in CATALOG}

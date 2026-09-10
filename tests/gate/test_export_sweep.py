@@ -103,6 +103,16 @@ MODELS = [
     # above are both WordPiece with a CoNLL-03 head, so this is the row that fails if
     # `spm_tokenizer_export`'s id authority stops being read -- and the only row in the sweep whose
     # position table numbers from 2, which the artifact records as an `add` the other two fold away.
+    #
+    # **SWEPT BUT NOT PUBLISHED, deliberately, and do not "tidy" it away.** `punctuate-all` took
+    # family 12's zoo slot (same task, same six classes, half the size) and this checkpoint is no
+    # longer in the card catalogue. It stays here because the two exercise DIFFERENT tokenizer paths:
+    # `punctuate-all` ships no protobuf and takes `sentencepiece_json`, while this one ships both and
+    # takes `sentencepiece_proto` -- so it is the ONLY row where the protobuf's piece order and the
+    # fast tokenizer's ids actually disagree, which is the whole subject of ADR-027. Every other
+    # `sentencepiece_proto` row either ships no `tokenizer.json` at all (the NeMo archives) or is not
+    # fairseq-derived (`flan-t5-small`), so a regression in the remap would change nothing they emit.
+    # This list is what the repo claims to EXPORT; it is not the list of what it publishes.
     ("fullstop-punc", "fullstop-punc", []),
     # Family 11 (P5): the first codec decoder, and the first export whose ROOT AXIS is a codec-frame
     # count rather than tokens or samples. Swept because its failure mode is invisible in a snapshot
