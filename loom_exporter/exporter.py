@@ -2742,6 +2742,14 @@ class LoomGGUFExporter:
             # writes exactly the file it wrote before, which is every NeMo caller.
             write_sentencepiece_vocab(w, proto_path.read_bytes(),
                                        hf_ids=read_hf_id_layout(tokenizer_dir))
+        elif family == "sentencepiece_json":
+            # The same Unigram vocabulary, from a checkpoint that ships no protobuf at all -- pieces
+            # and scores out of `model.vocab`, types out of `added_tokens[].special`, and the charsmap
+            # out of a `Precompiled` normalizer. Byte-identical to the branch above on a checkpoint
+            # that has both; `tokenizer_detect` refuses the case where neither source records the
+            # normalization.
+            from .spm_tokenizer_export import read_hf_id_layout, write_sentencepiece_vocab
+            write_sentencepiece_vocab(w, None, hf_ids=read_hf_id_layout(tokenizer_dir))
         elif family == "byte":
             from .byt5_tokenizer_export import write_byte_vocab
             write_byte_vocab(w, tokenizer_dir)
