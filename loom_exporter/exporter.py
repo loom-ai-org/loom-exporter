@@ -2232,7 +2232,34 @@ class LoomGGUFExporter:
                     f"only sound while a fused mask's ONLY consumers are cached ATTENTION nodes -- any "
                     f"other node's shape would be derived from an axis the trace never had."
                 )
-            declared[name]["shape"] = [axes.N_KV.name, self.root_axis]
+            # The two fastest axes are the key and the query, and only the KEY one moves. Everything
+            # above them is CARRIED, which is not what this did before: it wrote the whole shape as
+            # `[n_kv, root_axis]`, the same thing for the 2-D masks every family had and a silent
+            # truncation of one that carries a HEAD axis. T5's does -- its relative attention bias and
+            # its causal mask are one additive `[n_kv, n_tokens, n_head]` tensor, because that is how
+            # HF sums them and `ggml_soft_max_ext` takes a mask whose `ne[2]` divides the scores' own
+            # head count -- so the old spelling would have declared a 3-D input as 2-D and allocated it
+            # one head deep.
+            shape = list(declared[name]["shape"])
+            if len(shape) < 2 or shape[0] != self.root_axis or shape[1] != self.root_axis:
+                # Both leading axes carry the traced root symbol by construction: a mask's key and
+                # query axes are the same `ct.RangeDim` INSTANCE, because two independent ones fail
+                # coremltools' type inference over one attention block (KV-CACHE.md §2). Anything else
+                # is a mask this retyping does not understand, and widening the key axis of a shape
+                # whose key axis is somewhere else would be silent.
+                raise ValueError(
+                    f"topology '{func_name}': fused mask input '{name}' has shape {shape}, whose two "
+                    f"fastest axes are not both the root axis {self.root_axis!r}. The 'n_kv' retyping "
+                    f"widens the KEY axis of a [key, query, ...] mask; this is not one."
+                )
+            # Trailing unit axes are dropped rather than carried, which is what the whole-shape
+            # spelling produced and what keeps every existing fused topology byte-identical: an
+            # ne-order shape's trailing 1s are implicit (ggml tensors are 4-D whatever a spec lists),
+            # so `[n_kv, n_tokens, 1, 1]` and `[n_kv, n_tokens]` declare the same tensor.
+            tail = shape[2:]
+            while tail and tail[-1] == "1":
+                tail.pop()
+            declared[name]["shape"] = [axes.N_KV.name, self.root_axis] + tail
 
     def _route_windowed_masks(self, topo_inputs, nodes, func_name) -> dict:
         """Give each sliding-window attention block its own mask input, and say which window it wants.
