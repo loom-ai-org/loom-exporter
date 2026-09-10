@@ -223,6 +223,10 @@ class LoomExportConfig:
             # `text`, and what comes out is what a codec GGUF decodes rather than a waveform. A host
             # chaining the two matches this `output.kind` against that one's `input.kind`.
             "text-to-codes": ("text", "audio_codes"),
+            # The same pair as `text-generation`, deliberately: a host asking for text and getting
+            # text back should not have to know whether one stack or two produced it. What differs is
+            # the export shape, which is the task's business and not the contract's.
+            "text2text-generation": ("text", "text"),
         }.get(self.task)
         if pair is None:
             return {"task": self.task}

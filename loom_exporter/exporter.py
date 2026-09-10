@@ -2232,7 +2232,34 @@ class LoomGGUFExporter:
                     f"only sound while a fused mask's ONLY consumers are cached ATTENTION nodes -- any "
                     f"other node's shape would be derived from an axis the trace never had."
                 )
-            declared[name]["shape"] = [axes.N_KV.name, self.root_axis]
+            # The two fastest axes are the key and the query, and only the KEY one moves. Everything
+            # above them is CARRIED, which is not what this did before: it wrote the whole shape as
+            # `[n_kv, root_axis]`, the same thing for the 2-D masks every family had and a silent
+            # truncation of one that carries a HEAD axis. T5's does -- its relative attention bias and
+            # its causal mask are one additive `[n_kv, n_tokens, n_head]` tensor, because that is how
+            # HF sums them and `ggml_soft_max_ext` takes a mask whose `ne[2]` divides the scores' own
+            # head count -- so the old spelling would have declared a 3-D input as 2-D and allocated it
+            # one head deep.
+            shape = list(declared[name]["shape"])
+            if len(shape) < 2 or shape[0] != self.root_axis or shape[1] != self.root_axis:
+                # Both leading axes carry the traced root symbol by construction: a mask's key and
+                # query axes are the same `ct.RangeDim` INSTANCE, because two independent ones fail
+                # coremltools' type inference over one attention block (KV-CACHE.md §2). Anything else
+                # is a mask this retyping does not understand, and widening the key axis of a shape
+                # whose key axis is somewhere else would be silent.
+                raise ValueError(
+                    f"topology '{func_name}': fused mask input '{name}' has shape {shape}, whose two "
+                    f"fastest axes are not both the root axis {self.root_axis!r}. The 'n_kv' retyping "
+                    f"widens the KEY axis of a [key, query, ...] mask; this is not one."
+                )
+            # Trailing unit axes are dropped rather than carried, which is what the whole-shape
+            # spelling produced and what keeps every existing fused topology byte-identical: an
+            # ne-order shape's trailing 1s are implicit (ggml tensors are 4-D whatever a spec lists),
+            # so `[n_kv, n_tokens, 1, 1]` and `[n_kv, n_tokens]` declare the same tensor.
+            tail = shape[2:]
+            while tail and tail[-1] == "1":
+                tail.pop()
+            declared[name]["shape"] = [axes.N_KV.name, self.root_axis] + tail
 
     def _route_windowed_masks(self, topo_inputs, nodes, func_name) -> dict:
         """Give each sliding-window attention block its own mask input, and say which window it wants.
@@ -2732,10 +2759,34 @@ class LoomGGUFExporter:
             # Every entry point that imports loom_exporter (export_hf_causal_lm.py,
             # export_lfm2_*.py) inserts tools/ itself (not its parent) onto sys.path, so convert_nemo/ is
             # importable as a top-level package the same way loom_exporter is -- not "tools.convert_nemo".
-            from .spm_tokenizer_export import write_sentencepiece_vocab
-            proto_path = next(p for p in (Path(tokenizer_dir) / "tokenizer.model",
-                                           Path(tokenizer_dir) / "spiece.model") if p.exists())
-            write_sentencepiece_vocab(w, proto_path.read_bytes())
+            from .spm_tokenizer_export import read_hf_id_layout, write_sentencepiece_vocab
+            from .tokenizer_detect import _SPM_PROTO_NAMES
+            proto_path = next(Path(tokenizer_dir) / name for name in _SPM_PROTO_NAMES
+                              if (Path(tokenizer_dir) / name).exists())
+            # The protobuf says what the pieces ARE; a `tokenizer.json` beside it, where one exists,
+            # says what their IDS are, and for the fairseq-derived family those disagree -- see
+            # spm_tokenizer_export's module docstring. A directory without one reads None here and
+            # writes exactly the file it wrote before, which is every NeMo caller.
+            # The framing kwargs are FORWARDED rather than left to `hf_ids` alone. A `tokenizer.json`
+            # post-processor names the framing where there is one -- T5's does, which is why the flags
+            # are a no-op for `flan-t5-small` -- and a checkpoint that ships only the protobuf records
+            # its framing nowhere at all. `write_sentencepiece_vocab` has taken these arguments since
+            # the ALBERT/XLNet gap was closed and no caller could reach them through here, which is
+            # the "a hook honoured by one path out of two" failure this file warns about elsewhere.
+            write_sentencepiece_vocab(w, proto_path.read_bytes(),
+                                       hf_ids=read_hf_id_layout(tokenizer_dir),
+                                       bos_token_id=self.kwargs.get("bos_token_id"),
+                                       eos_token_id=self.kwargs.get("eos_token_id"),
+                                       add_bos_token=bool(self.kwargs.get("add_bos_token")),
+                                       add_eos_token=bool(self.kwargs.get("add_eos_token")))
+        elif family == "sentencepiece_json":
+            # The same Unigram vocabulary, from a checkpoint that ships no protobuf at all -- pieces
+            # and scores out of `model.vocab`, types out of `added_tokens[].special`, and the charsmap
+            # out of a `Precompiled` normalizer. Byte-identical to the branch above on a checkpoint
+            # that has both; `tokenizer_detect` refuses the case where neither source records the
+            # normalization.
+            from .spm_tokenizer_export import read_hf_id_layout, write_sentencepiece_vocab
+            write_sentencepiece_vocab(w, None, hf_ids=read_hf_id_layout(tokenizer_dir))
         elif family == "byte":
             from .byt5_tokenizer_export import write_byte_vocab
             write_byte_vocab(w, tokenizer_dir)

@@ -342,6 +342,31 @@ class TestFusedMaskRetyping(unittest.TestCase):
         # Only the mask: retyping anything else would move an axis the trace really did carry.
         self.assertEqual(topo_inputs[0]["shape"], ["n_tokens", "1"])
 
+    def test_a_masks_head_axis_is_carried_rather_than_flattened(self):
+        """The KEY axis moves; everything above it stays. T5's mask is per-head -- its relative
+        attention bias and its causal mask are one `[n_kv, n_tokens, n_head]` tensor -- and rewriting
+        the whole shape as `[n_kv, root_axis]` declares a 3-D input as 2-D and allocates it one head
+        deep, which is a wrong answer rather than a failure.
+
+        The trailing `1` is still dropped, because that is what the whole-shape spelling produced and
+        an ne-order shape's trailing units are implicit.
+        """
+        topo_inputs = self._inputs()
+        topo_inputs[1]["shape"] = ["n_tokens", "n_tokens", "6", "1"]
+        self._exporter()._retype_fused_mask_input(
+            topo_inputs, [self._attention(mask="attention_mask")], "main_topology")
+        self.assertEqual(topo_inputs[1]["shape"], ["n_kv", "n_tokens", "6"])
+
+    def test_a_mask_whose_key_axis_is_not_the_root_axis_raises(self):
+        """Retyping widens the KEY axis of a `[key, query, ...]` mask. A shape whose two fastest axes
+        are not both the traced root symbol is not one, and widening its dim 0 would be silent."""
+        topo_inputs = self._inputs()
+        topo_inputs[1]["shape"] = ["6", "n_tokens", "n_tokens"]
+        with self.assertRaises(ValueError) as ctx:
+            self._exporter()._retype_fused_mask_input(
+                topo_inputs, [self._attention(mask="attention_mask")], "main_topology")
+        self.assertIn("two fastest axes", str(ctx.exception))
+
     def test_an_uncached_attention_node_is_left_alone(self):
         """Whisper's cross-attention is `kv_cache=false` -- its mask is not over the cache extent."""
         topo_inputs = self._inputs()

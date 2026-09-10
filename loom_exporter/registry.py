@@ -201,6 +201,7 @@ _FAMILY_MODULES = (
     "token_classification_export",
     "audio_codec_export",
     "dia_export",
+    "t5_export",
 )
 
 
