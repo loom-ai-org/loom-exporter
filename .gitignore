@@ -6,3 +6,9 @@ build/
 dist/
 *.egg-info/
 .venv/
+
+# `tests/ci` exports REAL models into the repo root when pytest's basetemp lands here -- ~28 GB per
+# run, and it does not clean up after itself. Ignored so a stray tree cannot be committed; delete it
+# after a run, and prefer `TMPDIR=<somewhere with room> pytest` so it does not land here at all.
+pytest-of-*/
+tmp*/
