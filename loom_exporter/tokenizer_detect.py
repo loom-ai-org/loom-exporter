@@ -248,13 +248,33 @@ def detect_vocab_family(tokenizer_dir: str) -> str:
         if model_type == "WordPiece":
             return "wordpiece"
         if model_type == "Unigram":
-            if not any((tok_dir / n).exists() for n in _SPM_PROTO_NAMES):
+            if any((tok_dir / n).exists() for n in _SPM_PROTO_NAMES):
+                return "sentencepiece_proto"
+            # NO PROTOBUF, WHICH IS NO LONGER A REFUSAL. This used to raise: the charsmap was thought
+            # to live only in the protobuf. It does not -- a `Precompiled` normalizer in
+            # `tokenizer.json` carries the same bytes, base64'd, and `model.vocab` carries the pieces
+            # and scores in final id order. `write_sentencepiece_vocab` reads them and produces a
+            # BYTE-IDENTICAL vocabulary to the protobuf path on a checkpoint that ships both
+            # (`tests/ci/test_spm_tokenizer_export.py`), so this is a second source rather than a
+            # fallback.
+            #
+            # Still refused for a checkpoint with no `Precompiled` normalizer AND no protobuf: that is
+            # a tokenizer whose normalization nothing on disk records, and guessing it silently
+            # mis-segments text the model was trained on.
+            normalizer = json.loads(tokenizer_json_path.read_text()).get("normalizer") or {}
+            def _has_charsmap(node) -> bool:
+                if not isinstance(node, dict):
+                    return False
+                return bool(node.get("precompiled_charsmap")) or any(
+                    _has_charsmap(child) for child in node.get("normalizers") or [])
+            if not _has_charsmap(normalizer):
                 raise NotImplementedError(
-                    "tokenizer.json model.type=='Unigram' but no sibling "
-                    f"{'/'.join(_SPM_PROTO_NAMES)} SentencePiece protobuf found -- loom's Unigram support (loom::Vocab) needs the real "
-                    "protobuf for precompiled_charsmap; a tokenizer.json-only Unigram model is not "
-                    "supported yet (see EXPORT-BACKLOG.md item 4)")
-            return "sentencepiece_proto"
+                    "tokenizer.json model.type=='Unigram' with neither a sibling "
+                    f"{'/'.join(_SPM_PROTO_NAMES)} protobuf nor a `Precompiled` normalizer carrying "
+                    "`precompiled_charsmap`. One of the two has to say how text is normalized before "
+                    "it is segmented; nothing else on disk does, and a wrong answer mis-segments "
+                    "silently rather than failing.")
+            return "sentencepiece_json"
         raise NotImplementedError(f"tokenizer.json model.type={model_type!r} has no loom vocab-writer yet")
     if any((tok_dir / n).exists() for n in _SPM_PROTO_NAMES):
         return "sentencepiece_proto"

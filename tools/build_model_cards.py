@@ -503,6 +503,37 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         ),
     ),
     ModelCard(
+        slug="punctuate-all", checkpoint=Path("punctuate-all"),
+        task_type="token-classification", restores_punctuation=True,
+        base_repo="kredor/punctuate-all", license_id="mit",
+        language=["en", "de", "fr", "es", "bg", "it", "pl", "nl", "cs", "pt", "sk", "sl"],
+        title="Punctuate-All (12 languages)",
+        summary="kredor's XLM-RoBERTa-base fine-tuned on Europarl for punctuation restoration, "
+                "exported for loom.cpp. Family 12: text in, one class per token out -- here the class "
+                "is the mark that follows the token. Twelve languages against FullStop's four, and "
+                "half the size, because the encoder is XLM-R base rather than large.",
+        limitations=(
+            "Trained on **Europarl**, which is parliamentary proceedings: formal, complete sentences "
+            "in a register that is not chat, not code and not casual speech. It restores six classes "
+            "and nothing else (`.`, `,`, `?`, `-`, `:`, and `0` for no mark), so it will not give you "
+            "semicolons, quotation marks or apostrophes, and it does not capitalise -- truecasing is a "
+            "different head.\n\n"
+            "**Two of the six classes are weak and the upstream card says so.** Its own report gives "
+            "F1 0.99 for no-mark, 0.95 for `.` and 0.86 for `,`, but **0.39 for `-` and 0.58 for "
+            "`:`** -- the confusion matrix has half of all true `-` predicted as `,`. Treat the "
+            "hyphen and colon classes as advisory.\n\n"
+            "Feed it text with the punctuation already **removed**. Given punctuated input it still "
+            "labels every token and you get marks on top of marks.\n\n"
+            "The labels line up with the tokenizer's PIECES, not with your words -- a SentencePiece "
+            "vocabulary splits `wolfgang` into three -- and the mark you want is the one on a word's "
+            "LAST piece. The usage snippet above does that walk; the export hands back the pieces "
+            "alongside the labels rather than guessing at the rule for you.\n\n"
+            "The export takes one sequence at a time and no padding, so there is no batch dimension "
+            "to fill and no attention mask to pass. Sequences are capped at 512 tokens by the "
+            "checkpoint's own learned position table."
+        ),
+    ),
+    ModelCard(
         slug="fullstop-punc", checkpoint=Path("fullstop-punc"),
         task_type="token-classification", restores_punctuation=True,
         base_repo="oliverguhr/fullstop-punctuation-multilang-large", license_id="mit",

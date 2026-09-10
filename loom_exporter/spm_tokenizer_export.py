@@ -56,6 +56,7 @@ where the other vocab writers already were -- and it removes a cross-package imp
 to reach into `convert_nemo`, which only resolved when `tools/` happened to be on `sys.path` as a
 package root.
 """
+import base64
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,6 +68,7 @@ from sentencepiece import sentencepiece_model_pb2 as spm_pb2
 # SentencePiece's own `ModelProto.SentencePiece.Type`, which llama.cpp's `llama_token_type` matches
 # numerically (see the module docstring). Named here because the pieces this file SYNTHESIZES have no
 # protobuf entry to copy a type from.
+_TYPE_NORMAL = 1
 _TYPE_UNKNOWN = 2
 _TYPE_CONTROL = 3
 
@@ -94,6 +96,14 @@ class HfIdLayout:
     bos_id: Optional[int] = None
     eos_id: Optional[int] = None
     pad_id: Optional[int] = None
+    # Everything below is what the PROTOBUF supplies when there is one, read off `tokenizer.json`
+    # instead for the checkpoints that ship no `.model` at all -- see `write_sentencepiece_vocab`.
+    # `special_ids` are the ids `added_tokens` marks `special`, which is the only statement of piece
+    # TYPE a fast tokenizer makes.
+    special_ids: frozenset = frozenset()
+    precompiled_charsmap: Optional[bytes] = None
+    add_dummy_prefix: bool = True
+    remove_extra_whitespaces: bool = True
 
 
 def _template_framing(tokenizer_json: dict) -> tuple[Optional[str], Optional[str]]:
@@ -116,6 +126,44 @@ def _template_framing(tokenizer_json: dict) -> tuple[Optional[str], Optional[str
         return (entry or {}).get("SpecialToken", {}).get("id")
 
     return _special(single[0]), _special(single[-1])
+
+
+def _read_hf_normalizer(tokenizer_json: dict) -> tuple[Optional[bytes], bool, bool]:
+    """The three normalizer facts a SentencePiece GGUF needs, from `tokenizer.json` rather than a proto.
+
+    `tokenizers` stores exactly what the protobuf's `normalizer_spec` does, under different names: a
+    `Precompiled` normalizer carries the same `precompiled_charsmap` (base64 in JSON, raw bytes in the
+    proto), and `Metaspace`'s `prepend_scheme`/`add_prefix_space` is `add_dummy_prefix`. A `Strip`-ish
+    `Replace` of runs of spaces is `remove_extra_whitespaces`; absent one, the SentencePiece default
+    (true) is what the checkpoint was trained with, so that is the default here too.
+
+    Returns `(charsmap_or_None, add_dummy_prefix, remove_extra_whitespaces)`.
+    """
+    def walk(node):
+        if not isinstance(node, dict):
+            return
+        yield node
+        for child in node.get("normalizers") or node.get("pretokenizers") or []:
+            yield from walk(child)
+
+    charsmap: Optional[bytes] = None
+    for node in walk(tokenizer_json.get("normalizer") or {}):
+        raw = node.get("precompiled_charsmap")
+        if raw:
+            charsmap = base64.b64decode(raw) if isinstance(raw, str) else bytes(raw)
+            break
+
+    add_dummy_prefix = True
+    for node in walk(tokenizer_json.get("pre_tokenizer") or {}):
+        if node.get("type") == "Metaspace":
+            scheme = node.get("prepend_scheme")
+            if scheme is not None:
+                add_dummy_prefix = scheme != "never"
+            elif node.get("add_prefix_space") is not None:
+                add_dummy_prefix = bool(node["add_prefix_space"])
+            break
+
+    return charsmap, add_dummy_prefix, True
 
 
 def read_hf_id_layout(tokenizer_dir) -> Optional[HfIdLayout]:
@@ -147,9 +195,15 @@ def read_hf_id_layout(tokenizer_dir) -> Optional[HfIdLayout]:
                 for key, value in specials.items() if value}
 
     template_bos, template_eos = _template_framing(tokenizer_json)
+    norm_charsmap, dummy_prefix, strip_ws = _read_hf_normalizer(tokenizer_json)
     return HfIdLayout(
         pieces=pieces,
         scores=scores,
+        special_ids=frozenset(int(t["id"]) for t in tokenizer_json.get("added_tokens") or []
+                              if t.get("special") and t.get("id") is not None),
+        precompiled_charsmap=norm_charsmap,
+        add_dummy_prefix=dummy_prefix,
+        remove_extra_whitespaces=strip_ws,
         unk_id=by_piece.get(specials.get("unk_token")),
         # The post-processor decides the framing; the special-token map only supplies the piece text
         # when there is no post-processor to name it, which is the ALBERT/XLNet shape the explicit
@@ -160,12 +214,45 @@ def read_hf_id_layout(tokenizer_dir) -> Optional[HfIdLayout]:
     )
 
 
-def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: bytes, *,
+def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: Optional[bytes], *,
                                hf_ids: Optional[HfIdLayout] = None,
                                bos_token_id: int | None = None, eos_token_id: int | None = None,
                                add_bos_token: bool = False, add_eos_token: bool = False) -> None:
-    m = spm_pb2.ModelProto()
-    m.ParseFromString(tokenizer_model_bytes)
+    """Writes a SentencePiece vocabulary, from the protobuf where there is one and from
+    `tokenizer.json` where there is not.
+
+    THE PROTOBUF IS NO LONGER REQUIRED. It is still preferred and still the only authority for a
+    checkpoint that ships one, because piece TYPES are recorded nowhere else in full. But a growing
+    number of fast-tokenizer-only checkpoints ship `tokenizer.json` alone -- `kredor/punctuate-all` is
+    the family-12 case -- and everything a GGUF needs is in it:
+
+    | GGUF field              | protobuf                     | tokenizer.json                        |
+    |-------------------------|------------------------------|---------------------------------------|
+    | pieces, scores          | `pieces[].piece/.score`      | `model.vocab` as `[piece, score]`     |
+    | ids                     | position (but see below)     | position, already remapped            |
+    | types                   | `pieces[].type`              | `added_tokens[].special`              |
+    | UNIGRAM vs BPE          | `trainer_spec.model_type`    | `model.type`                          |
+    | charsmap, dummy prefix  | `normalizer_spec`            | `normalizer`, `pre_tokenizer`         |
+
+    The types column is the lossy one and the reason the protobuf still wins when present: it
+    distinguishes CONTROL from USER_DEFINED from BYTE, where `tokenizer.json` says only "special or
+    not". For a Unigram checkpoint that distinction does not reach `loom::Vocab`'s Viterbi -- it
+    segments on scores, and treats every non-NORMAL piece as un-segmentable alike -- so a two-way split
+    is faithful there. It would NOT be for a BPE model with byte-fallback pieces, which is why this
+    path refuses anything but Unigram rather than guessing.
+
+    AND THE FAIRSEQ REMAP IS A NO-OP HERE, which is the happy part: the reason `read_hf_id_layout`
+    exists at all is that a proto's piece order and a fairseq checkpoint's ids disagree. A checkpoint
+    with no proto has no second order to disagree with -- `model.vocab` IS the id order, `<s>/<pad>/
+    </s>/<unk>` already at 0..3 and `<mask>` already last.
+    """
+    m = None
+    if tokenizer_model_bytes is not None:
+        m = spm_pb2.ModelProto()
+        m.ParseFromString(tokenizer_model_bytes)
+    elif hf_ids is None:
+        raise ValueError("write_sentencepiece_vocab needs a `.model` protobuf or an HfIdLayout; "
+                         "got neither")
 
     if hf_ids is None:
         pieces = [p.piece for p in m.pieces]
@@ -178,12 +265,21 @@ def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: bytes, 
         # file that has them. Matched by piece text rather than by position, because the whole reason
         # this branch exists is that the two orders differ -- and by FIRST occurrence, so a duplicated
         # piece cannot make the lookup depend on which copy won.
-        type_of: dict[str, int] = {}
-        for piece in m.pieces:
-            type_of.setdefault(piece.piece, int(piece.type))
         pieces = list(hf_ids.pieces)
         scores = list(hf_ids.scores)
-        types = [type_of.get(piece, _TYPE_CONTROL) for piece in pieces]
+        if m is not None:
+            type_of: dict[str, int] = {}
+            for piece in m.pieces:
+                type_of.setdefault(piece.piece, int(piece.type))
+            types = [type_of.get(piece, _TYPE_CONTROL) for piece in pieces]
+        else:
+            # No protobuf: `added_tokens[].special` is the only type statement there is. UNKNOWN is
+            # named separately because it is a role rather than a flag, and `loom::Vocab` looks it up
+            # by type rather than by id.
+            types = [_TYPE_CONTROL if i in hf_ids.special_ids else _TYPE_NORMAL
+                     for i in range(len(pieces))]
+            if hf_ids.unk_id is not None and 0 <= hf_ids.unk_id < len(types):
+                types[hf_ids.unk_id] = _TYPE_UNKNOWN
         # Derived from the REMAPPED types, not carried over from the protobuf's own index: the piece
         # that is UNKNOWN is the same piece either way, and its id is the thing that moved.
         unk_id = hf_ids.unk_id
@@ -197,24 +293,39 @@ def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: bytes, 
         add_bos_token = add_bos_token or hf_ids.bos_id is not None
         add_eos_token = add_eos_token or hf_ids.eos_id is not None
 
-    model_type = m.trainer_spec.model_type
-    if model_type == m.trainer_spec.UNIGRAM:
-        tokenizer_model = "t5"
-    elif model_type == m.trainer_spec.BPE:
-        tokenizer_model = "llama"
+    if m is not None:
+        model_type = m.trainer_spec.model_type
+        if model_type == m.trainer_spec.UNIGRAM:
+            tokenizer_model = "t5"
+        elif model_type == m.trainer_spec.BPE:
+            tokenizer_model = "llama"
+        else:
+            raise NotImplementedError(f"SentencePiece model_type {model_type} (WORD/CHAR) is not "
+                                       "implemented on the C++ side (loom::Vocab only supports "
+                                       "UNIGRAM and BPE)")
     else:
-        raise NotImplementedError(f"SentencePiece model_type {model_type} (WORD/CHAR) is not implemented "
-                                   "on the C++ side (loom::Vocab only supports UNIGRAM and BPE)")
+        # `read_hf_id_layout` returns None for anything but Unigram, so reaching here without a proto
+        # means Unigram -- but assert it rather than assume, because the type split above is only
+        # faithful for Unigram and a BPE checkpoint arriving here would be silently mis-typed.
+        if hf_ids is None:
+            raise ValueError("no protobuf and no HfIdLayout")
+        tokenizer_model = "t5"
 
     writer.add_tokenizer_model(tokenizer_model)
     writer.add_token_list(pieces)
     writer.add_token_scores(scores)
     writer.add_token_types(types)
     writer.add_unk_token_id(unk_id)
-    writer.add_add_space_prefix(bool(m.normalizer_spec.add_dummy_prefix))
-    writer.add_remove_extra_whitespaces(bool(m.normalizer_spec.remove_extra_whitespaces))
-    if m.normalizer_spec.precompiled_charsmap:
-        writer.add_precompiled_charsmap(m.normalizer_spec.precompiled_charsmap)
+    if m is not None:
+        writer.add_add_space_prefix(bool(m.normalizer_spec.add_dummy_prefix))
+        writer.add_remove_extra_whitespaces(bool(m.normalizer_spec.remove_extra_whitespaces))
+        charsmap = m.normalizer_spec.precompiled_charsmap
+    else:
+        writer.add_add_space_prefix(bool(hf_ids.add_dummy_prefix))
+        writer.add_remove_extra_whitespaces(bool(hf_ids.remove_extra_whitespaces))
+        charsmap = hf_ids.precompiled_charsmap
+    if charsmap:
+        writer.add_precompiled_charsmap(charsmap)
 
     if bos_token_id is not None:
         writer.add_bos_token_id(bos_token_id)
