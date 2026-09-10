@@ -718,7 +718,11 @@ print(model.text2text.infer(
 
 # The same door, on the other tasks this checkpoint was tuned for:
 print(model.text2text.infer("Answer the following question. What is the capital of France?"))
-print(model.text2text.infer("summarize: " + open("article.txt").read(), max_new_tokens=64))
+print(model.text2text.infer(
+    "summarize: The committee met on Tuesday to discuss the annual budget. After three hours of "
+    "debate, the members agreed to postpone the vote until the following month, citing incomplete "
+    "figures from the finance office.",
+    max_new_tokens=64))
 """,
     "token-classification": """import loom
 
