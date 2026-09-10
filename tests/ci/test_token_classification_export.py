@@ -21,8 +21,11 @@ from loom_exporter.registry import default_registry
 from loom_exporter.tasks import task_spec
 from loom_exporter.token_classification_export import (
     TokenClassificationExportConfig,
+    _TokenClassifierWrapper,
     _build_hf_token_classifier,
     _is_hf_token_classifier,
+    _position_limit,
+    _position_offset,
     _read_labels,
 )
 
@@ -156,7 +159,28 @@ def _tiny_distilbert(max_position_embeddings: int):
         max_position_embeddings=max_position_embeddings, **_LABELS))
 
 
-ARCHITECTURES = {"bert": _tiny_bert, "distilbert": _tiny_distilbert}
+def _tiny_xlm_roberta(max_position_embeddings: int):
+    """The fairseq-derived shape, and the third structural difference this family absorbs: its position
+    table declares a `padding_idx`, so position 0 is table ROW 2 and the first two rows are never
+    addressed. BERT and DistilBERT number from zero; a template that only saw those two passes every
+    other test in this file and reads the wrong two rows here."""
+    from transformers import XLMRobertaConfig, XLMRobertaForTokenClassification
+
+    return XLMRobertaForTokenClassification(XLMRobertaConfig(
+        vocab_size=64, hidden_size=32, num_hidden_layers=2, num_attention_heads=2,
+        intermediate_size=64, max_position_embeddings=max_position_embeddings,
+        pad_token_id=1, bos_token_id=0, eos_token_id=2, type_vocab_size=1, **_LABELS))
+
+
+ARCHITECTURES = {"bert": _tiny_bert, "distilbert": _tiny_distilbert,
+                 "xlm-roberta": _tiny_xlm_roberta}
+
+# The two architectures whose checkpoints are the CLASSIC BERT layout (`vocab.txt`, no fast tokenizer),
+# which is what `_tiny_checkpoint` writes. XLM-R is not one of them -- its vocabulary is a SentencePiece
+# protobuf, exercised against a real one in `test_spm_tokenizer_export.py` and against the real
+# checkpoint in the gate sweep -- so the export-shaped tests below parametrize over these and the
+# offset tests over all three.
+WORDPIECE_ARCHITECTURES = ["bert", "distilbert"]
 
 
 def _tiny_checkpoint(tmp_path: Path, max_position_embeddings: int = 64,
@@ -206,7 +230,7 @@ def _export(checkpoint: Path, out: Path, **kwargs) -> dict:
     }
 
 
-@pytest.mark.parametrize("architecture", sorted(ARCHITECTURES))
+@pytest.mark.parametrize("architecture", WORDPIECE_ARCHITECTURES)
 def test_a_tiny_token_classifier_exports_with_a_dynamic_token_axis(tmp_path, architecture):
     pytest.importorskip("coremltools")
     checkpoint = _tiny_checkpoint(tmp_path, architecture=architecture)
@@ -237,7 +261,7 @@ def test_a_tiny_token_classifier_exports_with_a_dynamic_token_axis(tmp_path, arc
     assert exported["cls_id"] == 2 and exported["sep_id"] == 3
 
 
-@pytest.mark.parametrize("architecture", sorted(ARCHITECTURES))
+@pytest.mark.parametrize("architecture", WORDPIECE_ARCHITECTURES)
 def test_the_traced_length_does_not_reach_the_graph(tmp_path, architecture):
     """The same checkpoint at two trace lengths must produce the same topology.
 
@@ -264,3 +288,48 @@ def test_a_range_longer_than_the_position_table_is_refused(tmp_path):
     config.task = "token-classification"
     with pytest.raises(ValueError, match="max_position_embeddings"):
         config.export()
+
+
+# -- where position 0 lives ------------------------------------------------------------------------
+
+@pytest.mark.parametrize("architecture,expected", [("bert", 0), ("distilbert", 0), ("xlm-roberta", 2)])
+def test_the_position_offset_is_read_off_the_table_not_the_name(architecture, expected):
+    """`nn.Embedding`'s own `padding_idx`, which the fairseq family sets and BERT/DistilBERT do not.
+
+    A structural read for the same reason `_accepts` is one: the alternative is a list of `model_type`
+    strings to keep in step with `transformers`.
+    """
+    pytest.importorskip("torch")
+    model = ARCHITECTURES[architecture](64)
+    assert _position_offset(model.base_model) == expected
+
+
+@pytest.mark.parametrize("architecture,expected", [("bert", 64), ("distilbert", 64),
+                                                   ("xlm-roberta", 62)])
+def test_the_offset_shortens_the_length_the_family_can_serve(architecture, expected):
+    """`max_position_embeddings` is the SIZE OF THE TABLE, not the length it can answer.
+
+    Real numbers rather than this fixture's: XLM-R ships a 514-row table and serves 512 tokens. Reading
+    the declared number as the cap would let a 514-token sequence index two rows past the end.
+    """
+    pytest.importorskip("torch")
+    assert _position_limit(ARCHITECTURES[architecture](64)) == expected
+
+
+@pytest.mark.parametrize("architecture", sorted(ARCHITECTURES))
+def test_the_wrapper_reproduces_the_models_own_forward(architecture):
+    """THE ASSERTION THE OFFSET EXISTS FOR, and the one a token-level oracle would not have made.
+
+    The wrapper is handed 0-based `position_ids` -- `loom.range(0, n_tokens)`, the driver's one contract
+    for the whole family -- and has to produce what the model produces when it computes its own. On the
+    real checkpoint, passing 0-based ids to XLM-R moves the logits by up to 7.0 while 24 of 27 argmaxes
+    still agree, so this compares the TENSOR ([[feedback-tensor-oracle-not-token-oracle]]).
+    """
+    torch = pytest.importorskip("torch")
+    model = ARCHITECTURES[architecture](64).eval()
+    tokens = torch.arange(5, 17, dtype=torch.long).unsqueeze(0)
+    with torch.no_grad():
+        # No `position_ids` and no mask: the model computes both, which is the behaviour being matched.
+        expected = model(input_ids=tokens).logits
+        got = _TokenClassifierWrapper(model)(tokens, torch.arange(tokens.shape[1], dtype=torch.long))
+    assert torch.allclose(got, expected, atol=1e-5), (got - expected).abs().max()

@@ -1113,6 +1113,44 @@ class fuse_loom_attention(AbstractGraphPass):
         return src
 
     @staticmethod
+    def _key_before_merged_transpose(k_var):
+        """The `[b, seq, heads, dim]` tensor behind a K operand that arrives already transposed to
+        `[b, heads, dim, seq]`, or None.
+
+        **This is a coremltools artefact, not an architecture difference, and T5 is where it surfaced.**
+        Every HF attention writes `Q @ K^T` as `matmul(q, k.transpose(-1, -2))`, and MIL's own
+        `fuse_transpose_matmul` normally folds that trailing transpose into `transpose_y=True` -- which
+        is the form this pass matches. It only folds a permutation of the LAST TWO axes, though, and
+        `merge_consecutive_transposes` runs first: where nothing sits between the head-split
+        `.transpose(1, 2)` and the score `.transpose(3, 2)`, the two merge into the single perm
+        `[0, 2, 3, 1]`, which is no longer last-two-dims and no longer foldable. Qwen3 and Whisper are
+        unaffected because RoPE sits between theirs; T5 has no positional projection at all, so nothing
+        does.
+
+        Recovering the pre-transpose var lets the caller re-split it into the `[b, heads, seq, dim]`
+        layout `op_attention` reads K in. Structural rather than name-based, and every guard bails to
+        "leave it alone", which is the rule the rest of this pass follows.
+        """
+        op = getattr(k_var, "op", None)
+        if op is None or op.op_type != "transpose":
+            return None
+        perm = op.inputs.get("perm")
+        if perm is None or perm.val is None:
+            return None
+        src = op.inputs.get("x")
+        if src is None or src.shape is None or len(src.shape) != 4:
+            return None
+        # NEGATIVE AXES ARE THE NORMAL SPELLING HERE, not an edge case: the merge of
+        # `.transpose(1, 2)` and `.transpose(3, 2)` comes out as `[0, 2, -1, -3]`, because the second
+        # transpose was written against the end of the shape. coremltools' own
+        # `fuse_transpose_matmul` canonicalizes before comparing for the same reason; comparing
+        # against the literal `[0, 2, 3, 1]` matched nothing at all.
+        axes = [int(a) % 4 for a in np.array(perm.val).ravel()]
+        if axes != [0, 2, 3, 1]:
+            return None
+        return src
+
+    @staticmethod
     def _mask_kv_slice_source(mask_var):
         """The tensor behind HF's `mask[..., :kv_len]` slice, or `mask_var` unchanged.
 
@@ -1241,12 +1279,14 @@ class fuse_loom_attention(AbstractGraphPass):
         qk_var, mask_var = operands
         qk_op = qk_var.op
 
-        # Q @ K^T, and K must NOT be pre-transposed by a separate op -- `transpose_y` is how the traced
-        # graph spells it, and a False here means this is some other matmul that happens to feed a
-        # softmax.
+        # Q @ K^T. `transpose_y=True` is how the traced graph usually spells it, and a False is
+        # ordinarily a matmul that merely happens to feed a softmax -- with ONE exception, which is a
+        # coremltools artefact rather than a different architecture: see
+        # `_key_before_merged_transpose`, which recovers K when the two transposes on its way here
+        # merged into a permutation MIL could no longer fold.
         transpose_y = qk_op.inputs.get("transpose_y")
         transpose_x = qk_op.inputs.get("transpose_x")
-        if transpose_y is None or transpose_y.val is None or not bool(transpose_y.val):
+        if transpose_y is None or transpose_y.val is None:
             return False
         if transpose_x is not None and transpose_x.val is not None and bool(transpose_x.val):
             return False
@@ -1255,6 +1295,14 @@ class fuse_loom_attention(AbstractGraphPass):
         k_var = qk_op.inputs.get("y")
         if q_var is None or k_var is None:
             return False
+        # The var the anchor has to follow: the merged case reads K's SOURCE and builds a new
+        # transpose of it, so it is the source's own definition that constrains where this may go.
+        k_source = k_var
+        resplit_key = not bool(transpose_y.val)
+        if resplit_key:
+            k_source = self._key_before_merged_transpose(k_var)
+            if k_source is None:
+                return False
 
         # The scale HF folds onto Q. Recovered rather than recomputed from head_dim: a model with a
         # non-default scale (or none) is then still correct, and `scale=1.0` with the `mul` left in
@@ -1301,7 +1349,13 @@ class fuse_loom_attention(AbstractGraphPass):
 
         # Undo HF's repeat_kv() where it is safe, so the cache stores the checkpoint's real KV heads
         # rather than the expanded ones (KV-CACHE.md 2.3). Purely a size win; see _strip_gqa_repeat.
-        k_var, v_var = self._strip_gqa_repeat(k_var, v_var, q_var)
+        #
+        # **Skipped on the re-split path**, where it would look through a transpose that is about to be
+        # rebuilt: the repeat triple sits upstream of the merged transpose, so matching it there would
+        # mean reasoning about two rewrites at once. Bailing costs only cache size, which is what this
+        # strip is worth, and the first architecture that needs both is what should widen it.
+        if not resplit_key:
+            k_var, v_var = self._strip_gqa_repeat(k_var, v_var, q_var)
 
         # Attend against the mask the driver actually builds, not the trace-width slice of it
         # (KV-CACHE.md 3.2). Unlike the GQA strip above this one is a correctness requirement for a
@@ -1320,11 +1374,18 @@ class fuse_loom_attention(AbstractGraphPass):
         # The subsumed chain, in block order. The fused op replaces all six, so it may be inserted at
         # any of their positions that is still after every operand it reads -- see `_insertion_anchor`.
         chain = [qk_op, add_op, softmax_op, av_op, transpose_op, reshape_op]
-        anchor = self._insertion_anchor(block, chain, (q_var, k_var, v_var, mask_var))
+        anchor = self._insertion_anchor(block, chain, (q_var, k_source, v_var, mask_var))
         if anchor is None:
             return False
 
         with _scope_ctx_like(softmax_op):
+            if resplit_key:
+                # `[b, seq, heads, dim] -> [b, heads, seq, dim]`, which is the layout `op_attention`
+                # reads K in and the one the unmerged trace would have handed over. Inserted before
+                # the fused node rather than replacing the merged transpose in place: that transpose
+                # may still have other consumers, and deciding is `dead_code_elimination`'s job.
+                k_var = mb.transpose(x=k_source, perm=[0, 2, 1, 3],
+                                     name=f"{k_source.name}_attn_k", before_op=anchor)
             fused = mb.loom_fused_attention(
                 q=q_var, k=k_var, v=v_var, mask=mask_var,
                 scale=np.float32(scale), layer=np.int32(self._next_layer),

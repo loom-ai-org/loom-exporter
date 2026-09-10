@@ -43,6 +43,18 @@ it, which is what makes them worth naming individually:
   position-embedding table substitutes the caller's ids for the ones the model computed. **Both routes
   produce the same two graph inputs and the same driver**, which is the point: the difference is
   absorbed here rather than reaching the artifact.
+* **AND POSITION ZERO IS NOT ALWAYS ROW ZERO.** The driver hands every model in this family
+  `loom.range(0, n_tokens)`, and for BERT and DistilBERT that is what the model would have computed
+  itself. The fairseq-derived family -- RoBERTa, XLM-R -- would not: `create_position_ids_from_input_ids`
+  starts its numbering at `padding_idx + 1`, so token 0 reads position-table ROW 2 and rows 0 and 1 are
+  never addressed at all. Passing 0-based ids to such a model is the failure this whole family is
+  written against wearing a different hat -- it does not raise, it does not change a shape, it reads two
+  rows of a learned table that were trained as padding and produces plausible logits that are wrong for
+  every token. `_position_offset` reads it off the position table's own `padding_idx` (the fairseq
+  family declares one; BERT and DistilBERT construct the table without one) and the wrapper adds it, so
+  the artifact's contract stays `loom.range(0, n_tokens)` for every member. It also SHORTENS the family's
+  own length cap, which is the second thing that offset costs: an XLM-R checkpoint declares
+  `max_position_embeddings=514` and can only ever address 512 of those rows.
 
 Everything else is `AutoModelForTokenClassification`'s, whatever it is. This family names no
 architecture: `base_model` is HF's own accessor for the encoder underneath a task head, and which
@@ -77,6 +89,24 @@ def _accepts(fn, name: str) -> bool:
     return name in inspect.signature(fn).parameters
 
 
+def _position_offset(base) -> int:
+    """The row this model's position table calls position 0, read off the table itself.
+
+    `nn.Embedding`'s `padding_idx` is the marker, and it is a STRUCTURAL read for the same reason
+    `_accepts` is one: the fairseq-derived encoders construct
+    `nn.Embedding(max_pos, hidden, padding_idx=self.padding_idx)` and reserve those first rows for
+    padding, while BERT and DistilBERT construct the same table with no `padding_idx` at all. Asking the
+    table is asking the thing that knows; asking `config.model_type` would be a list of names to keep.
+
+    Returns `padding_idx + 1` rather than `padding_idx` because that is where
+    `create_position_ids_from_input_ids` starts counting -- `padding_idx` itself is the row a PAD token
+    reads, and a sequence with no padding never reads it.
+    """
+    table = getattr(getattr(base, "embeddings", None), "position_embeddings", None)
+    padding_idx = getattr(table, "padding_idx", None) if table is not None else None
+    return 0 if padding_idx is None else int(padding_idx) + 1
+
+
 class _PositionHolder:
     """The caller's `position_ids`, for a model that has no argument to receive them through.
 
@@ -103,6 +133,7 @@ class _TokenClassifierWrapper(torch.nn.Module):
         base = model.base_model
         self._takes_position_ids = _accepts(base.forward, "position_ids")
         self._takes_token_type_ids = _accepts(base.forward, "token_type_ids")
+        self._position_offset = _position_offset(base)
         self._holder = _PositionHolder()
         if not self._takes_position_ids:
             self._redirect_position_lookup(base)
@@ -132,6 +163,11 @@ class _TokenClassifierWrapper(torch.nn.Module):
         table.register_forward_pre_hook(lambda module, args: (self._holder.positions,))
 
     def forward(self, tokens, position_ids):
+        # The caller's ids are 0-based -- `loom.range(0, n_tokens)`, one contract for the whole family --
+        # and this is where a model that numbers its rows from somewhere else is met. An `add` of a
+        # traced constant, so the graph stays dynamic in the sequence length; zero for BERT and
+        # DistilBERT, where it folds away with every other identity.
+        position_ids = position_ids + self._position_offset
         # Set unconditionally, so the one attribute is live whether or not a hook reads it -- a value
         # assigned only on the branch that needs it is a `None` waiting for the next model shape.
         self._holder.positions = position_ids.unsqueeze(0)
@@ -243,12 +279,14 @@ class TokenClassificationExportConfig(LoomExportConfig):
         reason the causal-LM family shares its dim across three inputs. `tokens` is declared FIRST
         because `apply_monolithic_export` reads the root axis off the traced function's first input.
         """
-        limit = _position_limit(model.config)
+        limit = _position_limit(model)
         max_seq_len = self.max_seq_len or limit
         if limit and max_seq_len > limit:
             raise ValueError(
-                f"max_seq_len={max_seq_len} exceeds this checkpoint's own max_position_embeddings="
-                f"{limit}. A learned position table has no rows past that, so a longer sequence would "
+                f"max_seq_len={max_seq_len} exceeds the {limit} positions this checkpoint can address "
+                f"(max_position_embeddings={model.config.max_position_embeddings}, of which "
+                f"{_position_offset(model.base_model)} are reserved before position 0). A learned "
+                f"position table has no rows past that, so a longer sequence would "
                 f"index off the end of it rather than degrade -- unlike a RoPE decoder, where a longer "
                 f"range is merely extrapolation."
             )
@@ -316,9 +354,16 @@ def _read_labels(config) -> List[str]:
     return [by_id.get(i, f"LABEL_{i}") for i in range(max(by_id) + 1)]
 
 
-def _position_limit(config) -> int:
-    """`max_position_embeddings`, or 0 for a checkpoint that declares none."""
-    return int(getattr(config, "max_position_embeddings", 0) or 0)
+def _position_limit(model) -> int:
+    """The longest sequence this checkpoint can address, or 0 for one that declares no limit.
+
+    `max_position_embeddings` MINUS the offset, not `max_position_embeddings`. The two are the same
+    number for a model that numbers positions from zero, and differ by exactly the rows the fairseq
+    family reserves for padding: XLM-R's 514-row table answers a 512-token sequence and no more, so the
+    declared number is the size of the table rather than the length it can serve.
+    """
+    rows = int(getattr(model.config, "max_position_embeddings", 0) or 0)
+    return max(rows - _position_offset(model.base_model), 0) if rows else 0
 
 
 def _hf_config(path: Path) -> Optional[dict]:

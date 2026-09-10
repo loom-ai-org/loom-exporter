@@ -22,6 +22,43 @@ class _FakeTokenizer:
 
 
 class TestTokenizerDetect(unittest.TestCase):
+    def test_unigram_without_protobuf_is_sentencepiece_json(self):
+        """No `.model` is no longer a refusal -- the charsmap is in `tokenizer.json` too.
+
+        This used to raise NotImplementedError pointing at EXPORT-BACKLOG item 4, on the belief that
+        `precompiled_charsmap` lived only in the protobuf. A `Precompiled` normalizer carries the same
+        bytes base64'd, and `model.vocab` carries pieces and scores in final id order, so the family
+        resolves instead of failing. `kredor/punctuate-all` is the checkpoint that shape describes.
+        """
+        import base64
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "tokenizer.json").write_text(json.dumps({
+                "normalizer": {"type": "Precompiled",
+                               "precompiled_charsmap": base64.b64encode(b"\x00\x01").decode()},
+                "model": {"type": "Unigram", "unk_id": 0, "vocab": [["<unk>", 0.0], ["a", -1.0]]},
+            }), encoding="utf-8")
+            self.assertEqual(td.detect_vocab_family(tmp), "sentencepiece_json")
+
+    def test_unigram_with_a_protobuf_still_prefers_it(self):
+        """The protobuf stays the authority where there is one: it is the only file carrying full
+        piece TYPES, and this branch must not start winning by accident."""
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "tokenizer.json").write_text(json.dumps({
+                "normalizer": {"type": "Precompiled", "precompiled_charsmap": "AAE="},
+                "model": {"type": "Unigram", "unk_id": 0, "vocab": [["<unk>", 0.0]]},
+            }), encoding="utf-8")
+            (Path(tmp) / "sentencepiece.bpe.model").write_bytes(b"")
+            self.assertEqual(td.detect_vocab_family(tmp), "sentencepiece_proto")
+
+    def test_unigram_with_neither_protobuf_nor_charsmap_is_refused(self):
+        """Where NOTHING on disk records the normalization, guessing it mis-segments silently."""
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "tokenizer.json").write_text(json.dumps({
+                "model": {"type": "Unigram", "unk_id": 0, "vocab": [["<unk>", 0.0], ["a", -1.0]]},
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(NotImplementedError, "Precompiled"):
+                td.detect_vocab_family(tmp)
+
     def test_chkhsh_to_loom_pre_type_table_completeness(self):
         """Every llama.cpp pre name the hash table can produce must have an entry (possibly None, meaning
         "recognized but not yet implemented") in _LLAMA_PRE_TO_LOOM_PRE_TYPE -- catches a transcription
@@ -109,6 +146,21 @@ class TestTokenizerDetect(unittest.TestCase):
     def test_detect_vocab_family_bare_sentencepiece_model(self):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "tokenizer.model").write_bytes(b"")
+            self.assertEqual(td.detect_vocab_family(d), "sentencepiece_proto")
+
+    def test_detect_vocab_family_unigram_under_fairseqs_name_for_the_proto(self):
+        """`sentencepiece.bpe.model` is XLM-R's name for the same file, and it is a MISNOMER -- those
+        protobufs are Unigram models. Missing the name is not a wrong answer but a `NotImplementedError`
+        on a checkpoint the engine can run, which is how family 12's third checkpoint first failed
+        (P5)."""
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "tokenizer.json").write_text(json.dumps({"model": {"type": "Unigram"}}))
+            (Path(d) / "sentencepiece.bpe.model").write_bytes(b"")
+            self.assertEqual(td.detect_vocab_family(d), "sentencepiece_proto")
+
+    def test_detect_vocab_family_bare_fairseq_proto(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "sentencepiece.bpe.model").write_bytes(b"")
             self.assertEqual(td.detect_vocab_family(d), "sentencepiece_proto")
 
     def test_detect_vocab_family_byt5(self):

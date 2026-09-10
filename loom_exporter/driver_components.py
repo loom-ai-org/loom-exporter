@@ -549,6 +549,15 @@ class PrefillDecodeLoop(DriverComponent):
     # cached call at `n_tokens = 1`, with `xa` bound to the encoder phase's single run. Empty for a
     # plain causal LM, whose only input that is not host-computed IS the step's tokens.
     bound: dict = dataclasses.field(default_factory=dict)
+    # Axes this loop's decoder call binds BESIDES `n_tokens`/`n_past`, as `{name: IR expression}`.
+    #
+    # A second dynamic axis is what a cross-attention decoder has when its encoder's length is not
+    # fixed: Whisper's encoder always emits 1500 frames, so its `xk_i`/`xv_i` are declared at a
+    # constant and this field was never needed -- T5's source is a sentence, so they are declared over
+    # `n_enc_frames` and the call has to say how long it is. Unbound, `SymbolEnv` raises at the first
+    # decode step ("unbound symbol 'n_enc_frames'") rather than producing a wrong answer, which is why
+    # this is a plain dict rather than something that tries to derive the value.
+    extra_axes: dict = dataclasses.field(default_factory=dict)
     # The IR expression the loop's first iteration starts from, defaulting to the caller's own
     # `inputs.tokens`. An earlier component may instead have BUILT the prompt -- Whisper's is a
     # checkpoint-dependent prefix, with a language the driver may have had to detect -- in which case
@@ -632,6 +641,12 @@ class PrefillDecodeLoop(DriverComponent):
             "SubgraphCallComponent.length -- validate() over the assembled function is their authority. "
             "The input NAMES they are keyed by are checked, by this component's own `inputs` link, "
             "which is exact against the topology's real declared inputs."
+        ),
+        "extra_axes": Unchecked(
+            "same: driver_ir expressions, resolved by driver_ir.validate over the assembled function. "
+            "The axis NAMES are checked by the engine rather than here, and strictly -- SymbolEnv "
+            "raises on an unbound symbol at build time, so a missing entry is a load-bearing error "
+            "and a misspelled one cannot be mistaken for a bound axis."
         ),
         "prompt": Unchecked(
             "same: a driver_ir expression over a local an earlier component bound, whose reads "
@@ -718,7 +733,8 @@ class PrefillDecodeLoop(DriverComponent):
         body.append(SubgraphCall(
             outputs=[], module=self.topology,
             axes={ctx.root_axis(self.topology): Var(self.n_tokens_var),
-                  "n_past": Var(self.n_past_var)},
+                  "n_past": Var(self.n_past_var),
+                  **self.extra_axes},
             inputs=self._call_inputs(ctx),
             retain=True,
         ))
