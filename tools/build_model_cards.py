@@ -493,7 +493,14 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
     ),
     ModelCard(
         slug="flan-t5-small", checkpoint=Path("flan-t5-small"),
-        task_type="text2text-generation",
+        # `text2text-generation` is this export's task and is NOT a tag HuggingFace recognizes -- it
+        # was retired from their list, which now splits that space into `summarization`,
+        # `translation` and `text-generation`. An unrecognized tag leaves the card showing an
+        # inconsistency on the Hub, which is the whole reason `pipeline_tag` is a separate field.
+        # `text-generation` is the closest recognized fit and an honest one: text in, text out,
+        # through the same `text2text` door as the causal LMs. Upstream `google/flan-t5-small`
+        # declares no pipeline tag at all, so there is nothing to inherit.
+        task_type="text2text-generation", pipeline_tag="text-generation",
         base_repo="google/flan-t5-small", license_id="apache-2.0",
         # As upstream declares them. The list is the flan collection's, not this checkpoint's measured
         # competence -- see the limitations below, which say so.

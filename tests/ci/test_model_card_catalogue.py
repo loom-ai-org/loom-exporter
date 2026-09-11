@@ -65,3 +65,46 @@ def test_slugs_are_unique(cards):
     """Two entries with one slug write to the same directory, and the second silently wins."""
     slugs = [c.slug for c in cards.CATALOG]
     assert len(slugs) == len(set(slugs)), f"duplicate slugs: {sorted({s for s in slugs if slugs.count(s) > 1})}"
+
+
+# HuggingFace's recognized `pipeline_tag` values, transcribed from
+# `https://huggingface.co/api/models-tags-by-type` (52 tags, read 2026-09-11). Re-derive with:
+#
+#     python -c "import json,urllib.request; d=json.load(urllib.request.urlopen(
+#         'https://huggingface.co/api/models-tags-by-type')); print(sorted(
+#         t['id'] for t in d['pipeline_tag']))"
+#
+# Transcribed rather than fetched because tests/ci is hermetic: a check that reaches the network
+# fails for reasons that are not about this repo, and this list moves about once a year.
+HF_PIPELINE_TAGS = frozenset("""
+any-to-any audio-classification audio-text-to-text audio-to-audio automatic-speech-recognition
+depth-estimation document-question-answering feature-extraction fill-mask graph-ml
+image-classification image-feature-extraction image-segmentation image-text-to-image
+image-text-to-text image-text-to-video image-to-3d image-to-image image-to-text image-to-video
+keypoint-detection mask-generation object-detection question-answering reinforcement-learning
+robotics sentence-similarity summarization table-question-answering tabular-classification
+tabular-regression text-classification text-generation text-ranking text-to-3d text-to-audio
+text-to-image text-to-speech text-to-video time-series-forecasting token-classification
+translation unconditional-image-generation video-classification video-text-to-text video-to-video
+visual-document-retrieval visual-question-answering voice-activity-detection
+zero-shot-classification zero-shot-image-classification zero-shot-object-detection
+""".split())
+
+
+def test_every_card_publishes_a_tag_huggingface_recognizes(cards):
+    """The Hub only auto-identifies tags from its own closed list, and a card carrying anything else
+    renders with a visible inconsistency.
+
+    Three of this project's canonical task names are not on that list -- `audio-codec`,
+    `text-to-codes` and `text2text-generation`, the last of which HF retired -- which is exactly why
+    `pipeline_tag` exists as a field separate from `task_type`. Editing `task_type` to satisfy the Hub
+    instead is what broke the export sweep, so this check is the one that keeps the two concerns apart
+    without anyone having to remember which is which.
+    """
+    unrecognized = {c.slug: (c.pipeline_tag or c.task_type) for c in cards.CATALOG
+                    if (c.pipeline_tag or c.task_type) not in HF_PIPELINE_TAGS}
+    assert not unrecognized, (
+        f"cards whose pipeline_tag HuggingFace does not recognize: {unrecognized}. Set an explicit "
+        f"`pipeline_tag=` from HF's list; do NOT change `task_type`, which drives the usage snippet "
+        f"and render_readme's per-family checks."
+    )
