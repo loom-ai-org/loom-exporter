@@ -73,7 +73,15 @@ HOST_COMPUTED_INPUT_NAMES = POSITION_INPUT_NAMES | CAUSAL_MASK_INPUT_NAMES
 GENERIC_PRIMARY_INPUT = "tokens"
 
 # `DriverInputs.bindings` kinds.
-CALLER, POSITION, MASK = "caller", "position", "mask"
+CALLER, POSITION, MASK, NOISE = "caller", "position", "mask", "noise"
+
+# The seed a driver draws its noise from when the caller names none.
+#
+# **Fixed rather than absent**, which is a decision and not a placeholder: a model whose graph takes
+# noise is stochastic, and an unseeded default would make every gate that compares two runs -- or two
+# backends -- unable to compare anything until it knew to pass a seed. The caller overrides it per
+# call (`inputs.seed`), which is the same shape VITS's hand-written driver has had since P4.0.8.
+DEFAULT_NOISE_SEED = 1234
 
 
 def caller_input(name: str):
@@ -111,6 +119,14 @@ class DriverInputs(DriverComponent):
     # The length expression the host-computed bindings are built at. Reads a name this component binds
     # earlier in the same list, which is why `driver_ir.validate` is the authority on it.
     n_tokens: object
+    # {input name: how many samples per unit of `n_tokens`} for the NOISE bindings -- the graph's own
+    # stochastic leaves, drawn here rather than asked of the caller.
+    #
+    # **A multiple, not a length**, because that is the only form in which this is knowable: a noise
+    # leaf's real length is a fixed ratio of the root axis (SNAC's four are 32x/256x/1024x/2048x the
+    # coarse frame count, one per decoder upsampling stage), and the same ratios are what the export
+    # hands `declared_axes` so the graph agrees with the driver about the shape.
+    noise: dict = dataclasses.field(default_factory=dict)
     # {input name: sliding-window width} for the masks that are banded rather than full-causal
     # (BACKLOG.md P4.0.11a). Empty for every model that has no windowed attention, which is every model
     # on this roadmap but Gemma 3 -- and an absent entry means "full causal", so the emitted call is
@@ -135,10 +151,22 @@ class DriverInputs(DriverComponent):
             "the authority on whether it reads a symbol defined before it, and it runs over the "
             "assembled function, which is the only place the question is answerable."
         ),
+        "noise": Unchecked(
+            "the per-input sample-per-root-axis ratios, which the EXPORT states because it is what "
+            "declared the same ratios to coremltools -- the graph and this table are two readings of "
+            "one fact, and a mismatch is caught where it is expressible: the topology's own input "
+            "shape, against which `TopologyInput` checks every name this binds."
+        ),
     }
 
     def emit(self, ctx: DriverContext) -> List:
         out = []
+        if any(kind == NOISE for _, kind in self.bindings):
+            # ONCE, before the first draw, and not per input: `loom.gaussian_array` draws from one
+            # shared stream, so seeding between two draws would restart it and hand two stages
+            # correlated noise. The same reason every hand-written driver seeds at the top.
+            out.append(CallStmt(Call("loom.seed_rng", [
+                BinOp("or", FieldAccess("inputs", "seed"), Lit(DEFAULT_NOISE_SEED))])))
         for name, kind in self.bindings:
             if kind == POSITION:
                 out.append(Local(name, Call("loom.range", [Lit(0), self.n_tokens])))
@@ -148,6 +176,15 @@ class DriverInputs(DriverComponent):
                 if window:
                     args.append(Lit(window))
                 out.append(Local(name, Call("loom.causal_mask", args)))
+            elif kind == NOISE:
+                # `inputs.<name> or <draw>` -- the caller may hand the noise in, and that is not a
+                # convenience. A stochastic graph whose randomness only ever comes from inside it
+                # cannot be compared tensor-for-tensor against its reference, so this family's oracle
+                # would drop from "identical" to "similarly distributed", which is the standard this
+                # project has repeatedly found is not enough. Handing both sides the same noise keeps
+                # the export gradeable; nothing a card documents, and absent means drawn.
+                out.append(Local(name, BinOp("or", FieldAccess("inputs", name), Call(
+                    "loom.gaussian_array", [BinOp("*", Lit(self.noise[name]), self.n_tokens)]))))
             else:
                 out.append(Local(name, caller_input(name)))
         return out

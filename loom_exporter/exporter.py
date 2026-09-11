@@ -15,7 +15,7 @@ from .driver_ir import (
 from .driver_ir import Function as IRFunction
 from .driver_builder import DriverContext, DriverScript
 from .driver_components import (
-    CALLER, CAUSAL_MASK_INPUT_NAMES, HOST_COMPUTED_INPUT_NAMES, MASK, POSITION,
+    CALLER, CAUSAL_MASK_INPUT_NAMES, HOST_COMPUTED_INPUT_NAMES, MASK, NOISE, POSITION,
     POSITION_INPUT_NAMES, SYNTHESIZED_BUILDERS, ArgmaxEpilogue, ChainStage, CtcGreedyEpilogue,
     DriverInputs, ModularChain,
     DriverReturn, MonolithicCall, PrefillDecodeLoop, TokenLabelsEpilogue,
@@ -28,14 +28,21 @@ from .symbols import DYNAMIC_SYMBOL_RE
 from .topology_ops import TopologyContext, lookup_topology_rule
 from .value_facts import ValueFacts, is_const_producer, static_array, static_scalar, static_value
 
-def _binding_kind(name: str) -> str:
+def _binding_kind(name: str, noise_inputs=()) -> str:
     """How the driver obtains one traced-model input: computed host-side, or read from the caller.
 
     The two host-computed sets live in `driver_components.py` alongside the component that acts on
     them (P4.0.6/C.2). A traced model's own `cache_position`/`position_ids`/`attention_mask` inputs
     exist because passing them explicitly is what keeps the sequence length genuinely dynamic under
     `torch.jit.trace`; the driver knows `n_tokens`/`n_past` and fills them in, so a caller never has to
-    know they are there."""
+    know they are there.
+
+    The third host-computed kind is NAMED BY THE EXPORT rather than by a set of names here, and the
+    difference is real: `cache_position` is `cache_position` in every model that has one, while a noise
+    leaf is whatever its wrapper called it and carries a per-input length ratio only the export knows.
+    Guessing it from a name would be guessing the ratio too."""
+    if name in noise_inputs:
+        return NOISE
     if name in POSITION_INPUT_NAMES:
         return POSITION
     if name in CAUSAL_MASK_INPUT_NAMES:
@@ -1420,8 +1427,12 @@ class LoomGGUFExporter:
         # bindings read `n_tokens_expr`, which reads the first input, so anything that reordered this
         # would produce a driver reading a symbol before it is bound -- which `driver_ir.validate`
         # catches, but only after the fact.
+        # {input name: samples per unit of the root axis} for the graph's stochastic leaves, from the
+        # family's own `backend_kwargs` -- see `_binding_kind`.
+        noise_inputs = dict(self.kwargs.get("noise_inputs") or {})
         bindings = tuple(
-            (self.safe_name(name), _binding_kind(name)) for name in main_func.inputs.keys()
+            (self.safe_name(name), _binding_kind(self.safe_name(name), noise_inputs))
+            for name in main_func.inputs.keys()
         )
         # The synthesized windowed masks have no MIL var, so they are not in `main_func.inputs` -- they
         # exist only on the emitted topology (`_route_windowed_masks`). Appended rather than merged in
@@ -1514,7 +1525,8 @@ class LoomGGUFExporter:
         second call to fetch it.
         """
         self.driver_script = SYNTHESIZED_BUILDERS["CodecDecode"](
-            inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr),
+            inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr,
+                                noise=dict(self.kwargs.get("noise_inputs") or {})),
             call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr,
                                  retained=False),
             epilogue=DriverReturn(values=("_mono_out",)),

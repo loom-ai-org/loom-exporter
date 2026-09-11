@@ -70,7 +70,7 @@ differs is entirely what the host does with the one output. The family names its
 
 | component | class | emits | links | unchecked | used by |
 |---|---|---|---|---|---|
-| `driver_inputs` | `DriverInputs` | statements | 0 | 3 | conformer-ctc, dac, encodec, hf-causal-lm, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3, snac |
+| `driver_inputs` | `DriverInputs` | statements | 0 | 4 | conformer-ctc, dac, encodec, hf-causal-lm, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3, snac |
 | `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, dac, encodec, hf-causal-lm, hf-token-classifier, lfm2-monolithic, qwen3, snac |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
 | `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 16 | granite-speech, hf-causal-lm, lfm2-monolithic, qwen3, qwen3-asr, t5, whisper |
