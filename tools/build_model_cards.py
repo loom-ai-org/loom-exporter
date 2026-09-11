@@ -453,6 +453,41 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         ),
     ),
     ModelCard(
+        slug="snac-24khz", checkpoint=Path("snac-24khz"),
+        task_type="audio-codec", pipeline_tag="text-to-audio",
+        base_repo="hubertsiuzdak/snac_24khz", license_id="mit", language=[],
+        language_note="a codec, not a language model: it carries no vocabulary and no language. "
+                       "The upstream repo declares `license: mit` on its own card, and the package "
+                       "(github.com/hubertsiuzdak/snac) is MIT too.",
+        title="SNAC 24 kHz (decoder)",
+        summary="Multi-Scale Neural Audio Codec at 24 kHz, decode half, exported for loom.cpp. "
+                "Family 11: codec tokens in, a waveform out -- and the first with its codebooks at "
+                "different frame rates.",
+        limitations=(
+            "**This is the DECODE half only.** `encode` is audio-in/codes-out -- a different contract "
+            "with a different modality pair -- and no model that decodes through this codec ever calls "
+            "it, so exporting it would be weight in the file for a door nothing opens. To go the other "
+            "way, use the upstream checkpoint.\n\n"
+            "**A row is one COARSEST frame, and it is 7 ids wide.** SNAC's three codebooks run at "
+            "different rates -- `vq_strides` `[4, 2, 1]`, so codebook 0 emits one code where codebook "
+            "2 emits four -- and the flat frame-major layout this file takes is one row per coarsest "
+            "frame at **11.72 frames per second**, decoding to 2048 samples each. The 7 columns are "
+            "**level-major**: column 0 is codebook 0, columns 1-2 are codebook 1's two sub-frames in "
+            "order, columns 3-6 are codebook 2's four. An AR model that emits SNAC tokens 7 at a time "
+            "(Orpheus and its relatives) may interleave them depth-first instead; rearranging them is "
+            "the caller's job, as the delay pattern is.\n\n"
+            "**The decode is deterministic, and the reference model is not.** SNAC's decoder adds "
+            "`randn * linear(x)` at four points, so the PyTorch model returns a different waveform for "
+            "the same codes on every call. This file computes the mean of that distribution -- the "
+            "noise term dropped -- which measured 2.4% away in relative RMS from a sample whose own "
+            "seed-to-seed spread is 3.1%. A graph cannot carry the random draw: it would bake one at "
+            "the traced length.\n\n"
+            "**It does not undo a delay pattern.** An AR model that emits these codes typically offsets "
+            "stream *k* by *k* steps; realigning them is a property of that model, not of the codec, so "
+            "feed it aligned codes."
+        ),
+    ),
+    ModelCard(
         slug="dia-1.6b", checkpoint=Path("dia-1.6b"),
         task_type="text-to-codes", pipeline_tag="text-to-speech",
         base_repo="nari-labs/Dia-1.6B", license_id="apache-2.0", language=["en"],
