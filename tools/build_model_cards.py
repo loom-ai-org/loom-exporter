@@ -931,7 +931,22 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
         frontmatter += ["language:", lang_lines.rstrip("\n")]
     if card.base_repo:
         frontmatter += [f"base_model:", f"- {card.base_repo}"]
+    # `tags:` carries the CANONICAL task, and that is not decoration. Two readers need it.
+    #
+    # `upload_all.py` refuses to publish a card whose task contradicts the GGUF beside it -- the
+    # failure being a card regenerated from one catalogue entry beside weights rebuilt from another,
+    # which nothing downstream would notice. That check used to compare `pipeline_tag` against the
+    # file's `loom.task` directly, which worked only while the two vocabularies were the same one.
+    # They are not any more: three canonical tasks have no HuggingFace tag (`audio-codec`,
+    # `text-to-codes`, `text2text-generation`), so the card publishes a recognized tag and states its
+    # real task here. The uploader then compares two SELF-declarations rather than consulting a
+    # mapping table that would be a second authority able to drift.
+    #
+    # It is also the honest thing to show a reader: `dia-1.6b`'s page says `pipeline_tag:
+    # text-to-speech` because that is what the Hub understands, and `text-to-codes` because that is
+    # what the model does.
     frontmatter += [f"pipeline_tag: {card.pipeline_tag or card.task_type}",
+                    "tags:", "- loom", f"- {card.task_type}",
                     "library_name: loom-py-rt", "---", ""]
 
     if card.base_repo:
