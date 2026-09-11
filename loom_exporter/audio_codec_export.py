@@ -44,18 +44,22 @@ tensor per codebook. It is also the layout the caller already has: an AR LM over
 carry the 2x and 4x, as Kokoro's vocoder phase does) and worse: three arrays for a caller to keep in
 step, for a codec whose own `decode` takes a list only because Python has lists.
 
-**SNAC's decode is STOCHASTIC, and this exports its mean.** `NoiseBlock` computes
+**SNAC's decode is STOCHASTIC, and the noise is an INPUT.** `NoiseBlock` computes
 `x + randn(B, 1, T) * linear(x)` at four points in the decoder, so the reference model returns a
 different waveform for the same codes on every call. A trace BAKES that `randn` as a constant at the
-traced length, which is a silent wrong answer at every other length, so it cannot be left alone; and
-no node in a topology can draw it, because a topology is a pure graph `GraphBuilder` builds once and
-reuses (`topology_ops._op_random` says exactly this). What COULD carry it is the host RNG every
-stochastic model here already uses -- `loom.gaussian_array`, four extra inputs at lengths that are
-exact multiples of the root axis, the caller's contract untouched. It is not built because the term is
-smaller than the model's own variance: dropping it moves the waveform 2.4% in relative RMS, where two
-decodes of the SAME codes under different seeds differ by 3.1% -- the deterministic decode sits INSIDE
-the model's own sample-to-sample spread, nearer the centre of it than any sample is. ADR-029 has what
-it would cost and what measurement would reopen it.
+traced length, and no node in a topology can draw a fresh one either, because a topology is a pure
+graph `GraphBuilder` builds once and reuses (`topology_ops._op_random` says exactly this). So the
+noise is hoisted: four graph inputs at lengths that are exact multiples of the root axis
+(32/256/1024/2048 times `n_codes`, one per decoder upsampling stage), drawn per call by the DRIVER
+through the same `loom.seed_rng`/`loom.gaussian_array` host RNG every stochastic model here already
+uses. The caller's contract is untouched -- still one `codes` array in -- and the caller may hand the
+noise in instead, which is what keeps this family's oracle exact rather than distributional.
+
+**It shipped without the noise first, and that was wrong.** Dropping the term leaves exactly
+`E[output]`, 2.4% away in relative RMS where the reference's own seed-to-seed spread is 3.1%, with the
+ASR oracle reading 22/22 either way and every spectral difference more than 20 dB down. A listener
+called the mean "less sharp, slightly more artificial" on the first hearing. ADR-029 has both halves
+and Retro-043 the lesson.
 
 The modality pair is `audio_codes -> audio`, NOT `token_ids -> audio`: ADR-020 argues that at length,
 and the short version is that a file declaring `token_ids` here resolves to `text2speech` and gets
@@ -125,6 +129,13 @@ SNAC_MISSING = (
 )
 
 
+# The noise tensors the wrapper is currently handing the decoder, one per `NoiseBlock`, in decoder
+# order. A module-level handoff because `NoiseBlock.forward` is patched on the CLASS and the tensors
+# arrive at the wrapper: the alternative is threading a fifth argument through four `nn.Sequential`s
+# that were not written to carry one. Only ever read during the wrapper's own forward.
+_SNAC_NOISE: list = []
+
+
 def _patch_snac(layers) -> None:
     """The two class-level rewrites SNAC's decode needs to trace. Applied at `load`, not at import,
     because the package is optional -- see `SNAC_MISSING`.
@@ -137,15 +148,23 @@ def _patch_snac(layers) -> None:
     `[1, C, 1]` and broadcasts against `[B, C, T]` directly -- so the patch is the same arithmetic
     with the two reshapes removed, not an approximation of it.
 
-    **`NoiseBlock`, because the decode is stochastic.** See the module docstring: this leaves the
-    conditional mean, which is the only deterministic output the model actually has.
+    **`NoiseBlock`, because `torch.randn` is not traceable and the noise is not disposable.** The draw
+    becomes a CONSTANT at the traced length, so it cannot stay; this reads the tensor the wrapper was
+    handed instead, which makes the noise a graph INPUT and leaves the arithmetic untouched. The
+    driver draws it per call -- see `noise_multiples`.
+
+    **This is a class-level patch, so a `snac` model loaded in this process decodes through it too.**
+    Deliberate, and what makes an oracle possible at all: hand the reference the same noise and the
+    comparison is exact rather than distributional.
     """
     import torch as _torch
 
     layers.Snake1d.forward = (
         lambda self, x: x + (self.alpha + 1e-9).reciprocal() * _torch.sin(self.alpha * x).pow(2)
     )
-    layers.NoiseBlock.forward = lambda self, x: x
+    layers.NoiseBlock.forward = (
+        lambda self, x: x + _SNAC_NOISE[self._loom_noise_index] * self.linear(x)
+    )
 
 
 class CodecFamily(Enum):
@@ -185,7 +204,11 @@ class CodecFamily(Enum):
             # `from_pretrained` takes a local directory (it branches on `os.path.isdir`) and reads the
             # `config.json` + `pytorch_model.bin` pair this checkpoint ships. There is no safetensors
             # variant on the Hub, and no `dtype` argument: the package builds at F32 and stays there.
-            return SNAC.from_pretrained(model_dir).eval()
+            model = SNAC.from_pretrained(model_dir).eval()
+            for index, block in enumerate(
+                    m for m in model.decoder.modules() if isinstance(m, snac_layers.NoiseBlock)):
+                block._loom_noise_index = index
+            return model
 
         import transformers
 
@@ -227,6 +250,33 @@ class CodecFamily(Enum):
             f"scale its encoder produced. That is a second input and a different contract; this "
             f"family exports the un-normalised path only."
         )
+
+    def noise_multiples(self, model) -> list:
+        """How many noise samples each stochastic leaf needs per unit of the ROOT AXIS, in decoder
+        order -- `[32, 256, 1024, 2048]` for SNAC, and empty for a deterministic codec.
+
+        Every one is a fixed ratio because a `NoiseBlock` sits immediately after its stage's
+        transposed convolution, so its length is the coarse frame count times that stage's cumulative
+        upsampling: `coarse * prod(decoder_rates[:i+1])`. That is the form `declared_axes` takes and
+        the form the driver multiplies `n_codes` by, which is why it is computed once, here, rather
+        than twice in two spellings.
+
+        Read off the real modules rather than off `config.noise`: the config says whether the blocks
+        were BUILT, and what this needs is which stages actually have one.
+        """
+        if self is not CodecFamily.SNAC:
+            return []                                    # DAC and EnCodec decode deterministically
+        from snac.layers import DecoderBlock, NoiseBlock
+
+        multiples, cumulative = [], max(model.vq_strides)
+        rates = iter(model.decoder_rates)
+        for module in model.decoder.model:
+            if not isinstance(module, DecoderBlock):
+                continue
+            cumulative *= int(next(rates))
+            if any(isinstance(inner, NoiseBlock) for inner in module.block):
+                multiples.append(cumulative)
+        return multiples
 
     def geometry(self, model) -> dict:
         """`{n_codebooks, codebook_size, sample_rate, hop_length, vq_strides}`, read off the
@@ -271,7 +321,11 @@ class _CodecDecodeWrapper(torch.nn.Module):
         self.model = model
         self.family = family
 
-    def forward(self, codes):
+    def forward(self, codes, *noise):
+        # The handoff `NoiseBlock.forward` reads: see `_patch_snac`. Assigned rather than appended so
+        # a second forward through the same wrapper cannot see the first one's tensors.
+        global _SNAC_NOISE
+        _SNAC_NOISE = list(noise)
         waveform = self.family.decode(self.model, codes)
         # EnCodec and SNAC return [batch, channels, samples] where DAC returns [batch, samples]; one
         # reshape rather than two shapes reaching the topology, so the driver and the contract stay
@@ -310,6 +364,7 @@ class AudioCodecExportConfig(LoomExportConfig):
     _sample_rate: Optional[int] = None
     _hop_length: Optional[int] = None
     _vq_strides: Optional[list] = None
+    _noise_multiples: Optional[list] = None
 
     __unchecked__ = {
         "family": Unchecked(
@@ -353,7 +408,24 @@ class AudioCodecExportConfig(LoomExportConfig):
             "`codes_per_frame` and `frame_rate` are both derived from it, so it is the one field here "
             "a wrong value would corrupt silently -- which is why it is read rather than declared."
         ),
+        "_noise_multiples": Unchecked(
+            "walked off the real decoder's own NoiseBlocks during load_model. Empty for a codec that "
+            "decodes deterministically, which is every other member. A wrong ratio here is NOT silent: "
+            "the driver would hand the graph an array of the wrong length and the call would fail on "
+            "the shape, which is why one function computes it for both the axis declaration and the "
+            "driver."
+        ),
     }
+
+    @property
+    def _noise_inputs(self) -> dict:
+        """`{input name: samples per root-axis unit}` -- the one table both halves read.
+
+        The export declares these ratios to coremltools as `declared_axes` and to the driver as
+        `noise_inputs`, and the two have to agree exactly: one says what shape the graph accepts, the
+        other how long an array the driver draws.
+        """
+        return {f"noise_{i}": multiple for i, multiple in enumerate(self._noise_multiples or [])}
 
     @property
     def _coarse_stride(self) -> int:
@@ -384,6 +456,10 @@ class AudioCodecExportConfig(LoomExportConfig):
         self._sample_rate = geometry["sample_rate"]
         self._hop_length = geometry["hop_length"]
         self._vq_strides = geometry["vq_strides"]
+        self._noise_multiples = self.family.noise_multiples(model)
+        if self._noise_multiples:
+            print(f"  {len(self._noise_multiples)} stochastic leaves, at "
+                  f"{self._noise_multiples} samples per frame -- drawn by the driver")
         return model
 
     def export_architecture(self) -> str:
@@ -398,12 +474,21 @@ class AudioCodecExportConfig(LoomExportConfig):
         """
         width = self._codes_per_frame
         print(f"Tracing the codec decoder (dummy n_frames={self.n_frames}, {width} codes/frame)...")
-        dummy = (torch.zeros((1, self.n_frames, width), dtype=torch.long),)
+        dummy = [torch.zeros((1, self.n_frames, width), dtype=torch.long)]
         frames = ct.RangeDim(1, self.max_frames)
         mil_inputs = [
             ct.TensorType(name="codes", shape=(1, frames, width), dtype=np.int32),
         ]
-        return _CodecDecodeWrapper(model, self.family), dummy, mil_inputs
+        # One `ct.RangeDim` INSTANCE PER NOISE INPUT, deliberately not shared: coremltools gives two
+        # inputs that share an instance the same symbol, which is right for lengths that are equal and
+        # wrong for lengths that are four different multiples of one root. Each gets its own symbol
+        # here and `declared_axes` (via `backend_kwargs`) says what each one is in terms of `n_codes`.
+        for name, multiple in self._noise_inputs.items():
+            dummy.append(torch.zeros((1, 1, self.n_frames * multiple), dtype=torch.float32))
+            mil_inputs.append(ct.TensorType(
+                name=name, shape=(1, 1, ct.RangeDim(1, self.max_frames * multiple)),
+                dtype=np.float32))
+        return _CodecDecodeWrapper(model, self.family), tuple(dummy), mil_inputs
 
     def synthesized_builder_key(self) -> str:
         """The third family to override this, and the reason is the one P4.0.17 recorded: a
@@ -455,6 +540,12 @@ class AudioCodecExportConfig(LoomExportConfig):
             root_axis=self.root_axis,
             driver_builder=self.synthesized_builder_key(),
             hparams=self.hparams(),
+            # Both readings of `_noise_inputs`: what shape the graph takes, and how long an array the
+            # driver draws. Empty dicts for a deterministic codec, which is what DAC has always
+            # emitted -- so its GGUF does not move.
+            declared_axes={name: {2: f"{multiple}*{self.root_axis}"}
+                           for name, multiple in self._noise_inputs.items()},
+            noise_inputs=dict(self._noise_inputs),
         )
 
 

@@ -257,6 +257,14 @@ def _tiny_snac(tmp_path: Path) -> Path:
     return out
 
 
+def _snac_noise(model, frames):
+    """One tensor per stochastic leaf, at the length that leaf's own stage needs."""
+    import torch
+
+    return [torch.randn((1, 1, frames * m))
+            for m in CodecFamily.SNAC.noise_multiples(model)]
+
+
 def test_the_wrapper_slices_the_row_into_the_codebooks_the_model_expects(tmp_path):
     """The wrapper owes the tensor it took over: its `[1, n_frames, 7]` in must decode to exactly what
     the package's own `decode` returns for the three-tensor list a caller would have built by hand.
@@ -264,6 +272,36 @@ def test_the_wrapper_slices_the_row_into_the_codebooks_the_model_expects(tmp_pat
     Byte-identical rather than close -- it is the same arithmetic on the same weights, and the only
     question is whether the slicing put each id in the right codebook at the right rate. A level-major
     layout read as anything else still has the right shape, the right length and audio in it.
+
+    The noise is held FIXED across the two, which is what makes the comparison exact rather than
+    distributional -- the whole reason it is an input.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    from loom_exporter.audio_codec_export import _CodecDecodeWrapper, _SNAC_NOISE
+    import loom_exporter.audio_codec_export as module
+
+    model = CodecFamily.SNAC.load(str(_tiny_snac(tmp_path)))
+    frames = 5
+    rows = torch.randint(0, SNAC_CONFIG["codebook_size"], (1, frames, 7))
+    noise = _snac_noise(model, frames)
+    by_hand = [rows[:, :, 0:1].reshape(1, -1), rows[:, :, 1:3].reshape(1, -1),
+               rows[:, :, 3:7].reshape(1, -1)]
+    assert [tuple(c.shape) for c in by_hand] == [(1, 5), (1, 10), (1, 20)]
+    with torch.no_grad():
+        module._SNAC_NOISE = list(noise)
+        expected = model.decode(by_hand).reshape(1, -1)
+        got = _CodecDecodeWrapper(model, CodecFamily.SNAC)(rows, *noise)
+    assert torch.equal(got, expected)
+
+
+def test_the_noise_reaches_the_decoder_and_changes_the_waveform(tmp_path):
+    """A noise input nothing reads is the failure this catches, and it is a quiet one: the export
+    still runs, the driver still draws, and the audio is the mean decode forever.
+
+    Two draws through the same codes must differ, and by the right ORDER -- a `NoiseBlock` whose
+    tensor was broadcast from the wrong stage would still move the output.
     """
     pytest.importorskip("torch")
     import torch
@@ -273,13 +311,30 @@ def test_the_wrapper_slices_the_row_into_the_codebooks_the_model_expects(tmp_pat
     model = CodecFamily.SNAC.load(str(_tiny_snac(tmp_path)))
     frames = 5
     rows = torch.randint(0, SNAC_CONFIG["codebook_size"], (1, frames, 7))
-    by_hand = [rows[:, :, 0:1].reshape(1, -1), rows[:, :, 1:3].reshape(1, -1),
-               rows[:, :, 3:7].reshape(1, -1)]
-    assert [tuple(c.shape) for c in by_hand] == [(1, 5), (1, 10), (1, 20)]
+    wrapper = _CodecDecodeWrapper(model, CodecFamily.SNAC)
     with torch.no_grad():
-        expected = model.decode(by_hand).reshape(1, -1)
-        got = _CodecDecodeWrapper(model, CodecFamily.SNAC)(rows)
-    assert torch.equal(got, expected)
+        a = wrapper(rows, *_snac_noise(model, frames))
+        b = wrapper(rows, *_snac_noise(model, frames))
+        zeros = [torch.zeros_like(t) for t in _snac_noise(model, frames)]
+        mean_a = wrapper(rows, *zeros)
+        mean_b = wrapper(rows, *zeros)
+    assert not torch.equal(a, b), "two draws gave the same waveform -- the noise is not being read"
+    assert torch.equal(mean_a, mean_b), "zero noise is not deterministic"
+    # Zero noise IS the mean decode, which is what the deterministic export used to ship: it must sit
+    # between the two draws rather than off to one side, or the noise is entering with a bias.
+    spread = (a - b).abs().mean()
+    assert (a - mean_a).abs().mean() < spread and (b - mean_a).abs().mean() < spread
+
+
+def test_a_deterministic_codec_declares_no_noise_and_no_axes(tmp_path):
+    """DAC's export must not move. The noise machinery is per-checkpoint -- walked off the real
+    decoder's own `NoiseBlock`s -- so a codec that has none declares empty, and empty is what its
+    GGUF has always carried."""
+    config = _build_dac(tmp_path, "/tmp/x.gguf")
+    config._noise_multiples = []
+    assert config._noise_inputs == {}
+    assert config.backend_kwargs()["declared_axes"] == {}
+    assert config.backend_kwargs()["noise_inputs"] == {}
 
 
 def test_a_multi_rate_codec_keeps_the_length_in_the_root_axis(tmp_path):
@@ -296,9 +351,19 @@ def test_a_multi_rate_codec_keeps_the_length_in_the_root_axis(tmp_path):
                        family=CodecFamily.SNAC, architecture="snac")
     topo = exported["topology"]
 
-    assert {i["name"]: i["shape"] for i in topo["inputs"]} == {"codes": ["7", "n_codes", "1"]}
+    assert {i["name"]: i["shape"] for i in topo["inputs"]} == {
+        "codes": ["7", "n_codes", "1"],
+        # Each stochastic leaf at its own stage's multiple of the root axis, never a literal: a baked
+        # length here is a call that fails on the shape at any other frame count.
+        "noise_0": ["8*n_codes", "1", "1"], "noise_1": ["16*n_codes", "1", "1"],
+    }
     assert exported["n_codebooks"] == 7 and exported["sample_rate"] == 24000
     assert "math.floor(#codes / 7)" in exported["driver"]
+    # The driver draws them, seeded, and lets a caller hand them in instead -- which is what keeps
+    # this family's oracle exact rather than distributional.
+    assert "loom.seed_rng((inputs.seed or 1234))" in exported["driver"]
+    assert ("local noise_0 = (inputs.noise_0 or loom.gaussian_array((8 * math.floor(#codes / 7))))"
+            in exported["driver"])
 
     crops = [n["attrs"]["shape"] for n in topo["nodes"] if n["op"] == "VIEW"]
     assert [c for c in crops if c[1:] == ["n_codes", "1"]][:3] == [
