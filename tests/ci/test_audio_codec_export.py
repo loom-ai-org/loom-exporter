@@ -17,8 +17,11 @@ import pytest
 
 from loom_exporter.audio_codec_export import (
     AudioCodecExportConfig,
+    CodecFamily,
     _build_dac,
+    _build_snac,
     _is_dac,
+    _is_snac,
 )
 from loom_exporter.export_config import LoomExportConfig
 from loom_exporter.registry import default_registry
@@ -46,8 +49,6 @@ def test_encodec_is_recognized_and_refuses_with_its_reasons(tmp_path):
     blockers are real and specific (coremltools' dynamic-pad limitation and a 2-layer LSTM over the
     time axis), so the message names them rather than saying "unsupported".
     """
-    from loom_exporter.audio_codec_export import CodecFamily
-
     path = _hf_dir(tmp_path, "enc", {"model_type": "encodec"})
     assert default_registry().detect(path).name == "encodec"
     with pytest.raises(NotImplementedError, match="Dynamic padding"):
@@ -60,13 +61,15 @@ def test_encodecs_geometry_and_decode_are_already_written(tmp_path):
     """The half that IS done, pinned so it does not rot while the blockers are open: EnCodec's config
     spellings differ from DAC's in every field but `codebook_size`, and that mapping is what a future
     unblocking builds on."""
-    from loom_exporter.audio_codec_export import CodecFamily
-
     class _EncodecConfig:
         num_quantizers, codebook_size, sampling_rate, hop_length = 4, 2048, 32000, 640
 
-    assert CodecFamily.ENCODEC.geometry(_EncodecConfig()) == {
+    class _Encodec:
+        config = _EncodecConfig()
+
+    assert CodecFamily.ENCODEC.geometry(_Encodec()) == {
         "n_codebooks": 4, "codebook_size": 2048, "sample_rate": 32000, "hop_length": 640,
+        "vq_strides": [1, 1, 1, 1],
     }
 
 
@@ -78,6 +81,65 @@ def test_another_codec_is_not_claimed_by_dacs_recognizer(tmp_path):
     assert not _is_dac(_hf_dir(tmp_path, "enc2", {"model_type": "encodec"}))
     assert not _is_dac(_hf_dir(tmp_path, "mimi", {"model_type": "mimi"}))
     assert not _is_dac(tmp_path / "nothing-here")
+
+
+SNAC_CONFIG = {
+    "sampling_rate": 24000, "encoder_dim": 8, "encoder_rates": [2, 2], "decoder_dim": 16,
+    "decoder_rates": [2, 2], "attn_window_size": None, "codebook_size": 16, "codebook_dim": 4,
+    "vq_strides": [4, 2, 1], "noise": True, "depthwise": True,
+}
+
+
+def test_a_snac_directory_is_claimed_by_its_shape(tmp_path):
+    """SNAC's `config.json` is `SNAC.__init__`'s kwargs dumped verbatim: no `model_type`, no
+    `architectures`, nothing naming the class. So detection reads the SHAPE of the config, and
+    `vq_strides` is the key no HF codec config has."""
+    assert _is_snac(_hf_dir(tmp_path, "snac", SNAC_CONFIG))
+    assert default_registry().detect(_hf_dir(tmp_path, "snac2", SNAC_CONFIG)).name == "snac"
+
+
+def test_snacs_recognizer_defers_to_a_named_architecture(tmp_path):
+    """A config carrying BOTH `model_type` and `vq_strides` belongs to whichever recognizer owns that
+    `model_type`, not to this one -- a future HF port of SNAC would be loaded through a different
+    class with a different `decode`, and claiming it here would run the wrong loader on it."""
+    assert not _is_snac(_hf_dir(tmp_path, "named", {**SNAC_CONFIG, "model_type": "snac"}))
+    assert not _is_snac(_hf_dir(tmp_path, "dac", {"model_type": "dac"}))
+    assert not _is_snac(_hf_dir(tmp_path, "partial", {"vq_strides": [4, 2, 1]}))
+    assert not _is_dac(_hf_dir(tmp_path, "snac3", SNAC_CONFIG))
+
+
+def test_a_row_is_one_coarsest_frame_and_that_is_one_formula(tmp_path):
+    """`sum(coarse // stride)`, which is where a multi-rate codec stops agreeing with its own codebook
+    count -- and where a uniform one still does, with no branch.
+
+    This is the whole of what SNAC tested about "codes in, frame-major": 3 codebooks, 7 ids in a row.
+    """
+    config = _build_snac(tmp_path, "/tmp/x.gguf")
+    config._vq_strides = [4, 2, 1]
+    assert (config._coarse_stride, config._codes_per_frame) == (4, 7)
+    config._vq_strides = [1, 1, 1, 1]
+    assert (config._coarse_stride, config._codes_per_frame) == (1, 4)
+    config._vq_strides = [8, 4, 2, 1]
+    assert (config._coarse_stride, config._codes_per_frame) == (8, 15)
+
+
+def test_the_declared_frame_rate_is_the_rate_of_the_ROWS(tmp_path):
+    """A caller sizes a clip in rows, so `codec.frame_rate` has to be the rate of a row -- for SNAC
+    the COARSEST codebook's, one quarter of the codec's own finest.
+
+    And `codec.n_codebooks` stays the row WIDTH, which is the meaning it was given: it is the pairing
+    check between a family-10 LM and its codec (loom-py's `test_codec_pair`), and an LM over SNAC
+    emits 7 ids per step. Reporting the quantizer count here would read true and break that pair.
+    """
+    config = _build_snac(tmp_path, "/tmp/x.gguf")
+    config._vq_strides, config._n_codebooks = [4, 2, 1], 3
+    config._codebook_size, config._sample_rate, config._hop_length = 4096, 24000, 512
+    assert config.hparams() == {
+        "codec.n_codebooks": 7,
+        "codec.codebook_size": 4096,
+        "codec.frame_rate": 24000 / 512 / 4,
+        "sample_rate": 24000,
+    }
 
 
 def test_the_registry_resolves_a_synthetic_dac(tmp_path):
@@ -138,8 +200,8 @@ def _tiny_codec(tmp_path: Path) -> Path:
 def _export(checkpoint: Path, out: Path, **kwargs) -> dict:
     from gguf import GGUFReader
 
-    config = AudioCodecExportConfig(architecture=None, output_path=str(out),
-                                    model_dir=str(checkpoint), **kwargs)
+    kwargs.setdefault("architecture", None)
+    config = AudioCodecExportConfig(output_path=str(out), model_dir=str(checkpoint), **kwargs)
     config.task = "audio-codec"
     config.export()
     reader = GGUFReader(str(out))
@@ -176,6 +238,76 @@ def test_the_output_length_is_a_function_of_the_input_length(tmp_path):
     # layout is frame-major and not the model's own.
     assert "math.floor(#codes / 3)" in exported["driver"]
     assert "loom.run_subgraph('main_topology'" in exported["driver"]
+
+
+def _tiny_snac(tmp_path: Path) -> Path:
+    """A real, randomly-initialised `SNAC`, small enough to trace in a unit test.
+
+    `pytest.importorskip` rather than a vendored stub: SNAC is an optional dependency of this family
+    (`pip install --no-deps snac`), and what is under test is its own multi-rate `from_codes`.
+    """
+    pytest.importorskip("torch")
+    snac = pytest.importorskip("snac")
+    import torch
+
+    out = tmp_path / "tiny-snac"
+    out.mkdir()
+    (out / "config.json").write_text(json.dumps(SNAC_CONFIG))
+    torch.save(snac.SNAC(**SNAC_CONFIG).state_dict(), out / "pytorch_model.bin")
+    return out
+
+
+def test_the_wrapper_slices_the_row_into_the_codebooks_the_model_expects(tmp_path):
+    """The wrapper owes the tensor it took over: its `[1, n_frames, 7]` in must decode to exactly what
+    the package's own `decode` returns for the three-tensor list a caller would have built by hand.
+
+    Byte-identical rather than close -- it is the same arithmetic on the same weights, and the only
+    question is whether the slicing put each id in the right codebook at the right rate. A level-major
+    layout read as anything else still has the right shape, the right length and audio in it.
+    """
+    pytest.importorskip("torch")
+    import torch
+
+    from loom_exporter.audio_codec_export import _CodecDecodeWrapper
+
+    model = CodecFamily.SNAC.load(str(_tiny_snac(tmp_path)))
+    frames = 5
+    rows = torch.randint(0, SNAC_CONFIG["codebook_size"], (1, frames, 7))
+    by_hand = [rows[:, :, 0:1].reshape(1, -1), rows[:, :, 1:3].reshape(1, -1),
+               rows[:, :, 3:7].reshape(1, -1)]
+    assert [tuple(c.shape) for c in by_hand] == [(1, 5), (1, 10), (1, 20)]
+    with torch.no_grad():
+        expected = model.decode(by_hand).reshape(1, -1)
+        got = _CodecDecodeWrapper(model, CodecFamily.SNAC)(rows)
+    assert torch.equal(got, expected)
+
+
+def test_a_multi_rate_codec_keeps_the_length_in_the_root_axis(tmp_path):
+    """The same assertion the DAC test makes, on the leaf that could plausibly have lost it: three
+    slices at three rates, each of which has to stay an expression in `n_codes`.
+
+    The three level crops are the check that matters -- `['1', n_codes, '1']`, `['2', ...]`,
+    `['4', ...]` -- because a slice that baked its length would still decode, at the traced number of
+    frames, forever.
+    """
+    pytest.importorskip("coremltools")
+    pytest.importorskip("snac")
+    exported = _export(_tiny_snac(tmp_path), tmp_path / "tiny-snac.gguf", n_frames=8,
+                       family=CodecFamily.SNAC, architecture="snac")
+    topo = exported["topology"]
+
+    assert {i["name"]: i["shape"] for i in topo["inputs"]} == {"codes": ["7", "n_codes", "1"]}
+    assert exported["n_codebooks"] == 7 and exported["sample_rate"] == 24000
+    assert "math.floor(#codes / 7)" in exported["driver"]
+
+    crops = [n["attrs"]["shape"] for n in topo["nodes"] if n["op"] == "VIEW"]
+    assert [c for c in crops if c[1:] == ["n_codes", "1"]][:3] == [
+        ["1", "n_codes", "1"], ["2", "n_codes", "1"], ["4", "n_codes", "1"]
+    ], f"the per-level slices are not the three rates: {crops}"
+    assert all(any("n_codes" in str(d) for d in c) for c in crops), (
+        f"crop shapes with no dynamic axis in them: "
+        f"{[c for c in crops if not any('n_codes' in str(d) for d in c)]}"
+    )
 
 
 def test_the_traced_length_does_not_reach_the_graph(tmp_path):

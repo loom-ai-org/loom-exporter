@@ -20,8 +20,9 @@ version is subtly wrong:
   *correct*: the codebook count is a property of the checkpoint, not of the input, exactly as a token
   classifier's label count is. So there is no hparam the driver reads, no Lua loop, and no engine
   primitive -- the same finding family 12 produced, one family over.
-* **Codes arrive frame-major, `[1, n_frames, n_codebooks]`, and are transposed inside the wrapper.**
-  The model's own layout is `[1, n_codebooks, n_frames]`, and declaring it that way breaks the driver:
+* **Codes arrive frame-major, `[1, n_frames, codes_per_frame]`, and each codec adapts that to its own
+  layout.** DAC's own layout is `[1, n_codebooks, n_frames]` -- one transpose -- and declaring THAT as
+  the contract breaks the driver:
   `apply_monolithic_export` derives `n_tokens` as `Len(first_input) / shape[2]`, so a trailing axis
   that is the DYNAMIC one leaves the divisor at 1 and the driver counts `n_codebooks * n_frames`
   frames. Frame-major is also the better caller contract -- an AR LM emits all N codes for frame *t*
@@ -31,6 +32,30 @@ version is subtly wrong:
   a property of the LM, not of the codec -- DAC knows nothing about it. It belongs to family 10's
   driver, and putting it in this contract would make every codec carry a fact only some of its callers
   have. See [ADR-020].
+
+**The third leaf is what the layout claim was waiting for, and the claim holds.** SNAC's
+`vq_strides = [4, 2, 1]` puts its three codebooks at three DIFFERENT frame rates -- codebook 0 emits
+one code where codebook 2 emits four -- which is the one thing "codes in, frame-major" had never been
+asked. It survives, with the row read as the COARSEST codebook's frame: a row is
+`sum(coarse // stride)` codes wide -- 7 for SNAC, and exactly `n_codebooks` for a uniform codec, which
+is why ONE formula covers both -- laid out level-major, and the wrapper slices the row back into one
+tensor per codebook. It is also the layout the caller already has: an AR LM over SNAC emits those same
+7 ids per step. The alternative -- one input per codebook -- is expressible (`declared_axes` would
+carry the 2x and 4x, as Kokoro's vocoder phase does) and worse: three arrays for a caller to keep in
+step, for a codec whose own `decode` takes a list only because Python has lists.
+
+**SNAC's decode is STOCHASTIC, and this exports its mean.** `NoiseBlock` computes
+`x + randn(B, 1, T) * linear(x)` at four points in the decoder, so the reference model returns a
+different waveform for the same codes on every call. A trace BAKES that `randn` as a constant at the
+traced length, which is a silent wrong answer at every other length, so it cannot be left alone; and
+no node in a topology can draw it, because a topology is a pure graph `GraphBuilder` builds once and
+reuses (`topology_ops._op_random` says exactly this). What COULD carry it is the host RNG every
+stochastic model here already uses -- `loom.gaussian_array`, four extra inputs at lengths that are
+exact multiples of the root axis, the caller's contract untouched. It is not built because the term is
+smaller than the model's own variance: dropping it moves the waveform 2.4% in relative RMS, where two
+decodes of the SAME codes under different seeds differ by 3.1% -- the deterministic decode sits INSIDE
+the model's own sample-to-sample spread, nearer the centre of it than any sample is. ADR-029 has what
+it would cost and what measurement would reopen it.
 
 The modality pair is `audio_codes -> audio`, NOT `token_ids -> audio`: ADR-020 argues that at length,
 and the short version is that a file declaring `token_ids` here resolves to `text2speech` and gets
@@ -92,6 +117,37 @@ ENCODEC_BLOCKERS = (
 )
 
 
+SNAC_MISSING = (
+    "SNAC is not a transformers architecture -- it ships as its own MIT-licensed package, which this "
+    "family imports lazily so that the other leaves need no extra dependency. Install it with "
+    "`pip install --no-deps snac` (its unpinned `huggingface-hub` requirement will otherwise drag the "
+    "export venv to 1.x, which transformers 4.x refuses to import against)."
+)
+
+
+def _patch_snac(layers) -> None:
+    """The two class-level rewrites SNAC's decode needs to trace. Applied at `load`, not at import,
+    because the package is optional -- see `SNAC_MISSING`.
+
+    **`Snake1d`, because `snake` is `@torch.jit.script`.** Its body reshapes through
+    `x.reshape(shape[0], shape[1], -1)`, and a scripted function's `x.shape[i]` survives inlining as a
+    real `__getitem__` on a shape the converter only knows symbolically: `AssertionError: Item
+    selection is supported only on python list/tuple objects`, at the first of the decoder's 29
+    snakes. The reshape is a NO-OP for the rank-3 input every one of them gets -- `alpha` is
+    `[1, C, 1]` and broadcasts against `[B, C, T]` directly -- so the patch is the same arithmetic
+    with the two reshapes removed, not an approximation of it.
+
+    **`NoiseBlock`, because the decode is stochastic.** See the module docstring: this leaves the
+    conditional mean, which is the only deterministic output the model actually has.
+    """
+    import torch as _torch
+
+    layers.Snake1d.forward = (
+        lambda self, x: x + (self.alpha + 1e-9).reciprocal() * _torch.sin(self.alpha * x).pow(2)
+    )
+    layers.NoiseBlock.forward = lambda self, x: x
+
+
 class CodecFamily(Enum):
     """Which codec this is, as the three things that genuinely differ between them.
 
@@ -104,21 +160,41 @@ class CodecFamily(Enum):
     So what is shared is stated by the parts that are NOT here: the frame-major caller layout, the
     dynamic frame axis, the driver, the contract, and the fact that neither needed an engine
     primitive. A third codec adds a member, not a module.
+
+    THE THIRD LEAF MOVED ONE THING ACROSS THE LINE. `decode` used to take the model's own
+    `[1, n_codebooks, n_frames]` and the wrapper owned the transpose, which read as "the adaptation is
+    one op, shared". SNAC's is a slice per codebook, so the adaptation is per-codec after all: `decode`
+    now takes the CALLER's frame-major matrix and each member states how its own model wants it. The
+    wrapper keeps only what is genuinely common -- the flattening of the returned waveform.
     """
 
     DAC = "dac"
     ENCODEC = "encodec"
+    SNAC = "snac"
 
     def load(self, model_dir: str):
-        import transformers
-
         if self is CodecFamily.ENCODEC:
             raise NotImplementedError(ENCODEC_BLOCKERS)
+        if self is CodecFamily.SNAC:
+            try:
+                from snac import SNAC
+                from snac import layers as snac_layers
+            except ImportError as exc:                       # pragma: no cover - env-dependent
+                raise ImportError(SNAC_MISSING) from exc
+            _patch_snac(snac_layers)
+            # `from_pretrained` takes a local directory (it branches on `os.path.isdir`) and reads the
+            # `config.json` + `pytorch_model.bin` pair this checkpoint ships. There is no safetensors
+            # variant on the Hub, and no `dtype` argument: the package builds at F32 and stays there.
+            return SNAC.from_pretrained(model_dir).eval()
+
+        import transformers
+
         cls = {CodecFamily.DAC: "DacModel", CodecFamily.ENCODEC: "EncodecModel"}[self]
         return getattr(transformers, cls).from_pretrained(model_dir, dtype=torch.float32).eval()
 
     def decode(self, model, codes):
-        """`codes` is `[1, n_codebooks, n_frames]`; returns the waveform, batch axis included.
+        """`codes` is the CALLER's `[1, n_frames, codes_per_frame]`; returns the waveform with its
+        batch axis still on.
 
         EnCodec's public `decode` is CHUNKED -- its first axis is a chunk index, and its Python loop
         over chunks unrolls to one iteration at trace time, which is what a caller that hands over a
@@ -126,6 +202,22 @@ class CodecFamily(Enum):
         for every checkpoint this targets, and a normalised one would need the scale as a second input
         rather than a constant, which is a different contract.
         """
+        if self is CodecFamily.SNAC:
+            # A row is one COARSEST-codebook frame, level-major: codebook 0's single id, then
+            # codebook 1's `coarse // stride` ids for that span, and so on. The reshape is what turns
+            # the level's columns back into consecutive frames -- reading a `[1, n_frames, k]` slice
+            # row-major gives `f0s0 f0s1 f1s0 f1s1 ...`, which is exactly that level's own sequence.
+            # `-1` rather than an arithmetic expression so the frame axis stays symbolic.
+            strides, out, column = model.vq_strides, [], 0
+            for stride in strides:
+                width = strides[0] // stride
+                out.append(codes[:, :, column:column + width].reshape(1, -1))
+                column += width
+            # `from_codes` then does the repeat_interleave back up to the finest rate itself. Left to
+            # the model rather than lifted into this slicing: it is the model's arithmetic, and it
+            # converts (MIL `tile`, one per non-unit stride) without help.
+            return model.decode(out)
+        codes = codes.transpose(1, 2)                        # -> [1, n_codebooks, n_frames]
         if self is CodecFamily.DAC:
             return model.decode(audio_codes=codes).audio_values
         if not getattr(model.config, "normalize", False):
@@ -136,28 +228,42 @@ class CodecFamily(Enum):
             f"family exports the un-normalised path only."
         )
 
-    def geometry(self, config) -> dict:
-        """`{n_codebooks, codebook_size, sample_rate, hop_length}`, read off the checkpoint.
+    def geometry(self, model) -> dict:
+        """`{n_codebooks, codebook_size, sample_rate, hop_length, vq_strides}`, read off the
+        checkpoint.
 
-        The two codecs spell every one of these differently except `codebook_size`, which is the
-        reason this is a method rather than four attribute reads in `load_model`.
+        No two of these codecs spell any of it the same way except `codebook_size`, which is why this
+        is a method rather than four attribute reads in `load_model` -- and SNAC does not even keep
+        them in the same PLACE, having no `config` object at all: the package builds the geometry onto
+        the module in `__init__`. So this takes the loaded model, not a config.
+
+        `vq_strides` is the per-codebook downsampling factor, and it is what makes SNAC's rows wider
+        than its codebook count. A uniform codec reports `[1] * n_codebooks`, which is not a special
+        case anywhere downstream: every derived quantity falls out of the same formula.
         """
+        if self is CodecFamily.SNAC:
+            return dict(n_codebooks=len(model.vq_strides), codebook_size=int(model.codebook_size),
+                        sample_rate=int(model.sampling_rate), hop_length=int(model.hop_length),
+                        vq_strides=[int(s) for s in model.vq_strides])
+        config = model.config
         if self is CodecFamily.DAC:
-            return dict(n_codebooks=int(config.n_codebooks), codebook_size=int(config.codebook_size),
-                        sample_rate=int(config.sampling_rate), hop_length=int(config.hop_length))
-        # EnCodec's `num_quantizers` is the count for the bandwidth the checkpoint was configured at,
-        # which for the 32 kHz model is the 4 MusicGen emits. A checkpoint offering several bandwidths
-        # would need the caller to name one -- it is a property of the EXPORT, not of the file -- and
-        # that is why this reads the config rather than a maximum.
-        return dict(n_codebooks=int(config.num_quantizers), codebook_size=int(config.codebook_size),
-                    sample_rate=int(config.sampling_rate), hop_length=int(config.hop_length))
+            n_codebooks = int(config.n_codebooks)
+        else:
+            # EnCodec's `num_quantizers` is the count for the bandwidth the checkpoint was configured
+            # at, which for the 32 kHz model is the 4 MusicGen emits. A checkpoint offering several
+            # bandwidths would need the caller to name one -- it is a property of the EXPORT, not of
+            # the file -- and that is why this reads the config rather than a maximum.
+            n_codebooks = int(config.num_quantizers)
+        return dict(n_codebooks=n_codebooks, codebook_size=int(config.codebook_size),
+                    sample_rate=int(config.sampling_rate), hop_length=int(config.hop_length),
+                    vq_strides=[1] * n_codebooks)
 
 
 class _CodecDecodeWrapper(torch.nn.Module):
     """Reduces a codec to `(codes) -> waveform`, taking codes frame-major.
 
-    The transpose is the whole of the caller-facing adaptation and it is one op; see the module
-    docstring for why the caller's layout is the transpose of the model's own.
+    Down to one op now that the per-codec half of the adaptation lives on `CodecFamily.decode`; see
+    that method for why the caller's layout is not any of these models' own.
     """
 
     def __init__(self, model, family: "CodecFamily"):
@@ -166,10 +272,10 @@ class _CodecDecodeWrapper(torch.nn.Module):
         self.family = family
 
     def forward(self, codes):
-        # [1, n_frames, n_codebooks] -> [1, n_codebooks, n_frames], which is what `decode` expects.
-        waveform = self.family.decode(self.model, codes.transpose(1, 2))
-        # EnCodec returns [batch, channels, samples] where DAC returns [batch, samples]; one squeeze
-        # rather than two shapes reaching the topology, so the driver and the contract stay identical.
+        waveform = self.family.decode(self.model, codes)
+        # EnCodec and SNAC return [batch, channels, samples] where DAC returns [batch, samples]; one
+        # reshape rather than two shapes reaching the topology, so the driver and the contract stay
+        # identical across the family.
         return waveform.reshape(1, -1)
 
 
@@ -203,6 +309,7 @@ class AudioCodecExportConfig(LoomExportConfig):
     _codebook_size: Optional[int] = None
     _sample_rate: Optional[int] = None
     _hop_length: Optional[int] = None
+    _vq_strides: Optional[list] = None
 
     __unchecked__ = {
         "family": Unchecked(
@@ -231,26 +338,52 @@ class AudioCodecExportConfig(LoomExportConfig):
         "_resolved_architecture": Unchecked("load_model()'s output, cached so export_architecture() "
                                             "can read it back. A field only because this is a dataclass"),
         "_n_codebooks": Unchecked(
-            "READ off the checkpoint's own config during load_model, not declared -- it is the width "
-            "of the matrix a caller passes, and the checkpoint is the only authority on it."
+            "READ off the checkpoint's own config during load_model, not declared -- it is how many "
+            "codebooks the quantizer has, and the checkpoint is the only authority on it."
         ),
         "_codebook_size": Unchecked("same: the checkpoint's own config"),
         "_sample_rate": Unchecked("same"),
         "_hop_length": Unchecked(
-            "same. The frame rate the contract declares is `sample_rate / hop_length`, derived rather "
-            "than declared, because a codec states the two and never their quotient."
+            "same. The frame rate the contract declares is `sample_rate / hop_length / coarsest "
+            "stride`, derived rather than declared, because a codec states the parts and never their "
+            "quotient."
+        ),
+        "_vq_strides": Unchecked(
+            "same: the per-codebook downsampling factors, `[1] * n_codebooks` for a uniform codec. "
+            "`codes_per_frame` and `frame_rate` are both derived from it, so it is the one field here "
+            "a wrong value would corrupt silently -- which is why it is read rather than declared."
         ),
     }
+
+    @property
+    def _coarse_stride(self) -> int:
+        """The coarsest codebook's stride, which is what one ROW of the caller's matrix spans.
+
+        `vq_strides` is descending in every checkpoint that has one, but `max` rather than `[0]`: the
+        row's span is a property of the set, and nothing here depends on the order.
+        """
+        return max(self._vq_strides)
+
+    @property
+    def _codes_per_frame(self) -> int:
+        """The width of the caller's matrix: how many ids belong to one coarsest-codebook frame.
+
+        `sum(coarse // stride)`, which is `n_codebooks` exactly when every stride is 1 -- so a uniform
+        codec is not a branch here, it is the same formula with a factor of one.
+        """
+        return sum(self._coarse_stride // stride for stride in self._vq_strides)
 
     def load_model(self):
         print(f"Loading {self.family.value} codec from {self.model_dir}...")
         model = self.family.load(self.model_dir)
-        geometry = self.family.geometry(model.config)
-        self._resolved_architecture = self.architecture or getattr(model.config, "model_type", None)
+        geometry = self.family.geometry(model)
+        config = getattr(model, "config", None)
+        self._resolved_architecture = self.architecture or getattr(config, "model_type", None)
         self._n_codebooks = geometry["n_codebooks"]
         self._codebook_size = geometry["codebook_size"]
         self._sample_rate = geometry["sample_rate"]
         self._hop_length = geometry["hop_length"]
+        self._vq_strides = geometry["vq_strides"]
         return model
 
     def export_architecture(self) -> str:
@@ -259,15 +392,16 @@ class AudioCodecExportConfig(LoomExportConfig):
     def build_trace(self, model):
         """`Flattened`'s hook. One input, one symbolic axis.
 
-        The codebook axis is declared as the checkpoint's own N rather than as a range: it is a
+        The code axis is declared as the checkpoint's own width rather than as a range: it is a
         property of the model, and a graph that accepted a different width would be accepting codes
         from a different codec.
         """
-        print(f"Tracing the codec decoder (dummy n_frames={self.n_frames})...")
-        dummy = (torch.zeros((1, self.n_frames, self._n_codebooks), dtype=torch.long),)
+        width = self._codes_per_frame
+        print(f"Tracing the codec decoder (dummy n_frames={self.n_frames}, {width} codes/frame)...")
+        dummy = (torch.zeros((1, self.n_frames, width), dtype=torch.long),)
         frames = ct.RangeDim(1, self.max_frames)
         mil_inputs = [
-            ct.TensorType(name="codes", shape=(1, frames, self._n_codebooks), dtype=np.int32),
+            ct.TensorType(name="codes", shape=(1, frames, width), dtype=np.int32),
         ]
         return _CodecDecodeWrapper(model, self.family), dummy, mil_inputs
 
@@ -285,15 +419,32 @@ class AudioCodecExportConfig(LoomExportConfig):
         matrix a caller passes, `codebook_size` bounds the ids in it, `frame_rate` is how a caller
         sizes a clip, and `sample_rate` is what the returned floats mean. None of them is read by the
         driver, which is handed the codes and needs no geometry to pass them on.
+
+        **`codec.n_codebooks` is CODE STREAMS PER FRAME, not the quantizer count**, and the two part
+        company for the first time here: SNAC's three codebooks put 7 ids in a row. The key keeps the
+        meaning it was given and documented with -- it is the pairing check between a family-10 LM and
+        its codec (`loom-py`'s `tests/gate/test_codec_pair.py` asserts the two files agree on it, and
+        uses it as the row width), and an LM over SNAC emits 7 per step. A key that switched to 3 here
+        would break that pair while still reading true.
+
+        **The stride list itself is NOT written, and the reason is the writer's own rule.** `hparams()`
+        writes GGUF scalars a host reads with `hparam_u32`/`hparam_f32`; `[4, 2, 1]` is structured, and
+        `write_gguf` refuses it by design. Nothing needs it: the four keys above are what a caller
+        builds the matrix and interprets the output with, `codec.frame_rate` already carries the row
+        rate (11.72 Hz for SNAC, the COARSEST codebook's), and the driver reads none of them. What the
+        strides describe is the order of the columns WITHIN a row, which is documentation for whoever
+        rearranges an LM's output into it -- the model card's job, not a number's.
         """
         if self._n_codebooks is None:
             return {}   # built without a checkpoint, e.g. by component_registry.usage()
-        return {
-            "codec.n_codebooks": self._n_codebooks,
+        hparams = {
+            "codec.n_codebooks": self._codes_per_frame,
             "codec.codebook_size": self._codebook_size,
-            "codec.frame_rate": float(self._sample_rate) / float(self._hop_length),
+            "codec.frame_rate": (float(self._sample_rate) / float(self._hop_length)
+                                 / float(self._coarse_stride)),
             "sample_rate": self._sample_rate,
         }
+        return hparams
 
     def contract(self) -> dict:
         return super().contract()
@@ -344,6 +495,23 @@ def _is_encodec(path: Path) -> bool:
     return cfg is not None and cfg.get("model_type") == "encodec"
 
 
+def _is_snac(path: Path) -> bool:
+    """A SNAC checkpoint, which declares no `model_type` at all -- so this reads the SHAPE of the
+    config instead.
+
+    `config.json` here is the kwargs of `SNAC.__init__` dumped verbatim, because that is exactly what
+    `SNAC.from_config` passes back: no `architectures`, no `model_type`, nothing naming the class.
+    `vq_strides` is the discriminating key -- no HF codec config has it, and no SNAC config lacks it
+    -- and `encoder_rates`/`decoder_rates` are required alongside so that a future package reusing the
+    name does not get loaded through the wrong loader. The `model_type` check is what keeps this from
+    claiming a checkpoint one of the other recognizers owns: a config with both would be a config for
+    a model this leaf cannot drive.
+    """
+    cfg = _hf_config(path)
+    return (cfg is not None and "model_type" not in cfg
+            and all(key in cfg for key in ("vq_strides", "encoder_rates", "decoder_rates")))
+
+
 def _build_dac(path: Path, output_path: str) -> LoomExportConfig:
     return AudioCodecExportConfig(architecture=None, output_path=output_path, model_dir=str(path),
                                   family=CodecFamily.DAC)
@@ -352,6 +520,13 @@ def _build_dac(path: Path, output_path: str) -> LoomExportConfig:
 def _build_encodec(path: Path, output_path: str) -> LoomExportConfig:
     return AudioCodecExportConfig(architecture=None, output_path=output_path, model_dir=str(path),
                                   family=CodecFamily.ENCODEC)
+
+
+def _build_snac(path: Path, output_path: str) -> LoomExportConfig:
+    # The one leaf that must be TOLD its architecture: `load_model` reads `config.model_type` for it,
+    # and a SNAC model has no `config` at all.
+    return AudioCodecExportConfig(architecture="snac", output_path=output_path, model_dir=str(path),
+                                  family=CodecFamily.SNAC)
 
 
 def register(registry) -> None:
@@ -363,5 +538,6 @@ def register(registry) -> None:
         recognizers=[
             ModelRecognizer(name="dac", detect=_is_dac, build_config=_build_dac),
             ModelRecognizer(name="encodec", detect=_is_encodec, build_config=_build_encodec),
+            ModelRecognizer(name="snac", detect=_is_snac, build_config=_build_snac),
         ],
     ))
