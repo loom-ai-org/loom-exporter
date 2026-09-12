@@ -80,11 +80,21 @@ class TestResolution(unittest.TestCase):
 
 class TestADriverCarriesOnlyWhatItUses(unittest.TestCase):
     def test_the_prelude_is_the_transitive_closure_and_nothing_else(self):
-        text = "\n".join(LuaLibrary(uses=("run_proj1x1",)).prelude(DriverContext(topologies={})))
+        """`run_resblk_stack` still converts its caller's rows on the way in, so it pulls
+        `to_layout_a`; `run_proj1x1` pulls nothing at all now that both of its ends are retained
+        references (ADR-031). The pair is the closure test either way: one function with a dependency
+        and one without."""
+        text = "\n".join(LuaLibrary(uses=("run_resblk_stack",)).prelude(DriverContext(topologies={})))
         self.assertIn("local function to_layout_a", text)
-        self.assertIn("local function run_proj1x1", text)
-        self.assertNotIn("adpm2", text)
-        self.assertNotIn("run_bi_lstm", text)
+        self.assertIn("local function run_resblk_stack", text)
+        # The DEFINITION, not the name: a docstring that mentions a sibling function is not that
+        # function being emitted, and asserting on the bare name makes prose a test failure.
+        self.assertNotIn("local function adpm2", text)
+        self.assertNotIn("local function run_bi_lstm", text)
+
+        alone = "\n".join(LuaLibrary(uses=("run_proj1x1",)).prelude(DriverContext(topologies={})))
+        self.assertIn("local function run_proj1x1", alone)
+        self.assertNotIn("local function to_layout_a", alone)
 
     def test_unreferenced_reports_a_declaration_nothing_calls(self):
         library = LuaLibrary(uses=("array_sum", "compute_wsum"))

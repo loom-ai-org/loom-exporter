@@ -6,8 +6,10 @@
 -- was two full T x dim rebuilds per edge for a value nobody looked at. Each block retains instead and
 -- the next names it; `loom.output_shape` supplies the row count, since a block may change it.
 --
--- The two conversions that remain are the two that are genuinely host-side: the caller's rows coming
--- in (its producer is `run_bi_lstm`'s interleave) and the stack's result going out.
+-- **It returns a module NAME, not rows.** Its only consumer is `run_proj1x1`, which is a graph -- so
+-- converting the last block's output back into Lua here would be building a table for nobody. The one
+-- conversion left is the caller's rows coming IN, whose producer interleaves two LSTM directions
+-- host-side and so is genuinely a Lua value.
 local function run_resblk_stack(name_prefix, x_rows, style)
     local T = #x_rows
     local dim = #x_rows[1]
@@ -19,7 +21,7 @@ local function run_resblk_stack(name_prefix, x_rows, style)
     local prev = name_prefix .. "_block0"
     for i = 1, 2 do
         -- `shape[1]`, not `shape[2]`: layout A is `flat[c * T + t]`, so the TIME axis is the fastest
-        -- one (ne[0]) and the channel count is ne[1] -- the same reading `from_layout_a` gets below.
+        -- one (ne[0]) and the channel count is ne[1] -- the same reading the caller's rows get.
         -- The engine's own shape check caught this the first time round, which is that check earning
         -- its keep: marshalling through Lua compared element counts only, and [66,512] and [512,512]
         -- are not the same tensor even though a Lua table of 33792 numbers cannot tell you so.
@@ -28,6 +30,5 @@ local function run_resblk_stack(name_prefix, x_rows, style)
                                       {x = {from = prev}, style = style})
         prev = name_prefix .. "_block" .. i
     end
-    local flat, shape = loom.get_output(prev, 1)
-    return from_layout_a(flat, shape[1], shape[2])
+    return prev
 end

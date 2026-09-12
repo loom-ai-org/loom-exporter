@@ -81,7 +81,7 @@ differs is entirely what the host does with the one output. The family names its
 | `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 4 | hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
 | `export_constants` | `ExportConstants` | statements | 0 | 1 | dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
-| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
+| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 4 | dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
 | `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | dia, encodec, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
 | `recurrent_call` | `RecurrentCall` | statements | 1 | 8 | encodec |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 7 | matcha, supertonic |
@@ -265,15 +265,15 @@ namespace their caller passes, and that column is the shape a caller's `HelperCa
 | `round_half_to_even` | — | — | *`predict_durations`* only |
 | `to_row_major` | — | — | kokoro, styletts2 |
 | `from_row_major` | — | — | kokoro, styletts2 |
-| `to_layout_a` | — | — | *`run_proj1x1`, `run_resblk_stack`* only |
+| `to_layout_a` | — | — | *`run_resblk_stack`* only |
 | `from_layout_a` | — | — | kokoro, styletts2 |
 | `durations_from_logw` | — | — | matcha, vits |
 | `pad_last_to_multiple` | — | — | matcha |
 | `repeat_by_duration_tfast` | — | — | matcha |
 | `predict_durations` | `sigmoid`, `round_half_to_even` | — | kokoro, styletts2 |
 | `run_bi_lstm` | — | `<ns>_fwd`, `<ns>_bwd` ← `layer_input`, `h_prev`, `c_prev` | kokoro, styletts2 |
-| `run_resblk_stack` | `to_layout_a`, `from_layout_a` | `<ns>_block0`, `<ns>_block1`, `<ns>_block2` ← `x`, `style` | kokoro, styletts2 |
-| `run_proj1x1` | `to_layout_a` | `<ns>` ← `x` | kokoro, styletts2 |
+| `run_resblk_stack` | `to_layout_a` | `<ns>_block0`, `<ns>_block1`, `<ns>_block2` ← `x`, `style` | kokoro, styletts2 |
+| `run_proj1x1` | — | `<ns>` ← `x` | kokoro, styletts2 |
 | `compute_wsum` | — | — | kokoro, styletts2 |
 | `karras_schedule` | — | — | styletts2 |
 | `adpm2_step` | — | — | *`adpm2_sample`* only |
