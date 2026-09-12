@@ -106,6 +106,16 @@ class BinOp(Expr):
     def render(self) -> str:
         if self.op == "floordiv":
             return f"math.floor({self.left.render()} / {self.right.render()})"
+        if self.op == "//":
+            # The engine embeds LuaJIT, which is Lua 5.1; `//` arrived in 5.3. Nothing syntax-checks
+            # the emitted driver at export time, so writing it produces a GGUF that exports, writes
+            # and loads, and then dies at `load_script` with `unexpected symbol near '/'` the first
+            # time anything runs it. `floordiv` above is the spelling that works, and this says so at
+            # the point someone reaches for the other one.
+            raise DriverIRError(
+                "BinOp('//') is Lua 5.3 and the engine runs LuaJIT (5.1). Use BinOp('floordiv'), "
+                "which renders as math.floor(a / b)."
+            )
         return f"({self.left.render()} {self.op} {self.right.render()})"
 
 

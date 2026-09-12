@@ -252,6 +252,129 @@ class MonolithicCall(DriverComponent):
 
 
 @dataclass
+class ChunkedCodecCall(DriverComponent):
+    """A codec decoder that runs its graph over BOUNDED windows of the code sequence and stitches the
+    waveform back together -- family 11's second call shape, and its first host-side loop.
+
+    `encodec_export` wrote the sentence this component answers: "a chunked one is a different driver,
+    not a longer call." Qwen3-TTS's 12 Hz tokenizer is the first leaf that needs it, for two
+    independent reasons and either would be enough.
+
+    **It is what the reference computes.** `Qwen3TTSTokenizerV2Model.decode` calls
+    `chunked_decode(chunk_size=300, left_context_size=25)`, so past 300 frames the model's own answer
+    IS a sequence of bounded calls. Measured on real codes: whole-sequence and chunked are bit-identical
+    through 299 frames and then diverge -- 1.3e-3 RMS at 301 against a 1.24e-1 signal, and 1.11e-2 at
+    700, which is 8.9% and squarely inside the band [Retro-043] records a listener hearing.
+
+    **And it is what makes the decoder runnable.** This one has a TRANSFORMER between the quantizer and
+    the upsampling stack, where DAC, SNAC and EnCodec are convolutional throughout. Attention is
+    quadratic in the frame axis, so a whole-sequence call at a 4096-frame ceiling would build a
+    4096x4096 score matrix in each of 8 layers -- about a gigabyte -- on an engine whose reason for
+    existing is edge devices. Chunked, no call ever exceeds `chunk + context` frames and the cost is
+    flat in clip length. That is why the export declares `max_frames = 325` rather than trimming a
+    larger number: the graph is never asked for more because the driver never asks.
+
+    **The left context is dropped from the OUTPUT, not from the input**, which is what makes the seam
+    continuous: each chunk re-decodes `context` frames it has already emitted so that the first frame it
+    keeps has a populated receptive field, then discards `context * hop` samples from the front. So
+    every output sample is produced exactly once, by the call that had the most history for it.
+
+    The loop carries no state between iterations -- no cache, no overlap-add, no window function. A
+    chunk is a self-contained call, which is why this is a `SubgraphCall` in a `While` and not a
+    recurrence needing an engine binding.
+    """
+
+    topology: str = "main_topology"
+    inputs: Tuple[str, ...] = ()
+    # The caller-supplied codes array, flat and frame-major: `codes_per_frame` ids per frame.
+    codes_var: str = "codes"
+    codes_per_frame: int = 0
+    # Samples one frame decodes to -- the checkpoint's `decode_upsample_rate`, 1920 here. What the
+    # front of each chunk's output is trimmed by, in units of `context` frames.
+    hop_length: int = 0
+    chunk_frames: int = 0
+    left_context_frames: int = 0
+    out_var: str = "_wav"
+
+    __links__ = {
+        "topology": TopologyName(),
+        "inputs": TopologyInput(FieldRef("topology"), exact=True),
+    }
+    __unchecked__ = {
+        "codes_var": Unchecked(
+            "the one declared input this loop slices, bound by `DriverInputs` earlier in the same "
+            "function -- `driver_ir.validate` runs over the assembled function and is the authority "
+            "on whether the name is defined before it is read."
+        ),
+        "codes_per_frame": Unchecked(
+            "the width of the caller's matrix, which the EXPORT computed as `sum(coarse // stride)` "
+            "and declared to coremltools as the codes axis. The graph's own input shape is the second "
+            "reading of it and `TopologyInput` checks this call against it."
+        ),
+        "hop_length": Unchecked("read off the checkpoint by `CodecFamily.geometry`, never declared"),
+        "chunk_frames": Unchecked(
+            "the reference implementation's `chunked_decode` default, copied so the two agree -- "
+            "see `AudioCodecExportConfig.chunk_frames`, which is where the checkpoint has nothing to "
+            "check it against and a test compares it to the function signature instead."
+        ),
+        "left_context_frames": Unchecked("same: `chunked_decode`'s `left_context_size` default"),
+        "out_var": Unchecked("a local this component binds rather than one it refers to"),
+    }
+
+    def emit(self, ctx: DriverContext) -> List:
+        width, hop = Lit(self.codes_per_frame), Lit(self.hop_length)
+        n_frames, start, stop = Var("_n_frames"), Var("_start"), Var("_stop")
+        context, first, chunk = Var("_context"), Var("_first"), Var("_chunk")
+        out, shape, i = Var("_chunk_wav"), Var("_chunk_shape"), Var("_i")
+        return [
+            # `math.floor(a / b)`, not `a // b`: the engine embeds LuaJIT, which is Lua 5.1, and the
+            # integer-division operator arrived in 5.3. The emitted driver is not syntax-checked at
+            # export time, so this surfaces as `unexpected symbol near '/'` from `load_script` when the
+            # GGUF is first run -- see `driver_ir.BinOp`, which now refuses the operator outright.
+            # The caller's array is a whole number of frames by the contract; a partial one would be a
+            # caller error the graph rejects on its own shape anyway.
+            Local(n_frames.name, BinOp("floordiv", Len(Var(self.codes_var)), width)),
+            Local(self.out_var, TableLit({})),
+            Local(start.name, Lit(0)),
+            While(cond=BinOp("<", start, n_frames), body=[
+                Local(stop.name, Call("math.min",
+                                      [BinOp("+", start, Lit(self.chunk_frames)), n_frames])),
+                # The reference's own spelling: full context once there IS one, and everything
+                # before `start` while there is not -- which at `start = 0` is zero, so the first
+                # chunk trims nothing.
+                Local(context.name, Call("math.min", [start, Lit(self.left_context_frames)])),
+                Local(first.name, BinOp("-", start, context)),
+                # 1-based, so the `+ 1` is the Lua index convention and not an off-by-one guard.
+                Local(chunk.name, Call("array_slice", [
+                    Var(self.codes_var),
+                    BinOp("+", BinOp("*", first, width), Lit(1)),
+                    BinOp("*", BinOp("-", stop, first), width),
+                ])),
+                SubgraphCall(
+                    outputs=[out.name],
+                    extra_outputs=[shape.name],
+                    module=self.topology,
+                    axes={ctx.root_axis(self.topology): BinOp("-", stop, first), "n_past": Lit(0)},
+                    inputs={name: (chunk if name == self.codes_var else Var(name))
+                            for name in self.inputs},
+                ),
+                # Written at an absolute offset rather than appended, so the loop needs neither `#out`
+                # nor `table.insert` per sample: chunk `[start, stop)` owns exactly the samples
+                # `[start * hop, stop * hop)` of the answer, whatever its context was.
+                NumericFor(var=i.name, start=Lit(1),
+                           stop=BinOp("*", BinOp("-", stop, start), hop), body=[
+                    IndexAssign(
+                        table=Var(self.out_var),
+                        idx=BinOp("+", BinOp("*", start, hop), i),
+                        expr=Index(out, BinOp("+", BinOp("*", context, hop), i)),
+                    ),
+                ]),
+                Assign(start.name, stop),
+            ]),
+        ]
+
+
+@dataclass
 class ChainStage:
     """One `run_subgraph` in a modular chain: which topology, and where each of its declared inputs
     comes from -- the chain variable, an aux output, or a driver-bound local.
@@ -967,17 +1090,32 @@ class CodecDecodeBuilder(DriverBuilder):
     """
 
     inputs: DriverInputs
-    call: MonolithicCall
+    # `MonolithicCall` for a codec whose decode is one call over the whole sequence -- DAC, SNAC --
+    # and `ChunkedCodecCall` for one whose reference decodes in bounded windows. The two emit different
+    # statements and bind different locals, and that is the entire difference between the drivers: the
+    # inputs are the same codes and the epilogue hands back the same waveform either way.
+    call: object
     # Quoted: `DriverReturn` is declared with the peeled multi-phase components, several hundred lines
     # below, and it belongs there -- it is the component every peeled TTS driver ends on. Reusing it
     # rather than adding a fourth epilogue is the point, since "hand back what came out" is one job.
     epilogue: "DriverReturn"
+    # Only the chunked path has a library call (`array_slice`); the single-call leaves emit none, so
+    # their drivers do not move.
+    library: Optional["LuaLibrary"] = None
 
     __links__ = {name: NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN)
                  for name in ("inputs", "call", "epilogue")}
+    __unchecked__ = {
+        "library": CoveredBy(
+            "the same NestedSpec reasoning as the three fields above -- DriverBuilder.build registers "
+            "it with the export's checker like any other component, and LuaLibrary's own link checks "
+            "every name it declares against loom_exporter/lua/. Declared separately only because it "
+            "is optional."
+        ),
+    }
 
     def components(self):
-        return [self.inputs, self.call, self.epilogue]
+        return [c for c in (self.inputs, self.library, self.call, self.epilogue) if c is not None]
 
 
 @dataclass
