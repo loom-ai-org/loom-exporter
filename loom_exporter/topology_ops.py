@@ -2001,17 +2001,51 @@ def _op_conv(self, op, ctx):
     d0 = int(dilations[0]) if isinstance(dilations, (list, tuple, np.ndarray)) else int(dilations)
     g_val = int(groups[0]) if isinstance(groups, (list, tuple, np.ndarray)) else int(groups)
 
-    # Check if it is a depthwise convolution (groups > 1)
-    is_dw = (g_val > 1)
+    # Extract main inputs [x, weight]
+    x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
+    x_var = self.safe_name(x_var_obj.name)
+    weight_obj = op.inputs["weight"]
+    weight_var = self.safe_name(weight_obj.name)
+
+    # DEPTHWISE IS DECIDED BY THE KERNEL, NOT BY `groups > 1`, and the difference is a real case rather
+    # than pedantry. MIL declares a conv weight as [OC, IC/groups, K], so "one input channel per output
+    # channel" -- which is what depthwise MEANS, and what `op_conv_1d_dw`'s batched-per-channel mul_mat
+    # requires -- is `IC/groups == 1`. The two conditions coincide at both ends of the range, which is
+    # why `groups > 1` alone survived eight families: every convolution converted before this was either
+    # dense (groups == 1) or genuinely depthwise (groups == IC), verified over the shipped topologies.
+    # Family 4's positional convolution is neither -- groups=16 over 768 channels -- and under the old
+    # rule it was emitted as CONV_1D_DW and aborted the ENGINE inside ggml_im2col, with no mention of a
+    # model or a channel count (loom.cpp Retro-046).
+    ic_per_group = None
+    weight_shape = getattr(weight_obj, "shape", None)
+    if weight_shape is not None and len(weight_shape) >= 2:
+        # A conv WEIGHT is a constant, so its axes are concrete in every graph seen so far; the guard is
+        # for the shape that is not, where `int()` raises on a sympy symbol rather than returning one.
+        try:
+            ic_per_group = int(weight_shape[1])
+        except (TypeError, ValueError):
+            ic_per_group = None
+    if g_val > 1 and ic_per_group is None:
+        raise NotImplementedError(
+            f"conv op '{op.name}' has groups={g_val} and a weight whose input-channel axis is not a "
+            f"compile-time constant ({weight_shape!r}), so whether it is depthwise or grouped cannot "
+            f"be decided here -- and the two lower to different primitives.")
+
+    is_dw = (g_val > 1 and ic_per_group == 1)
+    is_grouped = (g_val > 1 and not is_dw)
+    if is_grouped and is_2d:
+        # No 2-D grouped convolution exists in any model this exporter has converted, and the engine
+        # has no lowering for one -- `conv_1d_grouped` is 1-D only. Raising names the gap; emitting
+        # CONV_2D and dropping the attr would compute a dense convolution and return a wrong answer.
+        raise NotImplementedError(
+            f"conv op '{op.name}' is a 2-D GROUPED convolution (groups={g_val}, {ic_per_group} input "
+            f"channels per group). CONV_2D reduces over every input channel and CONV_2D_DW needs one "
+            f"per output channel, so neither is it; the 1-D form is handled by `conv_1d_grouped` in "
+            f"src/ops/primitives_conv.cpp and the 2-D one would need its counterpart.")
     if is_dw:
         mapped_op = "CONV_2D_DW" if is_2d else "CONV_1D_DW"
     else:
         mapped_op = "CONV_2D" if is_2d else "CONV_1D"
-
-    # Extract main inputs [x, weight]
-    x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
-    x_var = self.safe_name(x_var_obj.name)
-    weight_var = self.safe_name(op.inputs["weight"].name)
 
     attrs = {"s0": s0, "p0": p0, "d0": d0, "groups": g_val}
     if is_2d:

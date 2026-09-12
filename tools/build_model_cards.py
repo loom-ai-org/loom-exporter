@@ -226,6 +226,29 @@ CATALOG = [
         base_repo="nvidia/stt_en_conformer_ctc_small", license_id="cc-by-4.0", language=["en"],
         title="Conformer-CTC Small (en)", summary="NVIDIA NeMo's small Conformer-CTC English ASR model, exported for loom.cpp.",
     ),
+    # Family 4 (P5): CNN + transformer + CTC. `export_model="hf-ctc-asr"` is the one generic
+    # recognizer, so both leaves name it -- which is the family's whole claim about itself.
+    #
+    # omniASR-CTC-300M-v2 is deliberately NOT here. It is exported and verified against `transformers`
+    # (max |d| 5.45e-04, 549/549 argmax) and it is not shippable: the checkpoint is scale-sensitive and
+    # its own documented processor path, which normalizes, transcribes garbage for English speech. loom
+    # reproduces that exactly, which is the right behaviour and not a model to publish. See Epic-03 §2.
+    ModelCard(
+        slug="hubert-large-ls960-ft", checkpoint=Path("hubert-large-ls960-ft"),
+        export_task="automatic-speech-recognition", export_model="hf-ctc-asr",
+        task_type="automatic-speech-recognition",
+        base_repo="facebook/hubert-large-ls960-ft", license_id="apache-2.0", language=["en"],
+        title="HuBERT Large (LS960 fine-tuned)",
+        summary="Meta's HuBERT Large English CTC ASR model, exported for loom.cpp.",
+    ),
+    ModelCard(
+        slug="data2vec-audio-base-960h", checkpoint=Path("data2vec-audio-base-960h"),
+        export_task="automatic-speech-recognition", export_model="hf-ctc-asr",
+        task_type="automatic-speech-recognition",
+        base_repo="facebook/data2vec-audio-base-960h", license_id="apache-2.0", language=["en"],
+        title="data2vec-audio Base (960h)",
+        summary="Meta's data2vec-audio Base English CTC ASR model, exported for loom.cpp.",
+    ),
     ModelCard(
         slug="parakeet-tdt-0.6b", checkpoint=Path("parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo"),
         export_task="automatic-speech-recognition", export_model="parakeet-tdt",
