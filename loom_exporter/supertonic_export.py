@@ -456,7 +456,7 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
 
         dp_expr, dp_names = bucket_call("dp")
         ttl_expr, ttl_names = bucket_call("ttl_text")
-        vfe_expr, _ = bucket_call("vfe")
+        vfe_expr, vfe_names = bucket_call("vfe")
         return [
             LuaFragment(fragment / "00_header.lua", top_level=True),
             # The numbers the caller used to have to supply (P4.0.8's first follow-up). The three the
@@ -498,7 +498,7 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
                      "    host arithmetic touches it, so marshalling it once would still have put a\n"
                      "    t_text x 256 table through the boundary for a value only a graph reads. ---"),
             FlowMatchingSampler(
-                spec=sampler, result="z", length=t_lat, estimator=vfe_expr,
+                spec=sampler, result="_z_gen", length=t_lat, estimator=vfe_expr,
                 n_elems=BinOp("*", t_lat, lat_dim), n_steps=FieldAccess("inputs", "n_steps"),
                 # By reference, and with the bucket expression the producing call used: the name is
                 # only knowable once the text is measured, which is what `OutputRef.module_expr` and
@@ -510,8 +510,12 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
                      "    text bucket the two encoders above ran at -- see sample_vfe above. ---"),
             SubgraphCallComponent(
                 topology="decoder", outputs=("waveform",), length=t_lat,
-                inputs={"latent": Var("z")},
-                note="--- SpeechDecoder: z (ne=[t_lat,lat_dim]) -> raw waveform ---"),
+                # The integrated state, still in the engine: `loom.run_ode_and_retain` left it in the
+                # estimator's own store and this is its only reader, so the whole sampler runs without
+                # a mel-sized Lua table at any point.
+                inputs={"latent": OutputRef(bucket_topology("vfe", T_TEXT_MAX),
+                                             module_expr=vfe_expr, variants=tuple(vfe_names))},
+                note="--- SpeechDecoder: the sampled latent (ne=[t_lat,lat_dim]) -> raw waveform ---"),
             DriverReturn(values=("waveform",)),
         ]
 
