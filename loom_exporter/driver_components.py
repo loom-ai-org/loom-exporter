@@ -1828,6 +1828,13 @@ class RecurrentCall(DriverComponent):
     engine's own `BiLstmStepper`. This binds the C++ binding instead -- one Lua call per layer, with
     the timestep loop, the h/c carry and the graph reuse all on the far side of the boundary.
 
+    **Use it only for a FIXED-LENGTH sweep.** It is handed a whole sequence and walks it, so it cannot
+    express a recurrence whose own output decides whether to step: a transducer's prediction network
+    advances only when the joint emits a non-blank, which is why `transducer_driver/02_decode.lua`
+    loops in Lua and carries `h`/`c` as tables across the boundary every step. That is the more
+    expensive shape and the necessary one there; a decoder-side LSTM over a known sequence is this
+    one.
+
     A STACK is this component once per layer, chained: the sequence in is the previous layer's
     output. That is what `RecurrentPhase`'s own `{name}_l0_fwd`/`{name}_l1_fwd` numbering is for.
 

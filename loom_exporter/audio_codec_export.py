@@ -176,7 +176,7 @@ class CodecFamily(Enum):
         batch axis still on.
 
         EnCodec used to be a member here and is not: its decoder contains a 2-layer LSTM, so it is a
-        three-phase export with a host-side loop (`encodec_export.py`) rather than one traced graph.
+        three-phase export with a C++-side recurrence (`encodec_export.py`) rather than one graph.
         What it left behind is this method's SIGNATURE -- the second leaf is what made the caller's
         layout a per-codec question rather than one shared transpose.
         """
@@ -564,7 +564,7 @@ def register(registry) -> None:
         recognizers=[
             ModelRecognizer(name="dac", detect=_is_dac, build_config=_build_dac),
             # Builds an `EnCodecExportConfig`, which is NOT an `AudioCodecExportConfig`: EnCodec's
-            # decoder contains an LSTM, so it is a three-phase export with a host-side loop rather
+            # decoder contains an LSTM, so it is a three-phase export with a C++ loop rather
             # than one traced graph. Same task, same contract, different export shape -- see
             # `encodec_export.py` and `tasks.py`'s own entry for why this task's declared base class
             # is the root one.
