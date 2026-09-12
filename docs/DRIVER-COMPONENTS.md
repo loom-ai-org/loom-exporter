@@ -70,8 +70,9 @@ differs is entirely what the host does with the one output. The family names its
 
 | component | class | emits | links | unchecked | used by |
 |---|---|---|---|---|---|
-| `driver_inputs` | `DriverInputs` | statements | 0 | 4 | conformer-ctc, dac, encodec, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3, snac |
-| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, dac, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, qwen3, snac |
+| `driver_inputs` | `DriverInputs` | statements | 0 | 4 | conformer-ctc, dac, encodec, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3, qwen3-tts-tokenizer-12hz, snac |
+| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, qwen3 |
+| `chunked_codec_call` | `ChunkedCodecCall` | statements | 2 | 6 | *nobody* (see below) |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
 | `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 16 | granite-speech, hf-causal-lm, lfm2-monolithic, qwen3, qwen3-asr, t5, whisper |
 | `waveform_valid_length` | `WaveformValidLength` | statements | 0 | 5 | granite-speech, qwen3-asr |
@@ -85,14 +86,14 @@ differs is entirely what the host does with the one output. The family names its
 | `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | dia, encodec, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
 | `recurrent_call` | `RecurrentCall` | statements | 1 | 8 | encodec |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 7 | matcha, supertonic |
-| `driver_return` | `DriverReturn` | statements | 0 | 1 | dac, dia, encodec, kokoro, matcha, snac, styletts2, supertonic, vits |
+| `driver_return` | `DriverReturn` | statements | 0 | 1 | dac, dia, encodec, kokoro, matcha, qwen3-tts-tokenizer-12hz, snac, styletts2, supertonic, vits |
 | `lua_library` | `LuaLibrary` | prelude | 1 | 0 | kokoro, matcha, styletts2, vits |
 
 ### `driver_inputs` — `DriverInputs`
 
 Binds every name the topologies below are called with: read from the caller's `inputs` table, or computed host-side (`cache_position` via loom.range, `attention_mask` via loom.causal_mask).
 
-*Emits:* statements. *Used by:* conformer-ctc, dac, encodec, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3, snac.
+*Emits:* statements. *Used by:* conformer-ctc, dac, encodec, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3, qwen3-tts-tokenizer-12hz, snac.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -100,10 +101,21 @@ Binds every name the topologies below are called with: read from the caller's `i
 
 The single `run_subgraph` call a flattened export's driver makes, capturing the output's shape alongside its data so the epilogue knows the vocab size -- or, for a KV-cached topology, retaining the output engine-side and binding nothing, so the logits never become a Lua table at all.
 
-*Emits:* statements. *Used by:* conformer-ctc, dac, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, qwen3, snac.
+*Emits:* statements. *Used by:* conformer-ctc, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, qwen3.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
+
+### `chunked_codec_call` — `ChunkedCodecCall`
+
+The same `run_subgraph` a codec decoder makes, run over BOUNDED WINDOWS of the code sequence and stitched back into one waveform -- family 11's second call shape. Each chunk re-decodes `left_context` frames it has already emitted so its first kept frame has a populated receptive field, then drops `left_context * hop` samples from the front, so every output sample is produced exactly once by the call with the most history for it. Used by a codec whose reference decodes in chunks (Qwen3-TTS's 12 Hz tokenizer, whose `chunked_decode` this reproduces) -- which is also what keeps a decoder with ATTENTION over the frame axis from building a 4096x4096 score matrix per layer.
+
+*Emits:* statements. *Used by:* **no model** — see below.
+
+* `topology` — TopologyName
+* `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
+
+> No model uses it today: its leaf is exported and verified but is not yet in the model sweep this column is computed from -- `qwen3-tts-tokenizer-12hz` is the codec half of a pair whose family-10 half is unwritten, and the sweep lists shipped models. So this reads as unused for the same reason the leaf is not on the Hub yet, and the row will fill in when the pair lands. Verified meanwhile against the reference's own `chunked_decode` at 42 and 700 frames (max abs difference 4.2e-06 and 1.7e-05), which is [ADR-034].
 
 ### `modular_chain` — `ModularChain`
 
@@ -231,7 +243,7 @@ A `FlowMatchingSpec`'s generated Euler-CFM sampler function, plus the line that 
 
 What the entry function hands back to the host.
 
-*Emits:* statements. *Used by:* dac, dia, encodec, kokoro, matcha, snac, styletts2, supertonic, vits.
+*Emits:* statements. *Used by:* dac, dia, encodec, kokoro, matcha, qwen3-tts-tokenizer-12hz, snac, styletts2, supertonic, vits.
 
 * nothing — every field is `__unchecked__`, with its reason
 

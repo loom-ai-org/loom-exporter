@@ -127,7 +127,7 @@ def _entries() -> Tuple[ComponentEntry, ...]:
     a module that imports this one's `DriverComponent` -- importing them at module scope would make the
     registry and the components a cycle."""
     from .driver_components import (
-        ArgmaxEpilogue, CtcGreedyEpilogue, DriverInputs, DriverReturn, ExportConstants,
+        ArgmaxEpilogue, ChunkedCodecCall, CtcGreedyEpilogue, DriverInputs, DriverReturn, ExportConstants,
         FlowMatchingSampler,
         LuaFragment, ModularChain,
         MonolithicCall, PrefillDecodeLoop, PromptSegments, RawLuaDriver, RecurrentCall,
@@ -149,6 +149,25 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "shape alongside its data so the epilogue knows the vocab size -- or, for a KV-cached "
             "topology, retaining the output engine-side and binding nothing, so the logits never "
             "become a Lua table at all.",
+        ),
+        ComponentEntry(
+            "chunked_codec_call", ChunkedCodecCall, (STATEMENTS,),
+            "The same `run_subgraph` a codec decoder makes, run over BOUNDED WINDOWS of the code "
+            "sequence and stitched back into one waveform -- family 11's second call shape. Each "
+            "chunk re-decodes `left_context` frames it has already emitted so its first kept frame "
+            "has a populated receptive field, then drops `left_context * hop` samples from the front, "
+            "so every output sample is produced exactly once by the call with the most history for "
+            "it. Used by a codec whose reference decodes in chunks (Qwen3-TTS's 12 Hz tokenizer, "
+            "whose `chunked_decode` this reproduces) -- which is also what keeps a decoder with "
+            "ATTENTION over the frame axis from building a 4096x4096 score matrix per layer.",
+            no_user_reason=(
+                "its leaf is exported and verified but is not yet in the model sweep this column is "
+                "computed from -- `qwen3-tts-tokenizer-12hz` is the codec half of a pair whose family-10 "
+                "half is unwritten, and the sweep lists shipped models. So this reads as unused for the "
+                "same reason the leaf is not on the Hub yet, and the row will fill in when the pair "
+                "lands. Verified meanwhile against the reference's own `chunked_decode` at 42 and 700 "
+                "frames (max abs difference 4.2e-06 and 1.7e-05), which is [ADR-034]"
+            ),
         ),
         ComponentEntry(
             "modular_chain", ModularChain, (STATEMENTS,),

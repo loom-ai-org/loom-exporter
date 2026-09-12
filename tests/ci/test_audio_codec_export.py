@@ -11,6 +11,7 @@ So the checks below are on the emitted crop shapes -- which must be expressions 
 numbers -- and on two exports at different trace lengths producing the identical topology.
 """
 import json
+import pathlib
 from pathlib import Path
 
 import pytest
@@ -58,7 +59,11 @@ def test_encodec_is_recognized_here_and_exported_elsewhere(tmp_path):
     recognizer = default_registry().detect(path)
     assert recognizer.name == "encodec"
     assert isinstance(recognizer.build_config(path, "/tmp/x.gguf"), EnCodecExportConfig)
-    assert [m.name for m in CodecFamily] == ["DAC", "SNAC"]
+    # The claim is EnCodec's ABSENCE, not the member count -- this module gained a third leaf
+    # (Qwen3-TTS's 12 Hz tokenizer) after this test was written, and an exact list would have failed
+    # for the one reason it is not about.
+    assert "ENCODEC" not in {m.name for m in CodecFamily}
+    assert "encodec" not in {m.value for m in CodecFamily}
 
 
 def test_another_codec_is_not_claimed_by_dacs_recognizer(tmp_path):
@@ -379,3 +384,103 @@ def test_the_traced_length_does_not_reach_the_graph(tmp_path):
     at_32 = _export(checkpoint, tmp_path / "b.gguf", n_frames=32)
     assert at_8["topology"] == at_32["topology"]
     assert at_8["driver"] == at_32["driver"]
+
+
+# ---------------------------------------------------------------------------------------------
+# Qwen3-TTS's 12 Hz speech tokenizer -- the family's first CHUNKED leaf.
+# ---------------------------------------------------------------------------------------------
+
+QWEN3_TTS_TOKENIZER_CONFIG = {
+    "model_type": "qwen3_tts_tokenizer_12hz",
+    "encoder_valid_num_quantizers": 16,
+    "input_sample_rate": 24000,
+    "output_sample_rate": 24000,
+    "decode_upsample_rate": 1920,
+    "encode_downsample_rate": 1920,
+}
+
+
+def test_the_speech_tokenizer_subfolder_is_claimed_and_the_talker_is_not(tmp_path):
+    """The codec is the `speech_tokenizer/` SUBFOLDER of a Qwen3-TTS checkpoint, not its root.
+
+    The root declares `qwen3_tts` and is the family-10 LM that EMITS these codes; two model types,
+    two exports, two GGUFs, by [ADR-022]'s argument. A recognizer that claimed the root would export
+    a talker through a codec's config.
+    """
+    from loom_exporter.audio_codec_export import _is_qwen3_tts_tokenizer_12hz
+
+    codec = _hf_dir(tmp_path, "speech_tokenizer", QWEN3_TTS_TOKENIZER_CONFIG)
+    assert _is_qwen3_tts_tokenizer_12hz(codec)
+    assert default_registry().detect(codec).name == "qwen3-tts-tokenizer-12hz"
+
+    talker = _hf_dir(tmp_path, "talker", {"model_type": "qwen3_tts"})
+    assert not _is_qwen3_tts_tokenizer_12hz(talker)
+    assert not _is_dac(codec)
+
+
+def test_its_graph_is_bounded_by_the_chunk_the_driver_asks_for(tmp_path):
+    """`max_frames` is a property of the DRIVER here, not of the checkpoint.
+
+    Every other leaf declares a ceiling it hopes is generous. This one is never asked for more than
+    one chunk plus its left context, because the driver never asks -- which is what keeps a decoder
+    with attention over the frame axis from building a 4096x4096 score matrix in each of 8 layers.
+    """
+    from loom_exporter.audio_codec_export import (
+        AudioCodecExportConfig, _build_qwen3_tts_tokenizer_12hz,
+    )
+
+    path = _hf_dir(tmp_path, "speech_tokenizer", QWEN3_TTS_TOKENIZER_CONFIG)
+    config = _build_qwen3_tts_tokenizer_12hz(path, "/tmp/x.gguf")
+    assert isinstance(config, AudioCodecExportConfig)
+    assert config.chunk_frames > 0 and config.left_context_frames > 0
+    assert config.max_frames == config.chunk_frames + config.left_context_frames
+
+
+def test_qwen3_tts_chunking_matches_reference():
+    """The two constants are the reference implementation's own, and nothing in the checkpoint says so.
+
+    `chunk_size` and `left_context_size` are DEFAULT ARGUMENTS of
+    `Qwen3TTSTokenizerV2Decoder.chunked_decode`, so `config.json` has nothing to check them against
+    and `AudioCodecExportConfig.chunk_frames` is `Unchecked`. This is the check instead: the function
+    signature is the authority, and a package upgrade that moved either number would fail here rather
+    than silently produce audio that diverges from the reference past the first chunk.
+    """
+    import inspect
+
+    qwen_modeling = pytest.importorskip(
+        "qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2",
+        reason="the optional `qwen-tts` package -- see audio_codec_export.QWEN3_TTS_MISSING",
+    )
+    from loom_exporter.audio_codec_export import _build_qwen3_tts_tokenizer_12hz
+
+    signature = inspect.signature(qwen_modeling.Qwen3TTSTokenizerV2Decoder.chunked_decode)
+    config = _build_qwen3_tts_tokenizer_12hz(pathlib.Path("/nonexistent"), "/tmp/x.gguf")
+    assert config.chunk_frames == signature.parameters["chunk_size"].default
+    assert config.left_context_frames == signature.parameters["left_context_size"].default
+
+
+def test_the_chunked_driver_avoids_lua_53_syntax():
+    """The engine embeds LuaJIT, which is Lua 5.1, and nothing syntax-checks an emitted driver.
+
+    `//` writes a GGUF that exports, writes and LOADS, and then dies the first time anything runs it
+    with `unexpected symbol near '/'` from `load_script`. `driver_ir.BinOp` refuses the operator now;
+    this is the check from the other end, over the statements this component actually emits.
+    """
+    from loom_exporter.driver_components import ChunkedCodecCall
+
+    call = ChunkedCodecCall(topology="main_topology", inputs=("codes",), codes_var="codes",
+                            codes_per_frame=16, hop_length=1920,
+                            chunk_frames=300, left_context_frames=25)
+
+    class _Ctx:
+        def root_axis(self, _topology):
+            return "n_codes"
+
+    from loom_exporter.driver_ir import LuaCodegen
+
+    # The real codegen, not a repr: what is being checked is the text that ships in the GGUF.
+    rendered = "\n".join(LuaCodegen()._emit_block(call.emit(_Ctx()), 1))
+    assert "//" not in rendered
+    assert "math.floor(#codes / 16)" in rendered
+    # And the seam the component exists for: each chunk drops its own left context, in samples.
+    assert "(_context * 1920)" in rendered

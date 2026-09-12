@@ -1555,9 +1555,33 @@ class LoomGGUFExporter:
         return value, so it has to cross the boundary either way, and retaining would only add a
         second call to fetch it.
         """
+        chunk = dict(self.kwargs.get("codec_chunk") or {})
+        inputs = DriverInputs(bindings=bindings, n_tokens=n_tokens_expr,
+                              noise=dict(self.kwargs.get("noise_inputs") or {}))
+        if chunk.get("chunk_frames"):
+            # A codec whose reference decodes in bounded windows (Qwen3-TTS's 12 Hz tokenizer is the
+            # first). The loop replaces the single call and binds a different local, so the epilogue
+            # returns that one -- everything else about the driver is unchanged.
+            from .driver_components import ChunkedCodecCall
+            from .lua_library import LuaLibrary
+
+            call = ChunkedCodecCall(
+                topology="main_topology", inputs=input_names,
+                codes_var=input_names[0],
+                codes_per_frame=int(chunk["codes_per_frame"]),
+                hop_length=int(chunk["hop_length"]),
+                chunk_frames=int(chunk["chunk_frames"]),
+                left_context_frames=int(chunk["left_context_frames"]),
+            )
+            self.driver_script = SYNTHESIZED_BUILDERS["CodecDecode"](
+                inputs=inputs, call=call,
+                library=LuaLibrary(uses=("array_slice",)),
+                epilogue=DriverReturn(values=(call.out_var,)),
+            ).build(self._driver_context())
+            return
+
         self.driver_script = SYNTHESIZED_BUILDERS["CodecDecode"](
-            inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr,
-                                noise=dict(self.kwargs.get("noise_inputs") or {})),
+            inputs=inputs,
             call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr,
                                  retained=False),
             epilogue=DriverReturn(values=("_mono_out",)),

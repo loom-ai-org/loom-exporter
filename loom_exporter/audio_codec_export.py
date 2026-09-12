@@ -127,6 +127,122 @@ def _patch_snac(layers) -> None:
     )
 
 
+QWEN3_TTS_MISSING = (
+    "Qwen3-TTS's 12 Hz tokenizer is not a transformers architecture -- it ships in Alibaba's own "
+    "Apache-2.0 `qwen-tts` package, which this family imports lazily so that the other leaves need no "
+    "extra dependency. Install it with `pip install --no-deps qwen-tts`: its pins "
+    "(`transformers==4.57.3`, `accelerate==1.12.0`) plus gradio, onnxruntime and sox would otherwise "
+    "move the export venv underneath every other model in the tree. The piper venv's transformers "
+    "4.57.6 satisfies what the package actually imports."
+)
+
+
+def _patch_qwen3_tts_tokenizer(modeling) -> None:
+    """The two class-level rewrites the 12 Hz decoder needs to convert. Both are exact, and both are
+    failures another family in this tree has already had.
+
+    **`Qwen3TTSTokenizerV2CausalConvNet.forward`, because its right-hand pad is DYNAMIC and always
+    ZERO.** `_get_extra_padding_for_conv1d` reads `hidden_state.shape[-1]`, which under tracing is a
+    0-d Tensor, so the pad width is a tensor and coremltools refuses it outright -- `NotImplementedError:
+    Dynamic padding for n-dimensional tensors is not supported`, at `pre_conv`. That is the same refusal
+    EnCodec's export is blocked on (`encodec_export.ENCODEC_BLOCKERS`), and here it DISSOLVES rather than
+    needing a workaround, because with `stride == 1` and `padding == kernel_size - stride`:
+
+        n_frames = (L - k + (k - 1)) / 1 + 1 = L
+        ideal    = (ceil(L) - 1) * 1 + (k - (k - 1)) = L
+        extra    = ideal - L = 0
+
+    identically, at every length. So this removes a pad that is provably zero rather than approximating
+    one -- and it asserts the stride rather than trusting the derivation, because the identity holds at
+    stride 1 only. Every causal conv in this decoder is stride 1; the upsampling ones are
+    `CausalTransConvNet`, a different class with no such pad.
+
+    **`rotate_half`, because a shape read becomes `aten::Int`.** Character for character Dia's failure
+    (`dia_export.install_rotate_half_patch`, [Retro-030]): `x[..., : x.shape[-1] // 2]` traces as
+    `aten::floor_divide` feeding `aten::Int`, and coremltools' `_int` handler dies with "only
+    0-dimensional arrays can be converted to Python scalars" -- here at
+    `pre_transformer/0/self_attn/901`. `torch.chunk` asks for a COUNT rather than an index, so it needs
+    no arithmetic over the axis at all.
+
+    Class-level, like `_patch_snac`, and for the same reason: the reference this is graded against has
+    to be computing what the export computes. Both rewrites are verified bit-identical to the
+    checkpoint's own `decoder.forward` (`max|delta| = 0.0`) before anything is traced.
+    """
+    import torch as _torch
+    import torch.nn.functional as _F
+
+    def causal_conv_forward(self, hidden_state):
+        assert self.stride == 1, (
+            "extra_padding is identically zero at stride 1 only; this decoder has no strided "
+            f"causal conv, but this one has stride {self.stride}"
+        )
+        return self.conv(_F.pad(hidden_state, (self.padding, 0),
+                                mode="constant", value=0)).contiguous()
+
+    def rotate_half(x):
+        x1, x2 = x.chunk(2, dim=-1)
+        return _torch.cat((-x2, x1), dim=-1)
+
+    modeling.Qwen3TTSTokenizerV2CausalConvNet.forward = causal_conv_forward
+    modeling.rotate_half = rotate_half
+
+
+def _qwen3_tts_sliding_causal_mask(hidden, window: int) -> "torch.Tensor":
+    """`[1, 1, T, T]`, additive: 0 where key `j` is visible to query `i`, `-max` elsewhere.
+
+    **The decoder does not convert without a prepared mask**, and the failure is neither of the two
+    above. transformers' `create_causal_mask` runs `torch.vmap` over mask functions
+    (`masking_utils.sdpa_mask_recent_torch`), which under `torch.jit.trace` recurses until it dies in
+    `custom_function_call_vmap` with `RuntimeError: unordered_map::at`. Handing the transformer a
+    prepared mask short-circuits that path entirely -- its forward starts
+    `if not isinstance(causal_mask_mapping := attention_mask, dict)` -- and every layer of this stack
+    declares `attention_type = "sliding_attention"`, so one entry covers all eight.
+
+    It cannot be a graph INPUT the way Whisper's and Dia's are. Those are decode loops whose mask is
+    one row; this is a single full-sequence pass, so an input would make the driver marshal `T x T`
+    floats per call -- 16 M at the 4096-frame ceiling, the cost [ADR-028] records for T5's relative
+    bias and did not want twice. Built in-graph from `torch.arange` off the tensor's own length, it
+    costs nothing and keeps the frame axis symbolic.
+
+    The spelling is `qwen3_asr_export.WindowedAudioEncoder`'s, and every oddity in it is that module's
+    finding rather than a preference: OUTER PRODUCTS against a ones vector rather than `unsqueeze`
+    broadcasting, because ggml repeats `b` into `a` and cannot broadcast two ways while MIL folds an
+    `.expand()` straight back into the broadcast it was meant to defeat; comparisons against SCALARS,
+    because a rank-0 constant repeats into any shape where two equal-rank tensors must match; and
+    `pos * 0.0 + 1.0` rather than `torch.ones_like`, because `fill` resolves its length through a
+    different expression for the same quantity and the two sides then disagree about T.
+
+    **The rank-4 wrapping is two `unsqueeze`s and must NOT be a `view(1, 1, -1, T)`**, which is the
+    spelling `qwen3_asr_export` uses and the one that fails here. A `-1` reaches the emitted topology
+    as a literal `-1` in the RESHAPE's shape, and the `attention_mask[:, :, :, :kv]` slice inside
+    `eager_attention_forward` then derives its own extent from it -- producing
+    `floor(1/n_codes)`, which is 0 at every length above 1 and aborts at run time with
+    `VIEW: non-positive dimension in resolved shape [42,0,1,1]`. The export, the write and the load all
+    succeed; only running it fails. [Retro-047] has it; it is [Retro-044]'s
+    shape-derived-slice failure from the other direction -- there MIL minted a fresh symbol and the
+    walk substituted the root axis, here the symbol is fine and the HOLE is the problem.
+
+    The `where` branches are TENSORS (`delta * 0.0`, `delta * 0.0 + neg`) rather than Python floats,
+    which is what makes the two `unsqueeze`s land on a rank-2 var and produce rank 4. With scalar
+    branches the result's rank is not established and coremltools' `slice` handler dies instead, with
+    `IndexError: list assignment index out of range`.
+
+    The window is `0 <= i - j < window`, read off the checkpoint's `sliding_window` rather than
+    declared -- 72 frames, 5.76 s at this codec's 12.5 Hz.
+    """
+    import torch as _torch
+
+    pos = _torch.arange(hidden.shape[1], device=hidden.device, dtype=hidden.dtype)
+    ones = pos * 0.0 + 1.0
+    rows = pos.unsqueeze(1) @ ones.unsqueeze(0)          # rows[i][j] = i
+    cols = ones.unsqueeze(1) @ pos.unsqueeze(0)          # cols[i][j] = j
+    delta = rows - cols                                  # exact in f32 at any length this accepts
+    visible = (delta > -0.5) & (delta < window - 0.5)
+    neg = float(-_torch.finfo(_torch.float32).max)
+    mask = _torch.where(visible, delta * 0.0, delta * 0.0 + neg)
+    return mask.unsqueeze(0).unsqueeze(0)
+
+
 class CodecFamily(Enum):
     """Which codec this is, as the three things that genuinely differ between them.
 
@@ -149,8 +265,41 @@ class CodecFamily(Enum):
 
     DAC = "dac"
     SNAC = "snac"
+    QWEN3_TTS_12HZ = "qwen3_tts_tokenizer_12hz"
 
     def load(self, model_dir: str):
+        if self is CodecFamily.QWEN3_TTS_12HZ:
+            try:
+                from qwen_tts.core.tokenizer_12hz import (
+                    configuration_qwen3_tts_tokenizer_v2 as qwen_config,
+                    modeling_qwen3_tts_tokenizer_v2 as qwen_modeling,
+                )
+            except ImportError as exc:               # pragma: no cover - env-dependent
+                raise ImportError(QWEN3_TTS_MISSING) from exc
+            import transformers
+
+            _patch_qwen3_tts_tokenizer(qwen_modeling)
+            # The package registers these itself only inside its own `Qwen3TTSTokenizer.from_pretrained`,
+            # which also builds a feature extractor for the ENCODE half this family does not export.
+            # Registering the pair directly is the smaller door.
+            #
+            # `try/except ValueError` rather than a membership test: `AutoConfig.register` raises on a
+            # model type it already holds, and that is the only reliable way to ask -- the mapping is a
+            # private `_LazyConfigMapping` whose spelling has moved between transformers versions.
+            # Re-registering matters because two exports in one process is the normal case here (the
+            # gate sweep is one).
+            try:
+                transformers.AutoConfig.register("qwen3_tts_tokenizer_12hz",
+                                                 qwen_config.Qwen3TTSTokenizerV2Config)
+                transformers.AutoModel.register(qwen_config.Qwen3TTSTokenizerV2Config,
+                                                qwen_modeling.Qwen3TTSTokenizerV2Model)
+            except ValueError:
+                pass
+            # `eager`, not sdpa: the prepared mask has to reach `eager_attention_forward`, and this
+            # graph is traced rather than run, so no fused kernel is being given up.
+            return transformers.AutoModel.from_pretrained(
+                model_dir, dtype=torch.float32, attn_implementation="eager").eval()
+
         if self is CodecFamily.SNAC:
             try:
                 from snac import SNAC
@@ -180,6 +329,36 @@ class CodecFamily(Enum):
         What it left behind is this method's SIGNATURE -- the second leaf is what made the caller's
         layout a per-codec question rather than one shared transpose.
         """
+        if self is CodecFamily.QWEN3_TTS_12HZ:
+            # This one does NOT call the model's own `decoder.forward`, and the prepared mask is why:
+            # that forward lets the pre-transformer build its own, which is the `vmap` path that does
+            # not trace. Everything else here is its body, in its order, unchanged -- verified against
+            # it at `max|delta| = 0.0` before the trace, which is the check `_patch_qwen3_tts_tokenizer`
+            # and this reimplementation are both graded by.
+            #
+            # **Whole-sequence, where `Qwen3TTSTokenizerV2Model.decode` calls `chunked_decode(300, 25)`.**
+            # Below 300 frames -- 24 s of audio -- that is one chunk with no carried context and the
+            # two are the same call, bit for bit. Above it they are not, and the whole-sequence pass is
+            # the MORE faithful of the two: the pre-transformer's window is 72 frames against a carried
+            # context of 25, so chunking truncates a receptive field this keeps. Chunking is the
+            # reference's memory ceiling, not its definition, and an engine that streams has its own.
+            decoder = model.decoder
+            hidden = decoder.quantizer.decode(codes.transpose(1, 2))
+            hidden = decoder.pre_conv(hidden).transpose(1, 2)
+            window = decoder.pre_transformer.config.sliding_window
+            hidden = decoder.pre_transformer(
+                inputs_embeds=hidden,
+                attention_mask={"sliding_attention":
+                                _qwen3_tts_sliding_causal_mask(hidden, window)},
+            ).last_hidden_state
+            hidden = hidden.permute(0, 2, 1)
+            for blocks in decoder.upsample:
+                for block in blocks:
+                    hidden = block(hidden)
+            for block in decoder.decoder:
+                hidden = block(hidden)
+            return hidden.clamp(min=-1, max=1)
+
         if self is CodecFamily.SNAC:
             # A row is one COARSEST-codebook frame, level-major: codebook 0's single id, then
             # codebook 1's `coarse // stride` ids for that span, and so on. The reshape is what turns
@@ -238,6 +417,18 @@ class CodecFamily(Enum):
         than its codebook count. A uniform codec reports `[1] * n_codebooks`, which is not a special
         case anywhere downstream: every derived quantity falls out of the same formula.
         """
+        if self is CodecFamily.QWEN3_TTS_12HZ:
+            # Two configs, because this checkpoint states the two halves in different places: the
+            # quantizer's width and codebook size belong to the decoder, while the sample rate and the
+            # hop are the WRAPPER's, being properties of the codec rather than of one of its halves.
+            decoder_config = model.config.decoder_config
+            return dict(n_codebooks=int(decoder_config.num_quantizers),
+                        codebook_size=int(decoder_config.codebook_size),
+                        sample_rate=int(model.config.output_sample_rate),
+                        # Spelled `decode_upsample_rate` here, and it is the hop: 1920 samples per
+                        # frame at 24 kHz is the 12.5 Hz the model is named for.
+                        hop_length=int(model.config.decode_upsample_rate),
+                        vq_strides=[1] * int(decoder_config.num_quantizers))
         if self is CodecFamily.SNAC:
             return dict(n_codebooks=len(model.vq_strides), codebook_size=int(model.codebook_size),
                         sample_rate=int(model.sampling_rate), hop_length=int(model.hop_length),
@@ -297,6 +488,12 @@ class AudioCodecExportConfig(LoomExportConfig):
     # `inputs=`, as in every other family.
     n_frames: int = 16
     max_frames: int = 4096
+    # How a leaf that decodes in CHUNKS cuts the sequence up, or 0 for one that does not. Declared
+    # here rather than derived because they are the reference implementation's own constants, and the
+    # point of matching them is that they are its constants: see `CodecFamily.decode`'s note on
+    # `chunked_decode` and `_build_qwen3_tts_tokenizer` for why this family gained a chunked member.
+    chunk_frames: int = 0
+    left_context_frames: int = 0
     # Read off the checkpoint by `load_model`, never declared: see `__unchecked__`.
     _resolved_architecture: Optional[str] = None
     _n_codebooks: Optional[int] = None
@@ -330,6 +527,13 @@ class AudioCodecExportConfig(LoomExportConfig):
             "checkpoint to check it against -- a convolutional decoder is length-agnostic -- so this "
             "is a declaration about the export, not a claim about the model."
         ),
+        "chunk_frames": Unchecked(
+            "the reference implementation's own chunk size, copied so the two agree. It is not in "
+            "`config.json` -- `Qwen3TTSTokenizerV2Decoder.chunked_decode` takes it as a DEFAULT "
+            "ARGUMENT -- so there is no checkpoint field to check it against, and checking it against "
+            "the function signature is what `test_qwen3_tts_chunking_matches_reference` does instead."
+        ),
+        "left_context_frames": Unchecked("same: `chunked_decode`'s `left_context_size` default"),
         "_resolved_architecture": Unchecked("load_model()'s output, cached so export_architecture() "
                                             "can read it back. A field only because this is a dataclass"),
         "_n_codebooks": Unchecked(
@@ -486,6 +690,13 @@ class AudioCodecExportConfig(LoomExportConfig):
             declared_axes={name: {2: f"{multiple}*{self.root_axis}"}
                            for name, multiple in self._noise_inputs.items()},
             noise_inputs=dict(self._noise_inputs),
+            # Absent (0) for a codec that decodes in one call, which is what DAC and SNAC emit and why
+            # their drivers do not move. Present, these are the whole difference between the two call
+            # shapes -- see `driver_components.ChunkedCodecCall`.
+            codec_chunk=dict(chunk_frames=self.chunk_frames,
+                             left_context_frames=self.left_context_frames,
+                             codes_per_frame=self._codes_per_frame if self._n_codebooks else 0,
+                             hop_length=self._hop_length or 0),
         )
 
 
@@ -543,6 +754,46 @@ def _is_snac(path: Path) -> bool:
             and all(key in cfg for key in ("vq_strides", "encoder_rates", "decoder_rates")))
 
 
+def _is_qwen3_tts_tokenizer_12hz(path: Path) -> bool:
+    """Qwen3-TTS's 12 Hz speech tokenizer, which declares `model_type == "qwen3_tts_tokenizer_12hz"`.
+
+    The directory is the `speech_tokenizer/` SUBFOLDER of a Qwen3-TTS checkpoint, not its root: the
+    root declares `qwen3_tts` and is the family-10 LM that emits the codes this decodes. Two model
+    types, two exports, two GGUFs, by [ADR-022]'s argument -- one codec serves every size and variant
+    of the talker, and the codes between them are worth having on their own.
+
+    Specific rather than generic, like `_is_dac`: `Qwen3TTSTokenizerV2Model` has its own `decode`
+    signature and its own patches, and a recognizer that claimed any codec-shaped directory would
+    claim checkpoints this leaf cannot drive.
+    """
+    cfg = _hf_config(path)
+    return cfg is not None and cfg.get("model_type") == "qwen3_tts_tokenizer_12hz"
+
+
+def _build_qwen3_tts_tokenizer_12hz(path: Path, output_path: str) -> LoomExportConfig:
+    """The first CHUNKED member of this family, and the first whose `max_frames` is small.
+
+    `Qwen3TTSTokenizerV2Model.decode` runs `chunked_decode(chunk_size=300, left_context_size=25)`, so
+    the reference's own answer past 300 frames is a sequence of bounded calls rather than one long
+    one. Matching it is not only fidelity, though it is that -- measured, whole-sequence and chunked
+    are bit-identical to 299 frames and then part company, 8.9% relative RMS apart at 700 (24 s), which
+    is the ~21 dB-down band [Retro-043] records a listener hearing.
+
+    It is also what makes the model RUNNABLE. This decoder's pre-transformer is full attention inside
+    its window over the frame axis, so a whole-sequence call at a 4096-frame ceiling would build a
+    4096x4096 score matrix per layer -- about a gigabyte, on an engine whose target is edge devices --
+    plus a 67 MB mask. Chunked, every call is at most 325 frames and the cost is flat in clip length.
+
+    So `max_frames` here is `chunk + context`, and it is a property of the driver rather than of the
+    checkpoint: the graph is never asked for more, because the driver never asks.
+    """
+    chunk, context = 300, 25
+    return AudioCodecExportConfig(architecture=None, output_path=output_path, model_dir=str(path),
+                                  family=CodecFamily.QWEN3_TTS_12HZ,
+                                  chunk_frames=chunk, left_context_frames=context,
+                                  max_frames=chunk + context)
+
+
 def _build_dac(path: Path, output_path: str) -> LoomExportConfig:
     return AudioCodecExportConfig(architecture=None, output_path=output_path, model_dir=str(path),
                                   family=CodecFamily.DAC)
@@ -570,5 +821,8 @@ def register(registry) -> None:
             # is the root one.
             ModelRecognizer(name="encodec", detect=_is_encodec, build_config=_build_encodec),
             ModelRecognizer(name="snac", detect=_is_snac, build_config=_build_snac),
+            ModelRecognizer(name="qwen3-tts-tokenizer-12hz",
+                            detect=_is_qwen3_tts_tokenizer_12hz,
+                            build_config=_build_qwen3_tts_tokenizer_12hz),
         ],
     ))
