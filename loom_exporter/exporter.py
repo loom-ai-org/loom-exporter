@@ -431,6 +431,12 @@ class LoomGGUFExporter:
             "cast", "log", "exp", "sqrt", "rsqrt", "abs", "neg", "sign", "floor", "clamp", "clip",
             "tanh", "sigmoid", "relu", "gelu", "softplus", "identity", "softmax", "logical_not", "silu",
             "leaky_relu", "cumsum", "atan", "sin", "cos", "square",
+            # `elu` is EnCodec's, and it arrived with the same failure every entry above was added
+            # for: the walk stops at the first op it does not know, falls back to the bare root axis,
+            # and the export succeeds with a wrong length. Its decoder puts one between every
+            # transposed convolution and the block that follows, so without this the FIRST upsampling
+            # stage is the last one whose length is related to the root.
+            "elu",
         }
         if op.op_type in _UNARY_PASSTHROUGH_OPS:
             # Pure unary, shape-preserving ops -- the axis's real expression is whatever its single
@@ -700,6 +706,31 @@ class LoomGGUFExporter:
                         inferred = self._infer_dynamic_dim_expr(operand, torch_axis, _seen)
                         if inferred is not None:
                             return inferred
+
+        if op.op_type == "pad":
+            # `pad` adds its own constant amounts to the padded axis and changes nothing else. MIL's
+            # `pad` applies its `[before, after]` pairs to the LAST `len(pad) // 2` axes, so an axis
+            # ahead of that window is a pure passthrough.
+            #
+            # EnCodec needed this, for the same reason `slice_by_index` below was needed: its decoder
+            # reflect-pads before every convolution inside a residual block, which sits between the
+            # transposed convolution that multiplies the length and the crop that reads it. Without it
+            # the walk gave up at the first pad of each stage and the emitted crop read `n_codes + 2`
+            # where the tensor was `8*n_codes + 2` -- no error, and a waveform a fraction of its
+            # proper length.
+            x_var = op.inputs.get("x") or op.inputs.get("data")
+            pad_vals = static_array(op.inputs.get("pad"))
+            if x_var is not None and pad_vals is not None and getattr(x_var, "shape", None) is not None:
+                pad_list = [int(v) for v in np.asarray(pad_vals).reshape(-1)]
+                rank = len(x_var.shape)
+                n_padded = len(pad_list) // 2
+                in_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
+                if in_expr is not None:
+                    first_padded_axis = rank - n_padded
+                    if torch_axis < first_padded_axis:
+                        return in_expr
+                    i = torch_axis - first_padded_axis
+                    return in_expr + pad_list[2 * i] + pad_list[2 * i + 1]
 
         if op.op_type == "slice_by_index":
             # `slice_by_index` over a dynamic axis, for the one shape this walk can state exactly: a

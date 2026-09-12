@@ -432,6 +432,32 @@ def _op_leaky_relu(self, op, ctx):
     })
 
 
+@topology_rule('elu')
+def _op_elu(self, op, ctx):
+    nodes, resolve = ctx.nodes, ctx.resolve
+    # EnCodec's SEANet decoder activation (family 11's second leaf), where every vocoder in families
+    # 7-9 uses LeakyReLU. `ggml_elu` already existed and the engine just had not exposed it, so the
+    # C++ side is one registration rather than a kernel.
+    #
+    # A RULE rather than an OP_MAP entry, and the reason is `alpha`: MIL's `elu` scales the negative
+    # branch by it (`alpha * (e^x - 1)`) and `ggml_elu` is fixed at 1. OP_MAP ignores attributes, so
+    # mapping it there would compute the wrong function for any alpha != 1 and say nothing. torch's
+    # own `nn.ELU` defaults to 1.0 and no model here sets otherwise; this raises if one ever does.
+    alpha = float(static_scalar(op.inputs.get("alpha"), 1.0))
+    if alpha != 1.0:
+        raise NotImplementedError(
+            f"elu op '{op.name}' has alpha={alpha} -- ggml's ELU is fixed at alpha=1, and scaling only "
+            f"the negative branch is not expressible as a SCALE around it. Compose it as "
+            f"`alpha*elu(x) + (1-alpha)*relu(x)` if a model ever needs one."
+        )
+    x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
+    nodes.append({
+        "op": "ELU",
+        "inputs": [resolve(self.safe_name(x_var_obj.name))],
+        "outputs": [self.safe_name(op.outputs[0].name)],
+    })
+
+
 @topology_rule('reverse')
 def _op_reverse(self, op, ctx):
     nodes, resolve, func_name = ctx.nodes, ctx.resolve, ctx.func_name

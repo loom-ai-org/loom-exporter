@@ -130,8 +130,8 @@ def _entries() -> Tuple[ComponentEntry, ...]:
         ArgmaxEpilogue, CtcGreedyEpilogue, DriverInputs, DriverReturn, ExportConstants,
         FlowMatchingSampler,
         LuaFragment, ModularChain,
-        MonolithicCall, PrefillDecodeLoop, PromptSegments, RawLuaDriver, SubgraphCallComponent,
-        TokenLabelsEpilogue, WaveformValidLength,
+        MonolithicCall, PrefillDecodeLoop, PromptSegments, RawLuaDriver, RecurrentCall,
+        SubgraphCallComponent, TokenLabelsEpilogue, WaveformValidLength,
     )
     from .lua_library import LuaLibrary
 
@@ -238,6 +238,11 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "subgraph_call", SubgraphCallComponent, (STATEMENTS,),
             "One `loom.run_subgraph` as IR rather than text, so `check_subgraph_calls` covers its "
             "output arity too -- what a peel buys structurally.",
+        ),
+        ComponentEntry(
+            "recurrent_call", RecurrentCall, (STATEMENTS,),
+            "One `loom.run_recurrent`: a whole sequence through one LSTM cell topology, with the "
+            "timestep loop and the h/c carry on the C++ side. A stack is one per layer, chained.",
         ),
         ComponentEntry(
             "flow_matching_sampler", FlowMatchingSampler, (PRELUDE, STATEMENTS),
