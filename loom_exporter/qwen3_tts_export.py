@@ -139,11 +139,79 @@ def install_patches(modeling) -> None:
         mean, std = self._compute_statistics(hidden_states, attention)
         return _torch.cat((mean, std), dim=1).unsqueeze(2)
 
+    def repeat_kv(hidden_states, n_rep):
+        # `repeat_interleave` on the heads axis, where HF writes `unsqueeze -> expand -> reshape`.
+        #
+        # That idiom's expand is a BROADCAST, and coremltools' own default pipeline folds it away
+        # before `passes.fuse_gqa_repeat_kv` ever runs -- which leaves the reshape behind, alone,
+        # asking for 16 heads of a tensor that still has 8. The export, the write and the load all
+        # succeed; the first call dies with `RESHAPE: target shape [128,10,16,1] has 20480 elements
+        # but input has 10240`. The same failure then reappears one level up as two cached phases
+        # disagreeing about their K/V geometry, which is the symptom, not the cause.
+        #
+        # `repeat_interleave` states the repetition as a repetition rather than as a broadcast that
+        # happens to be reshaped, so there is nothing for a broadcast-folding pass to remove. It is
+        # the same tensor either way -- HF's own docstring says the idiom IS `torch.repeat_interleave(
+        # x, dim=1, repeats=n_rep)`.
+        if n_rep == 1:
+            return hidden_states
+        return hidden_states.repeat_interleave(n_rep, dim=1)
+
+    # BOTH, because the two attention paths reach different copies: the checkpoint's own
+    # `eager_attention_forward` uses the one in its module, and the sdpa path this export traces
+    # through uses `transformers.integrations.sdpa_attention`'s.
+    from transformers.integrations import sdpa_attention as _sdpa
+
+    _sdpa.repeat_kv = repeat_kv
+    modeling.repeat_kv = repeat_kv
     modeling.rotate_half = rotate_half
     modeling.apply_multimodal_rotary_pos_emb = apply_rope
     modeling.Qwen3TTSTalkerRotaryEmbedding.forward = _torch.no_grad()(rotary_forward)
     modeling.AttentiveStatisticsPooling.forward = pooling_forward
 
+
+
+def materialise_gqa(module, config) -> None:
+    """Duplicate `k_proj`/`v_proj` so the model has as many K/V heads as query heads, in place.
+
+    **This removes `repeat_kv` from the graph rather than trying to convert it, and three attempts at
+    converting it are why.** HF writes the repeat as `unsqueeze -> expand -> reshape`; coremltools'
+    own pipeline folds the expand (it is a broadcast) before `passes.fuse_gqa_repeat_kv` can match the
+    pair, leaving a reshape that asks for 16 heads of a tensor with 8. Rewriting it as
+    `repeat_interleave` keeps a real `tile` -- and then the reshape that merges `(n_kv, n_rep)` back
+    into one axis comes out as `[128, n_tokens, n_tokens, 8]`, the root axis substituted into the head
+    slot, which is [Retro-044]'s failure exactly.
+
+    With `num_key_value_heads == num_attention_heads` the repeat is the identity and never traces at
+    all. What it costs is honest and small: `k_proj` and `v_proj` grow from `[1024, 1024]` to
+    `[2048, 1024]`, which is +4.2 M parameters on a 917 M model, and the KV cache doubles. What it
+    buys is that the one op in this architecture the converter cannot carry is simply not there.
+
+    Interleaved, not concatenated: `repeat_kv` repeats each K/V head `n_rep` times ADJACENTLY
+    (`[h0, h0, h1, h1, ...]`), which is what pairs head `2i` and `2i+1` of the query with K/V head
+    `i`. A concatenated duplicate would pair them with the wrong halves and is the one way to get
+    this wrong silently.
+    """
+    n_rep = config.num_attention_heads // config.num_key_value_heads
+    if n_rep == 1:
+        return
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    for layer in module.layers:
+        attention = layer.self_attn
+        for name in ("k_proj", "v_proj"):
+            projection = getattr(attention, name)
+            weight = projection.weight.data.view(config.num_key_value_heads, head_dim, -1)
+            widened = weight.repeat_interleave(n_rep, dim=0).reshape(-1, weight.shape[-1])
+            replacement = nn.Linear(widened.shape[1], widened.shape[0],
+                                    bias=projection.bias is not None)
+            with torch.no_grad():
+                replacement.weight.copy_(widened)
+                if projection.bias is not None:
+                    bias = projection.bias.data.view(config.num_key_value_heads, head_dim)
+                    replacement.bias.copy_(bias.repeat_interleave(n_rep, dim=0).reshape(-1))
+            setattr(attention, name, replacement)
+        attention.num_key_value_groups = 1
+    config.num_key_value_heads = config.num_attention_heads
 
 
 def causal_mask(seq_len: int) -> torch.Tensor:
@@ -304,67 +372,52 @@ class _TalkerWrapper(nn.Module):
         return self.codec_head(last), last
 
 
-class _PredictorPromptWrapper(nn.Module):
-    """`(codebook-0 id, talker hidden) -> the code predictor's two-row prompt`.
-
-    `cat(past_hidden, codec_embedding(first))`, which is what `Qwen3TTSTalkerForConditionalGeneration.
-    forward` assembles before calling `code_predictor.generate`. Its own phase so that neither operand
-    crosses the Lua boundary: the hidden state arrives as a reference to the talker's retained output
-    and the embedding is looked up here.
-    """
-
-    def __init__(self, talker):
-        super().__init__()
-        self.codec_embedding = talker.get_input_embeddings()
-        self.projection = talker.code_predictor.small_to_mtp_projection
-
-    def forward(self, first_id, talker_hidden):
-        return self.projection(
-            torch.cat([talker_hidden, self.codec_embedding(first_id)], dim=1))
-
-
 class _PredictorWrapper(nn.Module):
-    """`(inputs_embeds, position_ids, attention_mask) -> logits over all fifteen heads at once`.
+    """`(codebook-0 id, talker hidden[, the rows drawn so far]) -> logits over all fifteen heads`.
 
-    Five layers, KV-cached, and the cache is reset EVERY FRAME -- the driver does that by calling at
-    `n_past = 0`, which is what a fresh `DynamicCache` is in a model that appends at `n_past`.
+    **The code predictor is NOT KV-cached, and that is a decision rather than an omission.** One
+    KvCache is allocated per model with one per-layer width, so two cached phases must agree on their
+    K/V geometry -- and these two do not: the talker's 28 fused ATTENTION blocks report 16 heads where
+    this one's 5 report 8, because the talker's `repeat_kv` survives into its topology and this one's
+    does not. Rather than force them to agree, this phase stops needing the cache.
 
-    The single 15-way-concatenated head is the decision in `merged_predictor_tables`: group `g`'s
-    logits are the window `[g * 2048, (g + 1) * 2048)`, so one graph serves all fifteen steps and the
-    step lives in the driver's `lo`/`hi`.
+    It can afford to. The predictor never sees more than 16 positions, so re-running its prefix costs
+    `2 + 3 + ... + 16 = 135` row-forwards of a FIVE-layer, 1024-wide stack per audio frame, against a
+    cached 16. That is a fraction of the one 28-layer talker step beside it, and it buys a phase whose
+    cost is bounded and whose cache cannot disagree with anything.
+
+    **The prefix is rebuilt IN-GRAPH from ids**, which is what keeps the driver's per-frame traffic to
+    integers even without a cache: `cat(talker_hidden, codec_embedding(first), merged_table(rows))`.
+    The driver hands the same `rows` array it has been accumulating, one longer each step, and the
+    numbers in it are the absolute merged-table rows a windowed draw already returned.
+
+    Two topologies rather than one, and only because step 0 has no rows yet: an empty axis is not a
+    shape MIL will carry. They share every weight, which the writer aliases.
     """
 
-    def __init__(self, code_predictor, heads):
+    def __init__(self, code_predictor, talker, heads, with_rows: bool, embeddings):
         super().__init__()
         self.model = code_predictor.model
+        self.codec_embedding = talker.get_input_embeddings()
+        self.projection = code_predictor.small_to_mtp_projection
+        self.with_rows = with_rows
+        if with_rows:
+            self.row_embedding = nn.Embedding(embeddings.shape[0], embeddings.shape[1])
+            with torch.no_grad():
+                self.row_embedding.weight.copy_(embeddings)
         merged = nn.Linear(heads.shape[1], heads.shape[0], bias=False)
         with torch.no_grad():
             merged.weight.copy_(heads)
         self.lm_head = merged
 
-    def forward(self, inputs_embeds, position_ids, attention_mask):
-        hidden = self.model(inputs_embeds=inputs_embeds, position_ids=position_ids,
+    def forward(self, first_id, talker_hidden, position_ids, attention_mask, rows=None):
+        prefix = [talker_hidden, self.codec_embedding(first_id)]
+        if self.with_rows:
+            prefix.append(self.row_embedding(rows))
+        embeds = self.projection(torch.cat(prefix, dim=1))
+        hidden = self.model(inputs_embeds=embeds, position_ids=position_ids,
                             attention_mask=attention_mask, use_cache=False).last_hidden_state
         return self.lm_head(hidden[:, -1:]).view(1, -1)
-
-
-class _PredictorStepEmbedWrapper(nn.Module):
-    """`merged-table row -> that row`, the code predictor's input for steps 1..14.
-
-    The row index is `g * 2048 + t`, and a windowed `loom.sample_row` returns exactly that -- so the
-    driver hands back the number it was given, with no arithmetic. Its own phase only so the vector
-    stays engine-side between the draw and the next call.
-    """
-
-    def __init__(self, embeddings, projection):
-        super().__init__()
-        self.embedding = nn.Embedding(embeddings.shape[0], embeddings.shape[1])
-        with torch.no_grad():
-            self.embedding.weight.copy_(embeddings)
-        self.projection = projection
-
-    def forward(self, rows):
-        return self.projection(self.embedding(rows))
 
 
 class _FrameEmbedWrapper(nn.Module):
@@ -512,6 +565,8 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
                 "different prompt, not a longer one."
             )
         talker_config = model.config.talker_config
+        materialise_gqa(model.talker.model, talker_config)
+        materialise_gqa(model.talker.code_predictor.model, talker_config.code_predictor_config)
         self._n_code_groups = int(talker_config.num_code_groups)
         self._codebook_size = int(talker_config.code_predictor_config.vocab_size)
         self._eos_index = self._codebook_size
@@ -571,7 +626,8 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
         mel_fn = _mel_frontend(model)
         text_dim = ct.RangeDim(10, self.max_text_len)
         frames_dim = ct.RangeDim(1, self.max_frames)
-        steps_dim = ct.RangeDim(1, groups)
+        steps_dim = ct.RangeDim(3, groups)
+        rows_dim = ct.RangeDim(1, groups - 2)
 
         probe_text = torch.zeros((1, self.trace_text_len), dtype=torch.long)
         probe_spk = torch.zeros((1, hidden_size))
@@ -629,44 +685,40 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
                 kv_cache_size=self.max_frames,
             ),
             ExportPhase(
-                name="predictor_prompt",
-                wrapper=_PredictorPromptWrapper(talker).eval(),
+                name="predictor_prefill",
+                wrapper=_PredictorWrapper(predictor, talker, heads, False, embeddings).eval(),
                 dummy_inputs=(torch.zeros((1, 1), dtype=torch.long),
-                              torch.zeros(1, 1, hidden_size)),
+                              torch.zeros(1, 1, hidden_size),
+                              torch.arange(2).view(1, -1),
+                              causal_mask(2)),
                 mil_inputs=[
                     ct.TensorType(name="first_id", shape=(1, 1), dtype=np.int32),
                     ct.TensorType(name="talker_hidden", shape=(1, 1, hidden_size),
                                   dtype=np.float32),
+                    ct.TensorType(name="position_ids", shape=(1, 2), dtype=np.int32),
+                    ct.TensorType(name="attention_mask", shape=(1, 1, 2, 2), dtype=np.float32),
                 ],
             ),
             ExportPhase(
-                name="predictor",
-                wrapper=_PredictorWrapper(predictor, heads).eval(),
-                # Five, not the two positions its prompt actually has: `repeat_kv` reshapes through
-                # `[1, n_kv, n_rep, seq, head_dim]` and this model's `n_rep` is 2, so a trace at
-                # length 2 makes the sequence axis and the repeat axis the same number.
-                dummy_inputs=(torch.zeros(1, 5, hidden_size),
+                name="predictor_steps",
+                wrapper=_PredictorWrapper(predictor, talker, heads, True, embeddings).eval(),
+                dummy_inputs=(torch.zeros((1, 1), dtype=torch.long),
+                              torch.zeros(1, 1, hidden_size),
                               torch.arange(5).view(1, -1),
-                              causal_mask(5)),
+                              causal_mask(5),
+                              torch.zeros((1, 3), dtype=torch.long)),
                 mil_inputs=[
-                    ct.TensorType(name="inputs_embeds", shape=(1, steps_dim, hidden_size),
+                    ct.TensorType(name="first_id", shape=(1, 1), dtype=np.int32),
+                    ct.TensorType(name="talker_hidden", shape=(1, 1, hidden_size),
                                   dtype=np.float32),
                     ct.TensorType(name="position_ids", shape=(1, steps_dim), dtype=np.int32),
-                    ct.TensorType(name="attention_mask",
-                                  shape=(1, 1, steps_dim, steps_dim), dtype=np.float32),
+                    ct.TensorType(name="attention_mask", shape=(1, 1, steps_dim, steps_dim),
+                                  dtype=np.float32),
+                    # `rows` is two shorter than the prefix it becomes: the talker hidden and
+                    # codebook 0 are the other two positions.
+                    ct.TensorType(name="rows", shape=(1, rows_dim), dtype=np.int32),
                 ],
-                fuse_attention=True,
-                # The predictor never sees more than 16 positions, but one KvCache serves the whole
-                # model and the phases that share it must agree on its capacity. Declaring its real
-                # need would fail the export rather than save the memory.
-                kv_cache_size=self.max_frames,
-            ),
-            ExportPhase(
-                name="predictor_step",
-                wrapper=_PredictorStepEmbedWrapper(embeddings,
-                                                   predictor.small_to_mtp_projection).eval(),
-                dummy_inputs=(torch.zeros((1, 1), dtype=torch.long),),
-                mil_inputs=[ct.TensorType(name="rows", shape=(1, 1), dtype=np.int32)],
+                declared_axes={"rows": {1: "n_tokens - 2"}},
             ),
             ExportPhase(
                 name="frame_embed",

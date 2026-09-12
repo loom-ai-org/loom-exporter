@@ -57,34 +57,39 @@
         if _first == EOS_INDEX then break end
         _generated[#_generated + 1] = _first
 
-        -- The code predictor, conditioned on the talker's hidden state and on codebook 0. Its cache
-        -- is reset by calling at `n_past = 0`, which in a model that appends at `n_past` is what a
-        -- fresh cache is -- there is no reset binding and this family does not need one.
-        loom.run_subgraph_and_retain('predictor_prompt', {n_tokens = 1, n_past = 0},
-            {first_id = {_first}, talker_hidden = {from = 'talker', index = 2}})
-        loom.run_subgraph_and_retain('predictor', {n_tokens = 2, n_past = 0},
-            {inputs_embeds = {from = 'predictor_prompt'},
+        -- The code predictor, conditioned on the talker's hidden state and on codebook 0.
+        --
+        -- **It is not KV-cached, and it re-reads its own prefix every step.** One KvCache serves a
+        -- whole model with one per-layer width, and these two phases' K/V geometry does not agree --
+        -- so rather than force it, the smaller model stops needing a cache. It never exceeds sixteen
+        -- positions, so the whole frame costs 135 row-forwards of a five-layer stack, against one
+        -- 28-layer talker step beside it. What it buys is that the driver still passes only
+        -- integers: the prefix is rebuilt in-graph from `_prefix`, one longer each step.
+        local _hidden = {from = 'talker', index = 2}
+        loom.run_subgraph_and_retain('predictor_prefill', {n_tokens = 2, n_past = 0},
+            {first_id = {_first}, talker_hidden = _hidden,
              position_ids = loom.range(0, 2),
              attention_mask = loom.causal_mask(2, 0)})
 
         -- **Group `g` is the window `[g*V, (g+1)*V)` of one 15-way-concatenated head**, which is what
-        -- keeps fifteen steps on one topology. A windowed draw returns the ABSOLUTE index, so the
-        -- number that comes back is already the merged embedding table's row for the next step --
-        -- `_rows_of` holds those, and the real codes are recovered by subtracting the offset once,
-        -- at the end.
-        local _frame = {_first}
+        -- keeps fifteen draws on one head. A windowed draw returns the ABSOLUTE index, so the number
+        -- that comes back is already the merged embedding table's row -- `_prefix` holds those
+        -- unchanged, and the real codes are recovered by subtracting the offset once, at the end.
+        local _frame, _prefix = {_first}, {}
+        local _module = 'predictor_prefill'
         for _g = 0, N_GROUPS - 2 do
-            local _row = loom.sample_row('predictor', 0, {
+            local _row = loom.sample_row(_module, 0, {
                 temperature = _sub_temperature, top_k = _sub_top_k, top_p = _sub_top_p,
                 lo = _g * CODEBOOK_SIZE, hi = (_g + 1) * CODEBOOK_SIZE})
             _frame[#_frame + 1] = _row
             if _g < N_GROUPS - 2 then
-                loom.run_subgraph_and_retain('predictor_step', {n_tokens = 1, n_past = 0},
-                    {rows = {_row}})
-                loom.run_subgraph_and_retain('predictor', {n_tokens = 1, n_past = 2 + _g},
-                    {inputs_embeds = {from = 'predictor_step'},
-                     position_ids = loom.range(2 + _g, 1),
-                     attention_mask = loom.causal_mask(1, 2 + _g)})
+                _prefix[#_prefix + 1] = _row
+                local _n = #_prefix + 2
+                loom.run_subgraph_and_retain('predictor_steps', {n_tokens = _n, n_past = 0},
+                    {first_id = {_first}, talker_hidden = _hidden, rows = _prefix,
+                     position_ids = loom.range(0, _n),
+                     attention_mask = loom.causal_mask(_n, 0)})
+                _module = 'predictor_steps'
             end
         end
 
