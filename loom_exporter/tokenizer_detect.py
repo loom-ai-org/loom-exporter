@@ -297,6 +297,15 @@ def detect_vocab_family(tokenizer_dir: str) -> str:
     # really is -- this branch only fires when nothing else identified the directory.
     if (tok_dir / "vocab.txt").exists():
         return "wordpiece"
+    # The classic GPT-2 layout: `vocab.json` + `merges.txt` and no fast-tokenizer file. Same vintage
+    # gap as the `vocab.txt` branch above -- Qwen3-TTS ships it, where every other Qwen checkpoint in
+    # this tree ships `tokenizer.json`. BOTH files are required rather than either: `vocab.json` alone
+    # is ambiguous (SentencePiece directories carry one too), and it is the merges that make it BPE.
+    # Checked after every other marker for the same reason, so a directory that happens to carry a
+    # `vocab.json` beside a real fast-tokenizer file still resolves to what it really is.
+    if (tok_dir / "vocab.json").exists() and (tok_dir / "merges.txt").exists():
+        return "bpe"
     raise NotImplementedError(f"no recognized tokenizer file (tokenizer.json/tokenizer.model/spiece.model/"
-                               f"vocab.txt/a {'/'.join(sorted(_BYTE_TOKENIZER_CLASSES))} "
+                               f"vocab.txt/vocab.json+merges.txt/a "
+                               f"{'/'.join(sorted(_BYTE_TOKENIZER_CLASSES))} "
                                f"tokenizer_config.json) found in {tokenizer_dir}")
