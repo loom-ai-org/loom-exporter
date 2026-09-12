@@ -2232,7 +2232,13 @@ class FlowMatchingSampler(DriverComponent):
                     f"supply `estimator` -- the IR expression choosing between them."
                 )
             args.insert(0, self.estimator)
-        return _note_block(self.note) + [Local(self.result, Call(self.spec.func_name, args))]
+        # The generated function retains the integrated state (`spec.retain`), and it does so inside
+        # its own body -- which the adjacency check cannot see, since the body is in the prelude. So
+        # the call site declares it, naming every variant a bucketed estimator could have run.
+        retains = ([self.spec.estimator, *self.spec.estimator_variants] if self.spec.retain else [])
+        return _note_block(self.note) + [
+            Local(self.result, Call(self.spec.func_name, args), retains_=list(dict.fromkeys(retains)))
+        ]
 
 
 @dataclass

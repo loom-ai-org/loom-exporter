@@ -335,13 +335,21 @@ class VocoderWrapper(torch.nn.Module):
     once on the loaded module BEFORE tracing (see `load_vocoder`) so the trace bakes plain folded conv
     weights directly, matching `add_wn_conv`'s own folding in the bespoke conversion, rather than tracing
     the weight_norm `g*v/||v||` recomputation into the graph on every forward call.
+
+    **It denormalizes too, which used to be the driver's job.** `denormalize(x, mean, std)` is
+    `x * std + mean` over the whole spectrogram, and doing it host-side meant the sampler's state had
+    to become a Lua table on its way here -- the last mel-sized crossing in this driver (ADR-031).
+    Both constants are the checkpoint's own (`state_dict['mel_mean']`/`['mel_std']`), so folding them
+    in bakes two scalars into the graph rather than restating anything.
     """
-    def __init__(self, gen):
+    def __init__(self, gen, mel_mean: float, mel_std: float):
         super().__init__()
         self.gen = gen
+        self.mel_mean = float(mel_mean)
+        self.mel_std = float(mel_std)
 
-    def forward(self, mel):
-        wav = self.gen(mel)
+    def forward(self, z):
+        wav = self.gen(z * self.mel_std + self.mel_mean)
         return wav.reshape(-1)  # (T*256,)
 
 
@@ -490,7 +498,7 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
             DriverReturn, ExportConstants, FlowMatchingSampler, LuaFragment, SubgraphCallComponent,
         )
         from .lua_library import LuaLibrary
-        from .driver_ir import BinOp, FieldAccess, Var
+        from .driver_ir import BinOp, FieldAccess, OutputRef, Var
 
         fragment = self.driver_script_path
         t_text, t_mel, n_feats = Var("t_text"), Var("t_mel"), Var("N_FEATS")
@@ -499,7 +507,9 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
         return [
             LuaFragment(fragment / "00_header.lua", top_level=True),
             LuaLibrary(uses=("durations_from_logw", "array_sum", "pad_last_to_multiple",
-                             "repeat_by_duration_tfast", "array_affine")),
+                             # `array_affine` went with the denormalize, which the vocoder graph does
+                             # now -- see VocoderWrapper.
+                             "repeat_by_duration_tfast")),
             # The three numbers only the checkpoint knows, bound as IR locals rather than passed in by
             # the caller (P4.0.8's first follow-up). They were `infer` arguments, which made every host
             # -- including tests/tts_driver_inputs.h -- restate the model's own hyperparameters back to
@@ -527,7 +537,7 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
             # to "match" where its function appears is exactly the ordering `driver_ir.validate`
             # rejects -- it read `t_mel` before `02_durations.lua` binds it.
             FlowMatchingSampler(
-                spec=sampler, result="z", length=t_mel,
+                spec=sampler, result="_z_gen", length=t_mel,
                 n_elems=BinOp("*", t_mel, n_feats), n_steps=FieldAccess("inputs", "n_steps"),
                 step_inputs={"mu": Var("mu_y")},
                 note="--- Deterministic Euler CFM sampling over the Decoder U-Net estimator -- see\n"
@@ -535,12 +545,13 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
                      "    so loom.gaussian_array's sequential flat fill is usable directly as the\n"
                      "    Decoder's T-fast `z` input with no reindexing needed. ---",
             ),
-            LuaFragment(fragment / "04_denormalize.lua", reads=("z", "MEL_STD", "MEL_MEAN"),
-                        defines=("mel",)),
             SubgraphCallComponent(
-                topology="vocoder", outputs=("waveform",), inputs={"mel": Var("mel")}, length=t_mel,
-                note="--- HiFi-GAN v1 vocoder: mel (T-fast, matching its own native torch\n"
-                     "    (1,n_feats,T) layout) -> waveform ---"),
+                topology="vocoder", outputs=("waveform",),
+                # The sampler's own retained state, and the denormalize that used to sit between them
+                # is inside this graph now -- so nothing mel-sized crosses the boundary at any point.
+                inputs={"mel": OutputRef("decoder")}, length=t_mel,
+                note="--- HiFi-GAN v1 vocoder: the sampled latent, denormalized in-graph (T-fast,\n"
+                     "    matching its own native torch (1,n_feats,T) layout) -> waveform ---"),
             DriverReturn(values=("waveform",)),
         ]
 
@@ -592,7 +603,8 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
         dummy_mel = torch.randn(1, n_feats, dummy_voc_T)
         voc_seq_dim = ct.RangeDim(1, 4096)
         vocoder_phase = ExportPhase(
-            name="vocoder", wrapper=VocoderWrapper(gen).eval(), dummy_inputs=(dummy_mel,),
+            name="vocoder", wrapper=VocoderWrapper(gen, self.mel_mean, self.mel_std).eval(),
+            dummy_inputs=(dummy_mel,),
             mil_inputs=[ct.TensorType(name="mel", shape=(1, n_feats, voc_seq_dim), dtype=np.float32)],
         )
 

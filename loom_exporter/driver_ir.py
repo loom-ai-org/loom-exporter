@@ -363,6 +363,12 @@ class Stmt:
 class Local(Stmt):
     name: str
     expr: Expr
+    # Topologies the bound expression leaves RETAINED. Empty for almost every `Local`; set when the
+    # expression is a call to a GENERATED function whose body retains -- the flow-matching sampler,
+    # whose `loom.run_ode_and_retain` lives in the prelude where `_check_retained_reads` cannot see it.
+    # Same declaration `RawBlock.retains_` makes for a hand-written fragment, and read by the same
+    # `getattr` in the checker.
+    retains_: list = dataclasses.field(default_factory=list)
 
     def defines(self) -> list[str]:
         return [self.name]

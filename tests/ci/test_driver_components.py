@@ -758,8 +758,10 @@ class TestPeeledMatcha(unittest.TestCase):
         text = self._render()
         self.assertLess(text.index("local function sample_decoder"),
                         text.index("function infer(inputs)"))
+        # The local binds the sampler's GENERATION now, not the state: `loom.run_ode_and_retain`
+        # leaves the integrated latent in the estimator's own store and the vocoder names it.
         self.assertLess(text.index("function infer(inputs)"),
-                        text.index("local z = sample_decoder("))
+                        text.index("= sample_decoder("))
 
     def test_every_run_subgraph_call_is_ir_rather_than_text(self):
         """What the peel buys structurally: `check_subgraph_calls` sees these directly, including their
