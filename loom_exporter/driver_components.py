@@ -1818,6 +1818,72 @@ class SubgraphCallComponent(DriverComponent):
         )]
 
 
+@dataclass
+class RecurrentCall(DriverComponent):
+    """One `loom.run_recurrent` call: a whole sequence through one LSTM cell topology, in C++.
+
+    **The driver-side half of `RecurrentPhase`**, which until now had none. That phase emits
+    `{name}_fwd`/`{name}_bwd` cell topologies; the only callers were hand-written Lua
+    (`run_bi_lstm`, which loops timesteps IN LUA and marshals a hidden-width table per step) and the
+    engine's own `BiLstmStepper`. This binds the C++ binding instead -- one Lua call per layer, with
+    the timestep loop, the h/c carry and the graph reuse all on the far side of the boundary.
+
+    A STACK is this component once per layer, chained: the sequence in is the previous layer's
+    output. That is what `RecurrentPhase`'s own `{name}_l0_fwd`/`{name}_l1_fwd` numbering is for.
+
+    `seq_len` and the two widths are IR expressions rather than numbers because only the first is
+    dynamic -- the widths are the checkpoint's, and passing them as literals is what lets the binding
+    check the array it was handed (`sequence.size() == seq_len * input_dim`) instead of trusting it.
+    """
+
+    topology: str
+    out_var: str
+    # The flat, TIME-MAJOR sequence: `seq[t * input_dim + k]`, which is the layout the binding indexes
+    # and therefore the layout the phase before this one must emit.
+    sequence: object
+    seq_len: object
+    input_dim: int
+    hidden_dim: int
+    # Walk timesteps backward through the same forward-ordered array -- a `direction="reverse"` cell.
+    # False for every unidirectional LSTM, which is what a decoder-side stack is.
+    reverse: bool = False
+    note: Optional[str] = None
+
+    __links__ = {"topology": TopologyName()}
+    __unchecked__ = {
+        "note": _NOTE_IS_COSMETIC,
+        "out_var": Unchecked("the local this call binds; reads of it are checked by "
+                             "driver_ir.validate over the assembled function"),
+        "sequence": Unchecked("a driver_ir expression over locals earlier components bind -- "
+                              "validate() is its authority, as it is for SubgraphCallComponent's "
+                              "own `length`"),
+        "seq_len": Unchecked("same. The binding itself checks it against the array's real size, "
+                             "which is the check that matters: a wrong length here is an error "
+                             "naming both numbers, not a silently short sequence"),
+        "input_dim": Unchecked(
+            "the cell's input width, from the traced `lstm` op's own weights via RecurrentPhase. A "
+            "wrong value fails in the binding against the sequence length, and again against the "
+            "cell topology's own declared `layer_input` size"
+        ),
+        "hidden_dim": Unchecked("same, for the h/c width the cell declares"),
+        "reverse": Unchecked(
+            "which end of the sequence the walk starts from. It is a property of the traced op's own "
+            "`direction`, which RecurrentPhase reads when it decides whether to emit a `_bwd` "
+            "topology at all -- so the authority is the emitted topology NAME, and a caller asking "
+            "for a reverse walk of a forward cell is naming a topology that does not exist"
+        ),
+    }
+
+    def link_label(self) -> str:
+        return f"loom.run_recurrent({self.topology!r})"
+
+    def emit(self, ctx):
+        return _note_block(self.note) + [Local(self.out_var, Call("loom.run_recurrent", [
+            Lit(self.topology), self.sequence, self.seq_len,
+            Lit(self.input_dim), Lit(self.hidden_dim), Lit(self.reverse),
+        ]))]
+
+
 def _names_a_topology(link) -> bool:
     """Does `link` assert that its field holds a topology name -- including through a wrapper?
 

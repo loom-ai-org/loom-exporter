@@ -76,49 +76,9 @@ import torch
 import coremltools as ct
 
 from .decomposition import Decomposition, Flattened
+from .encodec_export import _build_encodec
 from .export_config import LoomExportConfig
 from .spec_protocol import Unchecked
-
-
-# What stops EnCodec from exporting today, raised at `load` rather than discovered 200 MB into a trace.
-#
-# THIS TEXT IS THE FINDING, kept here rather than in a doc because here is where the next person meets
-# it. Both blockers were confirmed on `facebook/encodec_32khz` (MusicGen's codec) after the DAC leaf
-# was already working, and neither is a gap in this exporter:
-#
-#  1. coremltools' own torch frontend refuses EnCodec's convolution padding once the length is
-#     genuinely dynamic -- `NotImplementedError: Dynamic padding for n-dimensional tensors is not
-#     supported`. `EncodecConv1d` pads by a LENGTH-DERIVED amount
-#     (`_get_extra_padding_for_conv1d`: `ideal_length - length`). It is the same wall Supertonic hit
-#     and the reason that model's text axis is static (see `supertonic_export`'s own docstring).
-#     **It looks tractable**: for a stride-1 convolution the extra padding works out to exactly 0
-#     (`n_frames = L - k + padding_total + 1 = L`, so `ideal_length = L`), and every convolution on
-#     the DECODE path is stride 1. Patching it to a constant 0 should be sound, but it has to be
-#     proved per stage rather than assumed -- a wrong pad is a silent output shift, not an error.
-#
-#  2. `EncodecDecoder` contains `LSTM(1024, 1024, num_layers=2)` OVER THE TIME AXIS, which DAC has
-#     nothing like -- DAC's decoder is purely convolutional. A flattened trace unrolls it at the
-#     traced length and bakes it, so this is a `ScriptedLoop`/`run_recurrent` export rather than the
-#     four-line `Flattened` one DAC gets. The machinery exists (StyleTTS2's BiLSTM goes through it,
-#     `recurrent.py` + `bilstm_stepper.h`); what is missing is wiring this family to it.
-#
-# Everything ELSE about EnCodec is already handled: `CodecFamily.decode` knows its chunked
-# `(audio_codes, audio_scales)` signature and `[chunks, batch, n_q, frames]` layout, and `geometry`
-# knows its config spellings. Those are exercised by nothing today, which is why the recognizer raises
-# THIS instead of letting a caller find out inside coremltools -- an unused member is fine, a live
-# branch selecting an unusable path is how the next person loses a morning.
-ENCODEC_BLOCKERS = (
-    "EnCodec cannot be exported yet, and the two reasons are specific rather than a general gap.\n"
-    "  1. coremltools refuses its length-derived convolution padding once the frame axis is dynamic "
-    "(`Dynamic padding for n-dimensional tensors is not supported`) -- the same limitation that keeps "
-    "Supertonic's text axis static. Every decode-path convolution is stride 1, where the extra "
-    "padding is provably 0, so patching it to a constant looks sound but must be proved per stage.\n"
-    "  2. Its decoder contains a 2-layer LSTM over the time axis, which a flattened trace bakes. That "
-    "needs the ScriptedLoop/run_recurrent path StyleTTS2's BiLSTM uses, not this family's Flattened "
-    "one.\n"
-    "`CodecFamily.decode`/`geometry` already know EnCodec's signature and config spellings, so the "
-    "work is the two items above. See loom.cpp docs/epics/epic-03-model-coverage.md."
-)
 
 
 SNAC_MISSING = (
@@ -188,12 +148,9 @@ class CodecFamily(Enum):
     """
 
     DAC = "dac"
-    ENCODEC = "encodec"
     SNAC = "snac"
 
     def load(self, model_dir: str):
-        if self is CodecFamily.ENCODEC:
-            raise NotImplementedError(ENCODEC_BLOCKERS)
         if self is CodecFamily.SNAC:
             try:
                 from snac import SNAC
@@ -212,18 +169,16 @@ class CodecFamily(Enum):
 
         import transformers
 
-        cls = {CodecFamily.DAC: "DacModel", CodecFamily.ENCODEC: "EncodecModel"}[self]
-        return getattr(transformers, cls).from_pretrained(model_dir, dtype=torch.float32).eval()
+        return transformers.DacModel.from_pretrained(model_dir, dtype=torch.float32).eval()
 
     def decode(self, model, codes):
         """`codes` is the CALLER's `[1, n_frames, codes_per_frame]`; returns the waveform with its
         batch axis still on.
 
-        EnCodec's public `decode` is CHUNKED -- its first axis is a chunk index, and its Python loop
-        over chunks unrolls to one iteration at trace time, which is what a caller that hands over a
-        whole clip wants. `audio_scales=[None]` is the un-normalised path; `config.normalize` is False
-        for every checkpoint this targets, and a normalised one would need the scale as a second input
-        rather than a constant, which is a different contract.
+        EnCodec used to be a member here and is not: its decoder contains a 2-layer LSTM, so it is a
+        three-phase export with a host-side loop (`encodec_export.py`) rather than one traced graph.
+        What it left behind is this method's SIGNATURE -- the second leaf is what made the caller's
+        layout a per-codec question rather than one shared transpose.
         """
         if self is CodecFamily.SNAC:
             # A row is one COARSEST-codebook frame, level-major: codebook 0's single id, then
@@ -240,16 +195,8 @@ class CodecFamily(Enum):
             # the model rather than lifted into this slicing: it is the model's arithmetic, and it
             # converts (MIL `tile`, one per non-unit stride) without help.
             return model.decode(out)
-        codes = codes.transpose(1, 2)                        # -> [1, n_codebooks, n_frames]
-        if self is CodecFamily.DAC:
-            return model.decode(audio_codes=codes).audio_values
-        if not getattr(model.config, "normalize", False):
-            return model.decode(audio_codes=codes[None], audio_scales=[None]).audio_values
-        raise NotImplementedError(
-            f"{model.config.model_type} declares normalize=True, so its decode needs the per-clip "
-            f"scale its encoder produced. That is a second input and a different contract; this "
-            f"family exports the un-normalised path only."
-        )
+        # -> [1, n_codebooks, n_frames], which is DAC's own layout.
+        return model.decode(audio_codes=codes.transpose(1, 2)).audio_values
 
     def noise_multiples(self, model) -> list:
         """How many noise samples each stochastic leaf needs per unit of the ROOT AXIS, in decoder
@@ -296,14 +243,7 @@ class CodecFamily(Enum):
                         sample_rate=int(model.sampling_rate), hop_length=int(model.hop_length),
                         vq_strides=[int(s) for s in model.vq_strides])
         config = model.config
-        if self is CodecFamily.DAC:
-            n_codebooks = int(config.n_codebooks)
-        else:
-            # EnCodec's `num_quantizers` is the count for the bandwidth the checkpoint was configured
-            # at, which for the 32 kHz model is the 4 MusicGen emits. A checkpoint offering several
-            # bandwidths would need the caller to name one -- it is a property of the EXPORT, not of
-            # the file -- and that is why this reads the config rather than a maximum.
-            n_codebooks = int(config.num_quantizers)
+        n_codebooks = int(config.n_codebooks)
         return dict(n_codebooks=n_codebooks, codebook_size=int(config.codebook_size),
                     sample_rate=int(config.sampling_rate), hop_length=int(config.hop_length),
                     vq_strides=[1] * n_codebooks)
@@ -575,12 +515,12 @@ def _is_dac(path: Path) -> bool:
 
 
 def _is_encodec(path: Path) -> bool:
-    """An HF directory declaring `model_type == "encodec"` -- MusicGen's codec, and the second leaf.
+    """An HF directory declaring `model_type == "encodec"` -- MusicGen's codec.
 
-    Registered even though the export raises, deliberately: detection working is what makes the
-    failure message reachable. Without this recognizer an EnCodec directory is "no family recognizes
-    this checkpoint", which is the wrong answer -- this family recognizes it fine and cannot yet trace
-    it, and `ENCODEC_BLOCKERS` says exactly why.
+    It exports through `encodec_export.py` rather than through this module's config: its decoder
+    contains a 2-layer LSTM over the time axis, which no single topology can express. The recognizer
+    stays HERE because detection is a property of the family -- one place answers "is this a codec
+    this project can decode", and which export shape it needs is the next question, not the first.
     """
     cfg = _hf_config(path)
     return cfg is not None and cfg.get("model_type") == "encodec"
@@ -608,11 +548,6 @@ def _build_dac(path: Path, output_path: str) -> LoomExportConfig:
                                   family=CodecFamily.DAC)
 
 
-def _build_encodec(path: Path, output_path: str) -> LoomExportConfig:
-    return AudioCodecExportConfig(architecture=None, output_path=output_path, model_dir=str(path),
-                                  family=CodecFamily.ENCODEC)
-
-
 def _build_snac(path: Path, output_path: str) -> LoomExportConfig:
     # The one leaf that must be TOLD its architecture: `load_model` reads `config.model_type` for it,
     # and a SNAC model has no `config` at all.
@@ -628,6 +563,11 @@ def register(registry) -> None:
         config_class=AudioCodecExportConfig,
         recognizers=[
             ModelRecognizer(name="dac", detect=_is_dac, build_config=_build_dac),
+            # Builds an `EnCodecExportConfig`, which is NOT an `AudioCodecExportConfig`: EnCodec's
+            # decoder contains an LSTM, so it is a three-phase export with a host-side loop rather
+            # than one traced graph. Same task, same contract, different export shape -- see
+            # `encodec_export.py` and `tasks.py`'s own entry for why this task's declared base class
+            # is the root one.
             ModelRecognizer(name="encodec", detect=_is_encodec, build_config=_build_encodec),
             ModelRecognizer(name="snac", detect=_is_snac, build_config=_build_snac),
         ],

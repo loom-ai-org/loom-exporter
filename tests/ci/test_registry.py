@@ -754,7 +754,11 @@ def test_both_reserved_names_were_claimed_by_the_families_that_arrived():
 
     entries = default_registry()._entries
     assert not task_spec("audio-codec").reserved
-    assert task_spec("audio-codec").base_config_class() is AudioCodecExportConfig
+    # The ROOT base class, since the task's two export shapes (one traced graph for DAC/SNAC, three
+    # phases and a host-side loop for EnCodec, whose decoder has an LSTM) share no narrower one --
+    # the same answer `automatic-speech-recognition` gives above, for the same reason.
+    assert task_spec("audio-codec").base_config_class() is LoomExportConfig
+    assert issubclass(AudioCodecExportConfig, LoomExportConfig)
     assert "audio-codec" in entries
 
     assert not task_spec("text-to-codes").reserved

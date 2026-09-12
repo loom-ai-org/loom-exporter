@@ -41,36 +41,24 @@ def test_a_dac_directory_is_claimed(tmp_path):
     assert _is_dac(_hf_dir(tmp_path, "dac", {"model_type": "dac"}))
 
 
-def test_encodec_is_recognized_and_refuses_with_its_reasons(tmp_path):
-    """The second leaf is DETECTED but not exportable, and detection is what makes that sayable.
+def test_encodec_is_recognized_here_and_exported_elsewhere(tmp_path):
+    """EnCodec's recognizer stays in this module and its EXPORT left it.
 
-    Without the recognizer an EnCodec directory would be "no family recognizes this checkpoint",
-    which is the wrong answer: this family recognizes it fine and cannot yet trace it. The two
-    blockers are real and specific (coremltools' dynamic-pad limitation and a 2-layer LSTM over the
-    time axis), so the message names them rather than saying "unsupported".
+    Detection is a property of the family -- one place answers "is this a codec this project can
+    decode" -- and which export shape a checkpoint needs is the next question, not the first. What
+    changed is the answer: EnCodec's decoder has a 2-layer LSTM over the time axis, which no single
+    topology can express, so the recognizer builds an `EnCodecExportConfig` (three phases and a
+    host-side loop) rather than this module's flattened one. `CodecFamily` no longer has a member for
+    it, and neither do the two dead branches that used to carry its `decode` signature and its config
+    spellings: a live branch selecting a path nothing takes is how the next person loses a morning.
     """
+    from loom_exporter.encodec_export import EnCodecExportConfig
+
     path = _hf_dir(tmp_path, "enc", {"model_type": "encodec"})
-    assert default_registry().detect(path).name == "encodec"
-    with pytest.raises(NotImplementedError, match="Dynamic padding"):
-        CodecFamily.ENCODEC.load(str(path))
-    with pytest.raises(NotImplementedError, match="LSTM"):
-        CodecFamily.ENCODEC.load(str(path))
-
-
-def test_encodecs_geometry_and_decode_are_already_written(tmp_path):
-    """The half that IS done, pinned so it does not rot while the blockers are open: EnCodec's config
-    spellings differ from DAC's in every field but `codebook_size`, and that mapping is what a future
-    unblocking builds on."""
-    class _EncodecConfig:
-        num_quantizers, codebook_size, sampling_rate, hop_length = 4, 2048, 32000, 640
-
-    class _Encodec:
-        config = _EncodecConfig()
-
-    assert CodecFamily.ENCODEC.geometry(_Encodec()) == {
-        "n_codebooks": 4, "codebook_size": 2048, "sample_rate": 32000, "hop_length": 640,
-        "vq_strides": [1, 1, 1, 1],
-    }
+    recognizer = default_registry().detect(path)
+    assert recognizer.name == "encodec"
+    assert isinstance(recognizer.build_config(path, "/tmp/x.gguf"), EnCodecExportConfig)
+    assert [m.name for m in CodecFamily] == ["DAC", "SNAC"]
 
 
 def test_another_codec_is_not_claimed_by_dacs_recognizer(tmp_path):
@@ -148,9 +136,16 @@ def test_the_registry_resolves_a_synthetic_dac(tmp_path):
     assert recognizer.task == "audio-codec"
 
 
-def test_the_task_declares_this_familys_base_config():
-    assert task_spec("audio-codec").base_config_class() is AudioCodecExportConfig
+def test_the_task_declares_the_root_base_class_because_two_shapes_claim_it():
+    """`LoomExportConfig`, not this module's config, and that is the honest answer rather than a
+    widening for convenience -- the same argument `automatic-speech-recognition` makes at its own
+    entry, on the same evidence. DAC and SNAC are one traced graph; EnCodec is three phases and a
+    loop. The I/O contract is identical for all three, and that is what the TASK is."""
+    from loom_exporter.export_config import LoomExportConfig
+
+    assert task_spec("audio-codec").base_config_class() is LoomExportConfig
     assert not task_spec("audio-codec").reserved
+    assert issubclass(AudioCodecExportConfig, LoomExportConfig)
 
 
 def test_the_modality_pair_is_codes_in_audio_out():

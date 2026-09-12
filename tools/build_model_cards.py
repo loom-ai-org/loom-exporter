@@ -453,6 +453,44 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         ),
     ),
     ModelCard(
+        slug="encodec-32khz", checkpoint=Path("encodec-32khz"),
+        task_type="audio-codec", pipeline_tag="text-to-audio",
+        base_repo="facebook/encodec_32khz", license_id="cc-by-nc-4.0", language=[],
+        # **The one entry here whose license is not permissive, and it took tracing.** The upstream
+        # repo declares NO `license:` tag and its README has no license line. Two candidates: the
+        # EnCodec CODE on github.com/facebookresearch/encodec is MIT, and this specific CHECKPOINT was
+        # trained as part of MusicGen ("intended to be used in conjunction with the MusicGen models",
+        # its own card), whose weights ship CC-BY-NC-4.0. A re-upload is about the weights, so the
+        # non-commercial tag is the safe reading and the one used here. Same shape of gap as DAC's and
+        # StyleTTS2's entries; different resolution, because the permissive candidate covers the code
+        # rather than these weights.
+        language_note="a codec, not a language model: it carries no vocabulary and no language. The "
+                       "upstream repo carries NO `license:` tag; `cc-by-nc-4.0` follows the MusicGen "
+                       "release this checkpoint was trained as part of, which is the stricter of the "
+                       "two readings. The EnCodec code itself is MIT, which covers the code and not "
+                       "these weights.",
+        title="EnCodec 32 kHz (decoder)",
+        summary="Meta's EnCodec at 32 kHz -- MusicGen's codec -- decode half, exported for loom.cpp. "
+                "Family 11: codec tokens in, a waveform out.",
+        limitations=(
+            "**This is the DECODE half only.** `encode` is audio-in/codes-out -- a different contract "
+            "with a different modality pair -- and no model that decodes through this codec ever calls "
+            "it, so exporting it would be weight in the file for a door nothing opens. To go the other "
+            "way, use the upstream checkpoint.\n\n"
+            "It takes **4 code streams per frame at 50 frames per second**, and one frame decodes to "
+            "640 samples. That is the 2.2 kbps bandwidth this checkpoint is configured at; codes from "
+            "EnCodec at another bandwidth are a different number of streams and are refused on the "
+            "width rather than decoded.\n\n"
+            "**Its decoder contains an LSTM, which the engine runs as a host-side loop.** The file "
+            "carries three graph topologies and a driver that walks the recurrence per frame, rather "
+            "than one graph -- invisible from the outside, and the reason a long clip costs more per "
+            "second than a purely convolutional codec does.\n\n"
+            "**It does not undo a delay pattern.** An AR model that emits these codes typically offsets "
+            "stream *k* by *k* steps; realigning them is a property of that model, not of the codec, so "
+            "feed it aligned codes."
+        ),
+    ),
+    ModelCard(
         slug="snac-24khz", checkpoint=Path("snac-24khz"),
         task_type="audio-codec", pipeline_tag="text-to-audio",
         base_repo="hubertsiuzdak/snac_24khz", license_id="mit", language=[],

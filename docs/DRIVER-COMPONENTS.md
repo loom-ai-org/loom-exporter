@@ -71,7 +71,7 @@ differs is entirely what the host does with the one output. The family names its
 | component | class | emits | links | unchecked | used by |
 |---|---|---|---|---|---|
 | `driver_inputs` | `DriverInputs` | statements | 0 | 4 | conformer-ctc, dac, encodec, hf-causal-lm, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3, snac |
-| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, dac, encodec, hf-causal-lm, hf-token-classifier, lfm2-monolithic, qwen3, snac |
+| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, dac, hf-causal-lm, hf-token-classifier, lfm2-monolithic, qwen3, snac |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
 | `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 16 | granite-speech, hf-causal-lm, lfm2-monolithic, qwen3, qwen3-asr, t5, whisper |
 | `waveform_valid_length` | `WaveformValidLength` | statements | 0 | 5 | granite-speech, qwen3-asr |
@@ -82,7 +82,8 @@ differs is entirely what the host does with the one output. The family names its
 | `export_constants` | `ExportConstants` | statements | 0 | 1 | dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
 | `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
-| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
+| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | dia, encodec, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
+| `recurrent_call` | `RecurrentCall` | statements | 1 | 7 | encodec |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 7 | matcha, supertonic |
 | `driver_return` | `DriverReturn` | statements | 0 | 1 | dac, dia, encodec, kokoro, matcha, snac, styletts2, supertonic, vits |
 | `lua_library` | `LuaLibrary` | prelude | 1 | 0 | kokoro, matcha, styletts2, vits |
@@ -99,7 +100,7 @@ Binds every name the topologies below are called with: read from the caller's `i
 
 The single `run_subgraph` call a flattened export's driver makes, capturing the output's shape alongside its data so the epilogue knows the vocab size -- or, for a KV-cached topology, retaining the output engine-side and binding nothing, so the logits never become a Lua table at all.
 
-*Emits:* statements. *Used by:* conformer-ctc, dac, encodec, hf-causal-lm, hf-token-classifier, lfm2-monolithic, qwen3, snac.
+*Emits:* statements. *Used by:* conformer-ctc, dac, hf-causal-lm, hf-token-classifier, lfm2-monolithic, qwen3, snac.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
@@ -205,10 +206,18 @@ One hand-written block of a peeled driver, kept as its own `.lua` file, declarin
 
 One `loom.run_subgraph` as IR rather than text, so `check_subgraph_calls` covers its output arity too -- what a peel buys structurally.
 
-*Emits:* statements. *Used by:* dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper.
+*Emits:* statements. *Used by:* dia, encodec, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
+
+### `recurrent_call` — `RecurrentCall`
+
+One `loom.run_recurrent`: a whole sequence through one LSTM cell topology, with the timestep loop and the h/c carry on the C++ side. A stack is one per layer, chained.
+
+*Emits:* statements. *Used by:* encodec.
+
+* `topology` — TopologyName
 
 ### `flow_matching_sampler` — `FlowMatchingSampler`
 
