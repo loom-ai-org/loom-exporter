@@ -2770,9 +2770,10 @@ class LoomGGUFExporter:
         `tokenizer_family`/`tokenizer_pre` kwargs -- see tokenizer_detect.py's own module docstring for
         the detection recipes.
 
-        "supertonic" is the one family that is never auto-detected: it is not an HF tokenizer directory at
-        all (no tokenizer.json, no protobuf -- one static JSON codepoint table), so a config that has one
-        names it explicitly via `tokenizer_family`, and `detect_vocab_family` is never asked."""
+        Two families are never auto-detected and both name themselves via `tokenizer_family`:
+        "supertonic", which is not an HF tokenizer directory at all (no tokenizer.json, no protobuf --
+        one static JSON codepoint table), and "ctc", whose directory holds a bare `vocab.json` that a
+        GPT-2 BPE directory spells identically. For both, `detect_vocab_family` is never asked."""
         from .tokenizer_detect import detect_vocab_family, detect_loom_pre_type
 
         family = self.kwargs.get("tokenizer_family") or detect_vocab_family(tokenizer_dir)
@@ -2794,6 +2795,12 @@ class LoomGGUFExporter:
             # the speech-LM families carry their prompt structure as `prompt_constants` instead.
             if self.kwargs.get("chat_template"):
                 self._write_chat_template(w, tokenizer_dir)
+        elif family == "ctc":
+            # Never auto-detected, like "supertonic": a `Wav2Vec2CTCTokenizer` directory carries
+            # `vocab.json` and nothing else, and that filename is also what a GPT-2 BPE directory calls
+            # its own piece table -- so the marker is not on disk and the family that knows names it.
+            from .ctc_tokenizer_export import write_ctc_vocab
+            write_ctc_vocab(w, tokenizer_dir)
         elif family == "wordpiece":
             from .wordpiece_tokenizer_export import write_wordpiece_vocab
             write_wordpiece_vocab(w, tokenizer_dir)
