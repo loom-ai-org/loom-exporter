@@ -1,6 +1,8 @@
 
     -- --- bert_encoder (existing bespoke topology, unchanged) ---
-    local d_en_flat = loom.run_subgraph("bert_encoder", {n_tokens = T_text, n_past = 0}, {x = bert_out})  -- Layout A [T,512]
+    -- `albert`'s output by reference: it is a graph input and nothing here reads it.
+    local d_en_flat = loom.run_subgraph("bert_encoder", {n_tokens = T_text, n_past = 0},
+                                         {x = {from = 'albert'}})  -- Layout A [T,512]
 
     -- --- DurationEncoder: 3x (BiLSTM + AdaLayerNorm), each re-concatenating style (bespoke, unchanged) ---
     local x = {}

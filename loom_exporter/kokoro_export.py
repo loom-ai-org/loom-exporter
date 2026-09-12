@@ -708,7 +708,7 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
             SubgraphCallComponent,
         )
         from .lua_library import LuaLibrary
-        from .driver_ir import Call, FieldAccess, Lit, Var
+        from .driver_ir import Call, FieldAccess, Lit, OutputRef, Var
 
         fragment = self.driver_script_path
         external = self.external_topologies()
@@ -770,6 +770,8 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
                            "cnn_rows", "t_en", "asr"),
                   drives=(HelperCall("run_bi_lstm", "text_encoder_lstm"),)),
             block("04_f0n.lua", reads=("en", "HIDDEN_PER_DIR", "s_predictor"),
+                  # `run_proj1x1` retains both projections; the vocoder call below names them.
+                  retains=("f0n_f0_proj", "f0n_n_proj"),
                   defines=("shared_out", "f0_feat", "n_feat", "F0_curve", "N_curve"),
                   drives=(
                       HelperCall("run_bi_lstm", "f0n_shared_lstm"),
@@ -787,7 +789,8 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
                 axes={"n_enc_frames": t_frames, "n_past": Lit(0)},
                 inputs={
                     "asr": Call("to_layout_a", [Var("asr"), t_frames, Lit(512)]),
-                    "f0_curve": Var("F0_curve"), "n_curve": Var("N_curve"),
+                    # Retained by `run_proj1x1`, which returns the module name these two locals hold.
+                    "f0_curve": OutputRef("f0n_f0_proj"), "n_curve": OutputRef("f0n_n_proj"),
                     "s": Var("s_decoder"), "rand_ini": Var("rand_ini"),
                     "noise_in": Var("noise_in"), "wsum": Var("wsum"),
                 },

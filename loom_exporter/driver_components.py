@@ -1570,6 +1570,10 @@ class LuaFragment(DriverComponent):
     # `HelperCall`/`ComputedCall` declarations for this fragment's call sites whose topology name is
     # computed at run time (D.2). Empty for a fragment that names every topology literally.
     drives: Tuple[object, ...] = ()
+    # Topologies this fragment leaves RETAINED for a LATER IR node to reference. Declared, not parsed:
+    # the retaining call can be a level down inside a `loom_lua` helper (`run_proj1x1`), which is where
+    # reading the fragment's own text stops. `driver_ir._check_retained_reads` is the consumer.
+    retains: Tuple[str, ...] = ()
 
     __links__ = {
         "drives": [
@@ -1622,6 +1626,12 @@ class LuaFragment(DriverComponent):
         ),
     }
     __unchecked__ = {
+        "retains": Unchecked(
+            "the topologies this fragment leaves retained, for a later `OutputRef` to name. There is "
+            "no second authority: the retaining call is inside the fragment's own Lua (or a helper it "
+            "calls), and what checks the claim is the ENGINE -- a reference to a module nothing "
+            "retained raises `has no retained outputs` on the first run."
+        ),
         "path": Unchecked(
             "the fragment file. `read_text()` reports a missing one with the path and the errno, "
             "which is strictly better than a link saying it does not exist"
@@ -1711,7 +1721,8 @@ class LuaFragment(DriverComponent):
         if self.top_level:
             return []
         return [RawBlock(list(self.lines), verbatim=True,
-                         reads_=list(self.reads), defines_=list(self.defines))]
+                         reads_=list(self.reads), defines_=list(self.defines),
+                         retains_=list(self.retains))]
 
 
 @dataclass
@@ -1814,7 +1825,7 @@ class SubgraphCallComponent(DriverComponent):
         return _note_block(self.note) + [SubgraphCall(
             outputs=list(self.outputs), extra_outputs=list(self.extra_outputs),
             module=self.topology, axes=axes, inputs=dict(self.inputs), multiline=self.multiline,
-            retain=self.retain, module_expr=self.topology_expr,
+            retain=self.retain, module_expr=self.topology_expr, variants=tuple(self.variants),
         )]
 
 

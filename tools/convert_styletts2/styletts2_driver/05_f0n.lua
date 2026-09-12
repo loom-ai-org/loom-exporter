@@ -4,5 +4,7 @@
     local f0_feat = run_resblk_stack("f0n_f0", shared_out, s_predictor)
     local n_feat = run_resblk_stack("f0n_n", shared_out, s_predictor)
 
+    -- `f0_feat`/`n_feat` are module NAMES now, and so are these: nothing between the shared BiLSTM
+    -- and the vocoder becomes a Lua table.
     local F0_curve = run_proj1x1("f0n_f0_proj", f0_feat)
     local N_curve = run_proj1x1("f0n_n_proj", n_feat)

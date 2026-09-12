@@ -428,7 +428,7 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
             SubgraphCallComponent,
         )
         from .lua_library import LuaLibrary
-        from .driver_ir import Call, FieldAccess, Lit, Var
+        from .driver_ir import Call, FieldAccess, Lit, OutputRef, Var
 
         fragment = self.driver_script_path
         external = self.external_topologies()
@@ -470,13 +470,16 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
             }),
             block("01_lengths.lua", defines=("T_text",)),
             SubgraphCallComponent(
-                topology="albert", outputs=("bert_out",), length=t_text,
+                topology="albert", outputs=(), retain=True, length=t_text,
                 inputs={"tokens": FieldAccess("inputs", "input_ids")},
-                note="--- CustomAlbert, ONE MIL-traced call -> bert_out, time-major (T,768)\n"
+                note="--- CustomAlbert, ONE MIL-traced call, time-major (T,768)\n"
                      "    (== ne=[768,T] Layout B, see module docstring for why this convention,\n"
-                     "    not styletts2_driver.lua's own explicit-transpose one). ---"),
+                     "    not styletts2_driver.lua's own explicit-transpose one).\n"
+                     "    RETAINED: its two readers are both graphs -- the diffusion estimator, at\n"
+                     "    EVERY sampler step, and the duration encoder -- and no host arithmetic\n"
+                     "    touches it, so it never becomes a Lua table. ---"),
             block("02_style_diffusion.lua",
-                  reads=("bert_out", "T_text", "STYLE_DIM", "SIGMA_MIN", "SIGMA_MAX", "RHO",
+                  reads=("T_text", "STYLE_DIM", "SIGMA_MIN", "SIGMA_MAX", "RHO",
                          "SIGMA_DATA"),
                   defines=("denoise_fn", "style_vec_dim", "noise0", "sigmas", "s_pred",
                            "s_decoder", "s_predictor")),
@@ -485,7 +488,7 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
             # loop here or inside the loom_lua helper one level down. Declaring the namespaces is what
             # turns them back into ordinary checked calls -- see driver_components.HelperCall.
             block("03_duration_encoder.lua",
-                  reads=("bert_out", "T_text", "D_MODEL", "STYLE_DIM", "s_predictor",
+                  reads=("T_text", "D_MODEL", "STYLE_DIM", "s_predictor",
                          "HIDDEN_PER_DIR"),
                   defines=("d_en_flat", "x", "d", "top_out", "duration_logits", "pred_dur"),
                   drives=(
@@ -501,6 +504,8 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
                            "cnn_rows", "t_en", "asr"),
                   drives=(HelperCall("run_bi_lstm", "text_encoder_lstm"),)),
             block("05_f0n.lua", reads=("en", "HIDDEN_PER_DIR", "s_predictor"),
+                  # `run_proj1x1` retains both projections; the vocoder call below names them.
+                  retains=("f0n_f0_proj", "f0n_n_proj"),
                   defines=("shared_out", "f0_feat", "n_feat", "F0_curve", "N_curve"),
                   drives=(
                       HelperCall("run_bi_lstm", "f0n_shared_lstm"),
@@ -518,7 +523,8 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
                 axes={"n_enc_frames": t_frames, "n_past": Lit(0)},
                 inputs={
                     "asr": Call("to_layout_a", [Var("asr"), t_frames, Lit(512)]),
-                    "f0_curve": Var("F0_curve"), "n_curve": Var("N_curve"),
+                    # Retained by `run_proj1x1`, which returns the module name these two locals hold.
+                    "f0_curve": OutputRef("f0n_f0_proj"), "n_curve": OutputRef("f0n_n_proj"),
                     "s": Var("s_decoder"), "rand_ini": Var("rand_ini"),
                     "noise_in": Var("noise_in"), "wsum": Var("wsum"),
                 },

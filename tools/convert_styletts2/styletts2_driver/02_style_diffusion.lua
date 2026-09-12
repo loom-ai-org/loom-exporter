@@ -11,7 +11,7 @@
         for i = 1, #x do x_scaled[i] = x[i] * c_in end
 
         local model_out = loom.run_subgraph("diffusion", {n_tokens = T_text, n_past = 0},
-                                             {x_in = x_scaled, time = {c_noise}, embedding = bert_out})
+                                             {x_in = x_scaled, time = {c_noise}, embedding = {from = 'albert'}})
 
         local x_denoised = {}
         for i = 1, #x do x_denoised[i] = c_skip * x[i] + c_out * model_out[i] end

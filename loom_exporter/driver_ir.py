@@ -209,6 +209,13 @@ class OutputRef(Expr):
     module: str
     # 1-based, indexing the target topology's own declared-output list.
     index: int = 1
+    # A COMPUTED module name, for a family whose topology is chosen at run time -- Supertonic's text
+    # buckets. `module` stays the canonical member so every check that reads it keeps working, and
+    # `variants` is the rest, exactly as `SubgraphCallComponent.topology_expr`/`variants` do one layer
+    # out. Without this a bucketed family cannot reference its own retained output at all, because the
+    # name it retained under is not knowable until the text is measured.
+    module_expr: Optional[Expr] = None
+    variants: tuple = ()
     # How many of that output's ROWS to copy, or None for all of them (BACKLOG.md P4.3d). An
     # expression, not an int: the count a family-3 driver trims to is computed at run time from the
     # caller's own audio length, and it is the same expression the segment's `n_tokens` uses -- which
@@ -226,10 +233,12 @@ class OutputRef(Expr):
         # and `row` are ordinary expressions over locals, and a reference this class did not report
         # would be a read `validate()` never resolved.
         out = list(self.rows.reads()) if self.rows is not None else []
-        return out + (list(self.row.reads()) if self.row is not None else [])
+        out += list(self.row.reads()) if self.row is not None else []
+        return out + (list(self.module_expr.reads()) if self.module_expr is not None else [])
 
     def render(self) -> str:
-        fields = [f"from = '{self.module}'"]
+        fields = [f"from = {self.module_expr.render()}" if self.module_expr is not None
+                  else f"from = '{self.module}'"]
         if self.index != 1:
             fields.append(f"index = {self.index}")
         if self.row is not None:
@@ -445,6 +454,9 @@ class SubgraphCall(Stmt):
     # reducing by name says the same two things separately, which is why the fused
     # `loom.run_subgraph_argmax` that used to say them at once no longer exists.
     retain: bool = False
+    # Every name `module_expr` can evaluate to, so a retaining computed call registers all of them for
+    # the adjacency check -- see `_check_retained_reads`. Mirrors `SubgraphCallComponent.variants`.
+    variants: tuple = ()
 
     def defines(self) -> list[str]:
         return list(self.outputs) + list(self.extra_outputs)
@@ -558,6 +570,12 @@ class RawBlock(Stmt):
     defines_: list = dataclasses.field(default_factory=list)
     reads_: list = dataclasses.field(default_factory=list)
     verbatim: bool = False
+    # Topologies this block leaves RETAINED, for `_check_retained_reads`. A hand-written fragment --
+    # or a `loom_lua` helper it calls -- can run `loom.run_subgraph_and_retain` where no IR node
+    # records it, and a later `OutputRef` in the IR would then be rejected as reading something
+    # nothing produced. Declared rather than parsed because the retaining call may be a level down
+    # inside a helper (`run_proj1x1`), which is exactly where parsing the fragment's own text stops.
+    retains_: list = dataclasses.field(default_factory=list)
 
     def defines(self) -> list[str]:
         return self.defines_
@@ -750,6 +768,10 @@ def _check_retained_reads(function: Function, topologies: dict) -> None:
             if isinstance(stmt, (While, NumericFor)):
                 walk(stmt.body, dict(produced))
                 continue
+            # What a hand-written block says it leaves retained -- see `RawBlock.retains_`. `None` for
+            # the declared-output count: the block is opaque, so an index cannot be checked against it.
+            for name in getattr(stmt, "retains_", ()):
+                produced[name] = None
             # `loom.run_recurrent_and_retain` retains too, and it is a plain `Call` rather than a
             # `SubgraphCall` -- a cell is driven per timestep by the binding, not by one call with an
             # axis table. Without this the checker saw an LSTM layer's retained sequence as never
@@ -779,10 +801,11 @@ def _check_retained_reads(function: Function, topologies: dict) -> None:
             for name, expr in stmt.inputs.items():
                 if not isinstance(expr, OutputRef):
                     continue
-                if expr.module not in produced:
+                missing = [m for m in (expr.module, *expr.variants) if m not in produced]
+                if missing:
                     raise DriverIRError(
                         f"driver IR: '{stmt.module}' input '{name}' reads the retained output of module "
-                        f"'{expr.module}', but no earlier "
+                        f"'{missing[0]}', but no earlier "
                         f"loom.run_subgraph_and_retain('{expr.module}', ...) runs in the same "
                         f"straight-line block -- a retained output only exists between the "
                         f"run that produced it and the next run of that module"
@@ -796,7 +819,11 @@ def _check_retained_reads(function: Function, topologies: dict) -> None:
                     )
             if stmt.retain:
                 topo = topologies.get(stmt.module)
-                produced[stmt.module] = None if topo is None else len(_topology_output_names(topo))
+                count = None if topo is None else len(_topology_output_names(topo))
+                # A computed call retains whichever variant it picked, and a computed reference names
+                # it with the same expression -- so all of them are "produced" together or none is.
+                for name in (stmt.module, *getattr(stmt, "variants", ())):
+                    produced[name] = count
 
     walk(function.body, {})
 

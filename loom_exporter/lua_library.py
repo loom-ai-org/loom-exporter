@@ -171,11 +171,14 @@ _FUNCTIONS = (
     LuaFunction("run_bi_lstm", drives=DrivenTopologies(
         suffixes=("_fwd", "_bwd"),
         inputs=("layer_input", "h_prev", "c_prev"))),
-    LuaFunction("run_resblk_stack", requires=("to_layout_a", "from_layout_a"),
+    # `from_layout_a` is gone from this one and `to_layout_a` from the next: both chained through Lua
+    # until the blocks and the projection started referencing each other's retained outputs, and the
+    # conversions existed only for that round trip. `run_resblk_stack` still converts its CALLER's rows
+    # on the way in, which is the one genuinely host-side end (ADR-031).
+    LuaFunction("run_resblk_stack", requires=("to_layout_a",),
                 drives=DrivenTopologies(suffixes=("_block0", "_block1", "_block2"),
                                         inputs=("x", "style"))),
-    LuaFunction("run_proj1x1", requires=("to_layout_a",),
-                drives=DrivenTopologies(suffixes=("",), inputs=("x",))),
+    LuaFunction("run_proj1x1", drives=DrivenTopologies(suffixes=("",), inputs=("x",))),
     # -- vocoder-side host precomputation ----------------------------------------------------------
     LuaFunction("compute_wsum"),
     # -- StyleTTS2's ADPM2 sampler, whole rather than shared ---------------------------------------
