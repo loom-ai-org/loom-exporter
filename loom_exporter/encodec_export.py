@@ -3,8 +3,12 @@
 DAC and SNAC are `Flattened` exports: codes in, waveform out, one traced topology
 (`audio_codec_export.py`). EnCodec decodes through a **2-layer LSTM over the time axis**, and ggml has
 no LSTM op -- a topology is a pure dataflow graph, so a recurrence is not expressible as one at all.
-That makes this a three-phase export with a host-side loop in the middle, and it is the only thing
-about this model that is genuinely different:
+That makes this a three-phase export with the recurrence between the graphs rather than inside one,
+and it is the only thing about this model that is genuinely different. **The timestep loop is in C++,
+not in the driver**: `loom.run_recurrent` takes a whole sequence and walks it, carrying `h`/`c` in
+`std::vector<float>` and reusing the cell's built graph across steps, so the Lua side makes ONE call
+per layer. (Parakeet's transducer is the other shape and loops in Lua by necessity -- how many symbols
+it emits per frame depends on what it just emitted, so there is no fixed-length sweep to hand over.)
 
     codes -> [pre] -> sequence -> [lstm_l0] -> [lstm_l1] -> [post] -> waveform
                           \\------------ residual ------------/
@@ -303,8 +307,9 @@ class EnCodecExportConfig(BaseMultiPhaseModelExportConfig):
             components.append(RecurrentCall(
                 topology=f"lstm_l{layer}_fwd", out_var=out_var, sequence=Var(previous),
                 seq_len=n_codes, input_dim=self._hidden or 1, hidden_dim=self._hidden or 1,
-                note=("The recurrence, one C++ call per layer. It is a host-side loop because a "
-                      "topology is a pure graph: no node in one can carry state across timesteps."
+                note=("The recurrence: ONE call per layer, with the timestep loop and the h/c "
+                      "carry on the C++ side. It is outside the graph because a topology is a pure "
+                      "graph -- no node in one can carry state across timesteps."
                       if layer == 0 else None),
             ))
             previous = out_var
