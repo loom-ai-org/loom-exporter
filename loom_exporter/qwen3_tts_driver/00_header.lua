@@ -1,0 +1,13 @@
+-- Qwen3-TTS's talker: text (plus a voice) in, `audio_codes` out, frame-major and 16 wide.
+--
+-- The codes are what `qwen3-tts-tokenizer-12hz` decodes -- two GGUFs by ADR-022, since one codec
+-- serves every size and variant of this talker. `codec.n_codebooks` is written by both files and a
+-- host that pipes one into the other should compare them.
+--
+-- **The loop is nested, and that is this family's whole difference from Dia.** One audio frame is
+-- sixteen transformer forwards: the talker emits codebook 0 from its own cached 28-layer stack, and
+-- the code predictor emits the other fifteen from a 5-layer stack whose cache is reset every frame.
+--
+-- Nothing but integers crosses this boundary inside the loop. Every embedding, hidden state and
+-- logit row stays in the engine and is named by module and index, which is ADR-031's rule applied to
+-- a model that would otherwise pay the crossing sixteen times per 80 ms of audio.

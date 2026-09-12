@@ -2531,10 +2531,17 @@ class LoomGGUFExporter:
                 # One cache is allocated for the whole model with one width per layer, so a model
                 # whose blocks disagree cannot be served by it. Better to say so than to write the
                 # first block's geometry and corrupt the rest.
+                # The DISTRIBUTION, not just the first disagreement. A multi-phase export with two
+                # cached phases splits cleanly by phase when one phase's `repeat_kv` fused and the
+                # other's did not -- "28 blocks at (16,128,128), 5 at (8,128,128)" says that at a
+                # glance, where naming one op and one earlier geometry reads like a stray layer.
+                from collections import Counter
+                census = Counter(g for _, g in self._fused_blocks("attention"))
                 raise NotImplementedError(
                     f"loom_fused_attention op '{op_name}' has K/V geometry {geom}, but an earlier "
                     f"block declared {(n_head_kv, head_dim_k, head_dim_v)}. A KvCache is allocated "
-                    "with ONE per-layer width, so per-block variation is unsupported."
+                    "with ONE per-layer width, so per-block variation is unsupported. Across this "
+                    f"export: {dict(census)} (geometry -> block count)."
                 )
         if not n_blocks:
             return {}
