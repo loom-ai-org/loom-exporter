@@ -137,7 +137,10 @@ class _PreWrapper(nn.Module):
     def forward(self, codes):
         embeddings = self.model.quantizer.decode(codes.transpose(1, 2).transpose(0, 1))
         hidden = self.model.decoder.layers[0](embeddings)        # [1, hidden, n_codes]
-        return hidden.transpose(1, 2).reshape(1, -1)
+        # `[1, n_codes, hidden]` and NOT flattened: the engine reads this as one ROW per timestep out of
+        # a retained `[hidden, n_codes]` tensor, so it has to keep its second axis. Flattening it made
+        # the driver marshal the whole sequence to hand it back unchanged.
+        return hidden.transpose(1, 2)
 
 
 class _PostWrapper(nn.Module):
@@ -281,7 +284,7 @@ class EnCodecExportConfig(BaseMultiPhaseModelExportConfig):
         from .driver_components import (
             CALLER, DriverInputs, DriverReturn, RecurrentCall, SubgraphCallComponent,
         )
-        from .driver_ir import BinOp, Len, Lit, Var
+        from .driver_ir import BinOp, Len, Lit, OutputRef, Var
 
         # `or` defaults, for the ONE caller that has no checkpoint: `component_registry.usage()`
         # builds every registered config without one to attribute components to models, and this
@@ -296,27 +299,35 @@ class EnCodecExportConfig(BaseMultiPhaseModelExportConfig):
             # each time.
             DriverInputs(bindings=(("codes", CALLER),), n_tokens=n_codes),
             SubgraphCallComponent(
-                topology="pre", outputs=("seq",), length=n_codes,
+                topology="pre", outputs=(), retain=True, length=n_codes,
                 inputs={"codes": Var("codes")},
-                note="The RVQ sum and the first convolution, emitted time-major for the loop below.",
+                note=("The RVQ sum and the first convolution, emitted time-major for the loop below. "
+                      "RETAINED: its sequence is read by the first LSTM layer and again at the end as "
+                      "the residual, and neither reader is the host -- so it never becomes a Lua "
+                      "table. `output_store.h`'s rule: marshal only what is genuinely host-side."),
             ),
         ]
-        previous = "seq"
+        previous = "pre"
         for layer in range(n_lstm_layers):
-            out_var = f"lstm_{layer}"
+            topology = f"lstm_l{layer}_fwd"
             components.append(RecurrentCall(
-                topology=f"lstm_l{layer}_fwd", out_var=out_var, sequence=Var(previous),
+                topology=topology, out_var=f"lstm_{layer}_gen", sequence=OutputRef(previous),
                 seq_len=n_codes, input_dim=self._hidden or 1, hidden_dim=self._hidden or 1,
-                note=("The recurrence: ONE call per layer, with the timestep loop and the h/c "
-                      "carry on the C++ side. It is outside the graph because a topology is a pure "
-                      "graph -- no node in one can carry state across timesteps."
+                retain=True,
+                note=("The recurrence: ONE call per layer, with the timestep loop, the h/c carry and "
+                      "the sequence itself all on the C++ side. It is outside the GRAPH because a "
+                      "topology is pure -- no node in one can carry state across timesteps -- but "
+                      "outside the graph is not the same as across the boundary, and nothing here "
+                      "crosses: each layer reads the previous one's retained rows."
                       if layer == 0 else None),
             ))
-            previous = out_var
+            previous = topology
         components.append(SubgraphCallComponent(
             topology="post", outputs=("wav",), length=n_codes,
-            inputs={"lstm_out": Var(previous), "residual": Var("seq")},
-            note="The residual add EncodecLSTM.forward performs, then the four upsampling stages.",
+            inputs={"lstm_out": OutputRef(previous), "residual": OutputRef("pre")},
+            note=("The residual add EncodecLSTM.forward performs, then the four upsampling stages. "
+                  "Its two inputs are the only two retained tensors still live, and the waveform it "
+                  "returns is the one value this driver marshals."),
         ))
         components.append(DriverReturn(values=("wav",)))
         return components

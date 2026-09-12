@@ -377,14 +377,19 @@ class BaseTransducerExportConfig(BaseMultiPhaseModelExportConfig):
             # before the call that reads `#_waveform`.
             LuaFragment(fragment / "01_inputs.lua", defines=("_waveform",)),
             SubgraphCallComponent(
-                topology="encoder", outputs=("_enc",), extra_outputs=("_enc_shape",),
+                # RETAINED, and it binds nothing: the decode loop consumes one encoder frame per call
+                # and names it (`{from = 'encoder', row = t, rows = 1}`), so the [n_embd, n_frames]
+                # tensor never becomes a Lua table. It used to be marshalled whole and sliced a row at
+                # a time -- the largest avoidable crossing in the zoo, and linear in the audio length.
+                # `loom.output_shape` gives the loop its frame count without the data.
+                topology="encoder", outputs=(), retain=True,
                 inputs={"waveform": Var("_waveform"),
                         "length": FieldAccess("inputs", "length")},
                 length=Len("_waveform"),
             ),
             LuaFragment(
                 fragment / "02_decode.lua",
-                reads=("_enc", "_enc_shape", "BLANK_ID", "N_DURATIONS", "DURATIONS", "PRED_HIDDEN",
+                reads=("BLANK_ID", "N_DURATIONS", "DURATIONS", "PRED_HIDDEN",
                        "N_PRED_LAYERS", "MAX_SYMBOLS_PER_STEP"),
                 defines=("tokens",),
                 drives=(
@@ -393,7 +398,11 @@ class BaseTransducerExportConfig(BaseMultiPhaseModelExportConfig):
                     ComputedCall(topologies=tuple(f"pred_lstm_l{i}_fwd"
                                                    for i in range(self.num_pred_layers or 0)),
                                  inputs=("layer_input", "h_prev", "c_prev"),
-                                 written="'pred_lstm_l' .. (l - 1) .. '_fwd'"),
+                                 # Bound to a local now, because the name is used four times in the
+                                 # body: once to run the cell and three times to NAME its retained
+                                 # outputs (`{from = cell, index = ...}`) as the next layer's input and
+                                 # as its own next h/c.
+                                 written="cell"),
                 ),
             ),
             LuaFragment(fragment / "03_return.lua", reads=("tokens",)),

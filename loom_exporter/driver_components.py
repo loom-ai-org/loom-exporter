@@ -1844,9 +1844,12 @@ class RecurrentCall(DriverComponent):
     """
 
     topology: str
+    # The local this call binds. With `retain` it holds the store GENERATION rather than the sequence,
+    # which is what a later `OutputRef(..., gen=)` would pin against; the data stays in the engine.
     out_var: str
-    # The flat, TIME-MAJOR sequence: `seq[t * input_dim + k]`, which is the layout the binding indexes
-    # and therefore the layout the phase before this one must emit.
+    # The sequence, either TIME-MAJOR `seq[t * input_dim + k]` as a Lua array, or an `OutputRef` to the
+    # producing module's retained output -- in which case the binding copies one ROW per timestep,
+    # backend-side, and the sequence never becomes a Lua value at all.
     sequence: object
     seq_len: object
     input_dim: int
@@ -1854,6 +1857,11 @@ class RecurrentCall(DriverComponent):
     # Walk timesteps backward through the same forward-ordered array -- a `direction="reverse"` cell.
     # False for every unidirectional LSTM, which is what a decoder-side stack is.
     reverse: bool = False
+    # Leave the output sequence in this module's own `OutputStore` instead of marshalling it. The point
+    # of the whole component: a stacked LSTM is then N calls with nothing crossing between them, which
+    # is `output_store.h`'s own rule (marshal only what is genuinely host-side) applied to the one
+    # binding that predated it.
+    retain: bool = False
     note: Optional[str] = None
 
     __links__ = {"topology": TopologyName()}
@@ -1873,6 +1881,11 @@ class RecurrentCall(DriverComponent):
             "cell topology's own declared `layer_input` size"
         ),
         "hidden_dim": Unchecked("same, for the h/c width the cell declares"),
+        "retain": Unchecked(
+            "whether this call leaves its sequence in the engine. Not a claim about the topology -- the "
+            "cell is identical either way -- and what checks it is the CONSUMER: an `OutputRef` naming "
+            "a module no earlier call retained is rejected by driver_ir.check_subgraph_calls"
+        ),
         "reverse": Unchecked(
             "which end of the sequence the walk starts from. It is a property of the traced op's own "
             "`direction`, which RecurrentPhase reads when it decides whether to emit a `_bwd` "
@@ -1882,10 +1895,12 @@ class RecurrentCall(DriverComponent):
     }
 
     def link_label(self) -> str:
-        return f"loom.run_recurrent({self.topology!r})"
+        binding = "loom.run_recurrent_and_retain" if self.retain else "loom.run_recurrent"
+        return f"{binding}({self.topology!r})"
 
     def emit(self, ctx):
-        return _note_block(self.note) + [Local(self.out_var, Call("loom.run_recurrent", [
+        binding = "loom.run_recurrent_and_retain" if self.retain else "loom.run_recurrent"
+        return _note_block(self.note) + [Local(self.out_var, Call(binding, [
             Lit(self.topology), self.sequence, self.seq_len,
             Lit(self.input_dim), Lit(self.hidden_dim), Lit(self.reverse),
         ]))]
