@@ -219,7 +219,7 @@ def drives_mismatches() -> Dict[str, list]:
 
     Two comparisons, both read off the body:
 
-    * **the suffixes**, through the string literals each `loom.run_subgraph` call concatenates onto its
+    * **the suffixes**, through the string literals each driving call concatenates onto its
       namespace. `run_bi_lstm` writes them whole (`namespace_ .. "_h_fwd"`), so the check is exact;
       `run_resblk_stack` writes a stem and an index (`.. "_block" .. i`), so the rule is prefix-based
       in both directions -- every declared suffix must start with a literal the body writes, and every
@@ -234,12 +234,13 @@ def drives_mismatches() -> Dict[str, list]:
         if fn.drives is None:
             if sites:
                 complaints.append(
-                    f"calls loom.run_subgraph {len(sites)} time(s) but declares no `drives`, so its "
+                    f"drives a topology by name {len(sites)} time(s) but declares no `drives`, so its "
                     f"call sites are reachable by no check at all")
             out.update({fn.name: complaints} if complaints else {})
             continue
         if not sites:
-            complaints.append("declares `drives` but its body never calls loom.run_subgraph")
+            complaints.append("declares `drives` but its body never drives a topology by name "
+                               f"(looked for {sorted(_DRIVING_BINDINGS)})")
         literals = sorted({lit for site in sites for lit in site[0]})
         for suffix in fn.drives.suffixes:
             if not any(suffix.startswith(lit) for lit in literals) and (literals or suffix):
@@ -261,24 +262,46 @@ def drives_mismatches() -> Dict[str, list]:
     return out
 
 
+# The bindings that drive a topology by name. `loom.run_recurrent` is one of them and was missed for
+# as long as it had no library caller: it takes the cell's name as its first argument exactly as
+# `run_subgraph` does, and the inputs it fills are the cell's three declared ones -- which it fills
+# itself rather than from a table the body writes, which is why its sites report no keys.
+_DRIVING_BINDINGS = {
+    "loom.run_subgraph(": 3,
+    "loom.run_subgraph_and_retain(": 3,
+    "loom.run_recurrent(": None,
+    "loom.run_recurrent_and_retain(": None,
+}
+
+
 def _driven_call_sites(source: str):
-    """`[(string literals in the topology-name expression, input table keys)]` for every
-    `loom.run_subgraph` in `source`."""
+    """`[(string literals in the topology-name expression, input table keys)]` for every call in
+    `source` that drives a topology by name.
+
+    `keys` is None where the binding fills the topology's inputs itself (the recurrent ones): there is
+    no table in the body to read them off, so the input half of the check is answered by the
+    declaration alone and by the cell topology it is compared against."""
     import re
 
     from .driver_components import _balanced_args, _split_top_level, _table_keys
 
-    sites, marker, index = [], "loom.run_subgraph(", 0
-    while True:
-        index = source.find(marker, index)
-        if index == -1:
-            return sites
-        args_text, end = _balanced_args(source, index + len(marker))
-        index = end
-        args = _split_top_level(args_text)
-        if len(args) != 3:
-            continue
-        sites.append((re.findall(r'"([^"]*)"', args[0]), _table_keys(args[2])))
+    sites = []
+    for marker, arity in _DRIVING_BINDINGS.items():
+        index = 0
+        while True:
+            index = source.find(marker, index)
+            if index == -1:
+                break
+            args_text, end = _balanced_args(source, index + len(marker))
+            index = end
+            args = _split_top_level(args_text)
+            if arity is not None:
+                if len(args) != arity:
+                    continue
+                sites.append((re.findall(r'"([^"]*)"', args[0]), _table_keys(args[2])))
+            else:
+                sites.append((re.findall(r'"([^"]*)"', args[0]), None))
+    return sites
 
 
 def undeclared_calls() -> Dict[str, list]:
