@@ -83,7 +83,7 @@ differs is entirely what the host does with the one output. The family names its
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
 | `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
 | `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | dia, encodec, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
-| `recurrent_call` | `RecurrentCall` | statements | 1 | 7 | encodec |
+| `recurrent_call` | `RecurrentCall` | statements | 1 | 8 | encodec |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 7 | matcha, supertonic |
 | `driver_return` | `DriverReturn` | statements | 0 | 1 | dac, dia, encodec, kokoro, matcha, snac, styletts2, supertonic, vits |
 | `lua_library` | `LuaLibrary` | prelude | 1 | 0 | kokoro, matcha, styletts2, vits |

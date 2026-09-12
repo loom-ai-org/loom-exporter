@@ -215,17 +215,25 @@ class OutputRef(Expr):
     # is the property that keeps the two from disagreeing, since a mismatch between them is a shape
     # error the engine raises rather than a silently short prompt.
     rows: Optional[Expr] = None
+    # The FIRST row to copy, 0-based, when `rows` does not mean "a prefix". Absent is row 0, which is
+    # every caller that trims rather than indexes. A transducer's joint consumes ONE encoder frame per
+    # call, and this is what lets it take that frame out of the encoder's retained output instead of
+    # out of a Lua table holding the whole thing.
+    row: Optional[Expr] = None
 
     def reads(self) -> list[str]:
         # Delegated, exactly as `Len` delegates: the module is not a symbol and never was, but `rows`
-        # is an ordinary expression over locals, and a reference this class did not report would be a
-        # read `validate()` never resolved.
-        return self.rows.reads() if self.rows is not None else []
+        # and `row` are ordinary expressions over locals, and a reference this class did not report
+        # would be a read `validate()` never resolved.
+        out = list(self.rows.reads()) if self.rows is not None else []
+        return out + (list(self.row.reads()) if self.row is not None else [])
 
     def render(self) -> str:
         fields = [f"from = '{self.module}'"]
         if self.index != 1:
             fields.append(f"index = {self.index}")
+        if self.row is not None:
+            fields.append(f"row = {self.row.render()}")
         if self.rows is not None:
             fields.append(f"rows = {self.rows.render()}")
         return "{" + ", ".join(fields) + "}"
@@ -742,6 +750,30 @@ def _check_retained_reads(function: Function, topologies: dict) -> None:
             if isinstance(stmt, (While, NumericFor)):
                 walk(stmt.body, dict(produced))
                 continue
+            # `loom.run_recurrent_and_retain` retains too, and it is a plain `Call` rather than a
+            # `SubgraphCall` -- a cell is driven per timestep by the binding, not by one call with an
+            # axis table. Without this the checker saw an LSTM layer's retained sequence as never
+            # produced and rejected the reader, which is the right rule applied to an incomplete idea
+            # of what produces. Its slot count is 1: the binding retains the sequence, not the cell's
+            # two declared outputs.
+            for expr in _own_exprs(stmt):
+                if (isinstance(expr, Call) and expr.fn == RECURRENT_RETAIN_FN and expr.args
+                        and isinstance(expr.args[0], Lit)):
+                    produced[str(expr.args[0].value)] = 1
+                # Only a CALL's own arguments here. A `SubgraphCall`'s inputs carry the same
+                # references and are checked below, where the message can name the input as well as
+                # the module -- which is the better error and the one the tests pin.
+                if not isinstance(expr, Call):
+                    continue
+                for ref in _output_refs_in(expr):
+                    if ref.module not in produced:
+                        raise DriverIRError(
+                            f"driver IR: {expr.fn} reads the retained output of module "
+                            f"'{ref.module}', but no earlier loom.run_subgraph_and_retain("
+                            f"'{ref.module}', ...) or loom.run_recurrent_and_retain('{ref.module}', "
+                            f"...) runs in the same straight-line block -- a retained output only "
+                            f"exists between the run that produced it and the next run of that module"
+                        )
             if not isinstance(stmt, SubgraphCall):
                 continue
             for name, expr in stmt.inputs.items():
@@ -767,6 +799,23 @@ def _check_retained_reads(function: Function, topologies: dict) -> None:
                 produced[stmt.module] = None if topo is None else len(_topology_output_names(topo))
 
     walk(function.body, {})
+
+
+# The binding whose retained sequence `_check_retained_reads` must know about, spelled once.
+RECURRENT_RETAIN_FN = "loom.run_recurrent_and_retain"
+
+
+def _output_refs_in(expr):
+    """Every `OutputRef` inside one expression, including the arguments of a call.
+
+    `_own_exprs` yields a statement's top-level expressions; a recurrent call's reference is an
+    ARGUMENT of one, so it needs one level of descent. Kept small deliberately: the only nesting that
+    matters here is a call's own argument list."""
+    if isinstance(expr, OutputRef):
+        return [expr]
+    if isinstance(expr, Call):
+        return [a for a in expr.args if isinstance(a, OutputRef)]
+    return []
 
 
 def check_subgraph_calls(function: Function, topologies: dict) -> None:

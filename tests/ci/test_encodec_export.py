@@ -141,7 +141,12 @@ def test_every_crop_carries_the_cumulative_upsampling(tmp_path):
     assert int(model.config.hop_length) == 640
 
     driver = reader.fields["model.driver_script"].contents()
-    # One call per layer, chained, and the residual is `pre`'s own output rather than a second copy.
-    assert "loom.run_recurrent('lstm_l0_fwd', seq," in driver
-    assert "loom.run_recurrent('lstm_l1_fwd', lstm_0," in driver
-    assert "{lstm_out = lstm_1, residual = seq}" in driver
+    # One call per layer, chained THROUGH THE ENGINE: every edge is a retained reference, so the only
+    # value this driver marshals is the waveform it returns. A regression here is silent in every other
+    # way -- the audio stays identical, and what changes is how many megabytes cross per call.
+    assert "loom.run_subgraph_and_retain('pre'" in driver
+    assert "loom.run_recurrent_and_retain('lstm_l0_fwd', {from = 'pre'}," in driver
+    assert "loom.run_recurrent_and_retain('lstm_l1_fwd', {from = 'lstm_l0_fwd'}," in driver
+    assert "{lstm_out = {from = 'lstm_l1_fwd'}, residual = {from = 'pre'}}" in driver
+    # Nothing else crosses: the codes in and the waveform out are the only Lua values in the script.
+    assert driver.count("loom.run_recurrent(") == 0, "a marshalling recurrent call survived"
