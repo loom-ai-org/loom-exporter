@@ -183,8 +183,10 @@ def materialise_gqa(module, config) -> None:
     slot, which is [Retro-044]'s failure exactly.
 
     With `num_key_value_heads == num_attention_heads` the repeat is the identity and never traces at
-    all. What it costs is honest and small: `k_proj` and `v_proj` grow from `[1024, 1024]` to
-    `[2048, 1024]`, which is +4.2 M parameters on a 917 M model, and the KV cache doubles. What it
+    all. What it costs, measured rather than estimated: `k_proj` and `v_proj` grow from `[1024, 1024]`
+    to `[2048, 1024]` in all 33 layers, which is **+69.2 M parameters** on a 917 M model -- 277 MB at
+    F32, and the written file grows by 275 MB, which is how the number was checked. The KV cache
+    doubles with it. What it
     buys is that the one op in this architecture the converter cannot carry is simply not there.
 
     Interleaved, not concatenated: `repeat_kv` repeats each K/V head `n_rep` times ADJACENTLY
@@ -598,6 +600,9 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
             "sample_rate": self._sample_rate,
         }
         hparams.update({f"sampling.{k}": v for k, v in read_sampling_defaults(self.model_dir).items()})
+        # Not in `read_sampling_defaults`' three, and load-bearing here -- see `_generation_value`.
+        hparams["sampling.repetition_penalty"] = float(
+            _generation_value(self.model_dir, "repetition_penalty", 1.0))
         return hparams
 
     def contract(self) -> dict:
@@ -765,14 +770,15 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
                 # `transformers` installs `MinNewTokensLengthLogitsProcessor` from the talker's own
                 # `min_new_tokens: 2`, and it runs under greedy like every other processor.
                 "MIN_NEW_TOKENS": MIN_NEW_TOKENS,
-                "MAX_NEW_TOKENS": int(sampling.get("max_new_tokens", 4096)),
+                "MAX_NEW_TOKENS": int(_generation_value(self.model_dir, "max_new_tokens", 4096)),
                 "DEFAULT_LANGUAGE_ID": int((self._language_ids or {}).get("english", 0)),
                 # The checkpoint's own decoding defaults as the driver's `or`-fallbacks -- the same
                 # numbers `hparams()` writes for the host, rendered twice from one attribute set.
                 "TEMPERATURE": sampling.get("temperature", 0.0),
                 "TOP_K": sampling.get("top_k", 0),
                 "TOP_P": sampling.get("top_p", 1.0),
-                "REPETITION_PENALTY": sampling.get("repetition_penalty", 1.0),
+                "REPETITION_PENALTY": float(
+                    _generation_value(self.model_dir, "repetition_penalty", 1.0)),
                 # The code predictor draws with its own three, which `generation_config.json` states
                 # separately under `subtalker_*`. They are genuinely different knobs on the same file.
                 "SUB_TEMPERATURE": _subtalker(self.model_dir, "temperature", 0.0),
@@ -799,20 +805,45 @@ PREFILL_LEN = 10
 MIN_NEW_TOKENS = 2
 
 
+def _generation_config(model_dir: str) -> dict:
+    if not model_dir:
+        return {}
+    path = Path(model_dir) / "generation_config.json"
+    if not path.exists():
+        return {}
+    try:
+        config = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def _generation_value(model_dir: str, key: str, fallback):
+    """One decoding default `read_sampling_defaults` does not return.
+
+    That reader answers the three standard knobs -- `temperature`, `top_k`, `top_p` -- and nothing
+    else, which is correct for every family that had no use for more. This one needs two it does not
+    carry, and **reading them through it silently produced the fallback**: `repetition_penalty` came
+    back 1.0, the identity, so the driver applied no penalty at all. Greedy then ran past the
+    reference's 42 frames to the token cap with only the first five frames matching -- which is
+    exactly the runaway this model's penalty exists to prevent, reintroduced by a `.get` on a dict
+    that was never going to have the key.
+
+    Local rather than an extension of the shared reader: adding a key there writes a new
+    `sampling.*` hparam into every model's GGUF and moves every gate snapshot, for two numbers that
+    so far only this checkpoint declares.
+    """
+    return _generation_config(model_dir).get(key, fallback)
+
+
 def _subtalker(model_dir: str, key: str, fallback):
     """One `subtalker_*` decoding default off `generation_config.json`.
 
     Not `read_sampling_defaults`, which reads the standard names: this checkpoint declares a SECOND
     set of three for the code predictor, and they are different numbers for a different draw.
     """
-    if not model_dir:
-        return fallback
-    path = Path(model_dir) / "generation_config.json"
-    if not path.exists():
-        return fallback
-    try:
-        config = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
+    config = _generation_config(model_dir)
+    if not config:
         return fallback
     if not config.get("subtalker_dosample", False) and key == "temperature":
         return 0.0                                   # the engine's spelling of greedy

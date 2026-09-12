@@ -100,6 +100,11 @@ class ModelCard:
     # reconstructs a SENTENCE, inserting each word's mark after its last piece. Showing the NER snippet
     # on a punctuation model would print `hello/, o/,` and explain nothing.
     restores_punctuation: bool = False
+    # Whether this text-to-codes model takes a REFERENCE CLIP for the voice rather than picking one
+    # itself. A per-model fact for the same reason `takes_text` is: both models emit codec tokens
+    # through one door, and what a caller has to supply is not implied by the task. Dia picks a voice
+    # from its seed; Qwen3-TTS has no speaker table at all and clones from audio.
+    clones_voice: bool = False
     # `--task`/`--model` for loom-export; empty means auto-detection resolves both.
     export_task: Optional[str] = None
     export_model: Optional[str] = None
@@ -558,6 +563,59 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         ),
     ),
     ModelCard(
+        slug="qwen3-tts-12hz-0.6b", checkpoint=Path("qwen3-tts-12hz-0.6b"),
+        task_type="text-to-codes", pipeline_tag="text-to-speech", clones_voice=True,
+        base_repo="Qwen/Qwen3-TTS-12Hz-0.6B-Base", license_id="apache-2.0",
+        language=["zh", "en", "ja", "ko", "de", "fr", "ru", "pt", "es", "it"],
+        title="Qwen3-TTS 12Hz 0.6B Base",
+        summary="Qwen's voice-cloning TTS talker, exported for loom.cpp. Family 10: text and a "
+                "reference voice in, neural-codec tokens out -- pair it with "
+                "`qwen3-tts-tokenizer-12hz-loom` for audio.",
+        limitations=(
+            "**This model does not produce audio.** It emits sixteen streams of Qwen3-TTS codec "
+            "tokens, and the codec turns those into a waveform -- "
+            "[`qwen3-tts-tokenizer-12hz-loom`](https://huggingface.co/loom-ai-org/qwen3-tts-tokenizer-12hz-loom), "
+            "which ships inside this same checkpoint upstream. They stay separate because one codec "
+            "serves every size and variant of this talker, and because the codes are the useful "
+            "intermediate.\n\n"
+            "**The voice comes from a reference clip, and there is no speaker table.** This "
+            "checkpoint's `spk_id` is empty, so cloning is the only mode: pass `waveform=` and the "
+            "speaker encoder extracts an x-vector from it. Pass `x_vector=` instead to reuse one you "
+            "already have -- it is 1024 floats and it is the whole of what the voice contributes.\n\n"
+            "**The reference TEXT is not used.** Upstream offers a second, higher-fidelity clone mode "
+            "that conditions on a transcript of the reference clip plus its codec tokens; it needs the "
+            "codec's ENCODE half, which this collection does not export, so this file implements the "
+            "x-vector mode only.\n\n"
+            "**`language_id` is a raw number**, because that is what the checkpoint declares -- "
+            "English 2050, Chinese 2055, Spanish 2054, German 2053, Japanese 2058, French 2061, "
+            "Korean 2064, Russian 2069, Portuguese 2071, Italian 2070. Omit it and English is "
+            "assumed.\n\n"
+            "**It samples by default.** The export declares this checkpoint's own decoding -- "
+            "`temperature 0.9`, `top_k 50`, `repetition_penalty 1.05`, and a second set for the code "
+            "predictor -- so two runs of a sentence give two takes; `seed=` is what pins one. "
+            "`temperature=0` decodes greedily and reproduces `transformers` **exactly**: verified at "
+            "672 codes over 42 frames, every one identical, and the pair's audio transcribes back to "
+            "the sentence it was given.\n\n"
+            "**The repetition penalty is not optional here.** `transformers` applies it as a "
+            "processor rather than a warper, so it moves a greedy argmax too, and without it this "
+            "model never emits its end token -- it runs to `max_new_tokens`. Passing "
+            "`repetition_penalty=1.0` turns it off and is a good way to see that.\n\n"
+            "**`max_new_tokens` counts audio frames at 12.5 per second**, not decoder steps -- one "
+            "frame is sixteen transformer passes here, since a code predictor emits fifteen of the "
+            "sixteen codebooks from the talker's hidden state.\n\n"
+            "**Generation is slower than the parameter count suggests**, for two reasons that are "
+            "this export's rather than the model's. The code predictor runs without a KV cache (it "
+            "re-reads its own sixteen-position prefix each step, which is what lets it share a file "
+            "with a cached talker), and the attention is materialised as MHA rather than GQA -- "
+            "`k_proj`/`v_proj` are duplicated so the key/value head count matches the query's, +69 M "
+            "parameters and a doubled cache, because the grouped form does not survive conversion.\n\n"
+            "**It is a big download**: 3.9 GB, F32, like the rest of this collection. Nearly a third "
+            "of it is the 151936 x 2048 text embedding table. `loom-export --quantize Q8_0` on the "
+            "upstream checkpoint packs the eligible weights to about 1.1 GB if you would rather have "
+            "that."
+        ),
+    ),
+    ModelCard(
         slug="qwen3-tts-tokenizer-12hz",
         # The `speech_tokenizer/` SUBFOLDER of the talker's checkpoint, not its root: the root is the
         # family-10 LM that emits these codes and exports through `qwen3_tts_export`.
@@ -977,6 +1035,41 @@ print(model.hparam("codec.n_codebooks"), "==", codec.hparam("codec.n_codebooks")
 # answer every time -- greedy is much flatter, and not what this checkpoint was tuned for.
 print(model.hparam("sampling.temperature", "f32"), model.hparam("sampling.guidance_scale", "f32"))
 """,
+    "text-to-codes-voice-clone": """import loom
+import librosa
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# The voice is a REFERENCE CLIP, not a speaker id -- this checkpoint carries no speaker table. A few
+# clear seconds is enough. 24 kHz is what the speaker encoder expects, so resample on the way in.
+reference, _ = librosa.load("reference.wav", sr=24000)
+
+# What comes back is codec TOKENS, not audio -- frame-major, one row per frame, 16 codebooks wide.
+# `max_new_tokens` counts AUDIO FRAMES, at 12.5 per second.
+codes = model.text2codes.infer(
+    "The quick brown fox jumps over the lazy dog.",
+    waveform=reference.tolist(),
+    language_id=2050,          # English; see "Known limitations" for the rest
+    max_new_tokens=200, seed=1234,
+)
+print(len(codes), "frames x", len(codes[0]), "codebooks")
+
+# The other half of the pair, in a repo of its own: the codec serves every size and variant of this
+# talker, and the codes are worth having on their own -- cache them, edit them, decode them elsewhere.
+codec = loom.Model.from_pretrained("loom-ai-org/qwen3-tts-tokenizer-12hz-loom")
+audio = codec.codes2speech.infer(codes)
+print(len(audio), "samples at", audio.sample_rate, "Hz =", round(audio.duration, 2), "s")
+audio.save("out.wav")
+
+# Nothing goes between those two calls. Both files declare the width of a frame, so a pair that does
+# not fit says so instead of producing audio of the wrong duration:
+print(model.hparam("codec.n_codebooks"), "==", codec.hparam("codec.n_codebooks"))
+
+# This model SAMPLES by default, at its own generation config's settings. `seed=` is what makes a
+# take reproducible; pass temperature=0 for greedy, which reproduces `transformers` exactly.
+print(model.hparam("sampling.temperature", "f32"),
+      model.hparam("sampling.repetition_penalty", "f32"))
+""",
     "text-to-speech-with-vocab": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
@@ -1033,6 +1126,8 @@ def snippet_key(card: ModelCard) -> str:
         return "automatic-speech-recognition-multilingual"
     if card.task_type == "token-classification" and card.restores_punctuation:
         return "token-classification-punctuation"
+    if card.task_type == "text-to-codes" and card.clones_voice:
+        return "text-to-codes-voice-clone"
     return card.task_type
 
 
