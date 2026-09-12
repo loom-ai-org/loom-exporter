@@ -708,7 +708,7 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
             SubgraphCallComponent,
         )
         from .lua_library import LuaLibrary
-        from .driver_ir import Call, FieldAccess, Lit, OutputRef, Var
+        from .driver_ir import FieldAccess, Lit, OutputRef, Var
 
         fragment = self.driver_script_path
         external = self.external_topologies()
@@ -724,8 +724,7 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
             # 112 lines, shipped twice. Only what is declared here is emitted.
             LuaLibrary(uses=(
                 "array_slice", "array_sum",
-                "to_row_major", "from_row_major", "to_layout_a",
-                "from_layout_a", "run_bi_lstm", "run_resblk_stack",
+                "run_bi_lstm", "run_resblk_stack",
                 "run_proj1x1", "predict_durations", "compute_wsum",
             )),
             # The seven numbers the caller used to have to supply (P4.0.8's first follow-up). Three
@@ -743,20 +742,20 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
             block("01_style.lua", reads=("STYLE_DIM",),
                   defines=("T_text", "s_decoder", "s_predictor")),
             SubgraphCallComponent(
-                topology="albert_bert_encoder", outputs=("d_en_flat",), length=t_text,
+                topology="albert_bert_encoder", outputs=(), retain=True, length=t_text,
                 inputs={"tokens": FieldAccess("inputs", "input_ids")},
                 note="--- CustomAlbert + bert_encoder, ONE MIL-traced call -> d_en, time-major\n"
                      "    (T,512) (see module docstring for why this convention, not\n"
-                     "    kokoro_driver.lua's own Layout-A one). ---"),
+                     "    kokoro_driver.lua's own Layout-A one). Retained: its only reader is\n"
+                     "    `duration_style_concat`, which is a graph. ---"),
             # `drives` is D.2: the call sites whose topology name this fragment computes at run time,
             # declared as data. Until now the six BiLSTMs, the three AdaLayerNorms, the two resblock
             # stacks and the two projections below were driven by names no check could read -- either
             # built in a Lua loop or built inside the loom_lua helper itself -- which is nine of this
             # driver's eleven call sites.
             block("02_duration_encoder.lua",
-                  reads=("d_en_flat", "T_text", "D_MODEL", "STYLE_DIM", "s_predictor",
-                         "HIDDEN_PER_DIR"),
-                  defines=("d_en_rows", "x", "d", "top_out", "duration_logits", "pred_dur"),
+                  reads=("T_text", "D_MODEL", "STYLE_DIM", "s_predictor", "HIDDEN_PER_DIR"),
+                  defines=("d_channels", "d", "top", "duration_logits", "pred_dur"),
                   drives=(
                       HelperCall("run_bi_lstm", tuple(f"duration_lstm_{i}" for i in range(3)),
                                  written='"duration_lstm_" .. i'),
@@ -765,9 +764,12 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
                       HelperCall("run_bi_lstm", "top_lstm"),
                   )),
             block("03_frame_expansion.lua",
-                  reads=("T_text", "pred_dur", "d", "D_MODEL", "STYLE_DIM", "HIDDEN_PER_DIR"),
-                  defines=("T_frames", "d_channels", "en", "cnn_flat", "cnn_shape", "te_channels",
-                           "cnn_rows", "t_en", "asr"),
+                  reads=("T_text", "pred_dur", "d", "HIDDEN_PER_DIR"),
+                  defines=("T_frames", "en", "te_channels", "asr"),
+                  # The frame-expanded text-encoder sequence, left in the forward cell's store for the
+                  # vocoder call below to name. Declared because the retaining call is
+                  # `loom.expand_by_duration_and_retain`, inside this fragment's own Lua.
+                  retains=("text_encoder_lstm_fwd",),
                   drives=(HelperCall("run_bi_lstm", "text_encoder_lstm"),)),
             block("04_f0n.lua", reads=("en", "HIDDEN_PER_DIR", "s_predictor"),
                   # `run_proj1x1` retains both projections; the vocoder call below names them.
@@ -788,7 +790,12 @@ class TTSKokoroExportConfig(BaseMultiPhaseModelExportConfig):
                 topology="decoder_vocoder", outputs=("waveform",),
                 axes={"n_enc_frames": t_frames, "n_past": Lit(0)},
                 inputs={
-                    "asr": Call("to_layout_a", [Var("asr"), t_frames, Lit(512)]),
+                    # Already Layout A, and already frame-expanded: `loom.expand_by_duration_and_retain`
+                    # wrote it that way in the BiLSTM's own store, so what used to be a T_frames x 512
+                    # Lua rebuild is a name. `asr` holds that module name -- one value, declared, so the
+                    # reference is checked like a literal.
+                    "asr": OutputRef("text_encoder_lstm_fwd", module_expr=Var("asr"),
+                                      variants=("text_encoder_lstm_fwd",)),
                     # Retained by `run_proj1x1`, which returns the module name these two locals hold.
                     "f0_curve": OutputRef("f0n_f0_proj"), "n_curve": OutputRef("f0n_n_proj"),
                     "s": Var("s_decoder"), "rand_ini": Var("rand_ini"),
@@ -930,18 +937,58 @@ def register(registry) -> None:
 
 
 class _DurationProjWrapper(torch.nn.Module):
-    """`predictor.duration_proj` -- Linear(512, 50) applied to ONE timestep.
+    """`predictor.duration_proj` -- Linear(512, 50) over a whole sequence.
 
-    No time axis at all: the driver calls this per timestep inside a Lua loop (`duration_logits[t] =
-    run_subgraph("duration_proj", {n_tokens = 0, ...}, {x = top_out[t]})`), which is why the bespoke
-    topology declares a bare `[512]` input."""
+    **It took one timestep until the BiLSTM above it stopped marshalling.** The bespoke topology
+    declared a bare `[512]` input because the driver called it inside a Lua loop, one call per token,
+    over rows it had just pulled out of `top_lstm`'s output -- so the loop was free in the only sense
+    that mattered: the rows were already Lua values. They are not any more (ADR-031's last edge), and a
+    per-row call would have to name `{from = "top_lstm_fwd", row = t, rows = 1}` T times, building and
+    computing a graph per token to apply one Linear.
+
+    So the time axis moves into the graph: one call, `(T, 512) -> (T, 50)`. The output IS host-side --
+    `predict_durations` sums its sigmoids and the host sizes every later stage by the result -- which is
+    why this is the one topology in the duration chain that still marshals, and why it is a
+    `run_subgraph` rather than a retaining call."""
 
     def __init__(self, proj):
         super().__init__()
         self.proj = proj
 
-    def forward(self, x):  # (512,) -> (50,)
+    def forward(self, x):  # (T, 512) rows_flat -> (T, 50) rows_flat
         return self.proj(x)
+
+
+class _StyleConcatWrapper(torch.nn.Module):
+    """`torch.cat([x, s], axis=-1)` -- the style vector concatenated into every row, as a graph.
+
+    **This is the re-trace ADR-031 left open.** `DurationEncoder.forward` really does re-concatenate
+    the style vector after each AdaLayerNorm (its own `x = torch.cat([x, s.permute(1, -1, 0)], axis=1)`)
+    and once before the first LSTM, and the driver did that arithmetic in Lua -- which forced BOTH ends
+    across the boundary: the AdaLayerNorm's whole `(T, 512)` output came back as a table so that
+    `STYLE_DIM` more numbers could be appended to each of its rows, and the result went straight into
+    the next BiLSTM. Per stage, four times per utterance.
+
+    One traced phase, called four times, rather than a tail on each AdaLayerNorm: the AdaLayerNorms keep
+    their existing interface (and with it their row in the bespoke-vs-MIL equivalence gate), and the
+    graph that does the concatenating is the same graph every time it is needed -- including the first
+    time, where there is no AdaLayerNorm to hang it on because the input comes from `bert_encoder`.
+
+    `torch.zeros_like(x[:, :S]) + style` rather than `style.expand(T, -1)`: an `expand` over a dynamic
+    axis traces to a `tile` whose `reps` is computed at run time, which is the shape
+    `AlbertBertEncoderWrapper`'s own docstring records as resolving to the wrong symbol. This traces to
+    a slice, a subtract and a broadcasting add -- all static-rank, no dynamic `reps` anywhere -- and
+    MIL folds the zeros into `x[:, :S] - x[:, :S]`, so nothing is materialised that the graph did not
+    already hold. It needs `C >= S`, which every DurationEncoder satisfies by construction (its LSTM
+    takes `d_model + style_dim`)."""
+
+    def __init__(self, style_dim: int):
+        super().__init__()
+        self.style_dim = style_dim
+
+    def forward(self, x, style):  # x: (T, C) rows_flat, style: (S,) -> (T, C + S)
+        rows = torch.zeros_like(x[:, :self.style_dim]) + style
+        return torch.cat([x, rows], dim=1)
 
 
 class _AdaLayerNormWrapper(torch.nn.Module):
@@ -994,21 +1041,29 @@ class _Proj1x1Wrapper(torch.nn.Module):
 
 
 class _TextEncoderCnnWrapper(torch.nn.Module):
-    """`TextEncoder`'s embedding + its three Conv1d/LayerNorm/LeakyReLU stages, tokens -> Layout A.
+    """`TextEncoder`'s embedding + its three Conv1d/LayerNorm/LeakyReLU stages, tokens -> rows_flat.
 
     The embedding is inside this topology rather than beside it because the bespoke `build_cnn` declares
-    a `tokens` input, and the driver hands it `inputs.input_ids` directly."""
+    a `tokens` input, and the driver hands it `inputs.input_ids` directly.
+
+    **It returned Layout A until its consumer stopped being Lua.** The only thing that reads this is
+    `text_encoder_lstm`, and a BiLSTM reads its input ONE ROW PER TIMESTEP -- which a retained
+    `[T, C]` tensor cannot serve, because a timestep's channels are `T` apart in it. The driver used to
+    bridge that with `from_layout_a`, rebuilding the whole thing as Lua rows; the transpose belongs in
+    the graph that produces it, exactly as `AlbertBertEncoderWrapper` already decided for `d_en`.
+    `.contiguous()` after the transpose for that wrapper's reason too: a bare permute as a declared
+    output is a live view this project's raw byte copy reads in pre-permute order."""
 
     def __init__(self, text_encoder):
         super().__init__()
         self.embedding = text_encoder.embedding
         self.cnn = text_encoder.cnn
 
-    def forward(self, tokens):  # (T,) int -> (C, T) Layout A
+    def forward(self, tokens):  # (T,) int -> (T, C) rows_flat
         x = self.embedding(tokens).transpose(0, 1).unsqueeze(0)  # (1, C, T)
         for stage in self.cnn:
             x = stage(x)
-        return x.squeeze(0).contiguous()
+        return x.squeeze(0).transpose(0, 1).contiguous()
 
 
 def check_istftnet_geometry(cfg) -> None:
@@ -1066,9 +1121,9 @@ def build_prosody_phases(text_encoder, predictor) -> List:
     Shared by Kokoro and StyleTTS2 rather than written twice, for the same reason
     `build_decoder_vocoder_phase` already is: these are **the same classes with different weights**
     (Kokoro is a StyleTTS2 derivative, and the bespoke converters reuse Kokoro's hyperparameter dicts
-    for StyleTTS2 wholesale). Twenty-one topologies: six BiLSTMs as `RecurrentPhase`s, and the CNN,
-    three AdaLayerNorms, the duration head, two AdainResBlk1d stacks and two 1x1 projections traced
-    normally.
+    for StyleTTS2 wholesale). Twenty-two topologies: six BiLSTMs as `RecurrentPhase`s, and the CNN,
+    three AdaLayerNorms, the style concatenation between them, the duration head, two AdainResBlk1d
+    stacks and two 1x1 projections traced normally.
 
     Together with the family's own encoder/decoder phases this is what makes the export
     self-contained -- before it, a driver call into any of these landed on a topology loaded from the
@@ -1112,11 +1167,16 @@ def build_prosody_phases(text_encoder, predictor) -> List:
                (seq, d_model), torch.randn(7, d_model))
         for i, idx in enumerate((1, 3, 5))
     ]
-    # The per-timestep duration head. No time axis: the driver calls it inside a Lua loop.
+    # ...and the concatenation between them, which DurationEncoder does four times and the driver used
+    # to do in Lua. ONE phase, called once per stage -- see `_StyleConcatWrapper`.
+    phases.append(styled("duration_style_concat", _StyleConcatWrapper(style_dim).eval(),
+                         (seq, d_model), torch.randn(7, d_model)))
+    # The duration head, over the whole sequence: one call, not one per token. See
+    # `_DurationProjWrapper` for why that changed with the BiLSTM above it.
     phases.append(ExportPhase(
         name="duration_proj", wrapper=_DurationProjWrapper(predictor.duration_proj).eval(),
-        dummy_inputs=(torch.randn(d_model),),
-        mil_inputs=[ct.TensorType(name="x", shape=(d_model,), dtype=np.float32)],
+        dummy_inputs=(torch.randn(7, d_model),),
+        mil_inputs=[ct.TensorType(name="x", shape=(seq, d_model), dtype=np.float32)],
     ))
     # F0Ntrain's two AdainResBlk1d stacks and their 1x1 projections, in Layout A.
     for branch, blocks in (("f0", predictor.F0), ("n", predictor.N)):
