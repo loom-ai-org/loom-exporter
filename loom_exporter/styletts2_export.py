@@ -428,7 +428,7 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
             SubgraphCallComponent,
         )
         from .lua_library import LuaLibrary
-        from .driver_ir import Call, FieldAccess, Lit, OutputRef, Var
+        from .driver_ir import FieldAccess, Lit, OutputRef, Var
 
         fragment = self.driver_script_path
         external = self.external_topologies()
@@ -444,8 +444,7 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
             # 112 lines, shipped twice. Only what is declared here is emitted.
             LuaLibrary(uses=(
                 "array_slice", "array_sum",
-                "to_row_major", "from_row_major", "to_layout_a",
-                "from_layout_a", "run_bi_lstm", "run_resblk_stack",
+                "run_bi_lstm", "run_resblk_stack",
                 "run_proj1x1", "predict_durations", "compute_wsum",
                 "karras_schedule", "adpm2_sample",
             )),
@@ -490,7 +489,7 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
             block("03_duration_encoder.lua",
                   reads=("T_text", "D_MODEL", "STYLE_DIM", "s_predictor",
                          "HIDDEN_PER_DIR"),
-                  defines=("d_en_flat", "x", "d", "top_out", "duration_logits", "pred_dur"),
+                  defines=("d_channels", "d", "top", "duration_logits", "pred_dur"),
                   drives=(
                       HelperCall("run_bi_lstm", tuple(f"duration_lstm_{i}" for i in range(3)),
                                  written='"duration_lstm_" .. i'),
@@ -499,9 +498,12 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
                       HelperCall("run_bi_lstm", "top_lstm"),
                   )),
             block("04_frame_expansion.lua",
-                  reads=("T_text", "pred_dur", "d", "D_MODEL", "STYLE_DIM", "HIDDEN_PER_DIR"),
-                  defines=("T_frames", "d_channels", "en", "cnn_flat", "cnn_shape", "te_channels",
-                           "cnn_rows", "t_en", "asr"),
+                  reads=("T_text", "pred_dur", "d", "HIDDEN_PER_DIR"),
+                  defines=("T_frames", "en", "te_channels", "asr"),
+                  # The frame-expanded text-encoder sequence, left in the forward cell's store for the
+                  # vocoder call below to name. Declared because the retaining call is
+                  # `loom.expand_by_duration_and_retain`, inside this fragment's own Lua.
+                  retains=("text_encoder_lstm_fwd",),
                   drives=(HelperCall("run_bi_lstm", "text_encoder_lstm"),)),
             block("05_f0n.lua", reads=("en", "HIDDEN_PER_DIR", "s_predictor"),
                   # `run_proj1x1` retains both projections; the vocoder call below names them.
@@ -522,7 +524,12 @@ class TTSStyleTTS2ExportConfig(BaseMultiPhaseModelExportConfig):
                 topology="decoder_vocoder", outputs=("waveform",),
                 axes={"n_enc_frames": t_frames, "n_past": Lit(0)},
                 inputs={
-                    "asr": Call("to_layout_a", [Var("asr"), t_frames, Lit(512)]),
+                    # Already Layout A, and already frame-expanded: `loom.expand_by_duration_and_retain`
+                    # wrote it that way in the BiLSTM's own store, so what used to be a T_frames x 512
+                    # Lua rebuild is a name. `asr` holds that module name -- one value, declared, so the
+                    # reference is checked like a literal.
+                    "asr": OutputRef("text_encoder_lstm_fwd", module_expr=Var("asr"),
+                                      variants=("text_encoder_lstm_fwd",)),
                     # Retained by `run_proj1x1`, which returns the module name these two locals hold.
                     "f0_curve": OutputRef("f0n_f0_proj"), "n_curve": OutputRef("f0n_n_proj"),
                     "s": Var("s_decoder"), "rand_ini": Var("rand_ini"),
@@ -722,23 +729,28 @@ def register(registry) -> None:
 
 
 class _BertEncoderWrapper(torch.nn.Module):
-    """`bert_encoder` -- Linear(768, 512), rows_flat in, **Layout A out**.
+    """`bert_encoder` -- Linear(768, 512), rows_flat in, rows_flat out.
 
     The input side is rows_flat: the bespoke topology declares `x` as `["768", "$n_tokens"]`
     (ne=[768, T], flat[t*768+c] -- a contiguous torch `(T, 768)`), and the driver hands it `bert_out`
     straight from the "albert" phase, which is time-major for exactly this reason.
 
-    The OUTPUT side crosses layouts, and this is the one place in the transfer where the two sides
-    genuinely disagreed. The bespoke topology ends in `PERMUTE(axes=[1,0,2,3]) + CONT`, so it returns
-    Layout A -- and the driver reads it that way (`d_en_flat[c * T_text + t + 1]`, with the fragment's
-    own comment saying "Layout A [T,512]"). A wrapper that just returned the Linear's natural `(T, 512)`
-    builds and runs and produces a transposed result: the equivalence test caught it as
-    mean_abs_diff=0.717 against a reference whose values only reach 2.23, which is what a transpose
-    looks like when nothing crashes."""
+    **The output side used to cross layouts, and no longer does.** The bespoke topology ended in
+    `PERMUTE(axes=[1,0,2,3]) + CONT`, so it returned Layout A, and the driver read it that way
+    (`d_en_flat[c * T_text + t + 1]`) -- which cost a full Lua rebuild into rows before the
+    DurationEncoder could use it. Its consumer is now `duration_style_concat`, a graph declaring
+    rows_flat exactly as Kokoro's `albert_bert_encoder` already produced it, so the transpose is gone
+    rather than moved: two models, one interface, one shared phase after it.
+
+    That is a deliberate interface change and the bespoke-vs-MIL equivalence gate is told so by name.
+    It is also why the transpose could not simply be deleted when this was first written: with the old
+    driver reading Layout A, returning the Linear's natural `(T, 512)` built and ran and produced a
+    transposed result -- mean_abs_diff=0.717 against a reference whose values only reach 2.23, which is
+    what a transpose looks like when nothing crashes."""
 
     def __init__(self, linear):
         super().__init__()
         self.linear = linear
 
-    def forward(self, x):  # (T, 768) rows_flat -> (512, T) Layout A
-        return self.linear(x).transpose(0, 1).contiguous()
+    def forward(self, x):  # (T, 768) rows_flat -> (T, 512) rows_flat
+        return self.linear(x)

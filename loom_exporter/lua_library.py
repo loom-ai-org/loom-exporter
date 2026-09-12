@@ -155,10 +155,13 @@ _FUNCTIONS = (
     LuaFunction("sigmoid"),
     LuaFunction("round_half_to_even"),
     # -- layout conversion, between the two conventions this project names ------------------------
-    LuaFunction("to_row_major"),
-    LuaFunction("from_row_major"),
-    LuaFunction("to_layout_a"),
-    LuaFunction("from_layout_a"),
+    # **All four are gone, and their absence is the result.** `to_row_major`/`from_row_major`/
+    # `to_layout_a`/`from_layout_a` existed for exactly one job: rebuilding a tensor in the other
+    # convention while it was passing through Lua on its way from one graph to the next. Every such edge
+    # in this family is a retained reference now (ADR-031 and its follow-up), and where the two
+    # conventions genuinely differ the PRODUCER is told which one to write -- `run_bi_lstm`'s `layout`
+    # argument, `loom.expand_by_duration_and_retain`'s. A conversion nobody performs is not a library
+    # function with no callers; it is an operation this driver no longer has.
     # -- duration prediction and frame expansion --------------------------------------------------
     LuaFunction("durations_from_logw"),
     LuaFunction("pad_last_to_multiple"),
@@ -171,11 +174,11 @@ _FUNCTIONS = (
     LuaFunction("run_bi_lstm", drives=DrivenTopologies(
         suffixes=("_fwd", "_bwd"),
         inputs=("layer_input", "h_prev", "c_prev"))),
-    # `from_layout_a` is gone from this one and `to_layout_a` from the next: both chained through Lua
-    # until the blocks and the projection started referencing each other's retained outputs, and the
-    # conversions existed only for that round trip. `run_resblk_stack` still converts its CALLER's rows
-    # on the way in, which is the one genuinely host-side end (ADR-031).
-    LuaFunction("run_resblk_stack", requires=("to_layout_a",),
+    # None of the three requires a layout converter any more. They chained through Lua until the blocks
+    # and the projection started referencing each other's retained outputs; `run_resblk_stack` still
+    # converted its CALLER's rows on the way in, because a BiLSTM's two directions were interleaved
+    # host-side -- and that was the last edge ADR-031 left open. Both ends are names now.
+    LuaFunction("run_resblk_stack",
                 drives=DrivenTopologies(suffixes=("_block0", "_block1", "_block2"),
                                         inputs=("x", "style"))),
     LuaFunction("run_proj1x1", drives=DrivenTopologies(suffixes=("",), inputs=("x",))),
@@ -265,15 +268,21 @@ def drives_mismatches() -> Dict[str, list]:
     return out
 
 
-# The bindings that drive a topology by name. `loom.run_recurrent` is one of them and was missed for
-# as long as it had no library caller: it takes the cell's name as its first argument exactly as
-# `run_subgraph` does, and the inputs it fills are the cell's three declared ones -- which it fills
-# itself rather than from a table the body writes, which is why its sites report no keys.
+# The bindings that drive a topology by name, as `marker -> (arity, which arguments name topologies)`.
+# `loom.run_recurrent` is one of them and was missed for as long as it had no library caller: it takes
+# the cell's name as its first argument exactly as `run_subgraph` does, and the inputs it fills are the
+# cell's three declared ones -- which it fills itself rather than from a table the body writes, which is
+# why its sites report no keys (`arity` None).
+#
+# `run_bi_recurrent_and_retain` names TWO, which is why the argument positions are data here rather than
+# assumed to be the first: it runs both directions of a BiLSTM in one call, and reading only the first
+# would leave `_bwd` -- half of what the declaration claims -- checked by nothing.
 _DRIVING_BINDINGS = {
-    "loom.run_subgraph(": 3,
-    "loom.run_subgraph_and_retain(": 3,
-    "loom.run_recurrent(": None,
-    "loom.run_recurrent_and_retain(": None,
+    "loom.run_subgraph(": (3, (0,)),
+    "loom.run_subgraph_and_retain(": (3, (0,)),
+    "loom.run_recurrent(": (None, (0,)),
+    "loom.run_recurrent_and_retain(": (None, (0,)),
+    "loom.run_bi_recurrent_and_retain(": (None, (0, 1)),
 }
 
 
@@ -289,7 +298,7 @@ def _driven_call_sites(source: str):
     from .driver_components import _balanced_args, _split_top_level, _table_keys
 
     sites = []
-    for marker, arity in _DRIVING_BINDINGS.items():
+    for marker, (arity, name_args) in _DRIVING_BINDINGS.items():
         index = 0
         while True:
             index = source.find(marker, index)
@@ -298,12 +307,12 @@ def _driven_call_sites(source: str):
             args_text, end = _balanced_args(source, index + len(marker))
             index = end
             args = _split_top_level(args_text)
-            if arity is not None:
-                if len(args) != arity:
-                    continue
-                sites.append((re.findall(r'"([^"]*)"', args[0]), _table_keys(args[2])))
-            else:
-                sites.append((re.findall(r'"([^"]*)"', args[0]), None))
+            if arity is not None and len(args) != arity:
+                continue
+            if max(name_args) >= len(args):
+                continue
+            literals = [lit for arg in name_args for lit in re.findall(r'"([^"]*)"', args[arg])]
+            sites.append((literals, _table_keys(args[2]) if arity is not None else None))
     return sites
 
 

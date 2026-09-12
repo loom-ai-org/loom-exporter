@@ -1125,20 +1125,23 @@ class TestComputedCallSitesAreDeclared(unittest.TestCase):
 
 class TestPeeledDriverCoverage(unittest.TestCase):
     def test_every_exported_topology_is_named_by_a_checked_call_site(self):
-        """Kokoro's own numbers, without an export: 27 topologies, and the driver names all of them
+        """Kokoro's own numbers, without an export: 28 topologies, and the driver names all of them
         once the computed sites are declared. Four before D.2.
 
         It was 39 until the LSTM cell topologies gained their second declared output: Kokoro drives six
         BiLSTMs, each of which was four topologies (`_h_fwd`/`_c_fwd`/`_h_bwd`/`_c_bwd`) and is now two
         (`_fwd`/`_bwd`) -- 6 x 2 fewer. The halved ones were never a second computation the model
-        needed, only a second declaration of the same one."""
+        needed, only a second declaration of the same one. 27 until `duration_style_concat`: the style
+        concatenation DurationEncoder does four times became a graph rather than Lua row surgery
+        (ADR-031's follow-up), and one phase serves all four call sites."""
         from loom_exporter.kokoro_export import TTSKokoroExportConfig
 
         config = TTSKokoroExportConfig(model_dir="/unused", output_path="/unused",
                                        architecture="kokoro")
         builder = MultiPhaseDriverBuilder(peeled=config.driver_components())
         called = builder.called_topologies()
-        self.assertEqual(len(called), 27)
+        self.assertEqual(len(called), 28)
         for name in ("albert_bert_encoder", "decoder_vocoder", "text_encoder_cnn", "duration_proj",
-                     "duration_adaln_2", "top_lstm_bwd", "f0n_f0_block2", "f0n_n_proj"):
+                     "duration_adaln_2", "duration_style_concat", "top_lstm_bwd", "f0n_f0_block2",
+                     "f0n_n_proj"):
             self.assertIn(name, called)

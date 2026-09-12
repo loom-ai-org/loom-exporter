@@ -263,16 +263,12 @@ namespace their caller passes, and that column is the shape a caller's `HelperCa
 | `array_affine` | — | — | matcha, vits |
 | `sigmoid` | — | — | *`predict_durations`* only |
 | `round_half_to_even` | — | — | *`predict_durations`* only |
-| `to_row_major` | — | — | kokoro, styletts2 |
-| `from_row_major` | — | — | kokoro, styletts2 |
-| `to_layout_a` | — | — | *`run_resblk_stack`* only |
-| `from_layout_a` | — | — | kokoro, styletts2 |
 | `durations_from_logw` | — | — | matcha, vits |
 | `pad_last_to_multiple` | — | — | matcha |
 | `repeat_by_duration_tfast` | — | — | matcha |
 | `predict_durations` | `sigmoid`, `round_half_to_even` | — | kokoro, styletts2 |
 | `run_bi_lstm` | — | `<ns>_fwd`, `<ns>_bwd` ← `layer_input`, `h_prev`, `c_prev` | kokoro, styletts2 |
-| `run_resblk_stack` | `to_layout_a` | `<ns>_block0`, `<ns>_block1`, `<ns>_block2` ← `x`, `style` | kokoro, styletts2 |
+| `run_resblk_stack` | — | `<ns>_block0`, `<ns>_block1`, `<ns>_block2` ← `x`, `style` | kokoro, styletts2 |
 | `run_proj1x1` | — | `<ns>` ← `x` | kokoro, styletts2 |
 | `compute_wsum` | — | — | kokoro, styletts2 |
 | `karras_schedule` | — | — | styletts2 |
