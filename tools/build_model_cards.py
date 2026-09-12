@@ -558,6 +558,36 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         ),
     ),
     ModelCard(
+        slug="qwen3-tts-tokenizer-12hz",
+        # The `speech_tokenizer/` SUBFOLDER of the talker's checkpoint, not its root: the root is the
+        # family-10 LM that emits these codes and exports through `qwen3_tts_export`.
+        checkpoint=Path("qwen3-tts-12hz-0.6b/speech_tokenizer"),
+        task_type="audio-codec", pipeline_tag="text-to-audio",
+        base_repo="Qwen/Qwen3-TTS-12Hz-0.6B-Base", license_id="apache-2.0", language=[],
+        language_note="a codec, not a language model: it carries no vocabulary and no language. "
+                       "The licence is the talker repo's, since this ships inside it.",
+        title="Qwen3-TTS Tokenizer 12 Hz (decoder)",
+        summary="Qwen3-TTS's own 12.5 Hz speech tokenizer, decode half, exported for loom.cpp. "
+                "Family 11: codec tokens in, a 24 kHz waveform out -- and the family's first leaf "
+                "with a transformer in it.",
+        limitations=(
+            "**This is the DECODE half only**, like every codec in this collection: `encode` is "
+            "audio-in/codes-out, a different contract, and no model that decodes through this codec "
+            "ever calls it.\n\n"
+            "**It decodes in CHUNKS, because its reference does.** `chunked_decode(chunk_size=300, "
+            "left_context_size=25)` is what Qwen's own `decode` calls, so past 300 frames -- 24 "
+            "seconds -- the model's answer *is* a sequence of bounded calls. Measured on real codes, "
+            "a whole-sequence pass is bit-identical to the chunked one through 299 frames and then "
+            "parts company: 1.1% relative RMS at 301 and 8.9% at 700. Matching it is also what keeps "
+            "this runnable: the decoder attends over the frame axis, so one long call at a 4096-frame "
+            "ceiling would build a 4096x4096 score matrix in each of 8 layers.\n\n"
+            "**Feed it 16 codes per frame, frame-major**, in codebook order. The talker that produces "
+            "them is [`qwen3-tts-12hz-0.6b-loom`](https://huggingface.co/loom-ai-org/qwen3-tts-12hz-0.6b-loom); "
+            "both files declare `codec.n_codebooks`, so a mismatched pair says so rather than "
+            "producing audio of the wrong duration."
+        ),
+    ),
+    ModelCard(
         slug="dia-1.6b", checkpoint=Path("dia-1.6b"),
         task_type="text-to-codes", pipeline_tag="text-to-speech",
         base_repo="nari-labs/Dia-1.6B", license_id="apache-2.0", language=["en"],
