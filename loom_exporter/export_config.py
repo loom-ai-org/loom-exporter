@@ -16,9 +16,33 @@ for. See `decomposition.py` for why that split, and for which families genuinely
 decomposition (only causal-LM) versus a structural one (everyone else).
 """
 from dataclasses import dataclass
+from pathlib import Path
 
 from .decomposition import Decomposition
 from .spec_protocol import NestedSpec, Unchecked
+
+
+@dataclass(frozen=True)
+class CompanionExport:
+    """A SECOND model that lives inside the checkpoint this config was pointed at, and that this
+    export does not cover.
+
+    Almost every checkpoint here is one model, so almost every config returns none of these. The case
+    that needs it is a family-10 talker whose codec ships in the same directory: `loom-export` on the
+    checkpoint root produces a file that emits codec tokens and cannot make audio, and nothing tells
+    the caller the other half was right there. Dia has the same SHAPE and not the same problem -- its
+    codec is a separate HF repo, so two invocations are self-evident.
+
+    It is a POINTER, not a merge. [ADR-022] decides that the two halves stay two files -- the codec is
+    shared (byte-identical inside every Qwen3-TTS 12 Hz checkpoint) and the codes are the useful
+    intermediate -- and this changes only whether a caller has to already know that.
+    """
+
+    # The output file's stem, and the codec's own catalogue slug, so the pair on disk is named the way
+    # the pair on the Hub is.
+    name: str
+    checkpoint: "Path"
+    why: str
 
 
 @dataclass(kw_only=True)
@@ -79,6 +103,16 @@ class LoomExportConfig:
     def export(self) -> str:
         """Runs the whole export -- load, trace, compile, write GGUF -- and returns `output_path`."""
         return self.decomposition.export(self)
+
+    def companions(self) -> "list[CompanionExport]":
+        """Other models this checkpoint CONTAINS that `export()` does not produce.
+
+        Empty for every family whose checkpoint is one model, which is all but one of them. Read by
+        the `loom-export` CLI, deliberately NOT by `main_export()`: the programmatic entry point is
+        what `tools/build_model_cards.py` calls once per Hub repo, and a second GGUF appearing beside
+        the first would put a stray file in a repo whose README lists exactly one.
+        """
+        return []
 
     # -- hooks the decompositions read; see decomposition.py for which one needs which ------------------
 
