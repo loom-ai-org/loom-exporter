@@ -484,3 +484,76 @@ def test_the_chunked_driver_avoids_lua_53_syntax():
     assert "math.floor(#codes / 16)" in rendered
     # And the seam the component exists for: each chunk drops its own left context, in samples.
     assert "(_context * 1920)" in rendered
+
+
+def test_the_talker_points_at_the_codec_in_its_own_checkpoint(tmp_path):
+    """`loom-export` on a Qwen3-TTS checkpoint produces BOTH halves, and they stay two files.
+
+    The pair is two GGUFs by [ADR-022] -- the codec is byte-identical inside every Qwen3-TTS 12 Hz
+    checkpoint, so merging would duplicate it per talker, and the codes are the useful intermediate.
+    What this checks is the other half of that decision: the codec lives in the talker's OWN
+    directory, so unlike Dia -- whose codec is a separate HF repo -- a caller who points at the
+    checkpoint root has no way to discover it. `companions()` is that pointer.
+    """
+    from loom_exporter.qwen3_tts_export import _build_qwen3_tts
+
+    root = tmp_path / "qwen3-tts"
+    root.mkdir()
+    (root / "config.json").write_text(json.dumps({"model_type": "qwen3_tts"}))
+    config = _build_qwen3_tts(root, str(tmp_path / "talker.gguf"))
+
+    # No `speech_tokenizer/` yet: a checkpoint that does not carry one declares no companion rather
+    # than naming a path that is not there.
+    assert config.companions() == []
+
+    _hf_dir(root, "speech_tokenizer", QWEN3_TTS_TOKENIZER_CONFIG)
+    companions = config.companions()
+    assert [c.name for c in companions] == ["qwen3-tts-tokenizer-12hz"]
+    assert companions[0].checkpoint == root / "speech_tokenizer"
+    # And the recognizer that will be handed that path is the codec's, not the talker's again.
+    assert default_registry().detect(companions[0].checkpoint).name == "qwen3-tts-tokenizer-12hz"
+
+
+def test_a_companion_is_named_for_itself_not_for_the_primary(tmp_path):
+    """Two talkers exported into one directory write the SAME codec path, not two copies.
+
+    `-o out/anything.gguf` puts the codec at `out/qwen3-tts-tokenizer-12hz.gguf` -- its own catalogue
+    slug, which is also its Hub repo's -- so the 0.6B and the 1.7B, whose `speech_tokenizer/` weights
+    are byte-identical, resolve to one file rather than to two names derived from their talkers.
+    """
+    from loom_exporter.export_config import CompanionExport
+    from loom_exporter.main_export import companion_output
+
+    companion = CompanionExport(name="qwen3-tts-tokenizer-12hz",
+                                checkpoint=tmp_path / "speech_tokenizer", why="")
+    assert (companion_output("/out/qwen3-tts-0.6b.gguf", companion)
+            == companion_output("/out/qwen3-tts-1.7b.gguf", companion)
+            == "/out/qwen3-tts-tokenizer-12hz.gguf")
+
+
+def test_every_other_family_declares_no_companion():
+    """The hook is empty everywhere else, and that is what keeps it from surprising anyone.
+
+    `main_export()` only acts on it when asked -- `tools/build_model_cards.py` calls that API once per
+    Hub repo, and a second GGUF beside the first would put a stray file in a repo whose README lists
+    exactly one.
+    """
+    from loom_exporter.audio_codec_export import AudioCodecExportConfig, CodecFamily
+
+    codec = AudioCodecExportConfig(architecture=None, output_path="/tmp/x.gguf",
+                                   model_dir="/nonexistent", family=CodecFamily.DAC)
+    assert codec.companions() == []
+
+
+def test_the_programmatic_entry_point_stays_single_file():
+    """`main_export()` must not write a companion unless asked, and the default is the whole point.
+
+    `tools/build_model_cards.py` calls it once per Hub repo with that repo's own output directory, and
+    lists exactly one GGUF in the README it writes beside it. A second file appearing there would be a
+    stray artifact in a published repo -- which is why the CLI opts in and the API does not.
+    """
+    import inspect
+
+    from loom_exporter.main_export import main_export
+
+    assert inspect.signature(main_export).parameters["companions"].default is False

@@ -394,6 +394,13 @@ _NOT_SPECS = {
     "driver_builder.DriverScript": "a build RESULT (the emitted prelude chunks and entry function), "
                                    "checked by driver_ir.validate/check_subgraph_calls at the moment "
                                    "DriverBuilder.build produces it rather than by a declaration",
+    "export_config.CompanionExport": "a POINTER at another model inside the same checkpoint "
+                                     "directory, read by the `loom-export` CLI. Its three fields are "
+                                     "a filename stem, a path the recognizer will be pointed at, and "
+                                     "a sentence for a human -- none of them is a claim ABOUT a "
+                                     "checkpoint, so there is nothing to check one against. The path "
+                                     "is validated by the only thing that can: `detect()` refuses it "
+                                     "if no recognizer claims it",
     "spm_tokenizer_export.HfIdLayout": "a READ of a checkpoint's own tokenizer.json -- every field is "
                                        "transcribed from that file, so there is no second authority "
                                        "to check one against. It is the authority, and what it is the "

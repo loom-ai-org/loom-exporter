@@ -40,6 +40,7 @@ import torch.nn as nn
 
 from .bpe_tokenizer_export import read_sampling_defaults
 from .decomposition import Decomposition, MultiPhase
+from .export_config import CompanionExport
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .spec_protocol import Unchecked
 
@@ -139,31 +140,6 @@ def install_patches(modeling) -> None:
         mean, std = self._compute_statistics(hidden_states, attention)
         return _torch.cat((mean, std), dim=1).unsqueeze(2)
 
-    def repeat_kv(hidden_states, n_rep):
-        # `repeat_interleave` on the heads axis, where HF writes `unsqueeze -> expand -> reshape`.
-        #
-        # That idiom's expand is a BROADCAST, and coremltools' own default pipeline folds it away
-        # before `passes.fuse_gqa_repeat_kv` ever runs -- which leaves the reshape behind, alone,
-        # asking for 16 heads of a tensor that still has 8. The export, the write and the load all
-        # succeed; the first call dies with `RESHAPE: target shape [128,10,16,1] has 20480 elements
-        # but input has 10240`. The same failure then reappears one level up as two cached phases
-        # disagreeing about their K/V geometry, which is the symptom, not the cause.
-        #
-        # `repeat_interleave` states the repetition as a repetition rather than as a broadcast that
-        # happens to be reshaped, so there is nothing for a broadcast-folding pass to remove. It is
-        # the same tensor either way -- HF's own docstring says the idiom IS `torch.repeat_interleave(
-        # x, dim=1, repeats=n_rep)`.
-        if n_rep == 1:
-            return hidden_states
-        return hidden_states.repeat_interleave(n_rep, dim=1)
-
-    # BOTH, because the two attention paths reach different copies: the checkpoint's own
-    # `eager_attention_forward` uses the one in its module, and the sdpa path this export traces
-    # through uses `transformers.integrations.sdpa_attention`'s.
-    from transformers.integrations import sdpa_attention as _sdpa
-
-    _sdpa.repeat_kv = repeat_kv
-    modeling.repeat_kv = repeat_kv
     modeling.rotate_half = rotate_half
     modeling.apply_multimodal_rotary_pos_emb = apply_rope
     modeling.Qwen3TTSTalkerRotaryEmbedding.forward = _torch.no_grad()(rotary_forward)
@@ -183,7 +159,12 @@ def materialise_gqa(module, config) -> None:
     slot, which is [Retro-044]'s failure exactly.
 
     With `num_key_value_heads == num_attention_heads` the repeat is the identity and never traces at
-    all. What it costs, measured rather than estimated: `k_proj` and `v_proj` grow from `[1024, 1024]`
+    all -- and the `repeat_interleave` rewrite above is deliberately NOT kept alongside this. It would
+    be dead code (`n_rep` is 1, so HF's own `repeat_kv` early-returns) that patched
+    `transformers.integrations.sdpa_attention` PROCESS-WIDE, where `tools/build_model_cards.py --all`
+    exports every model in one process. The next model exported would have traced through it: the same
+    arithmetic, a different op shape, and a GGUF whose bytes moved for a reason nothing in its own
+    family could explain. What it costs, measured rather than estimated: `k_proj` and `v_proj` grow from `[1024, 1024]`
     to `[2048, 1024]` in all 33 layers, which is **+69.2 M parameters** on a 917 M model -- 277 MB at
     F32, and the written file grows by 275 MB, which is how the number was checked. The KV cache
     doubles with it. What it
@@ -617,6 +598,23 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
 
     def backend_kwargs(self) -> dict:
         return dict(tokenizer_dir=self.model_dir, hparams=self.hparams())
+
+    def companions(self) -> List[CompanionExport]:
+        """The codec, which ships in this checkpoint's own `speech_tokenizer/` subfolder.
+
+        **The pair stays two files** ([ADR-022]) -- the codec is byte-identical inside every Qwen3-TTS
+        12 Hz checkpoint, so merging would duplicate 456 MB per talker, and the codes are the useful
+        intermediate rather than an implementation detail. What this fixes is only that a caller who
+        pointed `loom-export` at the checkpoint root got half a pipeline with nothing saying so.
+        """
+        codec = Path(self.model_dir) / "speech_tokenizer"
+        if not codec.is_dir():
+            return []
+        return [CompanionExport(
+            name="qwen3-tts-tokenizer-12hz",
+            checkpoint=codec,
+            why="this talker emits codec TOKENS, not audio; its decoder ships in the same checkpoint",
+        )]
 
     def phases(self) -> List[ExportPhase]:
         import coremltools as ct
