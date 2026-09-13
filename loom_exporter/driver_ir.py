@@ -106,6 +106,16 @@ class BinOp(Expr):
     def render(self) -> str:
         if self.op == "floordiv":
             return f"math.floor({self.left.render()} / {self.right.render()})"
+        if self.op == "//":
+            # The engine embeds LuaJIT, which is Lua 5.1; `//` arrived in 5.3. Nothing syntax-checks
+            # the emitted driver at export time, so writing it produces a GGUF that exports, writes
+            # and loads, and then dies at `load_script` with `unexpected symbol near '/'` the first
+            # time anything runs it. `floordiv` above is the spelling that works, and this says so at
+            # the point someone reaches for the other one.
+            raise DriverIRError(
+                "BinOp('//') is Lua 5.3 and the engine runs LuaJIT (5.1). Use BinOp('floordiv'), "
+                "which renders as math.floor(a / b)."
+            )
         return f"({self.left.render()} {self.op} {self.right.render()})"
 
 
@@ -209,23 +219,40 @@ class OutputRef(Expr):
     module: str
     # 1-based, indexing the target topology's own declared-output list.
     index: int = 1
+    # A COMPUTED module name, for a family whose topology is chosen at run time -- Supertonic's text
+    # buckets. `module` stays the canonical member so every check that reads it keeps working, and
+    # `variants` is the rest, exactly as `SubgraphCallComponent.topology_expr`/`variants` do one layer
+    # out. Without this a bucketed family cannot reference its own retained output at all, because the
+    # name it retained under is not knowable until the text is measured.
+    module_expr: Optional[Expr] = None
+    variants: tuple = ()
     # How many of that output's ROWS to copy, or None for all of them (BACKLOG.md P4.3d). An
     # expression, not an int: the count a family-3 driver trims to is computed at run time from the
     # caller's own audio length, and it is the same expression the segment's `n_tokens` uses -- which
     # is the property that keeps the two from disagreeing, since a mismatch between them is a shape
     # error the engine raises rather than a silently short prompt.
     rows: Optional[Expr] = None
+    # The FIRST row to copy, 0-based, when `rows` does not mean "a prefix". Absent is row 0, which is
+    # every caller that trims rather than indexes. A transducer's joint consumes ONE encoder frame per
+    # call, and this is what lets it take that frame out of the encoder's retained output instead of
+    # out of a Lua table holding the whole thing.
+    row: Optional[Expr] = None
 
     def reads(self) -> list[str]:
         # Delegated, exactly as `Len` delegates: the module is not a symbol and never was, but `rows`
-        # is an ordinary expression over locals, and a reference this class did not report would be a
-        # read `validate()` never resolved.
-        return self.rows.reads() if self.rows is not None else []
+        # and `row` are ordinary expressions over locals, and a reference this class did not report
+        # would be a read `validate()` never resolved.
+        out = list(self.rows.reads()) if self.rows is not None else []
+        out += list(self.row.reads()) if self.row is not None else []
+        return out + (list(self.module_expr.reads()) if self.module_expr is not None else [])
 
     def render(self) -> str:
-        fields = [f"from = '{self.module}'"]
+        fields = [f"from = {self.module_expr.render()}" if self.module_expr is not None
+                  else f"from = '{self.module}'"]
         if self.index != 1:
             fields.append(f"index = {self.index}")
+        if self.row is not None:
+            fields.append(f"row = {self.row.render()}")
         if self.rows is not None:
             fields.append(f"rows = {self.rows.render()}")
         return "{" + ", ".join(fields) + "}"
@@ -346,6 +373,12 @@ class Stmt:
 class Local(Stmt):
     name: str
     expr: Expr
+    # Topologies the bound expression leaves RETAINED. Empty for almost every `Local`; set when the
+    # expression is a call to a GENERATED function whose body retains -- the flow-matching sampler,
+    # whose `loom.run_ode_and_retain` lives in the prelude where `_check_retained_reads` cannot see it.
+    # Same declaration `RawBlock.retains_` makes for a hand-written fragment, and read by the same
+    # `getattr` in the checker.
+    retains_: list = dataclasses.field(default_factory=list)
 
     def defines(self) -> list[str]:
         return [self.name]
@@ -437,6 +470,9 @@ class SubgraphCall(Stmt):
     # reducing by name says the same two things separately, which is why the fused
     # `loom.run_subgraph_argmax` that used to say them at once no longer exists.
     retain: bool = False
+    # Every name `module_expr` can evaluate to, so a retaining computed call registers all of them for
+    # the adjacency check -- see `_check_retained_reads`. Mirrors `SubgraphCallComponent.variants`.
+    variants: tuple = ()
 
     def defines(self) -> list[str]:
         return list(self.outputs) + list(self.extra_outputs)
@@ -550,6 +586,12 @@ class RawBlock(Stmt):
     defines_: list = dataclasses.field(default_factory=list)
     reads_: list = dataclasses.field(default_factory=list)
     verbatim: bool = False
+    # Topologies this block leaves RETAINED, for `_check_retained_reads`. A hand-written fragment --
+    # or a `loom_lua` helper it calls -- can run `loom.run_subgraph_and_retain` where no IR node
+    # records it, and a later `OutputRef` in the IR would then be rejected as reading something
+    # nothing produced. Declared rather than parsed because the retaining call may be a level down
+    # inside a helper (`run_proj1x1`), which is exactly where parsing the fragment's own text stops.
+    retains_: list = dataclasses.field(default_factory=list)
 
     def defines(self) -> list[str]:
         return self.defines_
@@ -742,15 +784,44 @@ def _check_retained_reads(function: Function, topologies: dict) -> None:
             if isinstance(stmt, (While, NumericFor)):
                 walk(stmt.body, dict(produced))
                 continue
+            # What a hand-written block says it leaves retained -- see `RawBlock.retains_`. `None` for
+            # the declared-output count: the block is opaque, so an index cannot be checked against it.
+            for name in getattr(stmt, "retains_", ()):
+                produced[name] = None
+            # `loom.run_recurrent_and_retain` retains too, and it is a plain `Call` rather than a
+            # `SubgraphCall` -- a cell is driven per timestep by the binding, not by one call with an
+            # axis table. Without this the checker saw an LSTM layer's retained sequence as never
+            # produced and rejected the reader, which is the right rule applied to an incomplete idea
+            # of what produces. Its slot count is 1: the binding retains the sequence, not the cell's
+            # two declared outputs.
+            for expr in _own_exprs(stmt):
+                if (isinstance(expr, Call) and expr.fn == RECURRENT_RETAIN_FN and expr.args
+                        and isinstance(expr.args[0], Lit)):
+                    produced[str(expr.args[0].value)] = 1
+                # Only a CALL's own arguments here. A `SubgraphCall`'s inputs carry the same
+                # references and are checked below, where the message can name the input as well as
+                # the module -- which is the better error and the one the tests pin.
+                if not isinstance(expr, Call):
+                    continue
+                for ref in _output_refs_in(expr):
+                    if ref.module not in produced:
+                        raise DriverIRError(
+                            f"driver IR: {expr.fn} reads the retained output of module "
+                            f"'{ref.module}', but no earlier loom.run_subgraph_and_retain("
+                            f"'{ref.module}', ...) or loom.run_recurrent_and_retain('{ref.module}', "
+                            f"...) runs in the same straight-line block -- a retained output only "
+                            f"exists between the run that produced it and the next run of that module"
+                        )
             if not isinstance(stmt, SubgraphCall):
                 continue
             for name, expr in stmt.inputs.items():
                 if not isinstance(expr, OutputRef):
                     continue
-                if expr.module not in produced:
+                missing = [m for m in (expr.module, *expr.variants) if m not in produced]
+                if missing:
                     raise DriverIRError(
                         f"driver IR: '{stmt.module}' input '{name}' reads the retained output of module "
-                        f"'{expr.module}', but no earlier "
+                        f"'{missing[0]}', but no earlier "
                         f"loom.run_subgraph_and_retain('{expr.module}', ...) runs in the same "
                         f"straight-line block -- a retained output only exists between the "
                         f"run that produced it and the next run of that module"
@@ -764,9 +835,30 @@ def _check_retained_reads(function: Function, topologies: dict) -> None:
                     )
             if stmt.retain:
                 topo = topologies.get(stmt.module)
-                produced[stmt.module] = None if topo is None else len(_topology_output_names(topo))
+                count = None if topo is None else len(_topology_output_names(topo))
+                # A computed call retains whichever variant it picked, and a computed reference names
+                # it with the same expression -- so all of them are "produced" together or none is.
+                for name in (stmt.module, *getattr(stmt, "variants", ())):
+                    produced[name] = count
 
     walk(function.body, {})
+
+
+# The binding whose retained sequence `_check_retained_reads` must know about, spelled once.
+RECURRENT_RETAIN_FN = "loom.run_recurrent_and_retain"
+
+
+def _output_refs_in(expr):
+    """Every `OutputRef` inside one expression, including the arguments of a call.
+
+    `_own_exprs` yields a statement's top-level expressions; a recurrent call's reference is an
+    ARGUMENT of one, so it needs one level of descent. Kept small deliberately: the only nesting that
+    matters here is a call's own argument list."""
+    if isinstance(expr, OutputRef):
+        return [expr]
+    if isinstance(expr, Call):
+        return [a for a in expr.args if isinstance(a, OutputRef)]
+    return []
 
 
 def check_subgraph_calls(function: Function, topologies: dict) -> None:

@@ -80,11 +80,24 @@ class TestResolution(unittest.TestCase):
 
 class TestADriverCarriesOnlyWhatItUses(unittest.TestCase):
     def test_the_prelude_is_the_transitive_closure_and_nothing_else(self):
-        text = "\n".join(LuaLibrary(uses=("run_proj1x1",)).prelude(DriverContext(topologies={})))
-        self.assertIn("local function to_layout_a", text)
-        self.assertIn("local function run_proj1x1", text)
-        self.assertNotIn("adpm2", text)
-        self.assertNotIn("run_bi_lstm", text)
+        """`predict_durations` pulls the two scalar functions it calls; `run_proj1x1` pulls nothing at
+        all. The pair is the closure test: one function with dependencies and one without.
+
+        It used to be `run_resblk_stack` pulling `to_layout_a`. That function no longer exists -- every
+        edge it converted is a retained reference, and where the two layout conventions genuinely differ
+        the producer is now told which to write (ADR-031's follow-up)."""
+        text = "\n".join(LuaLibrary(uses=("predict_durations",)).prelude(DriverContext(topologies={})))
+        self.assertIn("local function sigmoid", text)
+        self.assertIn("local function round_half_to_even", text)
+        self.assertIn("local function predict_durations", text)
+        # The DEFINITION, not the name: a docstring that mentions a sibling function is not that
+        # function being emitted, and asserting on the bare name makes prose a test failure.
+        self.assertNotIn("local function adpm2", text)
+        self.assertNotIn("local function run_bi_lstm", text)
+
+        alone = "\n".join(LuaLibrary(uses=("run_proj1x1",)).prelude(DriverContext(topologies={})))
+        self.assertIn("local function run_proj1x1", alone)
+        self.assertNotIn("local function sigmoid", alone)
 
     def test_unreferenced_reports_a_declaration_nothing_calls(self):
         library = LuaLibrary(uses=("array_sum", "compute_wsum"))
@@ -132,11 +145,16 @@ class TestTheRealFamilies(unittest.TestCase):
             )
             self.assertEqual(library.unreferenced(text), [], type(config).__name__)
 
-    def test_the_eleven_duplicated_functions_now_have_exactly_one_definition(self):
+    def test_the_seven_duplicated_functions_now_have_exactly_one_definition(self):
         """The measurement this library was built from: 11 functions were byte-identical in Kokoro's and
-        StyleTTS2's headers. Their definitions must now exist once, in `lua/`, and nowhere else."""
-        shared = ("run_bi_lstm", "run_resblk_stack", "run_proj1x1", "to_row_major", "from_row_major",
-                  "to_layout_a", "from_layout_a", "sigmoid", "round_half_to_even",
+        StyleTTS2's headers. Their definitions must exist once, in `lua/`, and nowhere else.
+
+        Seven of the eleven, because the four layout converters are gone rather than shared: ADR-031's
+        follow-up made every edge that used to pass through Lua a retained reference, so nothing
+        converts between the two conventions any more. A family fragment redefining one of the seven is
+        still the failure this checks; a fragment that reintroduced `to_layout_a` would fail the
+        manifest scan instead, which is the check that owns that direction."""
+        shared = ("run_bi_lstm", "run_resblk_stack", "run_proj1x1", "sigmoid", "round_half_to_even",
                   "predict_durations", "compute_wsum")
         fragments = sorted(CONVERTERS.glob("convert_*/*_driver/*.lua"))
         self.assertTrue(fragments)

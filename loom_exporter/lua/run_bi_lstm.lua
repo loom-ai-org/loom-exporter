@@ -1,32 +1,24 @@
--- Host-steps one BiLSTM instance over a T x input_dim sequence, driving the per-timestep cell
--- topologies (`<ns>_fwd`/`_bwd`) the exporter's `recurrent.py` generates. ggml has no LSTM op; the
--- recurrence is genuinely host-side.
+-- Runs one BiLSTM instance over a `seq_len x input_dim` sequence and RETAINS the interleaved
+-- `[h_fwd | h_bwd]` result, returning the module name that holds it. ggml has no LSTM op, so the
+-- recurrence is genuinely outside the graph -- but outside the graph is not the same as across the
+-- boundary, and as of ADR-031's follow-up neither end of this crosses.
 --
--- Each cell topology declares BOTH of the step's outputs, so one call per timestep per direction
--- returns `h_new, c_new` together. It used to be two calls against two topologies that shared an
--- identical node list and differed only in which output they declared -- which meant computing the
--- gate stack, the four gate VIEWs and the six elementwise ops twice for every timestep of every
--- BiLSTM. See `recurrent.py::_lstm_cell_topology`.
-local function run_bi_lstm(namespace_, seq, hidden_dim)
-    local T = #seq
-    local out = {}
-    for t = 1, T do out[t] = {} end
-
-    local h_fwd, c_fwd = {}, {}
-    for i = 1, hidden_dim do h_fwd[i], c_fwd[i] = 0.0, 0.0 end
-    for t = 1, T do
-        local h_new, c_new = loom.run_subgraph(namespace_ .. "_fwd", {n_tokens = 0, n_past = 0}, {layer_input = seq[t], h_prev = h_fwd, c_prev = c_fwd})
-        h_fwd, c_fwd = h_new, c_new
-        for i = 1, hidden_dim do out[t][i] = h_new[i] end
-    end
-
-    local h_bwd, c_bwd = {}, {}
-    for i = 1, hidden_dim do h_bwd[i], c_bwd[i] = 0.0, 0.0 end
-    for i = 0, T - 1 do
-        local t = T - i
-        local h_new, c_new = loom.run_subgraph(namespace_ .. "_bwd", {n_tokens = 0, n_past = 0}, {layer_input = seq[t], h_prev = h_bwd, c_prev = c_bwd})
-        h_bwd, c_bwd = h_new, c_new
-        for j = 1, hidden_dim do out[t][hidden_dim + j] = h_new[j] end
-    end
-    return out
+-- **One call, not 4T, and no interleave in Lua.** This stepped the cells from Lua once: `layer_input`,
+-- `h_prev` and `c_prev` out and `h_new`/`c_new` back, per timestep, per direction. `loom.run_recurrent`
+-- moved the sweep into C++ with the carry in `std::vector<float>`, which left exactly one crossing --
+-- the two directions' outputs, pulled back so this function could build `[h_fwd | h_bwd]` rows for its
+-- consumers. That was the last one: `loom.run_bi_recurrent_and_retain` runs both directions and writes
+-- both halves of every row into one store slot, so a BiLSTM's output reaches the next graph as a name.
+--
+-- `seq` is a sequence to marshal or a `{from = "module"}` reference; `seq_len`/`input_dim` are stated
+-- rather than measured because a reference has no `#`. `layout` is the consumer's convention, "rows"
+-- (default, one row per timestep) or "layout_a" (time on the fastest axis, what the conv-family
+-- topologies declare) -- see the binding.
+local function run_bi_lstm(namespace_, seq, seq_len, input_dim, hidden_dim, layout)
+    loom.run_bi_recurrent_and_retain(namespace_ .. "_fwd", namespace_ .. "_bwd", seq, seq_len,
+                                      input_dim, hidden_dim, layout)
+    -- The forward cell's store is where the whole interleaved sequence lives, so the name a caller
+    -- threads onward is that module's. Returned rather than composed by the caller: which of the two
+    -- holds it is this function's business.
+    return namespace_ .. "_fwd"
 end

@@ -96,10 +96,44 @@ def read_sampling_defaults(model_dir) -> dict:
     }
 
 
+def _tokenizer_json_text(tok_dir: Path) -> str:
+    """`tokenizer.json`'s text, MATERIALISING it from a `vocab.json` + `merges.txt` pair if that is
+    all the checkpoint ships.
+
+    The classic GPT-2 layout predates the fast-tokenizer file, and Qwen3-TTS still ships it where
+    every other Qwen checkpoint in this tree ships `tokenizer.json`. The pair holds the same
+    vocabulary and the same merges, but not in this reader's schema, and the difference is not only
+    formatting: `added_tokens.json` and `tokenizer_config.json` carry the added tokens with their
+    flags, and the pre-tokenizer regex lives in the config rather than beside the merges.
+
+    So the conversion is `tokenizers`' own, through a round trip, rather than reimplemented here --
+    which is the same argument [ADR-027] makes about not re-deriving a tokenizer's own id order.
+    Verified against the reference's tokenization of a real prompt, id for id.
+    """
+    direct = tok_dir / "tokenizer.json"
+    if direct.exists():
+        return direct.read_text()
+
+    import tempfile
+
+    from transformers import AutoTokenizer
+
+    with tempfile.TemporaryDirectory() as staging:
+        AutoTokenizer.from_pretrained(str(tok_dir)).save_pretrained(staging)
+        written = Path(staging) / "tokenizer.json"
+        if not written.exists():                     # pragma: no cover - a slow tokenizer
+            raise NotImplementedError(
+                f"{tok_dir} has vocab.json + merges.txt but its tokenizer has no fast backend, so "
+                "there is no tokenizer.json to write and nothing on disk states the pre-tokenizer "
+                "regex this writer needs"
+            )
+        return written.read_text()
+
+
 def write_bpe_vocab(writer: GGUFWriter, tokenizer_dir: str, pre_type: str = "qwen2",
                     eos_token_ids: list[int] | None = None) -> None:
     tok_dir = Path(tokenizer_dir)
-    tokenizer_json = json.loads((tok_dir / "tokenizer.json").read_text())
+    tokenizer_json = json.loads(_tokenizer_json_text(tok_dir))
     config_path = tok_dir / "tokenizer_config.json"
     config = json.loads(config_path.read_text()) if config_path.exists() else {}
 

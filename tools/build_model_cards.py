@@ -100,6 +100,11 @@ class ModelCard:
     # reconstructs a SENTENCE, inserting each word's mark after its last piece. Showing the NER snippet
     # on a punctuation model would print `hello/, o/,` and explain nothing.
     restores_punctuation: bool = False
+    # Whether this text-to-codes model takes a REFERENCE CLIP for the voice rather than picking one
+    # itself. A per-model fact for the same reason `takes_text` is: both models emit codec tokens
+    # through one door, and what a caller has to supply is not implied by the task. Dia picks a voice
+    # from its seed; Qwen3-TTS has no speaker table at all and clones from audio.
+    clones_voice: bool = False
     # `--task`/`--model` for loom-export; empty means auto-detection resolves both.
     export_task: Optional[str] = None
     export_model: Optional[str] = None
@@ -225,6 +230,29 @@ CATALOG = [
         task_type="automatic-speech-recognition",
         base_repo="nvidia/stt_en_conformer_ctc_small", license_id="cc-by-4.0", language=["en"],
         title="Conformer-CTC Small (en)", summary="NVIDIA NeMo's small Conformer-CTC English ASR model, exported for loom.cpp.",
+    ),
+    # Family 4 (P5): CNN + transformer + CTC. `export_model="hf-ctc-asr"` is the one generic
+    # recognizer, so both leaves name it -- which is the family's whole claim about itself.
+    #
+    # omniASR-CTC-300M-v2 is deliberately NOT here. It is exported and verified against `transformers`
+    # (max |d| 5.45e-04, 549/549 argmax) and it is not shippable: the checkpoint is scale-sensitive and
+    # its own documented processor path, which normalizes, transcribes garbage for English speech. loom
+    # reproduces that exactly, which is the right behaviour and not a model to publish. See Epic-03 §2.
+    ModelCard(
+        slug="hubert-large-ls960-ft", checkpoint=Path("hubert-large-ls960-ft"),
+        export_task="automatic-speech-recognition", export_model="hf-ctc-asr",
+        task_type="automatic-speech-recognition",
+        base_repo="facebook/hubert-large-ls960-ft", license_id="apache-2.0", language=["en"],
+        title="HuBERT Large (LS960 fine-tuned)",
+        summary="Meta's HuBERT Large English CTC ASR model, exported for loom.cpp.",
+    ),
+    ModelCard(
+        slug="data2vec-audio-base-960h", checkpoint=Path("data2vec-audio-base-960h"),
+        export_task="automatic-speech-recognition", export_model="hf-ctc-asr",
+        task_type="automatic-speech-recognition",
+        base_repo="facebook/data2vec-audio-base-960h", license_id="apache-2.0", language=["en"],
+        title="data2vec-audio Base (960h)",
+        summary="Meta's data2vec-audio Base English CTC ASR model, exported for loom.cpp.",
     ),
     ModelCard(
         slug="parakeet-tdt-0.6b", checkpoint=Path("parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo"),
@@ -450,6 +478,171 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
             "**It does not undo a delay pattern.** An AR model that emits these codes typically offsets "
             "stream *k* by *k* steps; realigning them is a property of that model, not of the codec, so "
             "feed it aligned codes."
+        ),
+    ),
+    ModelCard(
+        slug="encodec-32khz", checkpoint=Path("encodec-32khz"),
+        task_type="audio-codec", pipeline_tag="text-to-audio",
+        base_repo="facebook/encodec_32khz", license_id="cc-by-nc-4.0", language=[],
+        # **The one entry here whose license is not permissive, and it took tracing.** The upstream
+        # repo declares NO `license:` tag and its README has no license line. Two candidates: the
+        # EnCodec CODE on github.com/facebookresearch/encodec is MIT, and this specific CHECKPOINT was
+        # trained as part of MusicGen ("intended to be used in conjunction with the MusicGen models",
+        # its own card), whose weights ship CC-BY-NC-4.0. A re-upload is about the weights, so the
+        # non-commercial tag is the safe reading and the one used here. Same shape of gap as DAC's and
+        # StyleTTS2's entries; different resolution, because the permissive candidate covers the code
+        # rather than these weights.
+        language_note="a codec, not a language model: it carries no vocabulary and no language. The "
+                       "upstream repo carries NO `license:` tag; `cc-by-nc-4.0` follows the MusicGen "
+                       "release this checkpoint was trained as part of, which is the stricter of the "
+                       "two readings. The EnCodec code itself is MIT, which covers the code and not "
+                       "these weights.",
+        title="EnCodec 32 kHz (decoder)",
+        summary="Meta's EnCodec at 32 kHz -- MusicGen's codec -- decode half, exported for loom.cpp. "
+                "Family 11: codec tokens in, a waveform out.",
+        limitations=(
+            "**This is the DECODE half only.** `encode` is audio-in/codes-out -- a different contract "
+            "with a different modality pair -- and no model that decodes through this codec ever calls "
+            "it, so exporting it would be weight in the file for a door nothing opens. To go the other "
+            "way, use the upstream checkpoint.\n\n"
+            "It takes **4 code streams per frame at 50 frames per second**, and one frame decodes to "
+            "640 samples. That is the 2.2 kbps bandwidth this checkpoint is configured at; codes from "
+            "EnCodec at another bandwidth are a different number of streams and are refused on the "
+            "width rather than decoded.\n\n"
+            "**Its decoder contains an LSTM, which the engine walks per frame.** The file carries "
+            "three graph topologies rather than one, with the recurrence run between them -- the "
+            "timestep loop is inside the engine, not in the script, and the whole thing is invisible "
+            "from the outside. It is why a clip costs about 0.44x real time here where a purely "
+            "convolutional codec is far cheaper: 8.8 ms per frame, flat from 25 frames to 400.\n\n"
+            "**It does not undo a delay pattern.** An AR model that emits these codes typically offsets "
+            "stream *k* by *k* steps; realigning them is a property of that model, not of the codec, so "
+            "feed it aligned codes."
+        ),
+    ),
+    ModelCard(
+        slug="snac-24khz", checkpoint=Path("snac-24khz"),
+        task_type="audio-codec", pipeline_tag="text-to-audio",
+        base_repo="hubertsiuzdak/snac_24khz", license_id="mit", language=[],
+        language_note="a codec, not a language model: it carries no vocabulary and no language. "
+                       "The upstream repo declares `license: mit` on its own card, and the package "
+                       "(github.com/hubertsiuzdak/snac) is MIT too.",
+        title="SNAC 24 kHz (decoder)",
+        summary="Multi-Scale Neural Audio Codec at 24 kHz, decode half, exported for loom.cpp. "
+                "Family 11: codec tokens in, a waveform out -- and the first with its codebooks at "
+                "different frame rates.",
+        limitations=(
+            "**This is the DECODE half only.** `encode` is audio-in/codes-out -- a different contract "
+            "with a different modality pair -- and no model that decodes through this codec ever calls "
+            "it, so exporting it would be weight in the file for a door nothing opens. To go the other "
+            "way, use the upstream checkpoint.\n\n"
+            "**A row is one COARSEST frame, and it is 7 ids wide.** SNAC's three codebooks run at "
+            "different rates -- `vq_strides` `[4, 2, 1]`, so codebook 0 emits one code where codebook "
+            "2 emits four -- and the flat frame-major layout this file takes is one row per coarsest "
+            "frame at **11.72 frames per second**, decoding to 2048 samples each. The 7 columns are "
+            "**level-major**: column 0 is codebook 0, columns 1-2 are codebook 1's two sub-frames in "
+            "order, columns 3-6 are codebook 2's four. An AR model that emits SNAC tokens 7 at a time "
+            "(Orpheus and its relatives) may interleave them depth-first instead; rearranging them is "
+            "the caller's job, as the delay pattern is.\n\n"
+            "**The decode is stochastic, like the model it comes from, and it is seeded.** SNAC's "
+            "decoder adds `randn * linear(x)` at four points. A graph cannot draw that itself, so the "
+            "driver draws it and passes it in -- seeded from `seed=` and defaulting to a fixed value, "
+            "so two runs of the same codes agree unless you ask them not to:\n\n"
+            "```python\n"
+            "a = model.codes2speech.infer(codes)              # the same waveform every time\n"
+            "b = model.codes2speech.infer(codes, seed=99)     # a different draw\n"
+            "```\n\n"
+            "Dropping the noise instead gives the mean of that distribution, which is 2.4% away in "
+            "relative RMS and measurably duller up high; this file does not do that.\n\n"
+            "**Its noise floor is reconstructed, not reproduced.** At 0.98 kbps a steady background "
+            "hiss in the source comes back slightly modulated -- audible as a slow wave under quiet "
+            "passages. That is the upstream model's own behaviour at this bitrate, present in the "
+            "reference decoder too, and not something the export introduces.\n\n"
+            "**It does not undo a delay pattern.** An AR model that emits these codes typically offsets "
+            "stream *k* by *k* steps; realigning them is a property of that model, not of the codec, so "
+            "feed it aligned codes."
+        ),
+    ),
+    ModelCard(
+        slug="qwen3-tts-12hz-0.6b", checkpoint=Path("qwen3-tts-12hz-0.6b"),
+        task_type="text-to-codes", pipeline_tag="text-to-speech", clones_voice=True,
+        base_repo="Qwen/Qwen3-TTS-12Hz-0.6B-Base", license_id="apache-2.0",
+        language=["zh", "en", "ja", "ko", "de", "fr", "ru", "pt", "es", "it"],
+        title="Qwen3-TTS 12Hz 0.6B Base",
+        summary="Qwen's voice-cloning TTS talker, exported for loom.cpp. Family 10: text and a "
+                "reference voice in, neural-codec tokens out -- pair it with "
+                "`qwen3-tts-tokenizer-12hz-loom` for audio.",
+        limitations=(
+            "**This model does not produce audio.** It emits sixteen streams of Qwen3-TTS codec "
+            "tokens, and the codec turns those into a waveform -- "
+            "[`qwen3-tts-tokenizer-12hz-loom`](https://huggingface.co/loom-ai-org/qwen3-tts-tokenizer-12hz-loom), "
+            "which ships inside this same checkpoint upstream. They stay separate because one codec "
+            "serves every size and variant of this talker, and because the codes are the useful "
+            "intermediate.\n\n"
+            "**The voice comes from a reference clip, and there is no speaker table.** This "
+            "checkpoint's `spk_id` is empty, so cloning is the only mode: pass `waveform=` and the "
+            "speaker encoder extracts an x-vector from it. Pass `x_vector=` instead to reuse one you "
+            "already have -- it is 1024 floats and it is the whole of what the voice contributes.\n\n"
+            "**The reference TEXT is not used.** Upstream offers a second, higher-fidelity clone mode "
+            "that conditions on a transcript of the reference clip plus its codec tokens; it needs the "
+            "codec's ENCODE half, which this collection does not export, so this file implements the "
+            "x-vector mode only.\n\n"
+            "**`language_id` is a raw number**, because that is what the checkpoint declares -- "
+            "English 2050, Chinese 2055, Spanish 2054, German 2053, Japanese 2058, French 2061, "
+            "Korean 2064, Russian 2069, Portuguese 2071, Italian 2070. Omit it and English is "
+            "assumed.\n\n"
+            "**It samples by default.** The export declares this checkpoint's own decoding -- "
+            "`temperature 0.9`, `top_k 50`, `repetition_penalty 1.05`, and a second set for the code "
+            "predictor -- so two runs of a sentence give two takes; `seed=` is what pins one. "
+            "`temperature=0` decodes greedily and reproduces `transformers` **exactly**: verified at "
+            "672 codes over 42 frames, every one identical, and the pair's audio transcribes back to "
+            "the sentence it was given.\n\n"
+            "**The repetition penalty is not optional here.** `transformers` applies it as a "
+            "processor rather than a warper, so it moves a greedy argmax too, and without it this "
+            "model never emits its end token -- it runs to `max_new_tokens`. Passing "
+            "`repetition_penalty=1.0` turns it off and is a good way to see that.\n\n"
+            "**`max_new_tokens` counts audio frames at 12.5 per second**, not decoder steps -- one "
+            "frame is sixteen transformer passes here, since a code predictor emits fifteen of the "
+            "sixteen codebooks from the talker's hidden state.\n\n"
+            "**Generation is slower than the parameter count suggests**, for two reasons that are "
+            "this export's rather than the model's. The code predictor runs without a KV cache (it "
+            "re-reads its own sixteen-position prefix each step, which is what lets it share a file "
+            "with a cached talker), and the attention is materialised as MHA rather than GQA -- "
+            "`k_proj`/`v_proj` are duplicated so the key/value head count matches the query's, +69 M "
+            "parameters and a doubled cache, because the grouped form does not survive conversion.\n\n"
+            "**It is a big download**: 3.9 GB, F32, like the rest of this collection. Nearly a third "
+            "of it is the 151936 x 2048 text embedding table. `loom-export --quantize Q8_0` on the "
+            "upstream checkpoint packs the eligible weights to about 1.1 GB if you would rather have "
+            "that."
+        ),
+    ),
+    ModelCard(
+        slug="qwen3-tts-tokenizer-12hz",
+        # The `speech_tokenizer/` SUBFOLDER of the talker's checkpoint, not its root: the root is the
+        # family-10 LM that emits these codes and exports through `qwen3_tts_export`.
+        checkpoint=Path("qwen3-tts-12hz-0.6b/speech_tokenizer"),
+        task_type="audio-codec", pipeline_tag="text-to-audio",
+        base_repo="Qwen/Qwen3-TTS-12Hz-0.6B-Base", license_id="apache-2.0", language=[],
+        language_note="a codec, not a language model: it carries no vocabulary and no language. "
+                       "The licence is the talker repo's, since this ships inside it.",
+        title="Qwen3-TTS Tokenizer 12 Hz (decoder)",
+        summary="Qwen3-TTS's own 12.5 Hz speech tokenizer, decode half, exported for loom.cpp. "
+                "Family 11: codec tokens in, a 24 kHz waveform out -- and the family's first leaf "
+                "with a transformer in it.",
+        limitations=(
+            "**This is the DECODE half only**, like every codec in this collection: `encode` is "
+            "audio-in/codes-out, a different contract, and no model that decodes through this codec "
+            "ever calls it.\n\n"
+            "**It decodes in CHUNKS, because its reference does.** `chunked_decode(chunk_size=300, "
+            "left_context_size=25)` is what Qwen's own `decode` calls, so past 300 frames -- 24 "
+            "seconds -- the model's answer *is* a sequence of bounded calls. Measured on real codes, "
+            "a whole-sequence pass is bit-identical to the chunked one through 299 frames and then "
+            "parts company: 1.1% relative RMS at 301 and 8.9% at 700. Matching it is also what keeps "
+            "this runnable: the decoder attends over the frame axis, so one long call at a 4096-frame "
+            "ceiling would build a 4096x4096 score matrix in each of 8 layers.\n\n"
+            "**Feed it 16 codes per frame, frame-major**, in codebook order. The talker that produces "
+            "them is [`qwen3-tts-12hz-0.6b-loom`](https://huggingface.co/loom-ai-org/qwen3-tts-12hz-0.6b-loom); "
+            "both files declare `codec.n_codebooks`, so a mismatched pair says so rather than "
+            "producing audio of the wrong duration."
         ),
     ),
     ModelCard(
@@ -842,6 +1035,41 @@ print(model.hparam("codec.n_codebooks"), "==", codec.hparam("codec.n_codebooks")
 # answer every time -- greedy is much flatter, and not what this checkpoint was tuned for.
 print(model.hparam("sampling.temperature", "f32"), model.hparam("sampling.guidance_scale", "f32"))
 """,
+    "text-to-codes-voice-clone": """import loom
+import librosa
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# The voice is a REFERENCE CLIP, not a speaker id -- this checkpoint carries no speaker table. A few
+# clear seconds is enough. 24 kHz is what the speaker encoder expects, so resample on the way in.
+reference, _ = librosa.load("reference.wav", sr=24000)
+
+# What comes back is codec TOKENS, not audio -- frame-major, one row per frame, 16 codebooks wide.
+# `max_new_tokens` counts AUDIO FRAMES, at 12.5 per second.
+codes = model.text2codes.infer(
+    "The quick brown fox jumps over the lazy dog.",
+    waveform=reference.tolist(),
+    language_id=2050,          # English; see "Known limitations" for the rest
+    max_new_tokens=200, seed=1234,
+)
+print(len(codes), "frames x", len(codes[0]), "codebooks")
+
+# The other half of the pair, in a repo of its own: the codec serves every size and variant of this
+# talker, and the codes are worth having on their own -- cache them, edit them, decode them elsewhere.
+codec = loom.Model.from_pretrained("loom-ai-org/qwen3-tts-tokenizer-12hz-loom")
+audio = codec.codes2speech.infer(codes)
+print(len(audio), "samples at", audio.sample_rate, "Hz =", round(audio.duration, 2), "s")
+audio.save("out.wav")
+
+# Nothing goes between those two calls. Both files declare the width of a frame, so a pair that does
+# not fit says so instead of producing audio of the wrong duration:
+print(model.hparam("codec.n_codebooks"), "==", codec.hparam("codec.n_codebooks"))
+
+# This model SAMPLES by default, at its own generation config's settings. `seed=` is what makes a
+# take reproducible; pass temperature=0 for greedy, which reproduces `transformers` exactly.
+print(model.hparam("sampling.temperature", "f32"),
+      model.hparam("sampling.repetition_penalty", "f32"))
+""",
     "text-to-speech-with-vocab": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
@@ -898,6 +1126,8 @@ def snippet_key(card: ModelCard) -> str:
         return "automatic-speech-recognition-multilingual"
     if card.task_type == "token-classification" and card.restores_punctuation:
         return "token-classification-punctuation"
+    if card.task_type == "text-to-codes" and card.clones_voice:
+        return "text-to-codes-voice-clone"
     return card.task_type
 
 

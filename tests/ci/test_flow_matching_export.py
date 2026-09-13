@@ -43,20 +43,33 @@ SUPERTONIC = FlowMatchingSpec(func_name="sample_vfe", estimator="vfe", carried_i
 
 
 class TestRenderSampler(unittest.TestCase):
-    def test_emits_the_declared_call_with_every_input(self):
+    def test_emits_the_declared_call_with_every_fixed_input(self):
         lua = render_sampler(SUPERTONIC)
         self.assertIn("local function sample_vfe(length, n_elems, n_steps, step_inputs)", lua)
-        self.assertIn('loom.run_subgraph("vfe", {n_tokens = length, n_past = 0}, args)', lua)
-        for line in ("z_t = z,", "txt_emb = step_inputs.txt_emb,",
-                     "stl_emb = step_inputs.stl_emb,", "t = { t },"):
+        self.assertIn('loom.run_ode_and_retain("vfe", {n_tokens = length, n_past = 0}, {', lua)
+        for line in ("txt_emb = step_inputs.txt_emb,", "stl_emb = step_inputs.stl_emb,"):
             self.assertIn(line, lua)
+        # The carried state and the time are the LOOP's, not the caller's: they are named in the opts
+        # so the binding can write them per stage, and they are not entries in the argument table.
+        self.assertIn('carried = "z_t", time = "t",', lua)
+        self.assertNotIn("z_t = z,", lua)
 
-    def test_emits_forward_euler_with_uniform_dt(self):
+    def test_the_schedule_is_uniform_and_the_default_method_is_euler(self):
+        """`t_k = k/n_steps` -- the same points the Lua loop walked, handed over as a schedule.
+
+        Euler by default is load-bearing rather than a preference: a different integrator is a
+        different numerical answer, and every flow-matching model in the zoo shipped under this one.
+        The engine pins it bit-identically against the loop it replaces (test_lua_bridge_ode.cpp)."""
         lua = render_sampler(MATCHA)
-        self.assertIn("local dt = 1.0 / n_steps", lua)
-        self.assertIn("for step = 0, n_steps - 1 do", lua)
-        self.assertIn("local t = step / n_steps", lua)
-        self.assertIn("z[i] = z[i] + v[i] * dt", lua)
+        self.assertIn("for step = 0, n_steps do times[step + 1] = step / n_steps end", lua)
+        self.assertIn('method = "euler", times = times, n_elems = n_elems,', lua)
+        self.assertNotIn("z[i] = z[i]", lua)
+
+    def test_a_second_order_method_is_opt_in_and_travels_into_the_call(self):
+        import dataclasses
+
+        lua = render_sampler(dataclasses.replace(MATCHA, method="midpoint"))
+        self.assertIn('method = "midpoint", times = times, n_elems = n_elems,', lua)
 
     def test_uses_only_double_quotes_so_the_lua_stays_valid(self):
         """The generated code is spliced into a Lua file; a stray Python repr quote would break it."""
@@ -174,11 +187,17 @@ class TestSpecProtocolRetrofit(unittest.TestCase):
 
     def test_supplied_inputs_is_what_the_generated_lua_actually_passes(self):
         """The link's subject is a derived property, so the declaration cannot drift from the emission:
-        every name checked here is a name `render_sampler` writes into the per-step table."""
+        every name checked here appears in what `render_sampler` writes.
+
+        The carried state and the time are supplied by the BINDING now rather than by a table entry,
+        so they appear as `carried = "z_t"` / `time = "t"` -- still named, still checked against the
+        estimator's declared inputs, and no longer values this driver holds."""
         lua = render_sampler(SUPERTONIC)
         self.assertEqual(SUPERTONIC.supplied_inputs, ["z_t", "txt_emb", "stl_emb", "t"])
-        for name in SUPERTONIC.supplied_inputs:
-            self.assertIn(f"{name} = ", lua)
+        for name in SUPERTONIC.fixed_inputs:
+            self.assertIn(f"{name} = step_inputs.{name},", lua)
+        self.assertIn(f'carried = "{SUPERTONIC.carried_input}"', lua)
+        self.assertIn(f'time = "{SUPERTONIC.time_input}"', lua)
 
     def test_every_field_of_both_specs_is_declared(self):
         """The standing rule, on the first two specs to adopt the protocol: each field is either

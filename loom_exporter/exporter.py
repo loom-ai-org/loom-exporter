@@ -15,7 +15,7 @@ from .driver_ir import (
 from .driver_ir import Function as IRFunction
 from .driver_builder import DriverContext, DriverScript
 from .driver_components import (
-    CALLER, CAUSAL_MASK_INPUT_NAMES, HOST_COMPUTED_INPUT_NAMES, MASK, POSITION,
+    CALLER, CAUSAL_MASK_INPUT_NAMES, HOST_COMPUTED_INPUT_NAMES, MASK, NOISE, POSITION,
     POSITION_INPUT_NAMES, SYNTHESIZED_BUILDERS, ArgmaxEpilogue, ChainStage, CtcGreedyEpilogue,
     DriverInputs, ModularChain,
     DriverReturn, MonolithicCall, PrefillDecodeLoop, TokenLabelsEpilogue,
@@ -28,14 +28,21 @@ from .symbols import DYNAMIC_SYMBOL_RE
 from .topology_ops import TopologyContext, lookup_topology_rule
 from .value_facts import ValueFacts, is_const_producer, static_array, static_scalar, static_value
 
-def _binding_kind(name: str) -> str:
+def _binding_kind(name: str, noise_inputs=()) -> str:
     """How the driver obtains one traced-model input: computed host-side, or read from the caller.
 
     The two host-computed sets live in `driver_components.py` alongside the component that acts on
     them (P4.0.6/C.2). A traced model's own `cache_position`/`position_ids`/`attention_mask` inputs
     exist because passing them explicitly is what keeps the sequence length genuinely dynamic under
     `torch.jit.trace`; the driver knows `n_tokens`/`n_past` and fills them in, so a caller never has to
-    know they are there."""
+    know they are there.
+
+    The third host-computed kind is NAMED BY THE EXPORT rather than by a set of names here, and the
+    difference is real: `cache_position` is `cache_position` in every model that has one, while a noise
+    leaf is whatever its wrapper called it and carries a per-input length ratio only the export knows.
+    Guessing it from a name would be guessing the ratio too."""
+    if name in noise_inputs:
+        return NOISE
     if name in POSITION_INPUT_NAMES:
         return POSITION
     if name in CAUSAL_MASK_INPUT_NAMES:
@@ -424,6 +431,12 @@ class LoomGGUFExporter:
             "cast", "log", "exp", "sqrt", "rsqrt", "abs", "neg", "sign", "floor", "clamp", "clip",
             "tanh", "sigmoid", "relu", "gelu", "softplus", "identity", "softmax", "logical_not", "silu",
             "leaky_relu", "cumsum", "atan", "sin", "cos", "square",
+            # `elu` is EnCodec's, and it arrived with the same failure every entry above was added
+            # for: the walk stops at the first op it does not know, falls back to the bare root axis,
+            # and the export succeeds with a wrong length. Its decoder puts one between every
+            # transposed convolution and the block that follows, so without this the FIRST upsampling
+            # stage is the last one whose length is related to the root.
+            "elu",
         }
         if op.op_type in _UNARY_PASSTHROUGH_OPS:
             # Pure unary, shape-preserving ops -- the axis's real expression is whatever its single
@@ -693,6 +706,31 @@ class LoomGGUFExporter:
                         inferred = self._infer_dynamic_dim_expr(operand, torch_axis, _seen)
                         if inferred is not None:
                             return inferred
+
+        if op.op_type == "pad":
+            # `pad` adds its own constant amounts to the padded axis and changes nothing else. MIL's
+            # `pad` applies its `[before, after]` pairs to the LAST `len(pad) // 2` axes, so an axis
+            # ahead of that window is a pure passthrough.
+            #
+            # EnCodec needed this, for the same reason `slice_by_index` below was needed: its decoder
+            # reflect-pads before every convolution inside a residual block, which sits between the
+            # transposed convolution that multiplies the length and the crop that reads it. Without it
+            # the walk gave up at the first pad of each stage and the emitted crop read `n_codes + 2`
+            # where the tensor was `8*n_codes + 2` -- no error, and a waveform a fraction of its
+            # proper length.
+            x_var = op.inputs.get("x") or op.inputs.get("data")
+            pad_vals = static_array(op.inputs.get("pad"))
+            if x_var is not None and pad_vals is not None and getattr(x_var, "shape", None) is not None:
+                pad_list = [int(v) for v in np.asarray(pad_vals).reshape(-1)]
+                rank = len(x_var.shape)
+                n_padded = len(pad_list) // 2
+                in_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
+                if in_expr is not None:
+                    first_padded_axis = rank - n_padded
+                    if torch_axis < first_padded_axis:
+                        return in_expr
+                    i = torch_axis - first_padded_axis
+                    return in_expr + pad_list[2 * i] + pad_list[2 * i + 1]
 
         if op.op_type == "slice_by_index":
             # `slice_by_index` over a dynamic axis, for the one shape this walk can state exactly: a
@@ -1420,8 +1458,12 @@ class LoomGGUFExporter:
         # bindings read `n_tokens_expr`, which reads the first input, so anything that reordered this
         # would produce a driver reading a symbol before it is bound -- which `driver_ir.validate`
         # catches, but only after the fact.
+        # {input name: samples per unit of the root axis} for the graph's stochastic leaves, from the
+        # family's own `backend_kwargs` -- see `_binding_kind`.
+        noise_inputs = dict(self.kwargs.get("noise_inputs") or {})
         bindings = tuple(
-            (self.safe_name(name), _binding_kind(name)) for name in main_func.inputs.keys()
+            (self.safe_name(name), _binding_kind(self.safe_name(name), noise_inputs))
+            for name in main_func.inputs.keys()
         )
         # The synthesized windowed masks have no MIL var, so they are not in `main_func.inputs` -- they
         # exist only on the emitted topology (`_route_windowed_masks`). Appended rather than merged in
@@ -1513,8 +1555,33 @@ class LoomGGUFExporter:
         return value, so it has to cross the boundary either way, and retaining would only add a
         second call to fetch it.
         """
+        chunk = dict(self.kwargs.get("codec_chunk") or {})
+        inputs = DriverInputs(bindings=bindings, n_tokens=n_tokens_expr,
+                              noise=dict(self.kwargs.get("noise_inputs") or {}))
+        if chunk.get("chunk_frames"):
+            # A codec whose reference decodes in bounded windows (Qwen3-TTS's 12 Hz tokenizer is the
+            # first). The loop replaces the single call and binds a different local, so the epilogue
+            # returns that one -- everything else about the driver is unchanged.
+            from .driver_components import ChunkedCodecCall
+            from .lua_library import LuaLibrary
+
+            call = ChunkedCodecCall(
+                topology="main_topology", inputs=input_names,
+                codes_var=input_names[0],
+                codes_per_frame=int(chunk["codes_per_frame"]),
+                hop_length=int(chunk["hop_length"]),
+                chunk_frames=int(chunk["chunk_frames"]),
+                left_context_frames=int(chunk["left_context_frames"]),
+            )
+            self.driver_script = SYNTHESIZED_BUILDERS["CodecDecode"](
+                inputs=inputs, call=call,
+                library=LuaLibrary(uses=("array_slice",)),
+                epilogue=DriverReturn(values=(call.out_var,)),
+            ).build(self._driver_context())
+            return
+
         self.driver_script = SYNTHESIZED_BUILDERS["CodecDecode"](
-            inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr),
+            inputs=inputs,
             call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr,
                                  retained=False),
             epilogue=DriverReturn(values=("_mono_out",)),
@@ -2464,10 +2531,17 @@ class LoomGGUFExporter:
                 # One cache is allocated for the whole model with one width per layer, so a model
                 # whose blocks disagree cannot be served by it. Better to say so than to write the
                 # first block's geometry and corrupt the rest.
+                # The DISTRIBUTION, not just the first disagreement. A multi-phase export with two
+                # cached phases splits cleanly by phase when one phase's `repeat_kv` fused and the
+                # other's did not -- "28 blocks at (16,128,128), 5 at (8,128,128)" says that at a
+                # glance, where naming one op and one earlier geometry reads like a stray layer.
+                from collections import Counter
+                census = Counter(g for _, g in self._fused_blocks("attention"))
                 raise NotImplementedError(
                     f"loom_fused_attention op '{op_name}' has K/V geometry {geom}, but an earlier "
                     f"block declared {(n_head_kv, head_dim_k, head_dim_v)}. A KvCache is allocated "
-                    "with ONE per-layer width, so per-block variation is unsupported."
+                    "with ONE per-layer width, so per-block variation is unsupported. Across this "
+                    f"export: {dict(census)} (geometry -> block count)."
                 )
         if not n_blocks:
             return {}
@@ -2727,9 +2801,10 @@ class LoomGGUFExporter:
         `tokenizer_family`/`tokenizer_pre` kwargs -- see tokenizer_detect.py's own module docstring for
         the detection recipes.
 
-        "supertonic" is the one family that is never auto-detected: it is not an HF tokenizer directory at
-        all (no tokenizer.json, no protobuf -- one static JSON codepoint table), so a config that has one
-        names it explicitly via `tokenizer_family`, and `detect_vocab_family` is never asked."""
+        Two families are never auto-detected and both name themselves via `tokenizer_family`:
+        "supertonic", which is not an HF tokenizer directory at all (no tokenizer.json, no protobuf --
+        one static JSON codepoint table), and "ctc", whose directory holds a bare `vocab.json` that a
+        GPT-2 BPE directory spells identically. For both, `detect_vocab_family` is never asked."""
         from .tokenizer_detect import detect_vocab_family, detect_loom_pre_type
 
         family = self.kwargs.get("tokenizer_family") or detect_vocab_family(tokenizer_dir)
@@ -2751,6 +2826,12 @@ class LoomGGUFExporter:
             # the speech-LM families carry their prompt structure as `prompt_constants` instead.
             if self.kwargs.get("chat_template"):
                 self._write_chat_template(w, tokenizer_dir)
+        elif family == "ctc":
+            # Never auto-detected, like "supertonic": a `Wav2Vec2CTCTokenizer` directory carries
+            # `vocab.json` and nothing else, and that filename is also what a GPT-2 BPE directory calls
+            # its own piece table -- so the marker is not on disk and the family that knows names it.
+            from .ctc_tokenizer_export import write_ctc_vocab
+            write_ctc_vocab(w, tokenizer_dir)
         elif family == "wordpiece":
             from .wordpiece_tokenizer_export import write_wordpiece_vocab
             write_wordpiece_vocab(w, tokenizer_dir)

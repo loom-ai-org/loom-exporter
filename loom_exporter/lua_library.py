@@ -155,10 +155,13 @@ _FUNCTIONS = (
     LuaFunction("sigmoid"),
     LuaFunction("round_half_to_even"),
     # -- layout conversion, between the two conventions this project names ------------------------
-    LuaFunction("to_row_major"),
-    LuaFunction("from_row_major"),
-    LuaFunction("to_layout_a"),
-    LuaFunction("from_layout_a"),
+    # **All four are gone, and their absence is the result.** `to_row_major`/`from_row_major`/
+    # `to_layout_a`/`from_layout_a` existed for exactly one job: rebuilding a tensor in the other
+    # convention while it was passing through Lua on its way from one graph to the next. Every such edge
+    # in this family is a retained reference now (ADR-031 and its follow-up), and where the two
+    # conventions genuinely differ the PRODUCER is told which one to write -- `run_bi_lstm`'s `layout`
+    # argument, `loom.expand_by_duration_and_retain`'s. A conversion nobody performs is not a library
+    # function with no callers; it is an operation this driver no longer has.
     # -- duration prediction and frame expansion --------------------------------------------------
     LuaFunction("durations_from_logw"),
     LuaFunction("pad_last_to_multiple"),
@@ -171,11 +174,14 @@ _FUNCTIONS = (
     LuaFunction("run_bi_lstm", drives=DrivenTopologies(
         suffixes=("_fwd", "_bwd"),
         inputs=("layer_input", "h_prev", "c_prev"))),
-    LuaFunction("run_resblk_stack", requires=("to_layout_a", "from_layout_a"),
+    # None of the three requires a layout converter any more. They chained through Lua until the blocks
+    # and the projection started referencing each other's retained outputs; `run_resblk_stack` still
+    # converted its CALLER's rows on the way in, because a BiLSTM's two directions were interleaved
+    # host-side -- and that was the last edge ADR-031 left open. Both ends are names now.
+    LuaFunction("run_resblk_stack",
                 drives=DrivenTopologies(suffixes=("_block0", "_block1", "_block2"),
                                         inputs=("x", "style"))),
-    LuaFunction("run_proj1x1", requires=("to_layout_a",),
-                drives=DrivenTopologies(suffixes=("",), inputs=("x",))),
+    LuaFunction("run_proj1x1", drives=DrivenTopologies(suffixes=("",), inputs=("x",))),
     # -- vocoder-side host precomputation ----------------------------------------------------------
     LuaFunction("compute_wsum"),
     # -- StyleTTS2's ADPM2 sampler, whole rather than shared ---------------------------------------
@@ -219,7 +225,7 @@ def drives_mismatches() -> Dict[str, list]:
 
     Two comparisons, both read off the body:
 
-    * **the suffixes**, through the string literals each `loom.run_subgraph` call concatenates onto its
+    * **the suffixes**, through the string literals each driving call concatenates onto its
       namespace. `run_bi_lstm` writes them whole (`namespace_ .. "_h_fwd"`), so the check is exact;
       `run_resblk_stack` writes a stem and an index (`.. "_block" .. i`), so the rule is prefix-based
       in both directions -- every declared suffix must start with a literal the body writes, and every
@@ -234,12 +240,13 @@ def drives_mismatches() -> Dict[str, list]:
         if fn.drives is None:
             if sites:
                 complaints.append(
-                    f"calls loom.run_subgraph {len(sites)} time(s) but declares no `drives`, so its "
+                    f"drives a topology by name {len(sites)} time(s) but declares no `drives`, so its "
                     f"call sites are reachable by no check at all")
             out.update({fn.name: complaints} if complaints else {})
             continue
         if not sites:
-            complaints.append("declares `drives` but its body never calls loom.run_subgraph")
+            complaints.append("declares `drives` but its body never drives a topology by name "
+                               f"(looked for {sorted(_DRIVING_BINDINGS)})")
         literals = sorted({lit for site in sites for lit in site[0]})
         for suffix in fn.drives.suffixes:
             if not any(suffix.startswith(lit) for lit in literals) and (literals or suffix):
@@ -261,24 +268,52 @@ def drives_mismatches() -> Dict[str, list]:
     return out
 
 
+# The bindings that drive a topology by name, as `marker -> (arity, which arguments name topologies)`.
+# `loom.run_recurrent` is one of them and was missed for as long as it had no library caller: it takes
+# the cell's name as its first argument exactly as `run_subgraph` does, and the inputs it fills are the
+# cell's three declared ones -- which it fills itself rather than from a table the body writes, which is
+# why its sites report no keys (`arity` None).
+#
+# `run_bi_recurrent_and_retain` names TWO, which is why the argument positions are data here rather than
+# assumed to be the first: it runs both directions of a BiLSTM in one call, and reading only the first
+# would leave `_bwd` -- half of what the declaration claims -- checked by nothing.
+_DRIVING_BINDINGS = {
+    "loom.run_subgraph(": (3, (0,)),
+    "loom.run_subgraph_and_retain(": (3, (0,)),
+    "loom.run_recurrent(": (None, (0,)),
+    "loom.run_recurrent_and_retain(": (None, (0,)),
+    "loom.run_bi_recurrent_and_retain(": (None, (0, 1)),
+}
+
+
 def _driven_call_sites(source: str):
-    """`[(string literals in the topology-name expression, input table keys)]` for every
-    `loom.run_subgraph` in `source`."""
+    """`[(string literals in the topology-name expression, input table keys)]` for every call in
+    `source` that drives a topology by name.
+
+    `keys` is None where the binding fills the topology's inputs itself (the recurrent ones): there is
+    no table in the body to read them off, so the input half of the check is answered by the
+    declaration alone and by the cell topology it is compared against."""
     import re
 
     from .driver_components import _balanced_args, _split_top_level, _table_keys
 
-    sites, marker, index = [], "loom.run_subgraph(", 0
-    while True:
-        index = source.find(marker, index)
-        if index == -1:
-            return sites
-        args_text, end = _balanced_args(source, index + len(marker))
-        index = end
-        args = _split_top_level(args_text)
-        if len(args) != 3:
-            continue
-        sites.append((re.findall(r'"([^"]*)"', args[0]), _table_keys(args[2])))
+    sites = []
+    for marker, (arity, name_args) in _DRIVING_BINDINGS.items():
+        index = 0
+        while True:
+            index = source.find(marker, index)
+            if index == -1:
+                break
+            args_text, end = _balanced_args(source, index + len(marker))
+            index = end
+            args = _split_top_level(args_text)
+            if arity is not None and len(args) != arity:
+                continue
+            if max(name_args) >= len(args):
+                continue
+            literals = [lit for arg in name_args for lit in re.findall(r'"([^"]*)"', args[arg])]
+            sites.append((literals, _table_keys(args[2]) if arity is not None else None))
+    return sites
 
 
 def undeclared_calls() -> Dict[str, list]:
