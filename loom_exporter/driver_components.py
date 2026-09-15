@@ -73,7 +73,7 @@ HOST_COMPUTED_INPUT_NAMES = POSITION_INPUT_NAMES | CAUSAL_MASK_INPUT_NAMES
 GENERIC_PRIMARY_INPUT = "tokens"
 
 # `DriverInputs.bindings` kinds.
-CALLER, POSITION, MASK, NOISE = "caller", "position", "mask", "noise"
+CALLER, POSITION, MASK, NOISE, DEFAULTED = "caller", "position", "mask", "noise", "defaulted"
 
 # The seed a driver draws its noise from when the caller names none.
 #
@@ -132,6 +132,17 @@ class DriverInputs(DriverComponent):
     # on this roadmap but Gemma 3 -- and an absent entry means "full causal", so the emitted call is
     # byte-identical to what it was before this field existed.
     mask_windows: dict = dataclasses.field(default_factory=dict)
+    # {input name: the literal the driver falls back to} for the DEFAULTED bindings -- a graph input
+    # the caller MAY set and usually does not.
+    #
+    # **It is a fallback, not a constant**, and the distinction is the whole reason the kind exists.
+    # Family 5's SANM checkpoint takes a four-row prompt beside its waveform: the language to decode as
+    # and whether to emit inverse-text-normalized output. Baking it into the graph would ship a model
+    # that can never punctuate; making it a plain CALLER binding would mean `transcribe(audio)` no
+    # longer works, because a required input nobody knows about is a required input. So the graph keeps
+    # the input, the contract publishes the tables a host picks values from, and the driver supplies
+    # the checkpoint's own default for the caller who passes nothing.
+    defaults: dict = dataclasses.field(default_factory=dict)
 
     __unchecked__ = {
         "mask_windows": Unchecked(
@@ -150,6 +161,13 @@ class DriverInputs(DriverComponent):
             "a driver_ir expression over names this component itself binds. `driver_ir.validate` is "
             "the authority on whether it reads a symbol defined before it, and it runs over the "
             "assembled function, which is the only place the question is answerable."
+        ),
+        "defaults": Unchecked(
+            "the fallback value for an input the EXPORT declared, stated by the family that declared "
+            "it -- for family 5 it is the same vector `SenseVoiceSmall.inference` builds from its own "
+            "default arguments. There is no second authority: what would falsify it is the model "
+            "rejecting an id, and every id in it is read off the model's own tables. The NAME is "
+            "checked where it is checkable, by TopologyInput on the MonolithicCall that consumes it."
         ),
         "noise": Unchecked(
             "the per-input sample-per-root-axis ratios, which the EXPORT states because it is what "
@@ -185,6 +203,13 @@ class DriverInputs(DriverComponent):
                 # the export gradeable; nothing a card documents, and absent means drawn.
                 out.append(Local(name, BinOp("or", FieldAccess("inputs", name), Call(
                     "loom.gaussian_array", [BinOp("*", Lit(self.noise[name]), self.n_tokens)]))))
+            elif kind == DEFAULTED:
+                # The same `inputs.<name> or <fallback>` shape NOISE uses, and for a related reason: an
+                # input the caller may set and usually does not. What differs is that the fallback is a
+                # value the CHECKPOINT states rather than a draw, so it is a literal array rather than
+                # a call.
+                out.append(Local(name, BinOp("or", FieldAccess("inputs", name),
+                                             ArrayLit([Lit(v) for v in self.defaults[name]]))))
             else:
                 out.append(Local(name, caller_input(name)))
         return out

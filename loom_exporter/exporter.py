@@ -15,7 +15,7 @@ from .driver_ir import (
 from .driver_ir import Function as IRFunction
 from .driver_builder import DriverContext, DriverScript
 from .driver_components import (
-    CALLER, CAUSAL_MASK_INPUT_NAMES, HOST_COMPUTED_INPUT_NAMES, MASK, NOISE, POSITION,
+    CALLER, CAUSAL_MASK_INPUT_NAMES, DEFAULTED, HOST_COMPUTED_INPUT_NAMES, MASK, NOISE, POSITION,
     POSITION_INPUT_NAMES, SYNTHESIZED_BUILDERS, ArgmaxEpilogue, ChainStage, CtcGreedyEpilogue,
     DriverInputs, ModularChain,
     DriverReturn, MonolithicCall, PrefillDecodeLoop, TokenLabelsEpilogue,
@@ -28,7 +28,7 @@ from .symbols import DYNAMIC_SYMBOL_RE
 from .topology_ops import TopologyContext, lookup_topology_rule
 from .value_facts import ValueFacts, is_const_producer, static_array, static_scalar, static_value
 
-def _binding_kind(name: str, noise_inputs=()) -> str:
+def _binding_kind(name: str, noise_inputs=(), defaulted_inputs=()) -> str:
     """How the driver obtains one traced-model input: computed host-side, or read from the caller.
 
     The two host-computed sets live in `driver_components.py` alongside the component that acts on
@@ -40,9 +40,15 @@ def _binding_kind(name: str, noise_inputs=()) -> str:
     The third host-computed kind is NAMED BY THE EXPORT rather than by a set of names here, and the
     difference is real: `cache_position` is `cache_position` in every model that has one, while a noise
     leaf is whatever its wrapper called it and carries a per-input length ratio only the export knows.
-    Guessing it from a name would be guessing the ratio too."""
+    Guessing it from a name would be guessing the ratio too.
+
+    The fourth kind is named by the export for the same reason, and is a CALLER binding with a fallback
+    rather than a host-computed one: the caller may set it, and the value it falls back to is a fact
+    about the checkpoint (family 5's prompt row ids) that nothing about the name could supply."""
     if name in noise_inputs:
         return NOISE
+    if name in defaulted_inputs:
+        return DEFAULTED
     if name in POSITION_INPUT_NAMES:
         return POSITION
     if name in CAUSAL_MASK_INPUT_NAMES:
@@ -437,6 +443,13 @@ class LoomGGUFExporter:
             # transposed convolution and the block that follows, so without this the FIRST upsampling
             # stage is the last one whose length is related to the root.
             "elu",
+            # `loom_scale` is this exporter's OWN dialect op -- `lower_reduce_mean` rewrites every
+            # `reduce_mean` into `reduce_sum` + this -- and it divides by a compile-time constant, so it
+            # preserves every axis exactly. It has been missing for as long as the op has existed, which
+            # means the walk stops dead at every lowered `reduce_mean` and falls back to the bare root
+            # axis. Family 5 found it: `x.mean(dim=2, keepdim=True)` one op upstream of a position
+            # table, where the answer came out as one row per audio SAMPLE.
+            "loom_scale",
         }
         if op.op_type in _UNARY_PASSTHROUGH_OPS:
             # Pure unary, shape-preserving ops -- the axis's real expression is whatever its single
@@ -489,6 +502,16 @@ class LoomGGUFExporter:
             inner = op.inputs.get("x")
             if inner is not None:
                 return self._infer_dynamic_dim_expr(inner, torch_axis, _seen)
+
+        if op.op_type == "fill_like":
+            # `fill_like(ref_tensor, value)` has `ref_tensor`'s shape, axis for axis -- the simplest
+            # case in this walk, and absent until family 5 because nothing had produced the op before.
+            # `fill`'s sibling: see `topology_ops._op_fill_like` on why the same `ones_like` reaches
+            # this exporter spelled two different ways.
+            ref_var = op.inputs.get("ref_tensor") or op.inputs.get("x")
+            if ref_var is not None and ref_var.shape is not None and torch_axis < len(ref_var.shape):
+                return self._infer_dynamic_dim_expr(ref_var, torch_axis, _seen)
+            return None
 
         if op.op_type in ("reshape", "fill"):
             # Unlike `expand_dims`/`squeeze`, a general `reshape` (or a dynamically-shaped `fill`, which
@@ -885,11 +908,23 @@ class LoomGGUFExporter:
             keep_dims_var = op.inputs.get("keep_dims")
             axes_val = static_value(axes_var)
             keep_dims_val = bool(static_value(keep_dims_var, False))
-            if x_var is not None and x_var.shape is not None and axes_val is not None and len(axes_val) == 1 and not keep_dims_val:
+            if x_var is not None and x_var.shape is not None and axes_val is not None and len(axes_val) == 1:
                 in_rank = len(x_var.shape)
                 reduced_axis = int(axes_val[0])
                 if reduced_axis < 0:
                     reduced_axis += in_rank
+                if keep_dims_val:
+                    # `keep_dims=True` removes no axis, so the correspondence is the identity and the
+                    # reduced axis itself is a literal 1. The case above had only ever been reached with
+                    # `keep_dims=False` (NeMo's STFT magnitude sums the complex pair away), so a kept
+                    # dimension fell straight through to the bare root-axis substitution -- family 5's
+                    # `x.mean(dim=2, keepdim=True)`, one op upstream of the position table, came out one
+                    # row per audio SAMPLE. Every axis but the reduced one is its input's own.
+                    if torch_axis == reduced_axis:
+                        return as_expr(1)
+                    if 0 <= torch_axis < in_rank:
+                        return self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
+                    return None
                 in_axis = torch_axis
                 if reduced_axis <= in_axis:
                     in_axis += 1
@@ -1127,7 +1162,8 @@ class LoomGGUFExporter:
             "add", "sub", "mul", "real_div", "floor_div", "mod", "logical_and", "logical_or",
             "maximum", "minimum", "pow",
         }
-        if op.op_type in _ELEMENTWISE_BROADCAST_OPS or op.op_type == "select":
+        if (op.op_type in _ELEMENTWISE_BROADCAST_OPS or op.op_type == "select"
+                or op.op_type == "loom_broadcast_to"):
             # Elementwise binary ops (and `select(cond, a, b)`, a ternary op with the exact same
             # broadcast-and-preserve-axes semantics over its `a`/`b` operands) preserve per-axis
             # correspondence between operands and output (only ever broadcasting a size-1 operand up,
@@ -1143,7 +1179,21 @@ class LoomGGUFExporter:
             # declared shape a downstream RESHAPE trusts verbatim (see the `expand_dims`/`squeeze` case
             # above) -- without this, the walk gave up at `select` and fell back to a bare "n_tokens"
             # substitution for what is actually always-1 batch axis, producing an invalid RESHAPE target.
-            operand_keys = ("a", "b") if op.op_type == "select" else ("x", "y")
+            # `loom_broadcast_to(x, like)` is this exporter's OWN dialect op (passes.py splices a pair
+            # of them in front of every mutually-broadcasting add/mul), and it belongs here rather than
+            # anywhere else: its output is `x` broadcast against `like`, so its per-axis rule is the
+            # elementwise rule with `like` in `y`'s place. It was missing, and the failure was the one
+            # every entry in the unary set above was added for -- the walk did not recognise the op,
+            # fell through to the bare root-axis substitution, and the REPEAT `_op_loom_broadcast_to`
+            # emits from this very answer claimed one row per audio SAMPLE. Family 5 found it, on a
+            # position table broadcast against a (1, rows, 1) column; it was reachable before then by
+            # anything whose two broadcast operands are both size-1 on an axis the other is dynamic on.
+            if op.op_type == "select":
+                operand_keys = ("a", "b")
+            elif op.op_type == "loom_broadcast_to":
+                operand_keys = ("x", "like")
+            else:
+                operand_keys = ("x", "y")
             # Both operands can independently report a DYNAMIC symbol at this axis under MIL's own type
             # inference (it doesn't always manage to prove one side is a literal 1, even when it truly
             # broadcasts from one) -- so picking whichever operand happens to be checked FIRST, as an
@@ -1461,8 +1511,10 @@ class LoomGGUFExporter:
         # {input name: samples per unit of the root axis} for the graph's stochastic leaves, from the
         # family's own `backend_kwargs` -- see `_binding_kind`.
         noise_inputs = dict(self.kwargs.get("noise_inputs") or {})
+        defaulted_inputs = dict(self.kwargs.get("defaulted_inputs") or {})
         bindings = tuple(
-            (self.safe_name(name), _binding_kind(self.safe_name(name), noise_inputs))
+            (self.safe_name(name),
+             _binding_kind(self.safe_name(name), noise_inputs, defaulted_inputs))
             for name in main_func.inputs.keys()
         )
         # The synthesized windowed masks have no MIL var, so they are not in `main_func.inputs` -- they
@@ -1622,7 +1674,10 @@ class LoomGGUFExporter:
             )
         blank_id = int(self.kwargs["ctc_blank_id"])
         self.driver_script = SYNTHESIZED_BUILDERS["CtcGreedy"](
-            inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr),
+            # `defaults` is empty for families 1 and 4, whose graphs take the waveform and nothing
+            # else, so their drivers do not move. Family 5's graph takes a prompt beside it.
+            inputs=DriverInputs(bindings=bindings, n_tokens=n_tokens_expr,
+                                defaults=dict(self.kwargs.get("defaulted_inputs") or {})),
             # Retained for the same reason a large-vocab LM retains: the reduction is engine-side, so
             # the [n_classes, n_frames] logits never become a Lua table.
             call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr,
