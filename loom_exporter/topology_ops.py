@@ -978,6 +978,39 @@ def _op_fill(self, op, ctx):
         })
 
 
+@topology_rule('fill_like')
+def _op_fill_like(self, op, ctx):
+    """MIL's `fill_like(ref_tensor, value)` -- the other lowering of `torch.ones_like`/`zeros_like`.
+
+    Which of `fill` and `fill_like` coremltools produces for the same torch source is not stable: the
+    same `ones_like` reaches this exporter as a `fill` shaped by a `shape` op in one graph and as a
+    `fill_like` in another. Both are the same tensor, so both compose the same way `_op_fill`'s dynamic
+    branch does -- a REPEAT broadcasting a genuinely scalar constant out to the target.
+
+    Simpler than `fill`, because there is no "shape" input to resolve: the target IS `ref_tensor`'s own
+    shape, which `_infer_dynamic_dim_expr`'s matching case derives axis by axis. A constant-valued
+    `fill_like` is not folded to a weight here for the same reason `fill`'s dynamic branch does not --
+    the extent is only known per call.
+    """
+    nodes, func_name = ctx.nodes, ctx.func_name
+    ref_var = op.inputs.get("ref_tensor") or op.inputs.get("x")
+    if ref_var is None:
+        raise NotImplementedError(f"fill_like op '{op.name}' names no reference tensor")
+    value_val = static_value(op.inputs.get("value"), 0.0)
+    target_shape = list(self.get_var_info(op.outputs[0])["shape"])
+
+    weight_name = self.safe_name(op.outputs[0].name) + "_fill_scalar"
+    namespaced_name = (weight_name if func_name == "main_topology" or self.flat_namespace
+                       else f"{func_name}.{weight_name}")
+    self.weights[namespaced_name] = np.full([1] * len(target_shape), value_val, dtype=np.float32)
+    nodes.append({
+        "op": "REPEAT",
+        "inputs": [namespaced_name],
+        "outputs": [self.safe_name(op.outputs[0].name)],
+        "attrs": {"shape": target_shape},
+    })
+
+
 @topology_rule('pad')
 def _op_pad(self, op, ctx):
     nodes, resolve = ctx.nodes, ctx.resolve
