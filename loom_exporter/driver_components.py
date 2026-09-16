@@ -2448,6 +2448,82 @@ class ExportConstants(DriverComponent):
 
 
 @dataclass
+class CifBoundary(DriverComponent):
+    """Where a CIF predictor's tokens fire, decided HOST-SIDE between two graph phases (family 5, P5).
+
+    Binds three locals: the predictor's `alphas`, the encoder's frame count, and the
+    `{weights, n_tokens}` table `cif_fire` computes from them -- a linear resampling matrix, so
+    everything downstream is one matmul.
+
+    **This is the one place in the zoo where a host binding is not an optimisation but the only correct
+    place for the computation.** Continuous integrate-and-fire emits a token each time a running sum of
+    `alphas` crosses an integer, so the number of tokens depends on the VALUES rather than on any shape
+    -- and the crossings are knife-edge, sitting within ~2e-06 of the boundary. FunASR decides them by
+    accumulating at float64, casting to float32, and flooring; a graph has no float64 and its own f32
+    cumsum lands on the other side of several boundaries. So the driver accumulates (Lua numbers are
+    doubles), rounds to float32 explicitly (`to_f32`), and hands the graph the ANSWER -- the weight of
+    every encoder frame in every token -- rather than the question. `cif_fire.lua` documents why a
+    matrix is the right form for that answer and not merely a convenient one.
+
+    `alphas` is `T + 1` floats and the host does real arithmetic on it, which is exactly the case
+    [ADR-031](../../loom.cpp/docs/adrs/adr-031-a-driver-edge-is-a-reference-unless-the-host-does-arithmetic.md)
+    allows a driver edge to bind a value for. The encoder's OUTPUT stays retained and crosses to the
+    decode phase as an `OutputRef`: it is `T * 512` floats that nothing host-side reads, and
+    `loom.output_shape` exists so its length can be learned without marshalling it.
+    """
+
+    encoder_module: str = "encoder"
+    # 1-based, indexing the encoder phase's own declared-output list: the hidden states, then alphas.
+    encoder_out_index: int = 1
+    alphas_index: int = 2
+    # The fire INDICATOR's value in FunASR's own `fires` tensor, read off the checkpoint's predictor
+    # rather than written here -- see `cif_fire.lua` on why it is passed at all.
+    threshold: float = 1.0
+    alphas_var: str = "_alphas"
+    fire_var: str = "_cif"
+    frames_var: str = "_n_enc_frames"
+
+    # A real check rather than a waiver: the name must be one of the export's own topologies, and
+    # `TopologyName` says so with the list of names that do exist. Whether it ran BEFORE this component
+    # is a different question, and `check_subgraph_calls`' adjacency rule is its authority.
+    __links__ = {"encoder_module": TopologyName()}
+
+    __unchecked__ = {
+        "encoder_out_index": Unchecked(
+            "1-based positions in the encoder phase's declared-output list, which the family's own "
+            "`phases()` writes and its wrapper returns in that order. A wrong index is not a silent "
+            "wrong answer: `loom.get_output` raises naming the module and the index it does not have."
+        ),
+        "alphas_index": CoveredBy("encoder_out_index"),
+        "threshold": Unchecked(
+            "READ off the restored predictor (`CifPredictorV2.threshold`), like every other number a "
+            "family's config takes from its checkpoint -- there is no second authority for it."
+        ),
+        "alphas_var": Unchecked("local names this component binds; driver_ir.validate is the "
+                                "authority that every later read of them resolves"),
+        "fire_var": CoveredBy("alphas_var"),
+        "frames_var": CoveredBy("alphas_var"),
+    }
+
+    def emit(self, ctx: DriverContext) -> List:
+        return [
+            Local(self.alphas_var, Call("loom.get_output",
+                                        [Lit(self.encoder_module), Lit(self.alphas_index)])),
+            # `output_shape` rather than `get_output`, and the difference is the whole reason that
+            # binding exists: the frame count is one number and the tensor behind it is T*512 floats.
+            # ggml reports `ne` fastest-axis first, so the row count is entry 2.
+            Local(self.frames_var, Index(Call("loom.output_shape",
+                                              [Lit(self.encoder_module), Lit(self.encoder_out_index)]),
+                                         Lit(2))),
+            # The frame count is passed rather than taken from `#alphas`: `alphas` is one LONGER than
+            # the encoder output (FunASR appends a tail frame so a final partial token still fires),
+            # and the weight matrix has one column per real frame.
+            Local(self.fire_var, Call("cif_fire", [Var(self.alphas_var), Lit(self.threshold),
+                                                   Var(self.frames_var)])),
+        ]
+
+
+@dataclass
 class DriverReturn(DriverComponent):
     """What the entry function hands back to the host."""
 

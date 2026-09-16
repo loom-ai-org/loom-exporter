@@ -127,7 +127,8 @@ def _entries() -> Tuple[ComponentEntry, ...]:
     a module that imports this one's `DriverComponent` -- importing them at module scope would make the
     registry and the components a cycle."""
     from .driver_components import (
-        ArgmaxEpilogue, ChunkedCodecCall, CtcGreedyEpilogue, DriverInputs, DriverReturn, ExportConstants,
+        ArgmaxEpilogue, ChunkedCodecCall, CifBoundary, CtcGreedyEpilogue, DriverInputs, DriverReturn,
+        ExportConstants,
         FlowMatchingSampler,
         LuaFragment, ModularChain,
         MonolithicCall, PrefillDecodeLoop, PromptSegments, RawLuaDriver, RecurrentCall,
@@ -218,6 +219,15 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "orchestration. `ctc_greedy_epilogue` without the collapse, and the absence is the point: "
             "here the alignment between row i and token i IS the answer, so consecutive duplicates are "
             "two tokens' labels rather than one repeated.",
+        ),
+        ComponentEntry(
+            "cif_boundary", CifBoundary, (STATEMENTS,),
+            "Where a CIF predictor's tokens fire, decided HOST-SIDE between two graph phases: reads "
+            "the predictor's alphas and the encoder's frame count out of the retained encoder phase, "
+            "and binds the linear resampling matrix `cif_fire` computes from them. The one place in "
+            "this catalogue where a host binding is not an optimisation -- the token count depends on "
+            "the VALUES, the crossings are knife-edge, and the reference decides them at float64 "
+            "rounded to float32, which a graph has no way to reproduce.",
         ),
         ComponentEntry(
             "argmax_epilogue", ArgmaxEpilogue, (STATEMENTS,),
