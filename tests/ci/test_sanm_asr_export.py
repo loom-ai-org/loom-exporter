@@ -298,3 +298,44 @@ def test_the_position_table_is_not_declared_one_row_per_sample():
             assert sympy.sympify(dim).equals(frames), (
                 f"REPEAT declares {dim!r}, which is not the frame count {frames} -- the shape walk "
                 f"fell back to the root axis somewhere in this chain")
+
+
+# -- the tags are metadata, not transcript ---------------------------------------------------------
+
+def test_the_tag_ids_are_declared_as_control_ids():
+    """SenseVoice's first four output rows are its own answers about the utterance -- the detected
+    language, emotion, audio event and text-normalization mode -- and they are ORDINARY vocabulary
+    pieces, so a plain decode puts them in front of the speech.
+
+    `loom.asr.control_ids` is the key `transcribe` already strips (it is how Whisper drops
+    `<|notimestamps|>`), so declaring them there needs no engine change and keeps the right split:
+    the transcript loses them, `detokenize` still returns them.
+
+    Measured: leaving them in put this model at WER 0.23 against `samples/jfk.wav` with a word-perfect
+    transcript underneath, and a gate baseline recording that 0.23 would leave a ceiling wide enough to
+    hide the regression it exists to catch -- which is the lesson loom-py's `ASR_BASELINE` already
+    records for `qwen3-asr-0.6b`.
+    """
+    config = SANMAsrExportConfig(architecture=None, output_path="x.gguf", model_dir="d")
+    config.task = "automatic-speech-recognition"
+    config._tag_ids = (24884, 24885, 25054)
+    assert config.contract()["asr.control_ids"] == [24884, 24885, 25054]
+
+
+def test_no_tag_ids_declares_no_control_ids():
+    """`component_registry.usage()` builds every registered config with no checkpoint on disk, so an
+    empty set has to be an answer rather than an empty array written into the file."""
+    config = SANMAsrExportConfig(architecture=None, output_path="x.gguf", model_dir="d")
+    config.task = "automatic-speech-recognition"
+    assert "asr.control_ids" not in config.contract()
+
+
+def test_the_tags_are_matched_by_spelling_not_by_id_range(tmp_path):
+    """171 contiguous ids today, and matching the range would bake that. A checkpoint that adds a tag
+    outside the block would otherwise leak it into every transcript with nothing failing."""
+    import inspect
+
+    from loom_exporter import sanm_asr_export
+    source = inspect.getsource(sanm_asr_export.read_tag_ids)
+    assert "id_to_piece" in source and "fullmatch" in source
+    assert "24884" not in source, "the tag block's numeric bounds must not be hardcoded"
