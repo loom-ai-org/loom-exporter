@@ -2887,6 +2887,12 @@ class LoomGGUFExporter:
             # its own piece table -- so the marker is not on disk and the family that knows names it.
             from .ctc_tokenizer_export import write_ctc_vocab
             write_ctc_vocab(w, tokenizer_dir)
+        elif family == "funasr":
+            # Family 5's CharTokenizer: a flat table like "ctc"'s, and a different composition. Named
+            # by the family rather than auto-detected, for the reason "ctc" and "supertonic" are --
+            # `tokens.json` is a bare JSON array that several other schemes could also be written as.
+            from .funasr_tokenizer_export import write_funasr_vocab
+            write_funasr_vocab(w, tokenizer_dir)
         elif family == "wordpiece":
             from .wordpiece_tokenizer_export import write_wordpiece_vocab
             write_wordpiece_vocab(w, tokenizer_dir)

@@ -55,15 +55,20 @@ The decode phase has TWO dynamic axes -- the token count it produces and the fra
 cross-attends over -- so it declares the second through `declared_axes`, the same way `t5_export` does
 for its cross-attention K/V.
 
-## What it does NOT do yet
+## The vocabulary
 
-**The vocabulary.** `tokens.json` is 8404 flat decode-only pieces, but the decode rule is not a join:
-FunASR merges `@@`-suffixed subword continuations, spaces Latin words and joins CJK bare. That cannot
-be folded into an existing family, because `@@` marks "continues into the NEXT piece" where
-SentencePiece's `▁` and WordPiece's `##` mark word START, and the same piece string appears in both
-roles. Until the engine has a reader for it this export writes **no vocabulary at all**, and the driver
-returns ids -- which is the honest state: a file that claimed a vocabulary it detokenized wrongly would
-be worse than one that admits it has none.
+`tokens.json` is 8404 flat decode-only pieces, and the table is the same shape family 4's is. What
+differs is how the pieces COMPOSE -- `@@` marks a continuation, a CJK piece eats the space before it,
+and runs of single letters collapse and upper-case -- which no existing tag expresses, because `@@` is
+a SUFFIX meaning "I continue" where SentencePiece's `▁` and WordPiece's `##` are PREFIXES meaning "a
+word starts here". Those are duals, and the same piece string appears in both roles, so no rewrite of
+the table turns one into the other.
+
+So it is written under its own tag and read by `loom::FunasrVocab`
+(`funasr_tokenizer_export.write_funasr_vocab`). The per-piece SCRIPT is computed at export time rather
+than in the engine, because the reference's tests are per-character against Python's Unicode
+`isalpha()` and this vocabulary contains a character that is alphabetic and outside the CJK block a
+C++ range check would use.
 """
 import json
 from dataclasses import dataclass, field
@@ -321,10 +326,16 @@ class ParaformerExportConfig(LoomExportConfig):
         return {} if self._sample_rate is None else {"sample_rate": self._sample_rate}
 
     def backend_kwargs(self) -> dict:
-        # No `tokenizer_dir`: this checkpoint's decode rule has no reader in the engine yet, and a file
-        # that claimed a vocabulary it detokenized wrongly is worse than one that admits it has none.
-        # See the module docstring.
-        return dict(flat_namespace=False, root_axis=self.root_axis, hparams=self.hparams())
+        return dict(
+            flat_namespace=False,
+            root_axis=self.root_axis,
+            hparams=self.hparams(),
+            # The checkpoint's own `tokens.json`, under this family's tag. Named rather than
+            # auto-detected: a bare JSON array is not self-describing, and `detect_vocab_family` would
+            # have to guess which scheme composes it.
+            tokenizer_dir=self.model_dir,
+            tokenizer_family="funasr",
+        )
 
 
 def _is_funasr_paraformer(path: Path) -> bool:
