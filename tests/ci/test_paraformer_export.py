@@ -64,16 +64,6 @@ def test_the_registry_routes_each_leaf_to_its_own_recognizer(tmp_path):
 
 # -- what the config declares ----------------------------------------------------------------------
 
-def test_no_vocabulary_is_written(tmp_path):
-    """This checkpoint's decode rule -- merge `@@` continuations, space Latin words, join CJK bare --
-    has no reader in the engine yet, and a file that claimed a vocabulary it detokenized wrongly would
-    be worse than one that admits it has none. When the reader lands this test changes; until then the
-    absence is the contract."""
-    kwargs = ParaformerExportConfig(output_path="x.gguf", model_dir="d").backend_kwargs()
-    assert "tokenizer_dir" not in kwargs
-    assert "tokenizer_family" not in kwargs
-
-
 def test_the_token_bounds_are_a_real_range():
     assert 1 <= MIN_TOKENS < MAX_TOKENS
 
@@ -186,3 +176,59 @@ def test_the_architecture_is_a_field_not_only_a_method():
     `export_architecture()` would export as the fallback `mil_model` with nothing raising, which is
     what this file did on its first successful export."""
     assert ParaformerExportConfig(output_path="x.gguf", model_dir="d").architecture == "paraformer"
+
+
+# -- the vocabulary: a flat table whose pieces compose differently -----------------------------------
+
+def test_the_vocabulary_is_written_under_its_own_tag():
+    """Not `ctc`, and not a rewrite into SentencePiece. ADR-033's rule is that a tag answers "which
+    scheme is this", and `@@` marks "I continue into the next piece" where `U+2581` and `##` mark "a
+    word starts here" -- duals, with the same piece string appearing in both roles, so no per-piece
+    rewrite turns one into the other."""
+    kwargs = ParaformerExportConfig(output_path="x.gguf", model_dir="d").backend_kwargs()
+    assert kwargs["tokenizer_family"] == "funasr"
+    assert kwargs["tokenizer_dir"] == "d"
+
+
+@pytest.mark.parametrize("piece,expected", [
+    ("and", 2), ("can't", 2), ("low", 2),        # Latin: alphabetic-or-apostrophe, per character
+    ("你", 1), ("9", 1), ("@", 1), ("9@@", 1),    # CJK: the block, ASCII DIGITS, and '@' all count
+    ("f@@", 0), ("<s>", 0), ("<blank>", 0),      # neither -- and `f@@` is still a continuation
+])
+def test_the_piece_script_is_per_character(piece, expected):
+    """The two predicates are per-CHARACTER, which decides real cases: `can't` is a word because the
+    apostrophe is allowed per character, and `9@@` is CJK because digits and '@' both are -- so it is
+    never treated as a subword continuation however much it looks like one."""
+    from loom_exporter.funasr_tokenizer_export import piece_script
+    assert piece_script(piece) == expected
+
+
+def test_the_continuation_marker_is_orthogonal_to_the_script():
+    """`f@@` classifies as OTHER (an '@' is neither CJK nor alphabetic) and is still a continuation,
+    while `9@@` is CJK and is NOT one. A reader that tested `@@` only inside its Latin branch would
+    emit `f@@` literally -- which is what the first version of `FunasrVocab::decode` did."""
+    from loom_exporter.funasr_tokenizer_export import SCRIPT_CJK, SCRIPT_OTHER, piece_script
+    assert piece_script("f@@") == SCRIPT_OTHER
+    assert piece_script("9@@") == SCRIPT_CJK
+
+
+def test_a_tokens_json_that_is_not_a_piece_array_is_refused(tmp_path):
+    from loom_exporter.funasr_tokenizer_export import read_funasr_tokens
+    d = tmp_path / "tok"
+    d.mkdir()
+    (d / "tokens.json").write_text(json.dumps({"a": 1}))
+    with pytest.raises(ValueError, match="JSON array"):
+        read_funasr_tokens(str(d))
+    (d / "tokens.json").write_text(json.dumps(["ok", 3]))
+    with pytest.raises(ValueError, match="non-string"):
+        read_funasr_tokens(str(d))
+
+
+def test_the_blank_is_not_treated_as_a_control_piece():
+    """It is row 0 and it looks like one, but `sentence_postprocess` drops exactly `<s>/</s>/<unk>/<OOV>`
+    and prints anything else literally. Marking `<blank>` control made the engine disagree with the
+    reference on one sequence in 5,011 -- unobservable in practice, because a non-autoregressive decoder
+    cannot emit it, which is precisely why it should not have been left in."""
+    from loom_exporter.funasr_tokenizer_export import CONTROL_PIECES
+    assert "<blank>" not in CONTROL_PIECES
+    assert set(CONTROL_PIECES) == {"<s>", "</s>", "<unk>", "<OOV>"}
