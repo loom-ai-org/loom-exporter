@@ -255,6 +255,37 @@ CATALOG = [
         summary="Meta's data2vec-audio Base English CTC ASR model, exported for loom.cpp.",
     ),
     ModelCard(
+        slug="sensevoice-small", checkpoint=Path("sensevoice-small"),
+        export_task="automatic-speech-recognition", export_model="funasr-sensevoice",
+        task_type="automatic-speech-recognition",
+        base_repo="FunAudioLLM/SenseVoiceSmall",
+        # `license: other` with a named link is exactly what the upstream card declares; FunASR's
+        # MODEL_LICENSE is not an SPDX id, so it goes in the two "other" fields rather than being
+        # approximated by a permissive tag that upstream did not choose.
+        license_id="other", license_name="model-license",
+        license_url="https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE",
+        # Upstream also lists "multilingual", which is not an ISO-639 code and which HF rejects.
+        language=["zh", "en", "ja", "ko", "yue"],
+        # `speech2text.infer(language=...)` does NOT reach this model. It picks a language through a
+        # four-row PROMPT prepended to its features (`prompt_ids`), not through a decoder token, so the
+        # canonical argument has nothing to bind to and the engine warns rather than acting. The card
+        # documents the prompt instead -- see loom.cpp ADR-035 on why the ids are published under
+        # `sanm.` rather than Whisper's `asr.language_ids`.
+        selects_language=False,
+        title="SenseVoice Small",
+        summary="Alibaba's SenseVoice Small multilingual ASR model (Chinese, English, Japanese, "
+                "Korean, Cantonese), exported for loom.cpp.",
+    ),
+    ModelCard(
+        slug="paraformer-zh", checkpoint=Path("paraformer-zh"),
+        export_task="automatic-speech-recognition", export_model="funasr-paraformer",
+        task_type="automatic-speech-recognition",
+        base_repo="funasr/paraformer-zh", license_id="apache-2.0", language=["zh", "en"],
+        selects_language=False,
+        title="Paraformer-large (Chinese/English)",
+        summary="Alibaba's Paraformer-large non-autoregressive ASR model, exported for loom.cpp.",
+    ),
+    ModelCard(
         slug="parakeet-tdt-0.6b", checkpoint=Path("parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo"),
         export_task="automatic-speech-recognition", export_model="parakeet-tdt",
         task_type="automatic-speech-recognition",

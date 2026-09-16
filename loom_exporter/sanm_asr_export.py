@@ -334,6 +334,30 @@ def _funasr_config(path: Path) -> Optional[dict]:
     return cfg if isinstance(cfg, dict) else None
 
 
+def read_tag_ids(model_dir: str) -> list:
+    """Every piece of the checkpoint's SentencePiece model spelled `<|...|>`, by id.
+
+    Structural rather than enumerated: SenseVoice's tag block is 171 pieces covering languages,
+    emotions, audio events, the two text-normalization modes and a run of reserved slots, and a
+    checkpoint that adds one would otherwise leak it into a transcript with nothing failing. Matching
+    the SPELLING is what the pieces have in common; matching a numeric range would bake a layout.
+
+    Returns [] when the protobuf is not on disk, because `component_registry.usage()` builds every
+    registered config without a checkpoint.
+    """
+    import re
+
+    staged = stage_spm_protobuf(model_dir)
+    if staged is None:
+        return []
+    import sentencepiece
+
+    sp = sentencepiece.SentencePieceProcessor()
+    sp.load(str(Path(staged) / "tokenizer.model"))
+    return [i for i in range(sp.get_piece_size())
+            if re.fullmatch(r"<\|.*\|>", sp.id_to_piece(i))]
+
+
 def stage_spm_protobuf(model_dir: str) -> Optional[str]:
     """Copies the checkpoint's SentencePiece protobuf into a temp dir as `tokenizer.model`.
 
@@ -389,6 +413,7 @@ class SANMAsrExportConfig(LoomExportConfig):
     _languages: dict = field(default_factory=dict, init=False, repr=False)
     _textnorms: dict = field(default_factory=dict, init=False, repr=False)
     _prompt_default: tuple = field(default=(), init=False, repr=False)
+    _tag_ids: tuple = field(default=(), init=False, repr=False)
 
     __links__ = {"root_axis": Axis()}
     __unchecked__ = {
@@ -413,6 +438,11 @@ class SANMAsrExportConfig(LoomExportConfig):
             "what would falsify it is the model declining an id, and every id here comes from it."
         ),
         "_textnorms": Unchecked("the checkpoint's own `textnorm_dict`, for the same reason."),
+        "_tag_ids": Unchecked(
+            "READ off the checkpoint's own SentencePiece model during build_trace -- every piece "
+            "spelled `<|...|>`. There is no second authority: what would falsify it is the model "
+            "emitting a tag this missed, and the set is derived from the table the head indexes."
+        ),
         "_prompt_default": Unchecked(
             "assembled from the two dicts above plus the two fixed event/emotion rows, which is the "
             "same vector `SenseVoiceSmall.inference` builds for its own default arguments."
@@ -466,6 +496,7 @@ class SANMAsrExportConfig(LoomExportConfig):
         # language query, the two fixed event/emotion queries (rows 1 and 2, which the reference
         # hardcodes), and the text-normalization query.
         self._prompt_default = (int(self._languages["auto"]), 1, 2, int(self._textnorms["woitn"]))
+        self._tag_ids = tuple(read_tag_ids(self.model_dir))
 
         wrapped = _SenseVoiceWrapper(model, KaldiFbankLfrCmvn(
             frontend.cmvn, n_mels=frontend.n_mels, sample_rate=self._sample_rate,
@@ -532,6 +563,27 @@ class SANMAsrExportConfig(LoomExportConfig):
             contract["sanm.textnorm_ids"] = [int(self._textnorms[n]) for n in names]
         if self._prompt_default:
             contract["sanm.prompt_default"] = [int(i) for i in self._prompt_default]
+        if self._tag_ids:
+            # **The four tags this model emits before the words are NOT part of the transcript**, and
+            # saying so here is what keeps them out of one. SenseVoice's first four output rows are its
+            # own answers about the utterance -- the language it detected, the emotion, the audio event,
+            # and whether inverse text normalization was asked for -- and they are ordinary vocabulary
+            # pieces, so a plain decode concatenates them in front of the speech. FunASR keeps them out
+            # of a transcript too: its `rich_transcription_postprocess` turns them into EMOJI, which is
+            # a presentation layer rather than a reading of the audio.
+            #
+            # `loom.asr.control_ids` is the key `transcribe` already strips (it is how Whisper drops
+            # `<|notimestamps|>`), so this needs no engine change -- and it strips them only from the
+            # TRANSCRIPT. `model.detokenize(ids)` still returns them, which is the right split: the
+            # metadata is reachable by a caller who wants it and absent from the text for one who does
+            # not.
+            #
+            # Leaving them in is not a neutral choice. Measured against `samples/jfk.wav`, four tags
+            # counted as spurious words against a 21-word reference put the model's WER at 0.23 with a
+            # word-perfect transcript underneath -- and a gate baseline recording that 0.23 would leave
+            # a ceiling wide enough to hide the regression it exists to catch. loom-py's own
+            # `ASR_BASELINE` records exactly that lesson for `qwen3-asr-0.6b`.
+            contract["asr.control_ids"] = [int(i) for i in self._tag_ids]
         return contract
 
     def backend_kwargs(self) -> dict:
