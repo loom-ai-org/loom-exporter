@@ -200,6 +200,7 @@ _FAMILY_MODULES = (
     "vits_export",
     "ctc_asr_export",
     "sanm_asr_export",
+    "paraformer_export",
     "token_classification_export",
     "audio_codec_export",
     "dia_export",

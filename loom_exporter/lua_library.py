@@ -182,6 +182,12 @@ _FUNCTIONS = (
                 drives=DrivenTopologies(suffixes=("_block0", "_block1", "_block2"),
                                         inputs=("x", "style"))),
     LuaFunction("run_proj1x1", drives=DrivenTopologies(suffixes=("",), inputs=("x",))),
+    # -- continuous integrate-and-fire (family 5's Paraformer) --------------------------------------
+    # `to_f32` is the only entry here that exists to LOSE precision, and it is declared through
+    # `requires` rather than inlined because the tie rule is the load-bearing part: CIF boundaries land
+    # exactly on float32 midpoints, so `round_half_to_even` is what decides them.
+    LuaFunction("to_f32", requires=("round_half_to_even",)),
+    LuaFunction("cif_fire", requires=("to_f32",)),
     # -- vocoder-side host precomputation ----------------------------------------------------------
     LuaFunction("compute_wsum"),
     # -- StyleTTS2's ADPM2 sampler, whole rather than shared ---------------------------------------
