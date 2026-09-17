@@ -315,6 +315,80 @@ class _PrefillEmbedWrapper(nn.Module):
         return prefill, schedule
 
 
+class _IclPrefillEmbedWrapper(nn.Module):
+    """`(role ids, the interleaved id stream, the reference's codes, ...) -> (prompt, text schedule)`.
+
+    The ICL prompt is the x-vector prompt's first nine rows followed by the REFERENCE utterance
+    replayed as if the model had just spoken it: its transcript on the text stream and its codec
+    frames on the codec stream, summed row for row. `_PrefillEmbedWrapper`'s tenth row -- the first
+    text token plus `codec_bos` -- is not built here, because in this mode `codec_bos` is the first
+    row of the replay instead.
+
+    **The two streams are different lengths and the reference picks the shorter, which is a branch on
+    two dynamic quantities that no graph can carry.** `generate_icl_prompt` reads
+    `text_lens > codec_lens` and either truncates the text or pads it with `tts_pad`, then returns
+    whatever text is left over as the trailing schedule. Both lengths are known to the HOST before
+    the call -- one is a token count, the other a frame count -- so the driver does the arithmetic and
+    hands this graph the answer: `icl_text_ids` is already exactly as long as the codec stream,
+    padded or truncated, and `schedule_ids` is already the remainder. That is
+    [Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md)'s rule one family over:
+    the host decides the boundary, the graph does the arithmetic, and the threshold is crossed in
+    exactly one place.
+
+    **`bos_mask` is why there is no slice here either.** The codec stream is `codec_bos` followed by
+    one summed embedding per reference frame, so it is one row longer than `ref_code` -- and a
+    concatenation whose two halves carry different symbols is a second independent axis for the sake
+    of one row. Instead `ref_code` already has that row (the driver writes zeros into it) and a 0/1
+    mask input selects `codec_bos`'s embedding over the garbage it produced. One symbol, no slice, no
+    concat: the whole ICL block is elementwise.
+
+    `ref_code` carries the same convention `_FrameEmbedWrapper`'s `codes` does -- group 0 indexes the
+    talker's own table and groups 1..15 index the merged predictor table at their absolute rows -- so
+    the driver offsets once, on the way in, exactly as it un-offsets once on the way out.
+    """
+
+    def __init__(self, talker, config, embeddings):
+        super().__init__()
+        self.talker = talker
+        self.codec_embedding = talker.get_input_embeddings()
+        self.predictor_embedding = nn.Embedding(embeddings.shape[0], embeddings.shape[1])
+        with torch.no_grad():
+            self.predictor_embedding.weight.copy_(embeddings)
+        self.register_buffer("specials", torch.tensor(
+            [[config.tts_bos_token_id, config.tts_eos_token_id, config.tts_pad_token_id]]),
+            persistent=False)
+        talker_config = config.talker_config
+        self.register_buffer("control_head", torch.tensor(
+            [[talker_config.codec_think_id, talker_config.codec_think_bos_id]]), persistent=False)
+        self.register_buffer("control_tail", torch.tensor(
+            [[talker_config.codec_think_eos_id]]), persistent=False)
+        self.register_buffer("codec_tail", torch.tensor(
+            [[talker_config.codec_pad_id, talker_config.codec_bos_id]]), persistent=False)
+
+    def _text(self, ids):
+        return self.talker.text_projection(self.talker.get_text_embeddings()(ids))
+
+    def forward(self, role_ids, icl_text_ids, ref_code, bos_mask, schedule_ids, language_id,
+                x_vector):
+        bos_e, _, pad_e = self._text(self.specials).chunk(3, dim=1)
+        control = torch.cat([self.control_head, language_id.view(1, 1), self.control_tail], dim=1)
+        codec_in = torch.cat([self.codec_embedding(control), x_vector.view(1, 1, -1),
+                              self.codec_embedding(self.codec_tail)], dim=1)
+        body = torch.cat([pad_e.expand(-1, codec_in.shape[1] - 2, -1), bos_e], dim=1) + codec_in[:, :-1]
+        head = torch.cat([self._text(role_ids), body], dim=1)
+
+        replay = (self.codec_embedding(ref_code[:, :, 0])
+                  + self.predictor_embedding(ref_code[:, :, 1:]).sum(dim=2))
+        # `codec_in[:, -1:]` IS `codec_bos`'s embedding -- the second row of `codec_tail` -- so the
+        # first replay row is selected rather than looked up a second time.
+        replay = replay * (1.0 - bos_mask) + codec_in[:, -1:] * bos_mask
+        prefill = torch.cat([head, self._text(icl_text_ids) + replay], dim=1)
+        # `tts_pad` appended for `_PrefillEmbedWrapper`'s reason: it turns the reference's
+        # "trailing[step] while there is one, else pad" into an index the driver clamps.
+        schedule = torch.cat([self._text(schedule_ids), pad_e], dim=1)
+        return prefill, schedule
+
+
 class _TalkerWrapper(nn.Module):
     """`(inputs_embeds, position_ids, attention_mask) -> (logits over the DRAWABLE ids, last hidden)`.
 
@@ -491,6 +565,8 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
     _eos_index: Optional[int] = None
     _language_ids: Optional[dict] = None
     _sample_rate: Optional[int] = None
+    _tts_pad_id: Optional[int] = None
+    _tts_eos_id: Optional[int] = None
 
     __unchecked__ = {
         "model_dir": Unchecked("path to the HF directory; `load_model` raises on anything it cannot "
@@ -515,6 +591,10 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
         ),
         "_language_ids": Unchecked("read off talker_config.codec_language_id by load_model"),
         "_sample_rate": Unchecked("read off speaker_encoder_config.sample_rate by load_model"),
+        "_tts_pad_id": Unchecked("read off config.tts_pad_token_id by load_model; the id the ICL "
+                                 "driver pads the interleaved text stream with"),
+        "_tts_eos_id": Unchecked("read off config.tts_eos_token_id by load_model; the id that "
+                                 "terminates it"),
     }
 
     def load_model(self):
@@ -555,6 +635,8 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
         self._eos_index = self._codebook_size
         self._language_ids = {k: int(v) for k, v in talker_config.codec_language_id.items()}
         self._sample_rate = int(model.config.speaker_encoder_config.sample_rate)
+        self._tts_pad_id = int(model.config.tts_pad_token_id)
+        self._tts_eos_id = int(model.config.tts_eos_token_id)
         self._model = model
         return model
 
@@ -630,6 +712,10 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
         text_dim = ct.RangeDim(10, self.max_text_len)
         frames_dim = ct.RangeDim(1, self.max_frames)
         steps_dim = ct.RangeDim(3, groups)
+        # The ICL replay: one row per reference frame plus `codec_bos`, capped by the same cache the
+        # talker's own axis is capped by -- a reference clip and the speech after it share one KV.
+        replay_dim = ct.RangeDim(2, self.max_frames)
+        schedule_dim = ct.RangeDim(1, self.max_text_len)
         rows_dim = ct.RangeDim(1, groups - 2)
 
         probe_text = torch.zeros((1, self.trace_text_len), dtype=torch.long)
@@ -657,6 +743,33 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
                     ct.TensorType(name="language_id", shape=(1,), dtype=np.int32),
                     ct.TensorType(name="x_vector", shape=(1, hidden_size), dtype=np.float32),
                 ],
+            ),
+            ExportPhase(
+                name="prefill_embed_icl",
+                wrapper=_IclPrefillEmbedWrapper(talker, model.config, embeddings).eval(),
+                dummy_inputs=(torch.zeros((1, 3), dtype=torch.long),
+                              torch.zeros((1, 12), dtype=torch.long),
+                              torch.zeros((1, 12, groups), dtype=torch.long),
+                              torch.zeros((1, 12, 1)),
+                              torch.zeros((1, 5), dtype=torch.long),
+                              probe_lang, probe_spk),
+                mil_inputs=[
+                    ct.TensorType(name="role_ids", shape=(1, 3), dtype=np.int32),
+                    # ONE `RangeDim` instance across the three ICL inputs, because their lengths do
+                    # not merely happen to agree -- the driver builds all three from the same frame
+                    # count. Three instances would be three symbols and `_validate_input_axes` would
+                    # (rightly) refuse the topology.
+                    ct.TensorType(name="icl_text_ids", shape=(1, replay_dim), dtype=np.int32),
+                    ct.TensorType(name="ref_code", shape=(1, replay_dim, groups), dtype=np.int32),
+                    ct.TensorType(name="bos_mask", shape=(1, replay_dim, 1), dtype=np.float32),
+                    ct.TensorType(name="schedule_ids", shape=(1, schedule_dim), dtype=np.int32),
+                    ct.TensorType(name="language_id", shape=(1,), dtype=np.int32),
+                    ct.TensorType(name="x_vector", shape=(1, hidden_size), dtype=np.float32),
+                ],
+                root_axis="n_tokens",
+                # The trailing text is genuinely independent of the replay's length: one is what the
+                # target sentence had left over, the other is how long the reference clip was.
+                declared_axes={"schedule_ids": {1: "n_schedule"}},
             ),
             ExportPhase(
                 name="talker",
@@ -770,6 +883,18 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
                 "MIN_NEW_TOKENS": MIN_NEW_TOKENS,
                 "MAX_NEW_TOKENS": int(_generation_value(self.model_dir, "max_new_tokens", 4096)),
                 "DEFAULT_LANGUAGE_ID": int((self._language_ids or {}).get("english", 0)),
+                # ICL's prompt is nine rows plus the replay, where the x-vector prompt is ten and
+                # constant. The ninth row is `tts_bos + codec_pad`; `codec_bos` opens the replay
+                # instead of closing the head.
+                "ICL_HEAD_LEN": PREFILL_LEN - 1,
+                # The template's shape, as counts rather than as literals in the Lua: the target text
+                # loses three tokens at the front and five at the back, the reference transcript
+                # three and two, because its template has no trailing `<|im_start|>assistant\n`.
+                "TEXT_HEAD": TEXT_HEAD, "TEXT_TAIL": TEXT_TAIL,
+                "REF_HEAD": REF_HEAD, "REF_TAIL": REF_TAIL,
+                # The two ids the driver pads and terminates the interleaved stream with.
+                "TTS_PAD_ID": self._tts_pad_id or 0,
+                "TTS_EOS_ID": self._tts_eos_id or 0,
                 # The checkpoint's own decoding defaults as the driver's `or`-fallbacks -- the same
                 # numbers `hparams()` writes for the host, rendered twice from one attribute set.
                 "TEMPERATURE": sampling.get("temperature", 0.0),
@@ -787,7 +912,9 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
                 self.driver_script_path / "01_generate.lua",
                 reads=("N_GROUPS", "CODEBOOK_SIZE", "EOS_INDEX", "PREFILL_LEN", "MIN_NEW_TOKENS",
                        "MAX_NEW_TOKENS", "DEFAULT_LANGUAGE_ID", "TEMPERATURE", "TOP_K", "TOP_P",
-                       "REPETITION_PENALTY", "SUB_TEMPERATURE", "SUB_TOP_K", "SUB_TOP_P"),
+                       "REPETITION_PENALTY", "SUB_TEMPERATURE", "SUB_TOP_K", "SUB_TOP_P",
+                       "ICL_HEAD_LEN", "TEXT_HEAD", "TEXT_TAIL", "REF_HEAD", "REF_TAIL",
+                       "TTS_PAD_ID", "TTS_EOS_ID"),
                 defines=("_codes",),
             ),
             DriverReturn(values=("_codes",)),
@@ -798,6 +925,12 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
 # three template tokens, five `tts_pad` plus `tts_bos` over the codec control run, and the first text
 # token. Everything after it arrives one token per generated frame.
 PREFILL_LEN = 10
+# How much of each rendered template is scaffolding. `<|im_start|>assistant\n` is three tokens at the
+# front of both; the target text is followed by `<|im_end|>\n<|im_start|>assistant\n` (five) and the
+# reference transcript by `<|im_end|>\n` (two). The reference implementation spells these as
+# `input_id[:, 3:-5]` and `ref_ids[:, 3:-2]`, and they are counted from an END, so no length is baked.
+TEXT_HEAD, TEXT_TAIL = 3, 5
+REF_HEAD, REF_TAIL = 3, 2
 # `generation_config.json` does not state it; `Qwen3TTSForConditionalGeneration.generate` passes
 # `min_new_tokens: 2` in `talker_kwargs`, so the authority is that call site.
 MIN_NEW_TOKENS = 2
