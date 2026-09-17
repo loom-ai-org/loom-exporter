@@ -127,11 +127,12 @@ def _entries() -> Tuple[ComponentEntry, ...]:
     a module that imports this one's `DriverComponent` -- importing them at module scope would make the
     registry and the components a cycle."""
     from .driver_components import (
-        ArgmaxEpilogue, CtcGreedyEpilogue, DriverInputs, DriverReturn, ExportConstants,
+        ArgmaxEpilogue, ChunkedCodecCall, CifBoundary, CtcGreedyEpilogue, DriverInputs, DriverReturn,
+        ExportConstants,
         FlowMatchingSampler,
         LuaFragment, ModularChain,
-        MonolithicCall, PrefillDecodeLoop, PromptSegments, RawLuaDriver, SubgraphCallComponent,
-        TokenLabelsEpilogue, WaveformValidLength,
+        MonolithicCall, PrefillDecodeLoop, PromptSegments, RawLuaDriver, RecurrentCall,
+        SubgraphCallComponent, TokenLabelsEpilogue, WaveformValidLength,
     )
     from .lua_library import LuaLibrary
 
@@ -149,6 +150,25 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "shape alongside its data so the epilogue knows the vocab size -- or, for a KV-cached "
             "topology, retaining the output engine-side and binding nothing, so the logits never "
             "become a Lua table at all.",
+        ),
+        ComponentEntry(
+            "chunked_codec_call", ChunkedCodecCall, (STATEMENTS,),
+            "The same `run_subgraph` a codec decoder makes, run over BOUNDED WINDOWS of the code "
+            "sequence and stitched back into one waveform -- family 11's second call shape. Each "
+            "chunk re-decodes `left_context` frames it has already emitted so its first kept frame "
+            "has a populated receptive field, then drops `left_context * hop` samples from the front, "
+            "so every output sample is produced exactly once by the call with the most history for "
+            "it. Used by a codec whose reference decodes in chunks (Qwen3-TTS's 12 Hz tokenizer, "
+            "whose `chunked_decode` this reproduces) -- which is also what keeps a decoder with "
+            "ATTENTION over the frame axis from building a 4096x4096 score matrix per layer.",
+            no_user_reason=(
+                "its leaf is exported and verified but is not yet in the model sweep this column is "
+                "computed from -- `qwen3-tts-tokenizer-12hz` is the codec half of a pair whose family-10 "
+                "half is unwritten, and the sweep lists shipped models. So this reads as unused for the "
+                "same reason the leaf is not on the Hub yet, and the row will fill in when the pair "
+                "lands. Verified meanwhile against the reference's own `chunked_decode` at 42 and 700 "
+                "frames (max abs difference 4.2e-06 and 1.7e-05), which is [ADR-034]"
+            ),
         ),
         ComponentEntry(
             "modular_chain", ModularChain, (STATEMENTS,),
@@ -201,6 +221,15 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "two tokens' labels rather than one repeated.",
         ),
         ComponentEntry(
+            "cif_boundary", CifBoundary, (STATEMENTS,),
+            "Where a CIF predictor's tokens fire, decided HOST-SIDE between two graph phases: reads "
+            "the predictor's alphas and the encoder's frame count out of the retained encoder phase, "
+            "and binds the linear resampling matrix `cif_fire` computes from them. The one place in "
+            "this catalogue where a host binding is not an optimisation -- the token count depends on "
+            "the VALUES, the crossings are knife-edge, and the reference decides them at float64 "
+            "rounded to float32, which a graph has no way to reproduce.",
+        ),
+        ComponentEntry(
             "argmax_epilogue", ArgmaxEpilogue, (STATEMENTS,),
             "Returns the next token rather than the raw logits: argmax over the active row, read out "
             "of the producing module's retained output by name, or -- for a topology that marshalled "
@@ -238,6 +267,11 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "subgraph_call", SubgraphCallComponent, (STATEMENTS,),
             "One `loom.run_subgraph` as IR rather than text, so `check_subgraph_calls` covers its "
             "output arity too -- what a peel buys structurally.",
+        ),
+        ComponentEntry(
+            "recurrent_call", RecurrentCall, (STATEMENTS,),
+            "One `loom.run_recurrent`: a whole sequence through one LSTM cell topology, with the "
+            "timestep loop and the h/c carry on the C++ side. A stack is one per layer, chained.",
         ),
         ComponentEntry(
             "flow_matching_sampler", FlowMatchingSampler, (PRELUDE, STATEMENTS),

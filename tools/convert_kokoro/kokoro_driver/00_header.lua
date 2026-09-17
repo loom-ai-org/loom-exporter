@@ -15,13 +15,14 @@
 --     mask (always all-zeros -- real usage is always a single, unpadded utterance, same convention
 --     convert_kokoro_albert.py's own bespoke topology already established) IN-GRAPH now, not host-side.
 --   - "albert_bert_encoder" returns TIME-MAJOR (T,512) (`flat[t*512+c]`, this file's own "row_major"
---     convention below) instead of kokoro_driver.lua's "d_en_flat" Layout-A convention (`flat[c*T+t]`) --
+--     convention) instead of kokoro_driver.lua's "d_en_flat" Layout-A convention (`flat[c*T+t]`) --
 --     a deliberate choice in export_kokoro_mil.py's own AlbertBertEncoderWrapper to avoid returning a
 --     bare `.transpose()` as a traced graph's own output (a live non-contiguous view read in PRE-permute
 --     order by this project's raw contiguous-byte-copy GGUF/weight extraction -- the exact bug
 --     export_vits_mil.py's own StatsWrapper already found and worked around for VITS's `stats` output).
---     `from_row_major` converts straight to the per-timestep rows DurationEncoder's own "x" construction
---     needs, actually SIMPLER than kokoro_driver.lua's own manual c*T+t indexing loop.
+--     It is also the layout every consumer here now declares: `text_encoder_cnn` was moved to it, and
+--     the four layout-conversion helpers this driver used to carry are gone, because no tensor passes
+--     through Lua between two graphs any more (ADR-031 and its follow-up).
 --   - "decoder_vocoder" replaces FOUR bespoke calls (decoder_core, sinegen, stft_forward, generator) with
 --     ONE: it takes asr/F0_curve/N_curve/style/rand_ini/noise_in/wsum directly and returns the finished
 --     WAVEFORM -- no host-side har (STFT mag/phase) assembly or Generator-input wiring needed at all,

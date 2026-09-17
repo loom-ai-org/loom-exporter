@@ -441,7 +441,7 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
         from .driver_components import (
             DriverReturn, ExportConstants, FlowMatchingSampler, LuaFragment, SubgraphCallComponent,
         )
-        from .driver_ir import BinOp, FieldAccess, Lit, Var
+        from .driver_ir import OutputRef, BinOp, FieldAccess, Lit, Var
 
         fragment = self.driver_script_path
         t_text, t_lat, lat_dim = Var("T_TEXT"), Var("t_lat"), Var("LAT_DIM")
@@ -456,7 +456,7 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
 
         dp_expr, dp_names = bucket_call("dp")
         ttl_expr, ttl_names = bucket_call("ttl_text")
-        vfe_expr, _ = bucket_call("vfe")
+        vfe_expr, vfe_names = bucket_call("vfe")
         return [
             LuaFragment(fragment / "00_header.lua", top_level=True),
             # The numbers the caller used to have to supply (P4.0.8's first follow-up). The three the
@@ -487,24 +487,35 @@ class TTSSupertonicExportConfig(TTSFlowMatchingModelExportConfig):
                         defines=("duration", "wav_length", "latent_size", "t_lat")),
             SubgraphCallComponent(
                 topology=bucket_topology("ttl_text", T_TEXT_MAX), topology_expr=ttl_expr,
-                variants=ttl_names, outputs=("txt_emb",), length=t_text,
+                variants=ttl_names, outputs=(), retain=True, length=t_text,
                 inputs={"txt_ids": txt_ids, "stl_emb": Var("style_ttl"),
                         "txt_msk": txt_msk},
                 note="--- TTLTextEncoder -> txt_emb, ne=[t_text,txt_dim] (T-fast, the traced module's\n"
                      "    own native torch layout -- no host-side layout crossing needed, unlike the\n"
                      "    bespoke driver's Layout A/B bridging, since \"vfe\" was traced expecting\n"
-                     "    exactly this same layout for its own txt_emb input). ---"),
+                     "    exactly this same layout for its own txt_emb input).\n"
+                     "    RETAINED: the sampler below feeds it to the estimator at EVERY step and no\n"
+                     "    host arithmetic touches it, so marshalling it once would still have put a\n"
+                     "    t_text x 256 table through the boundary for a value only a graph reads. ---"),
             FlowMatchingSampler(
-                spec=sampler, result="z", length=t_lat, estimator=vfe_expr,
+                spec=sampler, result="_z_gen", length=t_lat, estimator=vfe_expr,
                 n_elems=BinOp("*", t_lat, lat_dim), n_steps=FieldAccess("inputs", "n_steps"),
-                step_inputs={"txt_emb": Var("txt_emb"), "stl_emb": Var("style_ttl"),
-                             "txt_msk": txt_msk},
+                # By reference, and with the bucket expression the producing call used: the name is
+                # only knowable once the text is measured, which is what `OutputRef.module_expr` and
+                # `variants` are for.
+                step_inputs={"txt_emb": OutputRef(bucket_topology("ttl_text", T_TEXT_MAX),
+                                                   module_expr=ttl_expr, variants=tuple(ttl_names)),
+                             "stl_emb": Var("style_ttl"), "txt_msk": txt_msk},
                 note="--- Deterministic Euler CFM sampling over VectorFieldEstimator, at the same\n"
                      "    text bucket the two encoders above ran at -- see sample_vfe above. ---"),
             SubgraphCallComponent(
                 topology="decoder", outputs=("waveform",), length=t_lat,
-                inputs={"latent": Var("z")},
-                note="--- SpeechDecoder: z (ne=[t_lat,lat_dim]) -> raw waveform ---"),
+                # The integrated state, still in the engine: `loom.run_ode_and_retain` left it in the
+                # estimator's own store and this is its only reader, so the whole sampler runs without
+                # a mel-sized Lua table at any point.
+                inputs={"latent": OutputRef(bucket_topology("vfe", T_TEXT_MAX),
+                                             module_expr=vfe_expr, variants=tuple(vfe_names))},
+                note="--- SpeechDecoder: the sampled latent (ne=[t_lat,lat_dim]) -> raw waveform ---"),
             DriverReturn(values=("waveform",)),
         ]
 

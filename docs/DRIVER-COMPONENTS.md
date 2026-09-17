@@ -70,28 +70,31 @@ differs is entirely what the host does with the one output. The family names its
 
 | component | class | emits | links | unchecked | used by |
 |---|---|---|---|---|---|
-| `driver_inputs` | `DriverInputs` | statements | 0 | 3 | conformer-ctc, dac, encodec, hf-causal-lm, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3 |
-| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, dac, encodec, hf-causal-lm, hf-token-classifier, lfm2-monolithic, qwen3 |
+| `driver_inputs` | `DriverInputs` | statements | 0 | 5 | conformer-ctc, dac, encodec, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3, qwen3-tts-tokenizer-12hz, snac |
+| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, qwen3 |
+| `chunked_codec_call` | `ChunkedCodecCall` | statements | 2 | 6 | *nobody* (see below) |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
 | `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 16 | granite-speech, hf-causal-lm, lfm2-monolithic, qwen3, qwen3-asr, t5, whisper |
 | `waveform_valid_length` | `WaveformValidLength` | statements | 0 | 5 | granite-speech, qwen3-asr |
 | `prompt_segments` | `PromptSegments` | statements | 2 | 5 | granite-speech, qwen3-asr |
-| `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | conformer-ctc |
-| `token_labels_epilogue` | `TokenLabelsEpilogue` | statements | 1 | 0 | hf-token-classifier |
+| `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | conformer-ctc, funasr-sensevoice, hf-ctc-asr |
+| `token_labels_epilogue` | `TokenLabelsEpilogue` | statements | 1 | 0 | funasr-paraformer, hf-token-classifier |
+| `cif_boundary` | `CifBoundary` | statements | 1 | 6 | funasr-paraformer |
 | `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 4 | hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
-| `export_constants` | `ExportConstants` | statements | 0 | 1 | dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
+| `export_constants` | `ExportConstants` | statements | 0 | 1 | dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, qwen3-tts, styletts2, supertonic, t5, vits, whisper |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
-| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 3 | dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
-| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
+| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 4 | dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, qwen3-tts, styletts2, supertonic, t5, vits, whisper |
+| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | dia, encodec, funasr-paraformer, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
+| `recurrent_call` | `RecurrentCall` | statements | 1 | 8 | encodec |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 7 | matcha, supertonic |
-| `driver_return` | `DriverReturn` | statements | 0 | 1 | dac, dia, encodec, kokoro, matcha, styletts2, supertonic, vits |
-| `lua_library` | `LuaLibrary` | prelude | 1 | 0 | kokoro, matcha, styletts2, vits |
+| `driver_return` | `DriverReturn` | statements | 0 | 1 | dac, dia, encodec, kokoro, matcha, qwen3-tts, qwen3-tts-tokenizer-12hz, snac, styletts2, supertonic, vits |
+| `lua_library` | `LuaLibrary` | prelude | 1 | 0 | funasr-paraformer, kokoro, matcha, styletts2, vits |
 
 ### `driver_inputs` — `DriverInputs`
 
 Binds every name the topologies below are called with: read from the caller's `inputs` table, or computed host-side (`cache_position` via loom.range, `attention_mask` via loom.causal_mask).
 
-*Emits:* statements. *Used by:* conformer-ctc, dac, encodec, hf-causal-lm, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3.
+*Emits:* statements. *Used by:* conformer-ctc, dac, encodec, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, qwen3, qwen3-tts-tokenizer-12hz, snac.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -99,10 +102,21 @@ Binds every name the topologies below are called with: read from the caller's `i
 
 The single `run_subgraph` call a flattened export's driver makes, capturing the output's shape alongside its data so the epilogue knows the vocab size -- or, for a KV-cached topology, retaining the output engine-side and binding nothing, so the logits never become a Lua table at all.
 
-*Emits:* statements. *Used by:* conformer-ctc, dac, encodec, hf-causal-lm, hf-token-classifier, lfm2-monolithic, qwen3.
+*Emits:* statements. *Used by:* conformer-ctc, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, qwen3.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
+
+### `chunked_codec_call` — `ChunkedCodecCall`
+
+The same `run_subgraph` a codec decoder makes, run over BOUNDED WINDOWS of the code sequence and stitched back into one waveform -- family 11's second call shape. Each chunk re-decodes `left_context` frames it has already emitted so its first kept frame has a populated receptive field, then drops `left_context * hop` samples from the front, so every output sample is produced exactly once by the call with the most history for it. Used by a codec whose reference decodes in chunks (Qwen3-TTS's 12 Hz tokenizer, whose `chunked_decode` this reproduces) -- which is also what keeps a decoder with ATTENTION over the frame axis from building a 4096x4096 score matrix per layer.
+
+*Emits:* statements. *Used by:* **no model** — see below.
+
+* `topology` — TopologyName
+* `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
+
+> No model uses it today: its leaf is exported and verified but is not yet in the model sweep this column is computed from -- `qwen3-tts-tokenizer-12hz` is the codec half of a pair whose family-10 half is unwritten, and the sweep lists shipped models. So this reads as unused for the same reason the leaf is not on the Hub yet, and the row will fill in when the pair lands. Verified meanwhile against the reference's own `chunked_decode` at 42 and 700 frames (max abs difference 4.2e-06 and 1.7e-05), which is [ADR-034].
 
 ### `modular_chain` — `ModularChain`
 
@@ -144,7 +158,7 @@ A prompt made of alternating text and non-text pieces -- family 3's audio embedd
 
 Greedy CTC decode: per-frame argmax over the retained logits, then collapse consecutive duplicates and drop the blank. `argmax_epilogue`'s ASR counterpart -- the same single forward pass, but a reduction over EVERY row returning a sequence, rather than over one row returning a token.
 
-*Emits:* statements. *Used by:* conformer-ctc.
+*Emits:* statements. *Used by:* conformer-ctc, funasr-sensevoice, hf-ctc-asr.
 
 * `retained_module` — TopologyName
 
@@ -152,9 +166,17 @@ Greedy CTC decode: per-frame argmax over the retained logits, then collapse cons
 
 One class id per ROW of the retained output, in row order -- family 12's whole orchestration. `ctc_greedy_epilogue` without the collapse, and the absence is the point: here the alignment between row i and token i IS the answer, so consecutive duplicates are two tokens' labels rather than one repeated.
 
-*Emits:* statements. *Used by:* hf-token-classifier.
+*Emits:* statements. *Used by:* funasr-paraformer, hf-token-classifier.
 
 * `retained_module` — TopologyName
+
+### `cif_boundary` — `CifBoundary`
+
+Where a CIF predictor's tokens fire, decided HOST-SIDE between two graph phases: reads the predictor's alphas and the encoder's frame count out of the retained encoder phase, and binds the linear resampling matrix `cif_fire` computes from them. The one place in this catalogue where a host binding is not an optimisation -- the token count depends on the VALUES, the crossings are knife-edge, and the reference decides them at float64 rounded to float32, which a graph has no way to reproduce.
+
+*Emits:* statements. *Used by:* funasr-paraformer.
+
+* `encoder_module` — TopologyName
 
 ### `argmax_epilogue` — `ArgmaxEpilogue`
 
@@ -168,7 +190,7 @@ Returns the next token rather than the raw logits: argmax over the active row, r
 
 Values only the checkpoint knows (a blank id, a duration set, a hidden width), bound as ordinary locals so every read of them is checked by driver_ir.validate -- rather than interpolated into hand-written Lua through a marker, where a misspelled read is a silent nil (BACKLOG.md P4.0.18).
 
-*Emits:* statements. *Used by:* dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper.
+*Emits:* statements. *Used by:* dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, qwen3-tts, styletts2, supertonic, t5, vits, whisper.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -190,7 +212,7 @@ A hand-written `.lua` adopted whole -- prelude, one verbatim body block, postlud
 
 One hand-written block of a peeled driver, kept as its own `.lua` file, declaring what it reads and defines (and, since D.2, which topologies its computed call sites drive).
 
-*Emits:* prelude, statements. *Used by:* dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper.
+*Emits:* prelude, statements. *Used by:* dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, qwen3-tts, styletts2, supertonic, t5, vits, whisper.
 
 * `drives` — ConfigDerived(needs=[])
   <br>*says:* {label} has computed call site(s) {detail} that no `drives` declaration covers, so the topologies they run are checked by nothing.
@@ -205,10 +227,18 @@ One hand-written block of a peeled driver, kept as its own `.lua` file, declarin
 
 One `loom.run_subgraph` as IR rather than text, so `check_subgraph_calls` covers its output arity too -- what a peel buys structurally.
 
-*Emits:* statements. *Used by:* dia, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper.
+*Emits:* statements. *Used by:* dia, encodec, funasr-paraformer, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
+
+### `recurrent_call` — `RecurrentCall`
+
+One `loom.run_recurrent`: a whole sequence through one LSTM cell topology, with the timestep loop and the h/c carry on the C++ side. A stack is one per layer, chained.
+
+*Emits:* statements. *Used by:* encodec.
+
+* `topology` — TopologyName
 
 ### `flow_matching_sampler` — `FlowMatchingSampler`
 
@@ -222,7 +252,7 @@ A `FlowMatchingSpec`'s generated Euler-CFM sampler function, plus the line that 
 
 What the entry function hands back to the host.
 
-*Emits:* statements. *Used by:* dac, dia, encodec, kokoro, matcha, styletts2, supertonic, vits.
+*Emits:* statements. *Used by:* dac, dia, encodec, kokoro, matcha, qwen3-tts, qwen3-tts-tokenizer-12hz, snac, styletts2, supertonic, vits.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -230,7 +260,7 @@ What the entry function hands back to the host.
 
 Emits the `loom_lua` functions a driver declares, and only those -- the transitive closure of `uses`, in definition order.
 
-*Emits:* prelude. *Used by:* kokoro, matcha, styletts2, vits.
+*Emits:* prelude. *Used by:* funasr-paraformer, kokoro, matcha, styletts2, vits.
 
 * `uses` — ConfigDerived(needs=[])
   <br>*says:* {label} declares loom_lua function(s) {detail}, which do not exist.
@@ -253,18 +283,16 @@ namespace their caller passes, and that column is the shape a caller's `HelperCa
 | `array_slice` | — | — | kokoro, styletts2 |
 | `array_affine` | — | — | matcha, vits |
 | `sigmoid` | — | — | *`predict_durations`* only |
-| `round_half_to_even` | — | — | *`predict_durations`* only |
-| `to_row_major` | — | — | kokoro, styletts2 |
-| `from_row_major` | — | — | kokoro, styletts2 |
-| `to_layout_a` | — | — | *`run_proj1x1`, `run_resblk_stack`* only |
-| `from_layout_a` | — | — | kokoro, styletts2 |
+| `round_half_to_even` | — | — | *`predict_durations`, `to_f32`* only |
 | `durations_from_logw` | — | — | matcha, vits |
 | `pad_last_to_multiple` | — | — | matcha |
 | `repeat_by_duration_tfast` | — | — | matcha |
 | `predict_durations` | `sigmoid`, `round_half_to_even` | — | kokoro, styletts2 |
 | `run_bi_lstm` | — | `<ns>_fwd`, `<ns>_bwd` ← `layer_input`, `h_prev`, `c_prev` | kokoro, styletts2 |
-| `run_resblk_stack` | `to_layout_a`, `from_layout_a` | `<ns>_block0`, `<ns>_block1`, `<ns>_block2` ← `x`, `style` | kokoro, styletts2 |
-| `run_proj1x1` | `to_layout_a` | `<ns>` ← `x` | kokoro, styletts2 |
+| `run_resblk_stack` | — | `<ns>_block0`, `<ns>_block1`, `<ns>_block2` ← `x`, `style` | kokoro, styletts2 |
+| `run_proj1x1` | — | `<ns>` ← `x` | kokoro, styletts2 |
+| `to_f32` | `round_half_to_even` | — | *`cif_fire`* only |
+| `cif_fire` | `to_f32` | — | **nothing** ⚠ |
 | `compute_wsum` | — | — | kokoro, styletts2 |
 | `karras_schedule` | — | — | styletts2 |
 | `adpm2_step` | — | — | *`adpm2_sample`* only |

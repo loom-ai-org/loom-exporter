@@ -532,6 +532,34 @@ class ValueFacts:
         if self.value(shape_var) is not None:
             raw = self.array(shape_var).reshape(-1)
             return [-1 if int(x) == -1 else as_expr(int(x)) for x in raw]
+        if shape_var.op is not None and shape_var.op.op_type == "shape":
+            # 3. `shape_var` is the WHOLE shape of another tensor, unpacked by nothing --
+            #    `torch.ones_like(x)` / `zeros_like` / `full_like`, which coremltools lowers to
+            #    `fill(shape=shape(x), value=...)`. There is no `concat` of per-axis gathers to walk
+            #    because no axis was ever taken apart, so case 2 declines it and the caller falls to the
+            #    blind "every symbolic axis is the root axis" substitution -- which is exactly the bug
+            #    `_op_fill`'s own comment records against Conformer-CTC's `[T, T]` mask, and which family
+            #    5 hit again on a `(1, rows, 560)` fill that came out one row per audio SAMPLE.
+            #
+            #    The answer is not a guess and needs no new machinery: a fill shaped by `shape(x)` has
+            #    `x`'s shape, axis for axis, and `dim_expr` is the same walk case 2 reaches through
+            #    `range_scalar` -> `gather_shape_value` for one axis at a time. Static axes are read as
+            #    the literals they already are rather than re-derived. A single axis the walk cannot
+            #    resolve returns None for the whole shape, so a fill this cannot explain keeps the
+            #    behaviour it had.
+            real_var = shape_var.op.inputs.get("x")
+            if real_var is None or real_var.shape is None:
+                return None
+            resolved = []
+            for axis, dim in enumerate(real_var.shape):
+                if isinstance(dim, (int, np.integer)):
+                    resolved.append(as_expr(int(dim)))
+                    continue
+                derived = self.exporter._infer_dynamic_dim_expr(real_var, axis)
+                if derived is None:
+                    return None
+                resolved.append(as_expr(derived))
+            return resolved
         if shape_var.op is None or shape_var.op.op_type not in ("concat", "stack"):
             return None
         values = shape_var.op.inputs.get("values")

@@ -1,40 +1,38 @@
+    -- --- bert_encoder (existing bespoke topology) ---
+    -- `albert`'s output by reference, and its own output retained: it returns rows_flat now (the
+    -- Layout-A transpose it used to end in existed only so the Lua could rebuild rows from it), so its
+    -- consumer is the same `duration_style_concat` graph Kokoro's `albert_bert_encoder` feeds.
+    loom.run_subgraph_and_retain("bert_encoder", {n_tokens = T_text, n_past = 0},
+                                  {x = {from = 'albert'}})
 
-    -- --- bert_encoder (existing bespoke topology, unchanged) ---
-    local d_en_flat = loom.run_subgraph("bert_encoder", {n_tokens = T_text, n_past = 0}, {x = bert_out})  -- Layout A [T,512]
-
-    -- --- DurationEncoder: 3x (BiLSTM + AdaLayerNorm), each re-concatenating style (bespoke, unchanged) ---
-    local x = {}
-    for t = 0, T_text - 1 do
-        local row = {}
-        for c = 0, D_MODEL - 1 do row[c + 1] = d_en_flat[c * T_text + t + 1] end
-        for s = 1, STYLE_DIM do row[D_MODEL + s] = s_predictor[s] end
-        x[t + 1] = row
-    end
+    -- --- DurationEncoder: 3x (BiLSTM + AdaLayerNorm), each re-concatenating the style vector.
+    --     NOTHING between `bert_encoder` and `duration_proj` becomes a Lua table now: the
+    --     concatenation the real DurationEncoder does four times is a traced graph
+    --     (`duration_style_concat`), each BiLSTM leaves `[h_fwd | h_bwd]` in its own store, and every
+    --     edge here is a name (ADR-031's last open edge). ---
+    local d_channels = D_MODEL + STYLE_DIM
+    loom.run_subgraph_and_retain("duration_style_concat", {n_tokens = T_text, n_past = 0},
+                                  {x = {from = 'bert_encoder'}, style = s_predictor})
+    -- The module holding DurationEncoder's real "d" at each point, not the values.
+    local d = "duration_style_concat"
     for i = 0, 2 do
-        local lstm_out = run_bi_lstm("duration_lstm_" .. i, x, HIDDEN_PER_DIR)  -- T_text x 512
-        local seq_ct = {}
-        for t = 0, T_text - 1 do
-            for c = 0, D_MODEL - 1 do seq_ct[t * D_MODEL + c + 1] = lstm_out[t + 1][c + 1] end
-        end
-        local ada_out = loom.run_subgraph("duration_adaln_" .. i, {n_tokens = T_text, n_past = 0}, {x = seq_ct, style = s_predictor})
-        local new_x = {}
-        for t = 0, T_text - 1 do
-            local row = {}
-            for c = 0, D_MODEL - 1 do row[c + 1] = ada_out[t * D_MODEL + c + 1] end
-            for s = 1, STYLE_DIM do row[D_MODEL + s] = s_predictor[s] end
-            new_x[t + 1] = row
-        end
-        x = new_x
+        local lstm = run_bi_lstm("duration_lstm_" .. i, {from = d}, T_text, d_channels, HIDDEN_PER_DIR)
+        loom.run_subgraph_and_retain("duration_adaln_" .. i, {n_tokens = T_text, n_past = 0},
+                                      {x = {from = lstm}, style = s_predictor})
+        -- Re-running the same graph over its own last consumer's output: the BiLSTM above has already
+        -- read what this overwrites, which is the whole reason one phase can serve all four stages.
+        loom.run_subgraph_and_retain("duration_style_concat", {n_tokens = T_text, n_past = 0},
+                                      {x = {from = "duration_adaln_" .. i}, style = s_predictor})
+        d = "duration_style_concat"
     end
-    local d = x  -- (T_text, 640)
 
-    -- --- predictor.lstm (top BiLSTM) -> duration_proj -> predict_durations (bespoke, unchanged) ---
-    local top_out = run_bi_lstm("top_lstm", d, HIDDEN_PER_DIR)  -- T_text x 512
-    local duration_logits = {}
-    for t = 1, T_text do
-        duration_logits[t] = loom.run_subgraph("duration_proj", {n_tokens = 0, n_past = 0}, {x = top_out[t]})
-    end
+    -- --- predictor.lstm (top BiLSTM) -> duration_proj -> predict_durations ---
+    -- ONE duration_proj call over the whole sequence, not one per token: `top_lstm`'s output is a
+    -- retained tensor, so a per-row call would build and compute a graph per token to apply one Linear.
+    local top = run_bi_lstm("top_lstm", {from = d}, T_text, d_channels, HIDDEN_PER_DIR)
+    local duration_logits = loom.run_subgraph("duration_proj", {n_tokens = T_text, n_past = 0},
+                                               {x = {from = top}})
     -- Real quirk (no /speed at all -- the real demo's own inference() has no such parameter):
     -- pred_dur[-1] += 5, padding the last token's duration.
-    local pred_dur = predict_durations(duration_logits, 1.0)
+    local pred_dur = predict_durations(duration_logits, T_text, 1.0)
     pred_dur[#pred_dur] = pred_dur[#pred_dur] + 5

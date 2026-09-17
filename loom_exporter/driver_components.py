@@ -73,7 +73,15 @@ HOST_COMPUTED_INPUT_NAMES = POSITION_INPUT_NAMES | CAUSAL_MASK_INPUT_NAMES
 GENERIC_PRIMARY_INPUT = "tokens"
 
 # `DriverInputs.bindings` kinds.
-CALLER, POSITION, MASK = "caller", "position", "mask"
+CALLER, POSITION, MASK, NOISE, DEFAULTED = "caller", "position", "mask", "noise", "defaulted"
+
+# The seed a driver draws its noise from when the caller names none.
+#
+# **Fixed rather than absent**, which is a decision and not a placeholder: a model whose graph takes
+# noise is stochastic, and an unseeded default would make every gate that compares two runs -- or two
+# backends -- unable to compare anything until it knew to pass a seed. The caller overrides it per
+# call (`inputs.seed`), which is the same shape VITS's hand-written driver has had since P4.0.8.
+DEFAULT_NOISE_SEED = 1234
 
 
 def caller_input(name: str):
@@ -111,11 +119,30 @@ class DriverInputs(DriverComponent):
     # The length expression the host-computed bindings are built at. Reads a name this component binds
     # earlier in the same list, which is why `driver_ir.validate` is the authority on it.
     n_tokens: object
+    # {input name: how many samples per unit of `n_tokens`} for the NOISE bindings -- the graph's own
+    # stochastic leaves, drawn here rather than asked of the caller.
+    #
+    # **A multiple, not a length**, because that is the only form in which this is knowable: a noise
+    # leaf's real length is a fixed ratio of the root axis (SNAC's four are 32x/256x/1024x/2048x the
+    # coarse frame count, one per decoder upsampling stage), and the same ratios are what the export
+    # hands `declared_axes` so the graph agrees with the driver about the shape.
+    noise: dict = dataclasses.field(default_factory=dict)
     # {input name: sliding-window width} for the masks that are banded rather than full-causal
     # (BACKLOG.md P4.0.11a). Empty for every model that has no windowed attention, which is every model
     # on this roadmap but Gemma 3 -- and an absent entry means "full causal", so the emitted call is
     # byte-identical to what it was before this field existed.
     mask_windows: dict = dataclasses.field(default_factory=dict)
+    # {input name: the literal the driver falls back to} for the DEFAULTED bindings -- a graph input
+    # the caller MAY set and usually does not.
+    #
+    # **It is a fallback, not a constant**, and the distinction is the whole reason the kind exists.
+    # Family 5's SANM checkpoint takes a four-row prompt beside its waveform: the language to decode as
+    # and whether to emit inverse-text-normalized output. Baking it into the graph would ship a model
+    # that can never punctuate; making it a plain CALLER binding would mean `transcribe(audio)` no
+    # longer works, because a required input nobody knows about is a required input. So the graph keeps
+    # the input, the contract publishes the tables a host picks values from, and the driver supplies
+    # the checkpoint's own default for the caller who passes nothing.
+    defaults: dict = dataclasses.field(default_factory=dict)
 
     __unchecked__ = {
         "mask_windows": Unchecked(
@@ -135,10 +162,29 @@ class DriverInputs(DriverComponent):
             "the authority on whether it reads a symbol defined before it, and it runs over the "
             "assembled function, which is the only place the question is answerable."
         ),
+        "defaults": Unchecked(
+            "the fallback value for an input the EXPORT declared, stated by the family that declared "
+            "it -- for family 5 it is the same vector `SenseVoiceSmall.inference` builds from its own "
+            "default arguments. There is no second authority: what would falsify it is the model "
+            "rejecting an id, and every id in it is read off the model's own tables. The NAME is "
+            "checked where it is checkable, by TopologyInput on the MonolithicCall that consumes it."
+        ),
+        "noise": Unchecked(
+            "the per-input sample-per-root-axis ratios, which the EXPORT states because it is what "
+            "declared the same ratios to coremltools -- the graph and this table are two readings of "
+            "one fact, and a mismatch is caught where it is expressible: the topology's own input "
+            "shape, against which `TopologyInput` checks every name this binds."
+        ),
     }
 
     def emit(self, ctx: DriverContext) -> List:
         out = []
+        if any(kind == NOISE for _, kind in self.bindings):
+            # ONCE, before the first draw, and not per input: `loom.gaussian_array` draws from one
+            # shared stream, so seeding between two draws would restart it and hand two stages
+            # correlated noise. The same reason every hand-written driver seeds at the top.
+            out.append(CallStmt(Call("loom.seed_rng", [
+                BinOp("or", FieldAccess("inputs", "seed"), Lit(DEFAULT_NOISE_SEED))])))
         for name, kind in self.bindings:
             if kind == POSITION:
                 out.append(Local(name, Call("loom.range", [Lit(0), self.n_tokens])))
@@ -148,6 +194,22 @@ class DriverInputs(DriverComponent):
                 if window:
                     args.append(Lit(window))
                 out.append(Local(name, Call("loom.causal_mask", args)))
+            elif kind == NOISE:
+                # `inputs.<name> or <draw>` -- the caller may hand the noise in, and that is not a
+                # convenience. A stochastic graph whose randomness only ever comes from inside it
+                # cannot be compared tensor-for-tensor against its reference, so this family's oracle
+                # would drop from "identical" to "similarly distributed", which is the standard this
+                # project has repeatedly found is not enough. Handing both sides the same noise keeps
+                # the export gradeable; nothing a card documents, and absent means drawn.
+                out.append(Local(name, BinOp("or", FieldAccess("inputs", name), Call(
+                    "loom.gaussian_array", [BinOp("*", Lit(self.noise[name]), self.n_tokens)]))))
+            elif kind == DEFAULTED:
+                # The same `inputs.<name> or <fallback>` shape NOISE uses, and for a related reason: an
+                # input the caller may set and usually does not. What differs is that the fallback is a
+                # value the CHECKPOINT states rather than a draw, so it is a literal array rather than
+                # a call.
+                out.append(Local(name, BinOp("or", FieldAccess("inputs", name),
+                                             ArrayLit([Lit(v) for v in self.defaults[name]]))))
             else:
                 out.append(Local(name, caller_input(name)))
         return out
@@ -212,6 +274,129 @@ class MonolithicCall(DriverComponent):
             axes={ctx.root_axis(self.topology): self.n_tokens, "n_past": Lit(0)},
             inputs={name: Var(name) for name in self.inputs},
         )]
+
+
+@dataclass
+class ChunkedCodecCall(DriverComponent):
+    """A codec decoder that runs its graph over BOUNDED windows of the code sequence and stitches the
+    waveform back together -- family 11's second call shape, and its first host-side loop.
+
+    `encodec_export` wrote the sentence this component answers: "a chunked one is a different driver,
+    not a longer call." Qwen3-TTS's 12 Hz tokenizer is the first leaf that needs it, for two
+    independent reasons and either would be enough.
+
+    **It is what the reference computes.** `Qwen3TTSTokenizerV2Model.decode` calls
+    `chunked_decode(chunk_size=300, left_context_size=25)`, so past 300 frames the model's own answer
+    IS a sequence of bounded calls. Measured on real codes: whole-sequence and chunked are bit-identical
+    through 299 frames and then diverge -- 1.3e-3 RMS at 301 against a 1.24e-1 signal, and 1.11e-2 at
+    700, which is 8.9% and squarely inside the band [Retro-043] records a listener hearing.
+
+    **And it is what makes the decoder runnable.** This one has a TRANSFORMER between the quantizer and
+    the upsampling stack, where DAC, SNAC and EnCodec are convolutional throughout. Attention is
+    quadratic in the frame axis, so a whole-sequence call at a 4096-frame ceiling would build a
+    4096x4096 score matrix in each of 8 layers -- about a gigabyte -- on an engine whose reason for
+    existing is edge devices. Chunked, no call ever exceeds `chunk + context` frames and the cost is
+    flat in clip length. That is why the export declares `max_frames = 325` rather than trimming a
+    larger number: the graph is never asked for more because the driver never asks.
+
+    **The left context is dropped from the OUTPUT, not from the input**, which is what makes the seam
+    continuous: each chunk re-decodes `context` frames it has already emitted so that the first frame it
+    keeps has a populated receptive field, then discards `context * hop` samples from the front. So
+    every output sample is produced exactly once, by the call that had the most history for it.
+
+    The loop carries no state between iterations -- no cache, no overlap-add, no window function. A
+    chunk is a self-contained call, which is why this is a `SubgraphCall` in a `While` and not a
+    recurrence needing an engine binding.
+    """
+
+    topology: str = "main_topology"
+    inputs: Tuple[str, ...] = ()
+    # The caller-supplied codes array, flat and frame-major: `codes_per_frame` ids per frame.
+    codes_var: str = "codes"
+    codes_per_frame: int = 0
+    # Samples one frame decodes to -- the checkpoint's `decode_upsample_rate`, 1920 here. What the
+    # front of each chunk's output is trimmed by, in units of `context` frames.
+    hop_length: int = 0
+    chunk_frames: int = 0
+    left_context_frames: int = 0
+    out_var: str = "_wav"
+
+    __links__ = {
+        "topology": TopologyName(),
+        "inputs": TopologyInput(FieldRef("topology"), exact=True),
+    }
+    __unchecked__ = {
+        "codes_var": Unchecked(
+            "the one declared input this loop slices, bound by `DriverInputs` earlier in the same "
+            "function -- `driver_ir.validate` runs over the assembled function and is the authority "
+            "on whether the name is defined before it is read."
+        ),
+        "codes_per_frame": Unchecked(
+            "the width of the caller's matrix, which the EXPORT computed as `sum(coarse // stride)` "
+            "and declared to coremltools as the codes axis. The graph's own input shape is the second "
+            "reading of it and `TopologyInput` checks this call against it."
+        ),
+        "hop_length": Unchecked("read off the checkpoint by `CodecFamily.geometry`, never declared"),
+        "chunk_frames": Unchecked(
+            "the reference implementation's `chunked_decode` default, copied so the two agree -- "
+            "see `AudioCodecExportConfig.chunk_frames`, which is where the checkpoint has nothing to "
+            "check it against and a test compares it to the function signature instead."
+        ),
+        "left_context_frames": Unchecked("same: `chunked_decode`'s `left_context_size` default"),
+        "out_var": Unchecked("a local this component binds rather than one it refers to"),
+    }
+
+    def emit(self, ctx: DriverContext) -> List:
+        width, hop = Lit(self.codes_per_frame), Lit(self.hop_length)
+        n_frames, start, stop = Var("_n_frames"), Var("_start"), Var("_stop")
+        context, first, chunk = Var("_context"), Var("_first"), Var("_chunk")
+        out, shape, i = Var("_chunk_wav"), Var("_chunk_shape"), Var("_i")
+        return [
+            # `math.floor(a / b)`, not `a // b`: the engine embeds LuaJIT, which is Lua 5.1, and the
+            # integer-division operator arrived in 5.3. The emitted driver is not syntax-checked at
+            # export time, so this surfaces as `unexpected symbol near '/'` from `load_script` when the
+            # GGUF is first run -- see `driver_ir.BinOp`, which now refuses the operator outright.
+            # The caller's array is a whole number of frames by the contract; a partial one would be a
+            # caller error the graph rejects on its own shape anyway.
+            Local(n_frames.name, BinOp("floordiv", Len(Var(self.codes_var)), width)),
+            Local(self.out_var, TableLit({})),
+            Local(start.name, Lit(0)),
+            While(cond=BinOp("<", start, n_frames), body=[
+                Local(stop.name, Call("math.min",
+                                      [BinOp("+", start, Lit(self.chunk_frames)), n_frames])),
+                # The reference's own spelling: full context once there IS one, and everything
+                # before `start` while there is not -- which at `start = 0` is zero, so the first
+                # chunk trims nothing.
+                Local(context.name, Call("math.min", [start, Lit(self.left_context_frames)])),
+                Local(first.name, BinOp("-", start, context)),
+                # 1-based, so the `+ 1` is the Lua index convention and not an off-by-one guard.
+                Local(chunk.name, Call("array_slice", [
+                    Var(self.codes_var),
+                    BinOp("+", BinOp("*", first, width), Lit(1)),
+                    BinOp("*", BinOp("-", stop, first), width),
+                ])),
+                SubgraphCall(
+                    outputs=[out.name],
+                    extra_outputs=[shape.name],
+                    module=self.topology,
+                    axes={ctx.root_axis(self.topology): BinOp("-", stop, first), "n_past": Lit(0)},
+                    inputs={name: (chunk if name == self.codes_var else Var(name))
+                            for name in self.inputs},
+                ),
+                # Written at an absolute offset rather than appended, so the loop needs neither `#out`
+                # nor `table.insert` per sample: chunk `[start, stop)` owns exactly the samples
+                # `[start * hop, stop * hop)` of the answer, whatever its context was.
+                NumericFor(var=i.name, start=Lit(1),
+                           stop=BinOp("*", BinOp("-", stop, start), hop), body=[
+                    IndexAssign(
+                        table=Var(self.out_var),
+                        idx=BinOp("+", BinOp("*", start, hop), i),
+                        expr=Index(out, BinOp("+", BinOp("*", context, hop), i)),
+                    ),
+                ]),
+                Assign(start.name, stop),
+            ]),
+        ]
 
 
 @dataclass
@@ -930,17 +1115,32 @@ class CodecDecodeBuilder(DriverBuilder):
     """
 
     inputs: DriverInputs
-    call: MonolithicCall
+    # `MonolithicCall` for a codec whose decode is one call over the whole sequence -- DAC, SNAC --
+    # and `ChunkedCodecCall` for one whose reference decodes in bounded windows. The two emit different
+    # statements and bind different locals, and that is the entire difference between the drivers: the
+    # inputs are the same codes and the epilogue hands back the same waveform either way.
+    call: object
     # Quoted: `DriverReturn` is declared with the peeled multi-phase components, several hundred lines
     # below, and it belongs there -- it is the component every peeled TTS driver ends on. Reusing it
     # rather than adding a fourth epilogue is the point, since "hand back what came out" is one job.
     epilogue: "DriverReturn"
+    # Only the chunked path has a library call (`array_slice`); the single-call leaves emit none, so
+    # their drivers do not move.
+    library: Optional["LuaLibrary"] = None
 
     __links__ = {name: NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN)
                  for name in ("inputs", "call", "epilogue")}
+    __unchecked__ = {
+        "library": CoveredBy(
+            "the same NestedSpec reasoning as the three fields above -- DriverBuilder.build registers "
+            "it with the export's checker like any other component, and LuaLibrary's own link checks "
+            "every name it declares against loom_exporter/lua/. Declared separately only because it "
+            "is optional."
+        ),
+    }
 
     def components(self):
-        return [self.inputs, self.call, self.epilogue]
+        return [c for c in (self.inputs, self.library, self.call, self.epilogue) if c is not None]
 
 
 @dataclass
@@ -1533,6 +1733,10 @@ class LuaFragment(DriverComponent):
     # `HelperCall`/`ComputedCall` declarations for this fragment's call sites whose topology name is
     # computed at run time (D.2). Empty for a fragment that names every topology literally.
     drives: Tuple[object, ...] = ()
+    # Topologies this fragment leaves RETAINED for a LATER IR node to reference. Declared, not parsed:
+    # the retaining call can be a level down inside a `loom_lua` helper (`run_proj1x1`), which is where
+    # reading the fragment's own text stops. `driver_ir._check_retained_reads` is the consumer.
+    retains: Tuple[str, ...] = ()
 
     __links__ = {
         "drives": [
@@ -1585,6 +1789,12 @@ class LuaFragment(DriverComponent):
         ),
     }
     __unchecked__ = {
+        "retains": Unchecked(
+            "the topologies this fragment leaves retained, for a later `OutputRef` to name. There is "
+            "no second authority: the retaining call is inside the fragment's own Lua (or a helper it "
+            "calls), and what checks the claim is the ENGINE -- a reference to a module nothing "
+            "retained raises `has no retained outputs` on the first run."
+        ),
         "path": Unchecked(
             "the fragment file. `read_text()` reports a missing one with the path and the errno, "
             "which is strictly better than a link saying it does not exist"
@@ -1674,7 +1884,8 @@ class LuaFragment(DriverComponent):
         if self.top_level:
             return []
         return [RawBlock(list(self.lines), verbatim=True,
-                         reads_=list(self.reads), defines_=list(self.defines))]
+                         reads_=list(self.reads), defines_=list(self.defines),
+                         retains_=list(self.retains))]
 
 
 @dataclass
@@ -1777,8 +1988,96 @@ class SubgraphCallComponent(DriverComponent):
         return _note_block(self.note) + [SubgraphCall(
             outputs=list(self.outputs), extra_outputs=list(self.extra_outputs),
             module=self.topology, axes=axes, inputs=dict(self.inputs), multiline=self.multiline,
-            retain=self.retain, module_expr=self.topology_expr,
+            retain=self.retain, module_expr=self.topology_expr, variants=tuple(self.variants),
         )]
+
+
+@dataclass
+class RecurrentCall(DriverComponent):
+    """One `loom.run_recurrent` call: a whole sequence through one LSTM cell topology, in C++.
+
+    **The driver-side half of `RecurrentPhase`**, which until now had none. That phase emits
+    `{name}_fwd`/`{name}_bwd` cell topologies; the only callers were hand-written Lua
+    (`run_bi_lstm`, which loops timesteps IN LUA and marshals a hidden-width table per step) and the
+    engine's own `BiLstmStepper`. This binds the C++ binding instead -- one Lua call per layer, with
+    the timestep loop, the h/c carry and the graph reuse all on the far side of the boundary.
+
+    **Use it only for a FIXED-LENGTH sweep.** It is handed a whole sequence and walks it, so it cannot
+    express a recurrence whose own output decides whether to step: a transducer's prediction network
+    advances only when the joint emits a non-blank, which is why `transducer_driver/02_decode.lua`
+    loops in Lua and carries `h`/`c` as tables across the boundary every step. That is the more
+    expensive shape and the necessary one there; a decoder-side LSTM over a known sequence is this
+    one.
+
+    A STACK is this component once per layer, chained: the sequence in is the previous layer's
+    output. That is what `RecurrentPhase`'s own `{name}_l0_fwd`/`{name}_l1_fwd` numbering is for.
+
+    `seq_len` and the two widths are IR expressions rather than numbers because only the first is
+    dynamic -- the widths are the checkpoint's, and passing them as literals is what lets the binding
+    check the array it was handed (`sequence.size() == seq_len * input_dim`) instead of trusting it.
+    """
+
+    topology: str
+    # The local this call binds. With `retain` it holds the store GENERATION rather than the sequence,
+    # which is what a later `OutputRef(..., gen=)` would pin against; the data stays in the engine.
+    out_var: str
+    # The sequence, either TIME-MAJOR `seq[t * input_dim + k]` as a Lua array, or an `OutputRef` to the
+    # producing module's retained output -- in which case the binding copies one ROW per timestep,
+    # backend-side, and the sequence never becomes a Lua value at all.
+    sequence: object
+    seq_len: object
+    input_dim: int
+    hidden_dim: int
+    # Walk timesteps backward through the same forward-ordered array -- a `direction="reverse"` cell.
+    # False for every unidirectional LSTM, which is what a decoder-side stack is.
+    reverse: bool = False
+    # Leave the output sequence in this module's own `OutputStore` instead of marshalling it. The point
+    # of the whole component: a stacked LSTM is then N calls with nothing crossing between them, which
+    # is `output_store.h`'s own rule (marshal only what is genuinely host-side) applied to the one
+    # binding that predated it.
+    retain: bool = False
+    note: Optional[str] = None
+
+    __links__ = {"topology": TopologyName()}
+    __unchecked__ = {
+        "note": _NOTE_IS_COSMETIC,
+        "out_var": Unchecked("the local this call binds; reads of it are checked by "
+                             "driver_ir.validate over the assembled function"),
+        "sequence": Unchecked("a driver_ir expression over locals earlier components bind -- "
+                              "validate() is its authority, as it is for SubgraphCallComponent's "
+                              "own `length`"),
+        "seq_len": Unchecked("same. The binding itself checks it against the array's real size, "
+                             "which is the check that matters: a wrong length here is an error "
+                             "naming both numbers, not a silently short sequence"),
+        "input_dim": Unchecked(
+            "the cell's input width, from the traced `lstm` op's own weights via RecurrentPhase. A "
+            "wrong value fails in the binding against the sequence length, and again against the "
+            "cell topology's own declared `layer_input` size"
+        ),
+        "hidden_dim": Unchecked("same, for the h/c width the cell declares"),
+        "retain": Unchecked(
+            "whether this call leaves its sequence in the engine. Not a claim about the topology -- the "
+            "cell is identical either way -- and what checks it is the CONSUMER: an `OutputRef` naming "
+            "a module no earlier call retained is rejected by driver_ir.check_subgraph_calls"
+        ),
+        "reverse": Unchecked(
+            "which end of the sequence the walk starts from. It is a property of the traced op's own "
+            "`direction`, which RecurrentPhase reads when it decides whether to emit a `_bwd` "
+            "topology at all -- so the authority is the emitted topology NAME, and a caller asking "
+            "for a reverse walk of a forward cell is naming a topology that does not exist"
+        ),
+    }
+
+    def link_label(self) -> str:
+        binding = "loom.run_recurrent_and_retain" if self.retain else "loom.run_recurrent"
+        return f"{binding}({self.topology!r})"
+
+    def emit(self, ctx):
+        binding = "loom.run_recurrent_and_retain" if self.retain else "loom.run_recurrent"
+        return _note_block(self.note) + [Local(self.out_var, Call(binding, [
+            Lit(self.topology), self.sequence, self.seq_len,
+            Lit(self.input_dim), Lit(self.hidden_dim), Lit(self.reverse),
+        ]))]
 
 
 def _names_a_topology(link) -> bool:
@@ -2096,7 +2395,13 @@ class FlowMatchingSampler(DriverComponent):
                     f"supply `estimator` -- the IR expression choosing between them."
                 )
             args.insert(0, self.estimator)
-        return _note_block(self.note) + [Local(self.result, Call(self.spec.func_name, args))]
+        # The generated function retains the integrated state (`spec.retain`), and it does so inside
+        # its own body -- which the adjacency check cannot see, since the body is in the prelude. So
+        # the call site declares it, naming every variant a bucketed estimator could have run.
+        retains = ([self.spec.estimator, *self.spec.estimator_variants] if self.spec.retain else [])
+        return _note_block(self.note) + [
+            Local(self.result, Call(self.spec.func_name, args), retains_=list(dict.fromkeys(retains)))
+        ]
 
 
 @dataclass
@@ -2140,6 +2445,82 @@ class ExportConstants(DriverComponent):
             else:
                 out.append(Local(name, Lit(value)))
         return out
+
+
+@dataclass
+class CifBoundary(DriverComponent):
+    """Where a CIF predictor's tokens fire, decided HOST-SIDE between two graph phases (family 5, P5).
+
+    Binds three locals: the predictor's `alphas`, the encoder's frame count, and the
+    `{weights, n_tokens}` table `cif_fire` computes from them -- a linear resampling matrix, so
+    everything downstream is one matmul.
+
+    **This is the one place in the zoo where a host binding is not an optimisation but the only correct
+    place for the computation.** Continuous integrate-and-fire emits a token each time a running sum of
+    `alphas` crosses an integer, so the number of tokens depends on the VALUES rather than on any shape
+    -- and the crossings are knife-edge, sitting within ~2e-06 of the boundary. FunASR decides them by
+    accumulating at float64, casting to float32, and flooring; a graph has no float64 and its own f32
+    cumsum lands on the other side of several boundaries. So the driver accumulates (Lua numbers are
+    doubles), rounds to float32 explicitly (`to_f32`), and hands the graph the ANSWER -- the weight of
+    every encoder frame in every token -- rather than the question. `cif_fire.lua` documents why a
+    matrix is the right form for that answer and not merely a convenient one.
+
+    `alphas` is `T + 1` floats and the host does real arithmetic on it, which is exactly the case
+    [ADR-031](../../loom.cpp/docs/adrs/adr-031-a-driver-edge-is-a-reference-unless-the-host-does-arithmetic.md)
+    allows a driver edge to bind a value for. The encoder's OUTPUT stays retained and crosses to the
+    decode phase as an `OutputRef`: it is `T * 512` floats that nothing host-side reads, and
+    `loom.output_shape` exists so its length can be learned without marshalling it.
+    """
+
+    encoder_module: str = "encoder"
+    # 1-based, indexing the encoder phase's own declared-output list: the hidden states, then alphas.
+    encoder_out_index: int = 1
+    alphas_index: int = 2
+    # The fire INDICATOR's value in FunASR's own `fires` tensor, read off the checkpoint's predictor
+    # rather than written here -- see `cif_fire.lua` on why it is passed at all.
+    threshold: float = 1.0
+    alphas_var: str = "_alphas"
+    fire_var: str = "_cif"
+    frames_var: str = "_n_enc_frames"
+
+    # A real check rather than a waiver: the name must be one of the export's own topologies, and
+    # `TopologyName` says so with the list of names that do exist. Whether it ran BEFORE this component
+    # is a different question, and `check_subgraph_calls`' adjacency rule is its authority.
+    __links__ = {"encoder_module": TopologyName()}
+
+    __unchecked__ = {
+        "encoder_out_index": Unchecked(
+            "1-based positions in the encoder phase's declared-output list, which the family's own "
+            "`phases()` writes and its wrapper returns in that order. A wrong index is not a silent "
+            "wrong answer: `loom.get_output` raises naming the module and the index it does not have."
+        ),
+        "alphas_index": CoveredBy("encoder_out_index"),
+        "threshold": Unchecked(
+            "READ off the restored predictor (`CifPredictorV2.threshold`), like every other number a "
+            "family's config takes from its checkpoint -- there is no second authority for it."
+        ),
+        "alphas_var": Unchecked("local names this component binds; driver_ir.validate is the "
+                                "authority that every later read of them resolves"),
+        "fire_var": CoveredBy("alphas_var"),
+        "frames_var": CoveredBy("alphas_var"),
+    }
+
+    def emit(self, ctx: DriverContext) -> List:
+        return [
+            Local(self.alphas_var, Call("loom.get_output",
+                                        [Lit(self.encoder_module), Lit(self.alphas_index)])),
+            # `output_shape` rather than `get_output`, and the difference is the whole reason that
+            # binding exists: the frame count is one number and the tensor behind it is T*512 floats.
+            # ggml reports `ne` fastest-axis first, so the row count is entry 2.
+            Local(self.frames_var, Index(Call("loom.output_shape",
+                                              [Lit(self.encoder_module), Lit(self.encoder_out_index)]),
+                                         Lit(2))),
+            # The frame count is passed rather than taken from `#alphas`: `alphas` is one LONGER than
+            # the encoder output (FunASR appends a tail frame so a final partial token still fires),
+            # and the weight matrix has one column per real frame.
+            Local(self.fire_var, Call("cif_fire", [Var(self.alphas_var), Lit(self.threshold),
+                                                   Var(self.frames_var)])),
+        ]
 
 
 @dataclass

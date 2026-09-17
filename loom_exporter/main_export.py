@@ -51,8 +51,19 @@ def validate_quantize(name: str) -> str:
     return resolved
 
 
+def companion_output(output_path: str, companion) -> str:
+    """Where a companion's GGUF goes: beside the primary one, named after the companion.
+
+    `-o out/talker.gguf` puts the codec at `out/qwen3-tts-tokenizer-12hz.gguf` -- the companion's own
+    catalogue slug, so the two files on disk are named the way the two repos on the Hub are, and so a
+    second talker exported into the same directory writes the identical codec path rather than a
+    second copy under a talker-derived name.
+    """
+    return str(Path(output_path).parent / f"{companion.name}.gguf")
+
+
 def main_export(model_path: str, output_path: str, task: str = None, model: str = None,
-                quantize: str = None) -> str:
+                quantize: str = None, companions: bool = False) -> str:
     """Exports whatever `model_path` names to `output_path`. `task`/`model` are optional overrides --
     with neither, both axes are auto-detected; with `task` alone, detection is restricted to that task's
     recognizers; `model` requires `task` (it names one specific recognizer within it). `quantize` names
@@ -79,7 +90,19 @@ def main_export(model_path: str, output_path: str, task: str = None, model: str 
     # the ones whose own `backend_kwargs` never learned about quantization.
     if quantize:
         config.quantize = quantize
-    return config.export()
+    primary = config.export()
+
+    # **Off by default, and the default is the load-bearing half.** `tools/build_model_cards.py` calls
+    # this once per Hub repo with that repo's own output directory; a second GGUF appearing beside the
+    # first would put a stray file in a repo whose README lists exactly one. The CLI opts in, because
+    # the CLI is where a person -- rather than a script that already knows -- points at a checkpoint.
+    if companions:
+        for companion in config.companions():
+            destination = companion_output(output_path, companion)
+            print(f"\nAlso in this checkpoint: {companion.name} -- {companion.why}.")
+            print(f"  exporting it to {destination}")
+            main_export(str(companion.checkpoint), destination, quantize=quantize, companions=True)
+    return primary
 
 
 def main():
@@ -97,10 +120,17 @@ def main():
              "else none. Only weights ggml can read in that form are converted -- the export reports "
              "the coverage it achieved, which for convolutional models is a fraction of the file.",
     )
+    parser.add_argument(
+        "--no-companions", action="store_true",
+        help="Do not export the other models this checkpoint contains. A family-10 talker ships its "
+             "own codec (Qwen3-TTS does; Dia's is a separate repo), and by default that second GGUF "
+             "is written beside this one -- they stay two files, which is what a codec being shared "
+             "and the codes being the useful intermediate buy you.",
+    )
     args = parser.parse_args()
 
     output_path = main_export(args.model_path, args.output, task=args.task, model=args.model,
-                              quantize=args.quantize)
+                              quantize=args.quantize, companions=not args.no_companions)
     print(f"SUCCESS! Exported to: {output_path}")
 
 
