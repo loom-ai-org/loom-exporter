@@ -153,6 +153,18 @@ class FlowMatchingSpec:
     # NOT -- whether the other names exist and declare the same inputs -- is checked per variant
     # through `estimator_specs()`.
     estimator_variants: tuple = ()
+    # Which integrator `loom.run_ode` applies. **"euler" is the default and changing it changes the
+    # model's output** -- it is a different numerical answer to the same ODE, not a better one, and
+    # every flow-matching model in the zoo shipped its audio under Euler. A second-order method buys
+    # accuracy per step at the cost of an extra estimator evaluation per step, which for a CFM decoder
+    # is the whole cost of the step: `midpoint` at n/2 steps is roughly the price of `euler` at n.
+    # The engine's list is the authority (`kOdeMethods` in lua_bridge.cpp) and it rejects a name it
+    # does not know rather than falling back.
+    method: str = "euler"
+    # Retain the integrated state in the estimator module's own output store instead of marshalling it.
+    # The point of moving the loop: a CFM sampler's state is the model's whole mel spectrogram, and its
+    # only reader is the next graph.
+    retain: bool = True
 
     __links__ = {
         "estimator": [
@@ -186,6 +198,18 @@ class FlowMatchingSpec:
         ),
     }
     __unchecked__ = {
+        "method": Unchecked(
+            "which integrator `loom.run_ode` applies. The ENGINE is the authority and it is the only "
+            "one that can be: `kOdeMethods` in lua_bridge.cpp is the list, and a name not in it is "
+            "rejected by name at the first call rather than defaulted. Nothing on the export side "
+            "knows which methods a given engine build offers"
+        ),
+        "retain": Unchecked(
+            "whether the integrated state stays in the estimator's own output store. Not a claim "
+            "about the topology -- the estimator is identical either way -- and what checks it is the "
+            "CONSUMER: an `OutputRef` naming a module no earlier call retained is rejected by "
+            "driver_ir.check_subgraph_calls"
+        ),
         "note": Unchecked("cosmetic: rendered as a comment above the generated sampler."),
     }
 
@@ -231,9 +255,15 @@ class FlowMatchingSpec:
 def render_sampler(spec: FlowMatchingSpec) -> str:
     """The Lua source for `spec`'s sampler function.
 
-    Emits deterministic forward-Euler integration: `z_{k+1} = z_k + v(z_k, t_k) * dt` with
-    `t_k = k/n_steps` and `dt = 1/n_steps`, matching both bespoke drivers this replaces exactly (and,
-    through them, the reference `loom::MatchaDriver` / `loom::SupertonicDriver` C++ oracles).
+    **The integration itself is `loom.run_ode`'s now, not this function's.** What is emitted here is the
+    call: the time schedule (`t_k = k/n_steps`, so `dt = 1/n_steps` uniformly), the per-step argument
+    table, and which integrator to use. The loop, the state and the update live in C++ -- see ADR-031
+    for why (this loop crossed the boundary twice per step, carrying the whole state each way, for an
+    elementwise update with no decision in it).
+
+    `euler` reproduces what this function used to emit step for step, and the engine's own test pins it
+    bit-identically against the Lua loop it replaces -- which is what keeps every model that already
+    shipped unchanged.
     """
     fixed = ", ".join(f'"{n}"' for n in spec.fixed_inputs)
     # A computed estimator arrives as the function's first argument rather than as a literal in the
@@ -247,30 +277,26 @@ def render_sampler(spec: FlowMatchingSpec) -> str:
     if spec.note:
         for para in spec.note.strip().splitlines():
             lines.append(f"-- {para.rstrip()}")
+    name_expr = "estimator" if computed else chr(34) + spec.estimator + chr(34)
+    binding = "loom.run_ode_and_retain" if spec.retain else "loom.run_ode"
     lines += [
         "-- Generated from FlowMatchingSpec (loom_exporter/flow_matching_export.py):",
         f'--   {estimator_desc}, carried="{spec.carried_input}", '
-        f'time="{spec.time_input}", fixed=[{fixed}]',
+        f'time="{spec.time_input}", fixed=[{fixed}], method="{spec.method}"',
         f"local function {spec.func_name}({params})",
-        "    local z = loom.gaussian_array(n_elems)",
-        "    local dt = 1.0 / n_steps",
-        "    for step = 0, n_steps - 1 do",
-        "        local t = step / n_steps",
-        "        local args = {",
-        f"            {spec.carried_input} = z,",
+        "    -- The schedule, and nothing else host-side: N+1 points is N steps of 1/n_steps each,",
+        "    -- which is the `t_k = k/n_steps` this used to walk in Lua.",
+        "    local times = {}",
+        "    for step = 0, n_steps do times[step + 1] = step / n_steps end",
+        f"    return {binding}({name_expr}, {{n_tokens = length, n_past = 0}}, {{",
     ]
     for name in spec.fixed_inputs:
-        lines.append(f"            {name} = step_inputs.{name},")
+        lines.append(f"        {name} = step_inputs.{name},")
     lines += [
-        f"            {spec.time_input} = {{ t }},",
-        "        }",
-        f'        local v = loom.run_subgraph({"estimator" if computed else chr(34) + spec.estimator + chr(34)}, '
-        "{n_tokens = length, n_past = 0}, args)",
-        "        for i = 1, #z do",
-        "            z[i] = z[i] + v[i] * dt",
-        "        end",
-        "    end",
-        "    return z",
+        "    }, {",
+        f'        carried = "{spec.carried_input}", time = "{spec.time_input}",',
+        f'        method = "{spec.method}", times = times, n_elems = n_elems,',
+        "    })",
         "end",
     ]
     return "\n".join(lines)

@@ -198,9 +198,13 @@ _FAMILY_MODULES = (
     "styletts2_export",
     "supertonic_export",
     "vits_export",
+    "ctc_asr_export",
+    "sanm_asr_export",
+    "paraformer_export",
     "token_classification_export",
     "audio_codec_export",
     "dia_export",
+    "qwen3_tts_export",
     "t5_export",
 )
 

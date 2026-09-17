@@ -18,8 +18,11 @@
 --     own AlbertWrapper to avoid returning a bare `.transpose()`/permute as a traced graph's own output
 --     (the exact bug export_vits_mil.py's own StatsWrapper already found and worked around). Byte-identical
 --     to ne=[768,T] either way (row-major IS Layout B, see convert_styletts2_diffusion.py's own axis-
---     convention comment) -- `bert_out` feeds straight into both "bert_encoder" (unchanged, Layout-A-typed
---     input `x`) and "diffusion"'s own `embedding` input with NO reordering needed.
+--     convention comment) -- `bert_out` feeds straight into both "bert_encoder" (rows_flat-typed input
+--     `x`) and "diffusion"'s own `embedding` input with NO reordering needed. "bert_encoder" now
+--     RETURNS that convention too: the Layout-A transpose it used to end in existed so this driver
+--     could rebuild rows from it in Lua, and nothing between two graphs passes through Lua any more
+--     (ADR-031 and its follow-up), which is also why the four layout-conversion helpers are gone.
 --   - "diffusion" no longer takes an `attn_mask` input: the REAL Transformer1d has no masking at all
 --     (plain, un-masked self-attention -- confirmed reading Modules/diffusion/modules.py directly, no
 --     `attn_mask`/`rel_pos` argument anywhere in AttentionBase.forward). The OLD bespoke topology declared

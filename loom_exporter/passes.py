@@ -348,6 +348,93 @@ class insert_explicit_broadcasts(AbstractGraphPass):
 
 
 @register_pass(namespace="loom")
+class transpose_pad_to_last_axis(AbstractGraphPass):
+    """
+    Rewrites `pad` on a non-last axis into `transpose -> pad(last axis) -> transpose`.
+
+    **The engine can only pad ne[0]** -- MIL's last axis -- because that is the axis `ggml_pad_ext`
+    and `ggml_pad_reflect_1d` are given, and `topology_ops.py`'s `pad` rule says so by raising.
+    That has been true and sufficient for every model until EnCodec, whose decoder pads the TIME axis
+    of a `[batch, channels, time]` tensor -- the last axis, written that way in the model.
+
+    It stops being the last axis because of a rewrite nobody here asked for. `EncodecResidualVector
+    Quantizer.decode` ends in `permute(0, 2, 1)` and the convolution pads immediately after, so
+    coremltools' own `reduce_transposes` pass sinks the transpose PAST the pad and rewrites the pad's
+    axis to suit: `pad([1, T, 128], axis=1)` then `transpose -> [1, 128, T+6]`. The arithmetic is
+    identical and the axis is no longer one the engine can address.
+
+    So this puts it back, generically: swap the padded axis with the last, pad, swap back. The two
+    transposes cost two `PERMUTE` nodes -- both primitives `ensure_packed` their input, so a view is
+    fine -- and the surrounding transposes frequently cancel against the model's own.
+
+    Deliberately NOT a fight with `reduce_transposes`: a pass that tried to stop the sinking would be
+    coupling this exporter to the internals of a pass coremltools runs for its own reasons, and would
+    have to be re-checked on every version bump. Accepting whichever layout arrives and normalising it
+    is the version-independent shape of the fix.
+
+    Only ONE axis may carry a non-zero pad, which is what `topology_ops.py` already required: a
+    two-axis pad has no single transpose that makes it a last-axis one, and no model has asked.
+    """
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            self._rewrite_block(f)
+
+    @block_context_manager
+    def _rewrite_block(self, block):
+        for op in list(block.operations):
+            if getattr(op, "enclosing_block", block) is None:
+                continue
+            for b in op.blocks:
+                self._rewrite_block(b)
+            if op.op_type != "pad":
+                continue
+            self._try_transform(op, block)
+
+    @staticmethod
+    def _try_transform(op, block) -> bool:
+        x = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
+        if x is None or x.shape is None:
+            return False                              # the emitter raises on this with a better message
+        pad_vals = static_ints(op.inputs.get("pad"))
+        if pad_vals is None or len(pad_vals) % 2 != 0:
+            return False                              # same: not this pass's error to report
+        rank = len(x.shape)
+        n_padded = len(pad_vals) // 2
+        # MIL's `pad` applies its pairs to the LAST `n_padded` axes, so axis `rank - n_padded + i`
+        # carries pair `i`. Only the axes with a non-zero pair matter; a zero pair on the last axis is
+        # exactly what makes this rewrite necessary rather than a no-op.
+        padded_axes = [rank - n_padded + i for i in range(n_padded)
+                       if pad_vals[2 * i] or pad_vals[2 * i + 1]]
+        if not padded_axes or padded_axes == [rank - 1]:
+            return False
+        if len(padded_axes) > 1:
+            raise NotImplementedError(
+                f"pad op '{op.name}' has non-zero padding on {len(padded_axes)} axes {padded_axes} of "
+                f"a rank-{rank} tensor. One transpose cannot make both the last axis, and the engine "
+                f"pads only ne[0]; no model has needed this."
+            )
+        axis = padded_axes[0]
+        perm = list(range(rank))
+        perm[axis], perm[rank - 1] = perm[rank - 1], perm[axis]
+        # The pair that was on `axis` moves to the last position, and everything else is zeroed: after
+        # the transpose there is nothing left to pad but the axis that was swapped in.
+        moved = pad_vals[2 * (axis - (rank - n_padded))], pad_vals[2 * (axis - (rank - n_padded)) + 1]
+        new_pad = [0, 0, int(moved[0]), int(moved[1])]
+        mode = static_value(op.inputs.get("mode"), "constant")
+        out_name = op.outputs[0].name
+        with _scope_ctx_like(op):
+            swapped = mb.transpose(x=x, perm=perm, before_op=op)
+            padded = mb.pad(x=swapped, pad=new_pad, mode=mode, before_op=op)
+            new_out = mb.transpose(x=padded, perm=perm, name=out_name, before_op=op)
+        if not block.try_replace_uses_of_var_after_op(anchor_op=op, old_var=op.outputs[0],
+                                                      new_var=new_out):
+            return False
+        block.remove_ops([op])
+        return True
+
+
+@register_pass(namespace="loom")
 class canonicalize_replicate_pad(AbstractGraphPass):
     """
     Rewrites a `pad(mode="replicate")` op into a `loom_replicate_pad` op -- EXPORT-ROADMAP.md R2.
@@ -1553,6 +1640,10 @@ _LOOM_PASS_NAMES = [
     "loom::fuse_gqa_repeat_kv",
     "loom::normalize_matmul",
     "loom::insert_explicit_broadcasts",
+    # Before canonicalize_replicate_pad, so that pass sees every pad already on the last axis and its
+    # own "only the fastest-varying axis" check is about what the MODEL does rather than about which
+    # layout coremltools happened to leave the graph in.
+    "loom::transpose_pad_to_last_axis",
     "loom::canonicalize_replicate_pad",
     "loom::canonicalize_conv_transpose_dw",
     "loom::lower_stack",

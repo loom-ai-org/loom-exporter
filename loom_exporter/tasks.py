@@ -147,7 +147,15 @@ TASKS: Dict[str, TaskSpec] = {
                 "family 10's AR codec-token models decode through. Claimed by P5's family 11; the "
                 "encode direction is a different pair and has no family."
             ),
-            base_config="audio_codec_export:AudioCodecExportConfig",
+            # `LoomExportConfig`, for the reason `automatic-speech-recognition` above gives and on
+            # the same evidence: the families registered under this task do not share an export
+            # shape. DAC and SNAC are `AudioCodecExportConfig` (one traced graph); EnCodec is an
+            # `EnCodecExportConfig`, a `BaseMultiPhaseModelExportConfig`, because its decoder has an
+            # LSTM over the time axis and a recurrence is not expressible as a topology at all. The
+            # I/O contract is identical for all three -- `audio_codes -> audio`, one array in -- and
+            # that is what the TASK is. The real fix is the one recorded there: move `config_class`
+            # onto the recognizer, where the build actually happens.
+            base_config=None,
         ),
     )
 }

@@ -432,6 +432,32 @@ def _op_leaky_relu(self, op, ctx):
     })
 
 
+@topology_rule('elu')
+def _op_elu(self, op, ctx):
+    nodes, resolve = ctx.nodes, ctx.resolve
+    # EnCodec's SEANet decoder activation (family 11's second leaf), where every vocoder in families
+    # 7-9 uses LeakyReLU. `ggml_elu` already existed and the engine just had not exposed it, so the
+    # C++ side is one registration rather than a kernel.
+    #
+    # A RULE rather than an OP_MAP entry, and the reason is `alpha`: MIL's `elu` scales the negative
+    # branch by it (`alpha * (e^x - 1)`) and `ggml_elu` is fixed at 1. OP_MAP ignores attributes, so
+    # mapping it there would compute the wrong function for any alpha != 1 and say nothing. torch's
+    # own `nn.ELU` defaults to 1.0 and no model here sets otherwise; this raises if one ever does.
+    alpha = float(static_scalar(op.inputs.get("alpha"), 1.0))
+    if alpha != 1.0:
+        raise NotImplementedError(
+            f"elu op '{op.name}' has alpha={alpha} -- ggml's ELU is fixed at alpha=1, and scaling only "
+            f"the negative branch is not expressible as a SCALE around it. Compose it as "
+            f"`alpha*elu(x) + (1-alpha)*relu(x)` if a model ever needs one."
+        )
+    x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
+    nodes.append({
+        "op": "ELU",
+        "inputs": [resolve(self.safe_name(x_var_obj.name))],
+        "outputs": [self.safe_name(op.outputs[0].name)],
+    })
+
+
 @topology_rule('reverse')
 def _op_reverse(self, op, ctx):
     nodes, resolve, func_name = ctx.nodes, ctx.resolve, ctx.func_name
@@ -950,6 +976,39 @@ def _op_fill(self, op, ctx):
             "outputs": [self.safe_name(op.outputs[0].name)],
             "attrs": {"shape": target_shape}
         })
+
+
+@topology_rule('fill_like')
+def _op_fill_like(self, op, ctx):
+    """MIL's `fill_like(ref_tensor, value)` -- the other lowering of `torch.ones_like`/`zeros_like`.
+
+    Which of `fill` and `fill_like` coremltools produces for the same torch source is not stable: the
+    same `ones_like` reaches this exporter as a `fill` shaped by a `shape` op in one graph and as a
+    `fill_like` in another. Both are the same tensor, so both compose the same way `_op_fill`'s dynamic
+    branch does -- a REPEAT broadcasting a genuinely scalar constant out to the target.
+
+    Simpler than `fill`, because there is no "shape" input to resolve: the target IS `ref_tensor`'s own
+    shape, which `_infer_dynamic_dim_expr`'s matching case derives axis by axis. A constant-valued
+    `fill_like` is not folded to a weight here for the same reason `fill`'s dynamic branch does not --
+    the extent is only known per call.
+    """
+    nodes, func_name = ctx.nodes, ctx.func_name
+    ref_var = op.inputs.get("ref_tensor") or op.inputs.get("x")
+    if ref_var is None:
+        raise NotImplementedError(f"fill_like op '{op.name}' names no reference tensor")
+    value_val = static_value(op.inputs.get("value"), 0.0)
+    target_shape = list(self.get_var_info(op.outputs[0])["shape"])
+
+    weight_name = self.safe_name(op.outputs[0].name) + "_fill_scalar"
+    namespaced_name = (weight_name if func_name == "main_topology" or self.flat_namespace
+                       else f"{func_name}.{weight_name}")
+    self.weights[namespaced_name] = np.full([1] * len(target_shape), value_val, dtype=np.float32)
+    nodes.append({
+        "op": "REPEAT",
+        "inputs": [namespaced_name],
+        "outputs": [self.safe_name(op.outputs[0].name)],
+        "attrs": {"shape": target_shape},
+    })
 
 
 @topology_rule('pad')
@@ -1975,17 +2034,51 @@ def _op_conv(self, op, ctx):
     d0 = int(dilations[0]) if isinstance(dilations, (list, tuple, np.ndarray)) else int(dilations)
     g_val = int(groups[0]) if isinstance(groups, (list, tuple, np.ndarray)) else int(groups)
 
-    # Check if it is a depthwise convolution (groups > 1)
-    is_dw = (g_val > 1)
+    # Extract main inputs [x, weight]
+    x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
+    x_var = self.safe_name(x_var_obj.name)
+    weight_obj = op.inputs["weight"]
+    weight_var = self.safe_name(weight_obj.name)
+
+    # DEPTHWISE IS DECIDED BY THE KERNEL, NOT BY `groups > 1`, and the difference is a real case rather
+    # than pedantry. MIL declares a conv weight as [OC, IC/groups, K], so "one input channel per output
+    # channel" -- which is what depthwise MEANS, and what `op_conv_1d_dw`'s batched-per-channel mul_mat
+    # requires -- is `IC/groups == 1`. The two conditions coincide at both ends of the range, which is
+    # why `groups > 1` alone survived eight families: every convolution converted before this was either
+    # dense (groups == 1) or genuinely depthwise (groups == IC), verified over the shipped topologies.
+    # Family 4's positional convolution is neither -- groups=16 over 768 channels -- and under the old
+    # rule it was emitted as CONV_1D_DW and aborted the ENGINE inside ggml_im2col, with no mention of a
+    # model or a channel count (loom.cpp Retro-046).
+    ic_per_group = None
+    weight_shape = getattr(weight_obj, "shape", None)
+    if weight_shape is not None and len(weight_shape) >= 2:
+        # A conv WEIGHT is a constant, so its axes are concrete in every graph seen so far; the guard is
+        # for the shape that is not, where `int()` raises on a sympy symbol rather than returning one.
+        try:
+            ic_per_group = int(weight_shape[1])
+        except (TypeError, ValueError):
+            ic_per_group = None
+    if g_val > 1 and ic_per_group is None:
+        raise NotImplementedError(
+            f"conv op '{op.name}' has groups={g_val} and a weight whose input-channel axis is not a "
+            f"compile-time constant ({weight_shape!r}), so whether it is depthwise or grouped cannot "
+            f"be decided here -- and the two lower to different primitives.")
+
+    is_dw = (g_val > 1 and ic_per_group == 1)
+    is_grouped = (g_val > 1 and not is_dw)
+    if is_grouped and is_2d:
+        # No 2-D grouped convolution exists in any model this exporter has converted, and the engine
+        # has no lowering for one -- `conv_1d_grouped` is 1-D only. Raising names the gap; emitting
+        # CONV_2D and dropping the attr would compute a dense convolution and return a wrong answer.
+        raise NotImplementedError(
+            f"conv op '{op.name}' is a 2-D GROUPED convolution (groups={g_val}, {ic_per_group} input "
+            f"channels per group). CONV_2D reduces over every input channel and CONV_2D_DW needs one "
+            f"per output channel, so neither is it; the 1-D form is handled by `conv_1d_grouped` in "
+            f"src/ops/primitives_conv.cpp and the 2-D one would need its counterpart.")
     if is_dw:
         mapped_op = "CONV_2D_DW" if is_2d else "CONV_1D_DW"
     else:
         mapped_op = "CONV_2D" if is_2d else "CONV_1D"
-
-    # Extract main inputs [x, weight]
-    x_var_obj = op.inputs.get("x") or op.inputs.get("data") or op.inputs.get("input")
-    x_var = self.safe_name(x_var_obj.name)
-    weight_var = self.safe_name(op.inputs["weight"].name)
 
     attrs = {"s0": s0, "p0": p0, "d0": d0, "groups": g_val}
     if is_2d:
