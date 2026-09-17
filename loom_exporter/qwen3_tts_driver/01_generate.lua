@@ -27,10 +27,80 @@
     -- that arithmetic and the graph does none of it: `_icl_text` comes out exactly as long as the
     -- replay and `_schedule` is already the remainder.
     local _prefill_len, _rows
-    if inputs.ref_code then
+    if inputs.ref_code or inputs.ref_audio then
+        -- **The reference's own codes, drawn here when the caller passes audio rather than codes.**
+        -- This is the codec's ENCODER, four phases of it, living in the talker's file because the
+        -- ICL prompt is its only caller (`_RefEncodeWrapper` says why at more length).
+        local _ref_code = inputs.ref_code
+        if not _ref_code then
+            -- **Whole frames only, and that is the export's correctness condition rather than a
+            -- convenience.** Every convolution in the encode stack pads by a length-derived amount
+            -- that coremltools will not trace; trimmed to a multiple of the frame stride, that
+            -- amount is exactly zero at all fifteen of them. The reference keeps a PARTIAL final
+            -- frame (it ceil-divides); this drops it, which is at most 79 ms off the end of a
+            -- reference clip and is the difference between codes that match the reference on every
+            -- frame and codes that match it on all but the last.
+            local _samples = math.floor(#inputs.ref_audio / ENCODE_STRIDE) * ENCODE_STRIDE
+            if _samples < ENCODE_STRIDE then
+                error('ref_audio is shorter than one codec frame (' .. ENCODE_STRIDE ..
+                      ' samples at ' .. REF_SAMPLE_RATE .. ' Hz)')
+            end
+            local _clip = {}
+            for _i = 1, _samples do _clip[_i] = inputs.ref_audio[_i] end
+            local _conv_rows = _samples / CONV_STRIDE
+            local _frames = _samples / ENCODE_STRIDE
+
+            -- Causal, NOT the 250-wide window the codec's config declares -- the reference's own
+            -- `create_causal_mask` does not apply it on this path, and applying it moved 67 of 2192
+            -- ids at 137 frames. `encoder_attention_mask` carries the finding.
+            loom.run_subgraph_and_retain('ref_encode', {n_enc_frames = _conv_rows, n_past = 0},
+                {waveform = _clip, attention_mask = loom.causal_mask(_conv_rows, 0)})
+
+            -- One id per frame per codebook, drawn stage by stage: the graph scores, the driver
+            -- reduces, the ids come back in as the next stage's subtraction. `subtract = 0` is how
+            -- the first draw of each chain skips a subtraction it has nothing for.
+            local _zeros = {}
+            for _i = 1, _frames do _zeros[_i] = 0 end
+            local _first_range = loom.range(0, REF_CODEBOOK)
+
+            loom.run_subgraph_and_retain('rvq_project_semantic', {n_codes = _frames, n_past = 0},
+                {rows = {from = 'ref_encode'}})
+            loom.run_subgraph_and_retain('rvq_step', {n_codes = _frames, n_past = 0},
+                {rows = {from = 'rvq_project_semantic'}, prev_ids = _zeros,
+                 prev_codebook = _first_range, next_codebook = _first_range, subtract = {0.0}})
+            local _drawn = {loom.argmax_rows('rvq_step')}
+
+            loom.run_subgraph_and_retain('rvq_project_acoustic', {n_codes = _frames, n_past = 0},
+                {rows = {from = 'ref_encode'}})
+            local _rows = {from = 'rvq_project_acoustic'}
+            local _prev = _zeros
+            local _subtract = 0.0
+            for _stage = 1, N_GROUPS - 1 do
+                local _prev_range = loom.range(math.max(_stage - 1, 1) * REF_CODEBOOK, REF_CODEBOOK)
+                loom.run_subgraph_and_retain('rvq_step', {n_codes = _frames, n_past = 0},
+                    {rows = _rows, prev_ids = _prev, prev_codebook = _prev_range,
+                     next_codebook = loom.range(_stage * REF_CODEBOOK, REF_CODEBOOK),
+                     subtract = {_subtract}})
+                _prev = loom.argmax_rows('rvq_step')
+                _drawn[#_drawn + 1] = _prev
+                -- `rvq_step`'s second output is the residual it just produced, and it stays in the
+                -- engine: the next stage reads it by index rather than through Lua.
+                _rows = {from = 'rvq_step', index = 2}
+                _subtract = 1.0
+            end
+
+            -- Frame-major, which is the layout every codec in this tree passes codes in.
+            _ref_code = {}
+            for _f = 1, _frames do
+                for _g = 1, N_GROUPS do
+                    _ref_code[#_ref_code + 1] = _drawn[_g][_f]
+                end
+            end
+        end
+
         -- `math.floor`, because Lua's `/` is float division and these two numbers become an axis
         -- extent and a loop bound.
-        local _n_ref = math.floor(#inputs.ref_code / N_GROUPS)
+        local _n_ref = math.floor(#_ref_code / N_GROUPS)
         local _n_replay = _n_ref + 1
 
         -- The interleaved id stream: the reference transcript, the target text, then `tts_eos`.
@@ -57,25 +127,31 @@
         if #_schedule == 0 then _schedule[1] = TTS_PAD_ID end
 
         -- The codes, offset into the merged predictor table exactly as a drawn frame's are, with a
-        -- leading row of zeros where `codec_bos` goes -- `bos_mask` selects it, so the replay needs
-        -- no concatenation and no second symbol for the sake of one row.
+        -- leading column of zeros where `codec_bos` goes -- `bos_mask` selects it, so the replay
+        -- needs no concatenation and no second symbol for the sake of one row.
+        --
+        -- **GROUP-major, transposed here from the frame-major layout every codec in this tree passes
+        -- codes in.** A group has to be a contiguous run for `ggml_get_rows`: sliced out of a
+        -- frame-major array it is a strided view, and a strided view aborts the process inside ggml
+        -- rather than raising. One transpose here buys a legal gather in sixteen places.
         local _codes_in, _mask = {}, {}
-        for _g = 1, N_GROUPS do _codes_in[_g] = 0 end
         _mask[1] = 1.0
-        for _f = 0, _n_ref - 1 do
-            local _base = _f * N_GROUPS
-            _codes_in[#_codes_in + 1] = inputs.ref_code[_base + 1]
-            for _g = 1, N_GROUPS - 1 do
-                _codes_in[#_codes_in + 1] = inputs.ref_code[_base + _g + 1] + (_g - 1) * CODEBOOK_SIZE
+        for _f = 1, _n_ref do _mask[_f + 1] = 0.0 end
+        for _g = 1, N_GROUPS do
+            _codes_in[#_codes_in + 1] = 0            -- the `codec_bos` column
+            local _offset = (_g - 2) * CODEBOOK_SIZE
+            for _f = 0, _n_ref - 1 do
+                local _code = _ref_code[_f * N_GROUPS + _g]
+                if _g > 1 then _code = _code + _offset end
+                _codes_in[#_codes_in + 1] = _code
             end
-            _mask[#_mask + 1] = 0.0
         end
 
         local _role = {}
         for _i = 1, TEXT_HEAD do _role[_i] = inputs.tokens[_i] end
 
         loom.run_subgraph_and_retain('prefill_embed_icl',
-            {n_tokens = _n_replay, n_schedule = #_schedule, n_past = 0},
+            {n_codes = _n_replay, n_tokens = #_schedule, n_past = 0},
             {role_ids = _role, icl_text_ids = _icl_text, ref_code = _codes_in, bos_mask = _mask,
              schedule_ids = _schedule, language_id = {_language}, x_vector = _spk})
         _prefill_len = ICL_HEAD_LEN + _n_replay

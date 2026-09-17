@@ -28,6 +28,10 @@ torch = pytest.importorskip("torch")
 
 from loom_exporter.qwen3_tts_export import (  # noqa: E402
     PREFILL_LEN,
+    _RvqStepWrapper,
+    _concatenated_codebooks,
+    encoder_attention_mask,
+    install_encoder_patches,
     REF_HEAD,
     REF_TAIL,
     TEXT_HEAD,
@@ -110,17 +114,20 @@ def _wrapper():
     embeddings = torch.arange(
         1, (N_GROUPS - 1) * CODEBOOK * HIDDEN + 1, dtype=torch.float32
     ).view((N_GROUPS - 1) * CODEBOOK, HIDDEN) * 0.5
-    return _IclPrefillEmbedWrapper(_StubTalker(), _StubConfig, embeddings).eval(), embeddings
+    return (_IclPrefillEmbedWrapper(_StubTalker(), _StubConfig, embeddings, N_GROUPS).eval(),
+            embeddings)
 
 
 def _call(wrapper, n_frames, n_schedule=2, language_id=9):
     role = torch.tensor([[10, 11, 12]])
     replay = n_frames + 1
     icl_text = torch.arange(13, 13 + replay).view(1, -1)
-    codes = torch.zeros((1, replay, N_GROUPS), dtype=torch.long)
-    codes[0, 1:, 0] = torch.arange(1, n_frames + 1) % CODEC_VOCAB
+    # GROUP-major: `[16, C]`, one contiguous run per group. Frame-major is what a caller passes and
+    # what the driver transposes, and getting that backwards is a gather ggml aborts on.
+    codes = torch.zeros((N_GROUPS, replay), dtype=torch.long)
+    codes[0, 1:] = torch.arange(1, n_frames + 1) % CODEC_VOCAB
     for g in range(1, N_GROUPS):
-        codes[0, 1:, g] = (g - 1) * CODEBOOK + (torch.arange(n_frames) % CODEBOOK)
+        codes[g, 1:] = (g - 1) * CODEBOOK + (torch.arange(n_frames) % CODEBOOK)
     mask = torch.zeros(1, replay, 1)
     mask[0, 0, 0] = 1.0
     schedule_ids = torch.arange(30, 30 + n_schedule).view(1, -1)
@@ -196,3 +203,124 @@ def test_the_template_counts_match_the_reference_implementations_slices():
     driver slices with these four numbers, so they are the template's shape stated once."""
     assert (TEXT_HEAD, TEXT_TAIL) == (3, 5)
     assert (REF_HEAD, REF_TAIL) == (3, 2)
+
+
+# -- the reference clip's own codes ----------------------------------------------------------------
+
+def test_the_score_argmax_is_the_nearest_centroid():
+    """The claim the whole quantizer rests on. The reference draws with
+    `torch.cdist(x, e).argmin(-1)`; this graph has no `argmin` op and computes
+    `argmax_j (2 x.e_j - ||e_j||^2)` instead, which is the same answer because `||x||^2` does not
+    depend on j. Checked against `cdist` itself on random rows, because an algebraic identity that is
+    only asserted in a docstring is an identity nobody has run."""
+    torch.manual_seed(7)
+    size, dim, frames = 24, 6, 40
+    codebooks = torch.randn(size, dim)
+    step = _RvqStepWrapper(codebooks).eval()
+    rows = torch.randn(1, frames, dim)
+    with torch.no_grad():
+        scores, _ = step(rows, torch.zeros((1, frames), dtype=torch.long), torch.arange(size),
+                         torch.arange(size), torch.zeros(1))
+        mine = scores.argmax(dim=-1)
+        theirs = torch.cdist(rows[0][None].float(), codebooks[None].float(), p=2)[0].argmin(dim=-1)
+    assert torch.equal(mine[0], theirs)
+
+
+def test_a_stage_scores_against_its_own_slice_of_the_concatenated_table():
+    """Sixteen codebooks are written once and a stage selects its own with a range, which is what
+    makes one topology serve every stage. A stage reading the wrong slice would still return valid
+    ids in range -- there is no shape that separates codebook 3 from codebook 4."""
+    torch.manual_seed(7)
+    size, dim, frames = 8, 4, 5
+    codebooks = torch.randn(4 * size, dim)
+    step = _RvqStepWrapper(codebooks).eval()
+    rows = torch.randn(1, frames, dim)
+    for stage in range(4):
+        rng = torch.arange(stage * size, (stage + 1) * size)
+        with torch.no_grad():
+            scores, _ = step(rows, torch.zeros((1, frames), dtype=torch.long), rng, rng,
+                             torch.zeros(1))
+            direct = torch.cdist(rows[0][None], codebooks[stage * size:(stage + 1) * size][None],
+                                 p=2)[0].argmin(dim=-1)
+        assert scores.shape == (1, frames, size)
+        assert torch.equal(scores.argmax(dim=-1)[0], direct)
+
+
+def test_the_subtract_switch_is_an_identity_at_zero_and_a_subtraction_at_one():
+    """The first draw of each chain has nothing to take away, and a graph cannot skip an op. Zero has
+    to mean *exactly* unchanged: a residual that is off by one centroid on stage one is off by one
+    for every stage after it."""
+    torch.manual_seed(7)
+    size, dim, frames = 8, 4, 6
+    codebooks = torch.randn(4 * size, dim)
+    step = _RvqStepWrapper(codebooks).eval()
+    rows = torch.randn(1, frames, dim)
+    ids = torch.randint(0, size, (1, frames))
+    rng = torch.arange(size, 2 * size)
+    with torch.no_grad():
+        _, unchanged = step(rows, ids, rng, rng, torch.zeros(1))
+        _, subtracted = step(rows, ids, rng, rng, torch.ones(1))
+    assert torch.equal(unchanged, rows)
+    expected = rows - torch.nn.functional.embedding(ids.view(-1), codebooks[size:2 * size])
+    assert torch.allclose(subtracted, expected, atol=1e-6)
+
+
+def test_the_encoder_mask_is_causal_and_is_not_windowed():
+    """The checkpoint declares `sliding_window: 250` on the encoder and the reference never applies
+    it -- `create_causal_mask` returns a plain causal mask, so the last row of a 274-row sequence
+    attends to all 274. Applying the window moved 67 of 2192 ids at 137 frames, which is a model that
+    still speaks and clones a different voice. This pins the finding against a config that argues the
+    other way."""
+    n = 300
+    mask = encoder_attention_mask(n)
+    assert mask.shape == (1, 1, n, n)
+    allowed = mask[0, 0] == 0
+    assert bool(allowed[n - 1].all()), "the last row must see every earlier row, window or not"
+    assert int(allowed[0].sum()) == 1
+    assert not bool(allowed.triu(diagonal=1).any()), "and nothing after itself"
+
+
+def test_only_the_valid_codebooks_are_written():
+    """`encoder_valid_num_quantizers` of the codec's 32, which is what its own `encode` keeps. The
+    other sixteen are trained weights this model never draws from, and writing them would be 33 MB
+    of a file nothing indexes."""
+
+    class _Codebook:
+        def __init__(self, tag):
+            self.embed = torch.full((3, 2), float(tag))
+
+    class _Layer:
+        def __init__(self, tag):
+            self.codebook = _Codebook(tag)
+
+    class _Rvq:
+        def __init__(self, tags):
+            self.layers = [_Layer(t) for t in tags]
+
+    class _Encoder:
+        class quantizer:
+            semantic_residual_vector_quantizer = _Rvq([0])
+            acoustic_residual_vector_quantizer = _Rvq([1, 2, 3, 4, 5])
+
+    table = _concatenated_codebooks(_Encoder, 4)
+    assert table.shape == (12, 2)
+    assert [float(table[i * 3, 0]) for i in range(4)] == [0.0, 1.0, 2.0, 3.0]
+
+
+def test_the_convolution_padding_patch_is_idempotent_and_zero():
+    """The export's correctness condition, stated as code: with the patch installed every Mimi
+    convolution reports zero extra padding, whatever it is handed. That it is SOUND is a claim about
+    the driver trimming to whole frames, and only a real checkpoint can check that -- what belongs
+    here is that the patch applies once and actually returns zero."""
+    mimi = pytest.importorskip("transformers.models.mimi.modeling_mimi")
+    install_encoder_patches(mimi)
+    install_encoder_patches(mimi)          # twice: the second must not stack another wrapper
+
+    class _Conv:
+        _get_extra_padding_for_conv1d = mimi.MimiConv1d._get_extra_padding_for_conv1d
+
+    assert int(_Conv()._get_extra_padding_for_conv1d(torch.zeros(1, 1, 7331))) == 0
+    assert mimi.create_causal_mask(config=None, input_embeds=None,
+                                   attention_mask=torch.zeros(1, 1, 4, 4),
+                                   cache_position=None, past_key_values=None,
+                                   position_ids=None).shape == (1, 1, 4, 4)
