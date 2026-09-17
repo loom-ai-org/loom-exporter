@@ -315,6 +315,209 @@ class _PrefillEmbedWrapper(nn.Module):
         return prefill, schedule
 
 
+def install_encoder_patches(mimi_modeling) -> None:
+    """The two class-level rewrites the reference ENCODER needs to trace. Both are exact, and both
+    are the same failures other families in this zoo have already paid for.
+
+    **`_get_extra_padding_for_conv1d` becomes zero, which is a claim about the CALLER.** Mimi pads
+    each convolution by `ideal_length - length`, an amount derived from the input length -- the
+    dynamic-pad shape coremltools refuses outright (`encodec_export.ENCODEC_BLOCKERS`, and
+    [Retro-005](../retros/retro-005-supertonic-fixed-text-length.md) before it). It dissolved for the
+    12 Hz DECODER because every convolution there has stride 1; it does not dissolve here, because
+    this stack strides by 4, 5, 6, 8 and then 2. What makes it constant instead is the driver: a
+    waveform trimmed to a whole number of 1920-sample frames leaves every one of the fifteen
+    convolutions with exactly zero extra padding. That is proved from the real modules rather than
+    argued -- `tests/ci/test_qwen3_tts_export.py` re-derives it, with a partial frame as the arm that
+    must NOT be zero, and it is non-zero at three of the fifteen.
+
+    **`create_causal_mask` yields to a prepared mask**, which is [ADR-019]'s rule one model over.
+    `MimiTransformerModel` builds its sliding-window mask from `hidden_states.shape[1]` and a
+    `cache_position` it derives from the same number, so a trace bakes the traced length into the
+    mask and the export answers correctly at that length and at no other. A 4-D mask handed in is
+    returned unchanged; anything else falls through to the original, so a caller that wants the
+    stock behaviour still gets it.
+    """
+    if getattr(mimi_modeling, "_loom_encoder_patched", False):
+        return
+
+    def no_extra_padding(self, hidden_states):
+        return torch.tensor(0, dtype=torch.int64, device=hidden_states.device)
+
+    mimi_modeling.MimiConv1d._get_extra_padding_for_conv1d = no_extra_padding
+
+    original = mimi_modeling.create_causal_mask
+
+    def prepared_or_original(**kwargs):
+        mask = kwargs.get("attention_mask")
+        if mask is not None and getattr(mask, "ndim", 0) == 4:
+            return mask
+        return original(**kwargs)
+
+    mimi_modeling.create_causal_mask = prepared_or_original
+    mimi_modeling._loom_encoder_patched = True
+
+
+def encoder_attention_mask(n: int) -> torch.Tensor:
+    """The encoder transformer's mask: plain causal, and the checkpoint's `sliding_window` is a trap.
+
+    `encoder_config.sliding_window` is **250** and this mask does not apply it, because the reference
+    does not either: `MimiTransformerModel` asks `create_causal_mask` for its mask, and with
+    `layer_types` unset that function returns a purely causal one -- row 273 of 274 attends to every
+    earlier row, not to the last 250. Dumped from the reference rather than reasoned about, and the
+    export that DID apply the window matched at 25 frames and 6 frames and disagreed on **67 of 2192
+    ids at 137**, which is exactly where a 274-row sequence first outruns a 250-wide window.
+
+    So the two halves of this codec genuinely differ and neither is a typo: the DECODER's transformer
+    declares `attention_type = "sliding_attention"` and is masked by
+    `audio_codec_export._qwen3_tts_sliding_causal_mask`; this one does not declare it and is not
+    windowed. What the config says is what the checkpoint was TRAINED with; what the reference
+    computes is what its published outputs are, and the second is the oracle
+    ([Retro-049](../retros/retro-049-being-more-precise-than-the-reference.md): reproduce the
+    reference, including where it is not what you expected).
+
+    The driver builds this with `loom.causal_mask(n, 0)`; this helper exists so the tests can assert
+    against the same thing the graph is handed.
+    """
+    i = torch.arange(n).view(-1, 1)
+    j = torch.arange(n).view(1, -1)
+    return torch.where(i - j >= 0, 0.0, float("-inf")).view(1, 1, n, n)
+
+
+def load_reference_encoder(model_dir: str):
+    """The codec's ENCODER, out of the same checkpoint's `speech_tokenizer/` subfolder.
+
+    `companions()` already reads that directory -- it is where the decode-half GGUF comes from -- so
+    this adds a dependency on a folder the export already required, not a new one. What it loads is
+    only `model.encoder`: a `MimiModel` with the decoder side set to None by the checkpoint's own
+    class, 39.4 M parameters and 158 MB at F32, against the talker's 3.67 GB.
+    """
+    import transformers
+    from qwen_tts.core.tokenizer_12hz import configuration_qwen3_tts_tokenizer_v2 as qwen_config
+    from qwen_tts.core.tokenizer_12hz import modeling_qwen3_tts_tokenizer_v2 as qwen_modeling
+    import transformers.models.mimi.modeling_mimi as mimi_modeling
+
+    install_encoder_patches(mimi_modeling)
+    transformers.AutoConfig.register("qwen3_tts_tokenizer_12hz",
+                                     qwen_config.Qwen3TTSTokenizerV2Config, exist_ok=True)
+    codec_dir = Path(model_dir) / "speech_tokenizer"
+    if not (codec_dir / "config.json").exists():
+        raise FileNotFoundError(
+            f"{codec_dir} has no config.json. ICL replays the reference clip's own codes, so the "
+            "talker's export needs the codec's encoder out of this checkpoint -- the same subfolder "
+            "`companions()` exports the decode half from."
+        )
+    codec = qwen_modeling.Qwen3TTSTokenizerV2Model.from_pretrained(
+        str(codec_dir), dtype=torch.float32, local_files_only=True).eval()
+    return codec
+
+
+def _concatenated_codebooks(encoder, n_codes: int) -> "torch.Tensor":
+    """The sixteen codebooks a reference clip is quantized against, written once, in stage order.
+
+    One semantic codebook then the first fifteen acoustic ones -- `encoder_valid_num_quantizers` of
+    the thirty-two the checkpoint carries, which is what `Qwen3TTSTokenizerV2Model.encode` keeps. The
+    rest are trained weights this model never draws from, and writing them would be 33 MB of a file
+    nothing indexes.
+
+    Concatenated for the reason the code predictor's tables are: a stage then selects its own rows
+    with a range, so one topology serves every stage. `embed` is a PROPERTY on the reference codebook
+    (`embed_sum / cluster_usage`), computed here once rather than at every call.
+    """
+    quantizer = encoder.quantizer
+    semantic = quantizer.semantic_residual_vector_quantizer
+    acoustic = quantizer.acoustic_residual_vector_quantizer
+    layers = list(semantic.layers) + list(acoustic.layers)
+    return torch.cat([layer.codebook.embed for layer in layers[:n_codes]], dim=0)
+
+class _RefEncodeWrapper(nn.Module):
+    """`(a reference waveform, its sliding-window mask) -> the rows the quantizer sees`.
+
+    The reference clip's own codes are half of what ICL replays, and this is the first three of the
+    four steps that produce them: the SEANet convolution stack, the eight-layer sliding-window
+    transformer over its output, and the downsampling convolution. The fourth step is the quantizer,
+    which is not one graph (see `_RvqDrawWrapper`).
+
+    **It is the codec's encoder inside the TALKER's file**, which is worth stating because family 11
+    deliberately exports "the DECODE half only" and this does not change that. The decoder is its own
+    GGUF because one codec serves every size and variant of the talker ([ADR-022]); this encoder has
+    exactly one caller -- the ICL prompt -- and no task of its own to be exported under, since
+    `audio-codec` is `audio_codes -> audio` and the encode direction is a different pair with no
+    family. So it rides here, next to the speaker encoder, for the same reason that one does: its
+    output feeds this model's prompt and nothing else's.
+    """
+
+    def __init__(self, encoder):
+        super().__init__()
+        self.conv = encoder.encoder
+        self.transformer = encoder.encoder_transformer
+        self.downsample = encoder.downsample
+
+    def forward(self, waveform, attention_mask):
+        hidden = self.conv(waveform.unsqueeze(1))
+        out = self.transformer(hidden.transpose(1, 2), attention_mask=attention_mask)[0]
+        return self.downsample(out.transpose(1, 2)).transpose(1, 2)
+
+
+class _RvqStepWrapper(nn.Module):
+    """`(rows, the ids just drawn, two codebooks' row ranges, a subtract switch) -> (scores, rows)`.
+
+    One residual-vector-quantizer stage: subtract the centroid the driver just chose, then score the
+    result against the next codebook. Sixteen calls of this one topology are the whole quantizer.
+
+    **The reference's `cdist` + `argmin` is a matmul and a constant row.** `argmin_j ||x - e_j||^2`
+    expands to `argmin_j (||x||^2 - 2 x.e_j + ||e_j||^2)` and `||x||^2` is the same for every j, so
+    the answer is `argmax_j (2 x.e_j - ||e_j||^2)`. That matters because `argmin` is not an op in this
+    dialect at all: reducing rows to indices is a DRIVER binding (`loom.argmax_rows`, built for
+    Conformer-CTC's frame-wise head and reused by families 10 and 12), which is what makes the loop
+    the driver's -- scores out, ids in, one call per stage.
+
+    **The codebooks are GATHERED rather than owned.** All sixteen are written once, concatenated, and
+    a stage selects its own with `loom.range(stage * 2048, 2048)` -- the device that makes the code
+    predictor one topology instead of fifteen, one family over. Owning them per stage would be
+    sixteen topologies and, because the draw and the subtraction read the same table, two copies of
+    33 MB.
+
+    **`subtract` is a switch and not a branch.** The first draw of each chain has nothing to take
+    away yet, and a graph cannot skip an op; passing 0.0 makes the subtraction an identity while
+    keeping one topology for all sixteen calls. `bos_mask`'s trick in `_IclPrefillEmbedWrapper`, one
+    phase over.
+    """
+
+    def __init__(self, codebooks):
+        super().__init__()
+        self.codebooks = nn.Embedding(codebooks.shape[0], codebooks.shape[1])
+        with torch.no_grad():
+            self.codebooks.weight.copy_(codebooks)
+
+    def forward(self, rows, prev_ids, prev_codebook, next_codebook, subtract):
+        taken = nn.functional.embedding(prev_ids.view(-1), self.codebooks(prev_codebook.view(-1)))
+        # A DIFFERENT name from the input, deliberately: coremltools refuses a program whose var is
+        # "used both as function's input and output", and `rows = rows - ...` produces exactly that.
+        residual = rows - taken.unsqueeze(0) * subtract.view(1, 1, 1)
+        embed = self.codebooks(next_codebook.view(-1))
+        scores = residual @ embed.t() * 2.0 - (embed * embed).sum(dim=-1).view(1, 1, -1)
+        return scores, residual
+
+
+class _RvqProjectWrapper(nn.Module):
+    """`rows -> one residual-vector-quantizer's input projection of them`.
+
+    Split RVQ runs two independent chains over the same features -- one semantic codebook and
+    fifteen acoustic ones -- and each has its own kernel-1 `input_proj`. A kernel-1 convolution over
+    the channel axis is a linear map on rows, so this is a matmul; it is its own phase because the
+    two chains start from the same features and diverge exactly here.
+    """
+
+    def __init__(self, rvq):
+        super().__init__()
+        self.input_proj = rvq.input_proj
+
+    def forward(self, rows):
+        if self.input_proj is None:
+            return rows
+        return self.input_proj(rows.transpose(1, 2)).transpose(1, 2)
+
+
 class _IclPrefillEmbedWrapper(nn.Module):
     """`(role ids, the interleaved id stream, the reference's codes, ...) -> (prompt, text schedule)`.
 
@@ -347,9 +550,10 @@ class _IclPrefillEmbedWrapper(nn.Module):
     the driver offsets once, on the way in, exactly as it un-offsets once on the way out.
     """
 
-    def __init__(self, talker, config, embeddings):
+    def __init__(self, talker, config, embeddings, n_groups):
         super().__init__()
         self.talker = talker
+        self.n_groups = int(n_groups)
         self.codec_embedding = talker.get_input_embeddings()
         self.predictor_embedding = nn.Embedding(embeddings.shape[0], embeddings.shape[1])
         with torch.no_grad():
@@ -377,8 +581,20 @@ class _IclPrefillEmbedWrapper(nn.Module):
         body = torch.cat([pad_e.expand(-1, codec_in.shape[1] - 2, -1), bos_e], dim=1) + codec_in[:, :-1]
         head = torch.cat([self._text(role_ids), body], dim=1)
 
-        replay = (self.codec_embedding(ref_code[:, :, 0])
-                  + self.predictor_embedding(ref_code[:, :, 1:]).sum(dim=2))
+        # **`ref_code` is GROUP-major, and the layout is what makes the gather legal.**
+        # `ggml_get_rows` asserts `a->ne[2] == b->ne[1]`: against a 2-D table the ids have to be a
+        # contiguous run. Frame-major `[1, C, 16]` looks right and is not -- slicing group g out of it
+        # is a STRIDED view, which the exporter lowers to `VIEW(shape=[1, n_codes, 1])`, and that
+        # aborts the process inside ggml with a raw `GGML_ASSERT` after the export, the write and the
+        # load have all succeeded. Group-major `[16, C]` makes each group a contiguous ROW, the view
+        # rank 1, and the assertion trivially true. The driver transposes on the way in, once.
+        #
+        # The loop is unrolled because the group count is a property of the CHECKPOINT rather than of
+        # the input -- family 11's RVQ loop is the same fact.
+        replay = self.codec_embedding(ref_code[0])
+        for group in range(1, self.n_groups):
+            replay = replay + self.predictor_embedding(ref_code[group])
+        replay = replay.unsqueeze(0)
         # `codec_in[:, -1:]` IS `codec_bos`'s embedding -- the second row of `codec_tail` -- so the
         # first replay row is selected rather than looked up a second time.
         replay = replay * (1.0 - bos_mask) + codec_in[:, -1:] * bos_mask
@@ -567,6 +783,11 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
     _sample_rate: Optional[int] = None
     _tts_pad_id: Optional[int] = None
     _tts_eos_id: Optional[int] = None
+    _encoder: Optional[object] = None
+    _ref_codes: Optional[int] = None
+    _conv_stride: Optional[int] = None
+    _encode_stride: Optional[int] = None
+    _ref_codebook: Optional[int] = None
 
     __unchecked__ = {
         "model_dir": Unchecked("path to the HF directory; `load_model` raises on anything it cannot "
@@ -595,6 +816,15 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
                                  "driver pads the interleaved text stream with"),
         "_tts_eos_id": Unchecked("read off config.tts_eos_token_id by load_model; the id that "
                                  "terminates it"),
+        "_encoder": Unchecked("the codec's encoder, loaded from speech_tokenizer/ by load_model"),
+        "_ref_codes": Unchecked("encoder_valid_num_quantizers -- how many of the codec's 32 "
+                                "codebooks the talker's prompt replays"),
+        "_conv_stride": Unchecked("the encode convolution stack's total stride, read off the real "
+                                  "modules by load_model rather than assumed from the config"),
+        "_encode_stride": Unchecked("samples per codec frame: the convolution stride times the "
+                                    "downsampling convolution's own"),
+        "_ref_codebook": Unchecked("the CODEC's codebook size, read off its own quantizer; not the "
+                                   "code predictor's, which is a different 2048"),
     }
 
     def load_model(self):
@@ -637,6 +867,22 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
         self._sample_rate = int(model.config.speaker_encoder_config.sample_rate)
         self._tts_pad_id = int(model.config.tts_pad_token_id)
         self._tts_eos_id = int(model.config.tts_eos_token_id)
+
+        codec = load_reference_encoder(self.model_dir)
+        self._encoder = codec.encoder
+        self._ref_codes = int(codec.encoder_valid_num_quantizers)
+        self._encode_stride = int(codec.encode_downsample_rate)
+        # Derived from the real module rather than from the config's own number: the convolution
+        # stack's stride is the frame rate divided by the downsampling convolution's stride, and it
+        # is the ratio the `ref_encode` phase declares between its waveform and its rows.
+        self._conv_stride = self._encode_stride // int(codec.encoder.downsample.conv.stride[0])
+        self._ref_codebook = int(
+            codec.encoder.quantizer.semantic_residual_vector_quantizer.layers[0].codebook.embed.shape[0])
+        if self._ref_codes != self._n_code_groups:
+            raise ValueError(
+                f"the codec encodes {self._ref_codes} codebooks and the talker consumes "
+                f"{self._n_code_groups}; ICL replays one row per reference frame, so the two must "
+                "agree")
         self._model = model
         return model
 
@@ -661,6 +907,10 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
             "n_text_ctx": self.max_text_len,
             "n_codes_ctx": self.max_frames,
             "sample_rate": self._sample_rate,
+            # ICL's own geometry, declared because a caller cannot derive it: a reference clip is
+            # consumed in whole codec frames of this many samples, and the driver trims to a multiple
+            # of it. The capability is declared by the EXPORT rather than assumed by the host.
+            "ref_audio.frame_stride": self._encode_stride,
         }
         hparams.update({f"sampling.{k}": v for k, v in read_sampling_defaults(self.model_dir).items()})
         # Not in `read_sampling_defaults`' three, and load-bearing here -- see `_generation_value`.
@@ -715,6 +965,22 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
         # The ICL replay: one row per reference frame plus `codec_bos`, capped by the same cache the
         # talker's own axis is capped by -- a reference clip and the speech after it share one KV.
         replay_dim = ct.RangeDim(2, self.max_frames)
+        # The reference clip, in three linked extents: samples, the convolution stack's output rows,
+        # and the frames left after the /2 downsample. One `RangeDim` instance per phase, because
+        # each is that phase's own root and the driver passes it explicitly.
+        max_rows = self.max_ref_seconds * self._sample_rate // self._conv_stride
+        conv_rows = ct.RangeDim(2, max_rows)
+        rows_samples = ct.RangeDim(2 * self._conv_stride, max_rows * self._conv_stride)
+        frames_dim2 = ct.RangeDim(1, self.max_frames)
+        frames_dim3 = ct.RangeDim(1, self.max_frames)
+        frames_dim4 = ct.RangeDim(1, self.max_frames)
+        encoder = self._encoder
+        quantizer = encoder.quantizer
+        semantic = quantizer.semantic_residual_vector_quantizer
+        acoustic = quantizer.acoustic_residual_vector_quantizer
+        latent_dim = int(encoder.config.hidden_size)
+        codebooks = _concatenated_codebooks(encoder, self._ref_codes)
+        codebook_size, code_dim = self._ref_codebook, int(codebooks.shape[1])
         schedule_dim = ct.RangeDim(1, self.max_text_len)
         rows_dim = ct.RangeDim(1, groups - 2)
 
@@ -745,11 +1011,69 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
                 ],
             ),
             ExportPhase(
+                name="ref_encode",
+                wrapper=_RefEncodeWrapper(encoder).eval(),
+                dummy_inputs=(torch.zeros((1, 8 * self._encode_stride)),
+                              encoder_attention_mask(8 * 2)),
+                mil_inputs=[
+                    ct.TensorType(name="waveform", shape=(1, rows_samples), dtype=np.float32),
+                    ct.TensorType(name="attention_mask", shape=(1, 1, conv_rows, conv_rows),
+                                  dtype=np.float32),
+                ],
+                # `n_enc_frames` in `axes.py`'s own sense -- encoder output frames, here the rows
+                # the transformer runs over, before the downsampling convolution halves them into
+                # codec frames. The vocabulary is a closed enum on purpose and this is one of its
+                # names, not a per-model symbol.
+                root_axis="n_enc_frames",
+                # The waveform is not a second dynamic quantity -- it is this one times the
+                # convolution stack's total stride. Declared rather than shared, because the two
+                # axes differ by a factor and `_validate_input_axes` would otherwise (rightly) call
+                # them two roots. Kokoro's vocoder declares its four inputs the same way.
+                declared_axes={"waveform": {1: f"{self._conv_stride}*n_enc_frames"}},
+            ),
+            ExportPhase(
+                name="rvq_project_semantic",
+                wrapper=_RvqProjectWrapper(semantic).eval(),
+                dummy_inputs=(torch.zeros((1, 4, latent_dim)),),
+                mil_inputs=[ct.TensorType(name="rows", shape=(1, frames_dim2, latent_dim),
+                                          dtype=np.float32)],
+                root_axis="n_codes",
+            ),
+            ExportPhase(
+                name="rvq_project_acoustic",
+                wrapper=_RvqProjectWrapper(acoustic).eval(),
+                dummy_inputs=(torch.zeros((1, 4, latent_dim)),),
+                mil_inputs=[ct.TensorType(name="rows", shape=(1, frames_dim3, latent_dim),
+                                          dtype=np.float32)],
+                root_axis="n_codes",
+            ),
+            ExportPhase(
+                name="rvq_step",
+                wrapper=_RvqStepWrapper(codebooks).eval(),
+                dummy_inputs=(torch.zeros((1, 4, code_dim)),
+                              torch.zeros((1, 4), dtype=torch.long),
+                              torch.arange(codebook_size, dtype=torch.long),
+                              torch.arange(codebook_size, dtype=torch.long),
+                              torch.zeros(1)),
+                mil_inputs=[
+                    ct.TensorType(name="rows", shape=(1, frames_dim4, code_dim), dtype=np.float32),
+                    # One id per frame, so the SAME `RangeDim` instance as `rows`: the driver hands
+                    # back exactly what `loom.argmax_rows` returned, and on the first call of a chain
+                    # a run of zeros that `subtract` then multiplies away.
+                    ct.TensorType(name="prev_ids", shape=(1, frames_dim4), dtype=np.int32),
+                    # Static: a codebook is 2048 rows wherever it sits in the concatenated table.
+                    ct.TensorType(name="prev_codebook", shape=(codebook_size,), dtype=np.int32),
+                    ct.TensorType(name="next_codebook", shape=(codebook_size,), dtype=np.int32),
+                    ct.TensorType(name="subtract", shape=(1,), dtype=np.float32),
+                ],
+                root_axis="n_codes",
+            ),
+            ExportPhase(
                 name="prefill_embed_icl",
-                wrapper=_IclPrefillEmbedWrapper(talker, model.config, embeddings).eval(),
+                wrapper=_IclPrefillEmbedWrapper(talker, model.config, embeddings, groups).eval(),
                 dummy_inputs=(torch.zeros((1, 3), dtype=torch.long),
                               torch.zeros((1, 12), dtype=torch.long),
-                              torch.zeros((1, 12, groups), dtype=torch.long),
+                              torch.zeros((groups, 12), dtype=torch.long),
                               torch.zeros((1, 12, 1)),
                               torch.zeros((1, 5), dtype=torch.long),
                               probe_lang, probe_spk),
@@ -760,16 +1084,18 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
                     # count. Three instances would be three symbols and `_validate_input_axes` would
                     # (rightly) refuse the topology.
                     ct.TensorType(name="icl_text_ids", shape=(1, replay_dim), dtype=np.int32),
-                    ct.TensorType(name="ref_code", shape=(1, replay_dim, groups), dtype=np.int32),
+                    ct.TensorType(name="ref_code", shape=(groups, replay_dim), dtype=np.int32),
                     ct.TensorType(name="bos_mask", shape=(1, replay_dim, 1), dtype=np.float32),
                     ct.TensorType(name="schedule_ids", shape=(1, schedule_dim), dtype=np.int32),
                     ct.TensorType(name="language_id", shape=(1,), dtype=np.int32),
                     ct.TensorType(name="x_vector", shape=(1, hidden_size), dtype=np.float32),
                 ],
-                root_axis="n_tokens",
-                # The trailing text is genuinely independent of the replay's length: one is what the
-                # target sentence had left over, the other is how long the reference clip was.
-                declared_axes={"schedule_ids": {1: "n_schedule"}},
+                # The replay is one row per reference CODEC FRAME plus `codec_bos`, so `n_codes`;
+                # the trailing text is genuinely independent of it -- one is what the target sentence
+                # had left over, the other is how long the reference clip was -- so it is declared,
+                # as `n_tokens`, which is what it counts.
+                root_axis="n_codes",
+                declared_axes={"schedule_ids": {1: "n_tokens"}},
             ),
             ExportPhase(
                 name="talker",
@@ -895,6 +1221,15 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
                 # The two ids the driver pads and terminates the interleaved stream with.
                 "TTS_PAD_ID": self._tts_pad_id or 0,
                 "TTS_EOS_ID": self._tts_eos_id or 0,
+                # The reference clip's own geometry. `ENCODE_STRIDE` is samples per codec frame and
+                # is also the trim the export's zero-padding claim depends on; `CONV_STRIDE` is the
+                # convolution stack's own, which is the ratio `ref_encode` declares.
+                "ENCODE_STRIDE": self._encode_stride or 0,
+                "CONV_STRIDE": self._conv_stride or 0,
+                "REF_SAMPLE_RATE": self._sample_rate or 0,
+                # The CODEC's codebook, which is not `CODEBOOK_SIZE` above -- that one is the code
+                # predictor's. They are both 2048 in this checkpoint and they are different numbers.
+                "REF_CODEBOOK": self._ref_codebook or 0,
                 # The checkpoint's own decoding defaults as the driver's `or`-fallbacks -- the same
                 # numbers `hparams()` writes for the host, rendered twice from one attribute set.
                 "TEMPERATURE": sampling.get("temperature", 0.0),
@@ -914,7 +1249,8 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
                        "MAX_NEW_TOKENS", "DEFAULT_LANGUAGE_ID", "TEMPERATURE", "TOP_K", "TOP_P",
                        "REPETITION_PENALTY", "SUB_TEMPERATURE", "SUB_TOP_K", "SUB_TOP_P",
                        "ICL_HEAD_LEN", "TEXT_HEAD", "TEXT_TAIL", "REF_HEAD", "REF_TAIL",
-                       "TTS_PAD_ID", "TTS_EOS_ID"),
+                       "TTS_PAD_ID", "TTS_EOS_ID", "ENCODE_STRIDE", "CONV_STRIDE",
+                       "REF_SAMPLE_RATE", "REF_CODEBOOK"),
                 defines=("_codes",),
             ),
             DriverReturn(values=("_codes",)),
