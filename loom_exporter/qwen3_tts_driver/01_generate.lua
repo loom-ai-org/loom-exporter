@@ -10,23 +10,92 @@
         _spk = {from = 'speaker_encoder'}
     end
 
-    -- The prompt and the TEXT SCHEDULE, in one call. This model is streaming: only the first text
-    -- token is in the prompt, and every later one is added to a generated frame's embedding, one per
-    -- step. `schedule` is that sequence with `tts_pad` appended, so "use trailing[step] while there
-    -- is one, else pad" becomes an index rather than a branch.
+    -- This model is streaming: only the first text token is in the prompt, and every later one is
+    -- added to a generated frame's embedding, one per step. `schedule` is that sequence with
+    -- `tts_pad` appended, so "use trailing[step] while there is one, else pad" becomes an index
+    -- rather than a branch.
     local _language = inputs.language_id or DEFAULT_LANGUAGE_ID
-    loom.run_subgraph_and_retain('prefill_embed', {n_tokens = #inputs.tokens, n_past = 0},
-        {text_ids = inputs.tokens, language_id = {_language}, x_vector = _spk})
+    local _prompt
 
-    -- The template contributes three tokens before the text and five after, and the schedule drops
-    -- the first text token (it is in the prompt) and appends `tts_eos` and `tts_pad`. So its row
-    -- count is `#tokens - 9 + 2`, and the driver needs it only to clamp the index at the end.
-    local _rows = #inputs.tokens - 7
+    -- THE PROMPT, in one of two modes. `x_vector_only` is ten rows and constant; ICL is nine rows
+    -- plus the REFERENCE utterance replayed -- its transcript on the text stream, its codec frames on
+    -- the codec stream, summed row for row -- which is how the model is shown a voice rather than
+    -- told about one. Both modes carry the x-vector; ICL is the nested arm, not the alternative.
+    --
+    -- **The reference picks the shorter of the two streams and slices the other by its length.** Both
+    -- lengths are known here -- one is a token count, the other a frame count -- so this driver does
+    -- that arithmetic and the graph does none of it: `_icl_text` comes out exactly as long as the
+    -- replay and `_schedule` is already the remainder.
+    local _prefill_len, _rows
+    if inputs.ref_code then
+        -- `math.floor`, because Lua's `/` is float division and these two numbers become an axis
+        -- extent and a loop bound.
+        local _n_ref = math.floor(#inputs.ref_code / N_GROUPS)
+        local _n_replay = _n_ref + 1
 
-    loom.run_subgraph_and_retain('talker', {n_tokens = PREFILL_LEN, n_past = 0},
-        {inputs_embeds = {from = 'prefill_embed', index = 1},
-         position_ids = loom.range(0, PREFILL_LEN),
-         attention_mask = loom.causal_mask(PREFILL_LEN, 0)})
+        -- The interleaved id stream: the reference transcript, the target text, then `tts_eos`.
+        -- Both are stripped of their own template, which is `ref_ids[:, 3:-2]` and
+        -- `input_id[:, 3:-5]` in the reference implementation.
+        local _stream = {}
+        for _i = REF_HEAD + 1, #inputs.ref_tokens - REF_TAIL do
+            _stream[#_stream + 1] = inputs.ref_tokens[_i]
+        end
+        for _i = TEXT_HEAD + 1, #inputs.tokens - TEXT_TAIL do
+            _stream[#_stream + 1] = inputs.tokens[_i]
+        end
+        _stream[#_stream + 1] = TTS_EOS_ID
+
+        -- Cut it where the replay ends: what fits is the prompt's text half, what is left is the
+        -- schedule. A stream shorter than the replay is padded, which is the reference's other arm.
+        local _icl_text, _schedule = {}, {}
+        for _i = 1, _n_replay do
+            _icl_text[_i] = _stream[_i] or TTS_PAD_ID
+        end
+        for _i = _n_replay + 1, #_stream do
+            _schedule[#_schedule + 1] = _stream[_i]
+        end
+        if #_schedule == 0 then _schedule[1] = TTS_PAD_ID end
+
+        -- The codes, offset into the merged predictor table exactly as a drawn frame's are, with a
+        -- leading row of zeros where `codec_bos` goes -- `bos_mask` selects it, so the replay needs
+        -- no concatenation and no second symbol for the sake of one row.
+        local _codes_in, _mask = {}, {}
+        for _g = 1, N_GROUPS do _codes_in[_g] = 0 end
+        _mask[1] = 1.0
+        for _f = 0, _n_ref - 1 do
+            local _base = _f * N_GROUPS
+            _codes_in[#_codes_in + 1] = inputs.ref_code[_base + 1]
+            for _g = 1, N_GROUPS - 1 do
+                _codes_in[#_codes_in + 1] = inputs.ref_code[_base + _g + 1] + (_g - 1) * CODEBOOK_SIZE
+            end
+            _mask[#_mask + 1] = 0.0
+        end
+
+        local _role = {}
+        for _i = 1, TEXT_HEAD do _role[_i] = inputs.tokens[_i] end
+
+        loom.run_subgraph_and_retain('prefill_embed_icl',
+            {n_tokens = _n_replay, n_schedule = #_schedule, n_past = 0},
+            {role_ids = _role, icl_text_ids = _icl_text, ref_code = _codes_in, bos_mask = _mask,
+             schedule_ids = _schedule, language_id = {_language}, x_vector = _spk})
+        _prefill_len = ICL_HEAD_LEN + _n_replay
+        _rows = #_schedule + 1
+        _prompt = 'prefill_embed_icl'
+    else
+        loom.run_subgraph_and_retain('prefill_embed', {n_tokens = #inputs.tokens, n_past = 0},
+            {text_ids = inputs.tokens, language_id = {_language}, x_vector = _spk})
+        -- The template contributes three tokens before the text and five after, and the schedule
+        -- drops the first text token (it is in the prompt) and appends `tts_eos` and `tts_pad`. So
+        -- its row count is `#tokens - 9 + 2`, and the driver needs it only to clamp the index.
+        _prefill_len = PREFILL_LEN
+        _rows = #inputs.tokens - 7
+        _prompt = 'prefill_embed'
+    end
+
+    loom.run_subgraph_and_retain('talker', {n_tokens = _prefill_len, n_past = 0},
+        {inputs_embeds = {from = _prompt, index = 1},
+         position_ids = loom.range(0, _prefill_len),
+         attention_mask = loom.causal_mask(_prefill_len, 0)})
 
     if inputs.seed then loom.seed_rng(inputs.seed) end
     local _temperature = inputs.temperature or TEMPERATURE
@@ -105,9 +174,9 @@
         if _schedule_row > _rows - 1 then _schedule_row = _rows - 1 end
         loom.run_subgraph_and_retain('frame_embed', {n_tokens = _rows, n_past = 0},
             {codes = _frame, schedule_row = {_schedule_row},
-             schedule = {from = 'prefill_embed', index = 2}})
-        loom.run_subgraph_and_retain('talker', {n_tokens = 1, n_past = PREFILL_LEN + _step},
+             schedule = {from = _prompt, index = 2}})
+        loom.run_subgraph_and_retain('talker', {n_tokens = 1, n_past = _prefill_len + _step},
             {inputs_embeds = {from = 'frame_embed'},
-             position_ids = loom.range(PREFILL_LEN + _step, 1),
-             attention_mask = loom.causal_mask(1, PREFILL_LEN + _step)})
+             position_ids = loom.range(_prefill_len + _step, 1),
+             attention_mask = loom.causal_mask(1, _prefill_len + _step)})
     end
