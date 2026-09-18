@@ -401,6 +401,15 @@ _NOT_SPECS = {
                                      "checkpoint, so there is nothing to check one against. The path "
                                      "is validated by the only thing that can: `detect()` refuses it "
                                      "if no recognizer claims it",
+    "exporter.WeightPacking": "a RECORD of what `pack_weights` did -- which GGML type each weight "
+                              "became and how many bytes that saved. Every field is an output of the "
+                              "packing, so checking one against the model it came from is circular, "
+                              "the same argument ModularExportResult is here for. What holds it is "
+                              "the artifact: tests/gate's byte-identity snapshot",
+    "phase_conversion.PhaseResult": "a converted phase's outputs -- its topologies, its packed weights "
+                                   "and the fused geometry read off its program. Same category as "
+                                   "ModularExportResult, and produced by the same kind of call: it is "
+                                   "what a conversion RETURNED, not what anything declared",
     "spm_tokenizer_export.HfIdLayout": "a READ of a checkpoint's own tokenizer.json -- every field is "
                                        "transcribed from that file, so there is no second authority "
                                        "to check one against. It is the authority, and what it is the "
