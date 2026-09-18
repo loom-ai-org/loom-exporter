@@ -1,7 +1,10 @@
+import hashlib
 import json
 import math
 import re
 import os
+from dataclasses import dataclass, field
+
 import numpy as np
 import sympy
 from coremltools.converters.mil.mil import Block, Function, Operation, Var
@@ -56,6 +59,11 @@ def _binding_kind(name: str, noise_inputs=(), defaulted_inputs=()) -> str:
     return CALLER
 
 
+#: How much of a tensor `_payload_digest` reads at a time. 8 MiB: large enough that the per-chunk
+#: overhead is noise against a multi-GB weight set, small enough that a memmapped spill stays paged.
+_DIGEST_CHUNK_BYTES = 8 << 20
+
+
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, (np.integer, np.int32, np.int64)):
@@ -65,6 +73,74 @@ class NumpyEncoder(json.JSONEncoder):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         return super().default(obj)
+
+
+def _payload_digest(array: np.ndarray) -> str:
+    """The content address of one tensor's on-disk payload: its dtype and shape, then its bytes.
+
+    Streamed in chunks rather than hashed as one `tobytes()`, which is not a micro-optimisation
+    (BACKLOG.md P5.0): under `--isolate-phases` a weight reaching here is a `np.memmap` over a phase's
+    spill file, and `tobytes()` would fault the whole tensor into anonymous memory to hash it -- the
+    exact cost the spill exists to avoid, paid one tensor at a time instead of all at once. A chunked
+    read leaves the pages evictable.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(str(array.dtype).encode("ascii"))
+    hasher.update(str(array.shape).encode("ascii"))
+    flat = np.ascontiguousarray(array).reshape(-1).view(np.uint8)
+    for start in range(0, flat.size, _DIGEST_CHUNK_BYTES):
+        hasher.update(flat[start:start + _DIGEST_CHUNK_BYTES].tobytes())
+    return hasher.hexdigest()
+
+
+@dataclass
+class WeightPacking:
+    """What `pack_weights` did, and -- via `raw_dtypes` -- which names it has already done it to.
+
+    **Why this is a record rather than local variables in `write_gguf`** (BACKLOG.md P5.0). Packing
+    used to happen once, over the merged weight dict, at write time; a multi-phase export therefore
+    carried every phase's weights at full F32 width from the moment that phase converted until the
+    last one had, which is a sum over phases of the quantity the export is trying to bound. Packing is
+    per-phase now, so the counters a caller sees at the end are accumulated from N packings rather
+    than computed in one, and `raw_dtypes` is what makes a second pack over an already-packed weight a
+    no-op instead of a quantization of quantized bytes.
+
+    `raw_dtypes` is keyed by every packed name (value `None` for one left in its float form), so
+    membership -- not truthiness -- is the "already packed" test.
+    """
+
+    #: {weight name: the GGML type it was packed to, or None if it was left as-is}. Its KEYS are the
+    #: packed set; `write_gguf` reads the values back as `add_tensor`'s `raw_dtype`.
+    raw_dtypes: dict = field(default_factory=dict)
+    n_folded: int = 0
+    #: Eligible by OP and declined for SHAPE -- a different question from `n_folded` and reported
+    #: separately, because merging the two is what made the original cause unfindable. See
+    #: `_fold_conv_kernels_for_quantization`.
+    n_declined_shape: int = 0
+    #: Bytes, not just tensor counts, because the count answers the wrong question. A convolutional
+    #: model can report "44 tensor(s) quantized" and have shrunk by a fifth, since the weights that
+    #: dominate it are conv kernels and those were not eligible -- see `_collect_mul_mat_weight_names`.
+    #: What tells a caller that is the FRACTION of the file that actually moved, which is these three.
+    quantized_bytes_before: int = 0
+    quantized_bytes_after: int = 0
+    float_bytes_total: int = 0
+
+    @property
+    def n_quantized(self) -> int:
+        return sum(1 for qtype in self.raw_dtypes.values() if qtype is not None)
+
+    def absorb(self, other: "WeightPacking") -> "WeightPacking":
+        """Fold a phase's packing into this one. Names cannot collide -- every multi-phase weight
+        carries its own phase's `{func_name}.` prefix, which `MultiPhase.export` re-checks against the
+        merged topologies rather than trusting."""
+        self.raw_dtypes.update(other.raw_dtypes)
+        self.n_folded += other.n_folded
+        self.n_declined_shape += other.n_declined_shape
+        self.quantized_bytes_before += other.quantized_bytes_before
+        self.quantized_bytes_after += other.quantized_bytes_after
+        self.float_bytes_total += other.float_bytes_total
+        return self
+
 
 class LoomGGUFExporter:
     # A mapping from standard/custom MIL op_types to Loom's C++ register_op primitives.
@@ -165,6 +241,11 @@ class LoomGGUFExporter:
         # the only thing the torch module's own tensors are still shared with, so keeping one program
         # per phase pinned every phase's weights twice over for the sake of these few integers.
         self.phase_geometry = {}
+        # What `pack_weights` has already turned into on-disk bytes, and the counters the export
+        # reports at the end. A multi-phase export packs each phase as it converts and hands the
+        # phase's packing to the output exporter's (`absorb`), so this is either one packing or a sum
+        # of N -- and either way it is what `write_gguf` reads `add_tensor`'s `raw_dtype` out of.
+        self.packing = WeightPacking()
         # {declared input name: window}, filled by `_route_windowed_masks` as each topology is
         # generated and read by the driver assembly, which is what turns a synthesized mask input into
         # a `loom.causal_mask(n_tokens, n_past, window)` call (BACKLOG.md P4.0.11a).
@@ -2935,9 +3016,105 @@ class LoomGGUFExporter:
         else:
             raise NotImplementedError(f"_write_tokenizer: no vocab writer for tokenizer family {family!r}")
 
+    def pack_weights(self) -> WeightPacking:
+        """Turn every not-yet-packed entry of `self.weights` into the exact array that will be written
+        -- dtype-normalised, conv kernels folded, eligible tensors quantized -- and record what each one
+        became in `self.packing`. Idempotent: a name already in `self.packing.raw_dtypes` is skipped.
+
+        **Why this is separable from `write_gguf` at all** (BACKLOG.md P5.0's second change). Nothing
+        here needs the file, the writer or the driver; it needs this exporter's weights and the
+        topologies that decide their eligibility. Both of those exist for a multi-phase model the
+        moment a phase has converted, which is roughly a `1 / n_phases` fraction of the way through the
+        export -- and the F32 arrays this replaces were being carried, at full width, from then until
+        the last phase had converted too. On Granite-Speech that is a 8.75 GB artifact's worth of
+        weights, and at Q8_0 packing them as they arrive is the difference between carrying that and
+        carrying a quarter of it.
+
+        **What makes a per-phase answer equal to the merged one.** Both gates -- `name in quantizable`
+        and the fold's `usage[name] == {(op, 0)}` -- are read off *every* topology in `self.topologies`,
+        so a per-phase exporter answers them from one phase's topology and could in principle differ
+        from the merged answer. It cannot, because a multi-phase export leaves `flat_namespace` False
+        and every weight is therefore written as `{func_name}.{weight}`: two phases cannot name the same
+        tensor, so no other phase's topology can have an opinion about this phase's weights. That is an
+        invariant rather than a coincidence, so `MultiPhase.export` checks it against the merged
+        topologies instead of trusting it -- see `_check_phase_weight_namespaces`.
+
+        Pruning is deliberately NOT part of this. `_prune_dead_weights` drops names no node references,
+        and `write_gguf` adds the driver's own `loom.get_weight` tensors immediately after it for
+        exactly that reason; running it here would put the two in the wrong order for an export that
+        packs early.
+        """
+        pending = [name for name in self.weights if name not in self.packing.raw_dtypes]
+        if not pending:
+            return self.packing
+
+        packing = WeightPacking()
+        # Resolved before the loop rather than beside it, because the FOLD rewrites topology nodes and
+        # `self.weights` both, and the topologies are serialized into the file well before any of this
+        # is written. `quantizable` is unaffected by the fold either way -- it is read off node INPUTS,
+        # which the fold does not touch.
+        qtype = None
+        quantizable = set()
+        block_size = 1
+        if self.quantize:
+            from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
+            qtype = GGMLQuantizationType[self.quantize]
+            block_size, _ = GGML_QUANT_SIZES[qtype]
+            quantizable = self._collect_mul_mat_weight_names()
+            # Already-packed kernels are skipped by the fold on their own terms: a quantized array is
+            # uint8 blocks, which its `np.issubdtype(..., np.floating)` gate declines. So this counts
+            # only what THIS packing folded, which is what `absorb` then sums.
+            packing.n_folded = self._fold_conv_kernels_for_quantization(block_size)
+
+        for name in pending:
+            array = self.weights[name]
+            if array.dtype == bool or array.dtype == np.bool_:
+                array = array.astype(np.int32)
+            elif np.issubdtype(array.dtype, np.floating):
+                # `copy=False` so an array that is ALREADY F32 -- which is nearly all of them, since
+                # `ct.convert` runs at `compute_precision=FLOAT32` -- is not duplicated to be left
+                # unchanged. The cast used to be inside `write_gguf`'s own loop and copied every time;
+                # for a multi-GB weight set that is a second copy of the largest tensor, transiently,
+                # at the point of the export where the least headroom is left (BACKLOG.md P5.0).
+                # Nothing downstream mutates a packed array in place -- the fold reshapes (a view),
+                # quantization allocates, and `GGUFWriter` only reads -- so sharing is safe.
+                array = array.astype(np.float32)
+            elif array.dtype == np.int64:
+                array = array.astype(np.int32)
+            elif not np.issubdtype(array.dtype, np.number):
+                # Not a tensor a GGUF can carry. Dropped rather than skipped-at-write-time, so that the
+                # packed dict IS the set of tensors the file will hold and nothing downstream has to
+                # re-apply this test.
+                del self.weights[name]
+                continue
+
+            # Only MUL_MAT weight tensors are quantized (matching llama.cpp's own convention: norm/bias
+            # 1D tensors have negligible size benefit and real accuracy cost). Tensors whose last
+            # (fastest-varying) dimension isn't block-aligned are left F32 rather than erroring, same
+            # graceful behavior as the standalone quantize_gguf_q8_0.py POC.
+            eligible_by_op = qtype is not None and name in quantizable and array.dtype == np.float32
+            aligned = array.ndim >= 2 and array.shape[-1] % block_size == 0
+            if eligible_by_op and not aligned:
+                packing.n_declined_shape += 1
+            if eligible_by_op and aligned:
+                from gguf import quants
+                array_to_write = quants.quantize(np.ascontiguousarray(array), qtype)
+                raw_dtype = qtype
+                packing.quantized_bytes_before += array.nbytes
+                packing.quantized_bytes_after += array_to_write.nbytes
+            else:
+                array_to_write = array
+                raw_dtype = None
+            if array.dtype == np.float32:
+                packing.float_bytes_total += array.nbytes
+
+            self.weights[name] = array_to_write
+            packing.raw_dtypes[name] = raw_dtype
+
+        return self.packing.absorb(packing)
+
     def write_gguf(self, driver_script: str):
         from gguf import GGUFWriter
-        import hashlib
         import os
 
         self._prune_dead_weights()
@@ -2962,20 +3139,11 @@ class LoomGGUFExporter:
                 )
             self.weights[name] = array
 
-        # Resolved here rather than beside the weight loop that uses it, because the FOLD below
-        # rewrites topology nodes and `self.weights` both, and the topologies are serialized into the
-        # file well before that loop runs. `quantizable` is unaffected by the fold either way -- it is
-        # read off node INPUTS, which the fold does not touch.
-        qtype = None
-        quantizable = set()
-        block_size = 1
-        n_folded = 0
-        if self.quantize:
-            from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
-            qtype = GGMLQuantizationType[self.quantize]
-            block_size, _ = GGML_QUANT_SIZES[qtype]
-            quantizable = self._collect_mul_mat_weight_names()
-            n_folded = self._fold_conv_kernels_for_quantization(block_size)
+        # The on-disk form of everything not already in it, which for a single-exporter path is
+        # everything and for a multi-phase one is only the driver's own tensors above -- each phase
+        # packed its own as it converted (BACKLOG.md P5.0). It runs BEFORE the topologies are
+        # serialized a few lines down because the conv-kernel fold rewrites nodes as well as weights.
+        packing = self.pack_weights()
 
         arch = self.kwargs.get("architecture") or os.environ.get("LOOM_ARCH", "mil_model")
         w = GGUFWriter(self.output_path, f"loom-{arch}")
@@ -3083,27 +3251,6 @@ class LoomGGUFExporter:
         for submodule_name, topo in self.topologies.items():
             w.add_string(f"model.graph_topology.{submodule_name}", json.dumps(topo, cls=NumpyEncoder))
 
-        n_quantized = 0
-        # Bytes, not just tensor counts, because the count answers the wrong question. A convolutional
-        # model can report "44 tensor(s) quantized" and have shrunk by a fifth, since the weights that
-        # dominate it are conv kernels and those are not eligible -- see `_collect_mul_mat_weight_names`
-        # for why. Reporting what fraction of the file actually moved is what tells a caller that.
-        quantized_bytes_before = 0
-        quantized_bytes_after = 0
-        float_bytes_total = 0
-        # Eligible BY OP but declined afterwards, and why. The two gates are genuinely different and
-        # reporting them as one sent a reader looking for a bug in the op list when the real answer was
-        # the tensor's shape: ggml lays quantization blocks along ne[0], which for a convolution kernel
-        # is the KERNEL WIDTH (1, 3, 5 ...) and never a multiple of 32.
-        #
-        # `_fold_conv_kernels_for_quantization` (P4.13) is what answers that for the DENSE convolutions,
-        # by folding their spatial axes into ne[0] before this loop runs -- VITS went from 0 of 117 conv
-        # kernels alignable to 114. What is still counted here is what the fold declines: the depthwise
-        # forms (whose batched mul_mat the fold would break), a kernel another node also reads, and a
-        # kernel that comes out unaligned anyway. Keep the two counts separate; merging them is what
-        # made the original cause unfindable.
-        n_declined_shape = 0
-
         # Content-address weight payloads (BACKLOG.md P0.2): a split export can legitimately declare the
         # SAME weight under two different names (LFM2's tied embedding is both `prefix.module_weight` and
         # `suffix_1.module_weight` under the modular profile), and a single traced model routinely
@@ -3121,35 +3268,11 @@ class LoomGGUFExporter:
         alias_names = []
         alias_targets = []
 
-        # Quantize & write weights / tensors
-        for name, array in self.weights.items():
-            if array.dtype == bool or array.dtype == np.bool_:
-                array = array.astype(np.int32)
-            elif np.issubdtype(array.dtype, np.floating):
-                array = array.astype(np.float32)
-            elif array.dtype == np.int64:
-                array = array.astype(np.int32)
-            elif not np.issubdtype(array.dtype, np.number):
-                continue
-
-            # Only MUL_MAT weight tensors are quantized (matching llama.cpp's own convention: norm/bias
-            # 1D tensors have negligible size benefit and real accuracy cost). Tensors whose last
-            # (fastest-varying) dimension isn't block-aligned are left F32 rather than erroring, same
-            # graceful behavior as the standalone quantize_gguf_q8_0.py POC.
-            eligible_by_op = qtype is not None and name in quantizable and array.dtype == np.float32
-            if eligible_by_op and not (array.ndim >= 2 and array.shape[-1] % block_size == 0):
-                n_declined_shape += 1
-            if (eligible_by_op and array.ndim >= 2 and array.shape[-1] % block_size == 0):
-                from gguf import quants
-                array_to_write = quants.quantize(np.ascontiguousarray(array), qtype)
-                raw_dtype = qtype
-                quantized_bytes_before += array.nbytes
-                quantized_bytes_after += array_to_write.nbytes
-            else:
-                array_to_write = array
-                raw_dtype = None
-            if array.dtype == np.float32:
-                float_bytes_total += array.nbytes
+        # Write weights / tensors. Everything here is already in its on-disk form -- see
+        # `pack_weights`, which is where the dtype normalisation, the fold and the quantization moved
+        # to so that a multi-phase export need not carry N phases of F32 arrays at once.
+        for name, array_to_write in self.weights.items():
+            raw_dtype = packing.raw_dtypes[name]
 
             # The dtype+shape tag guards against two same-bytes-different-meaning collisions a pure byte
             # hash would miss: an all-zero I32 array vs an all-zero F32 array of the same byte length,
@@ -3158,11 +3281,7 @@ class LoomGGUFExporter:
             # for different consumers, and aliasing them would silently hand one consumer the other's
             # shape, not just its bytes. Two names only ever become aliases of each other when the
             # tensor a consumer would see -- shape, dtype, AND data -- is indistinguishable either way.
-            hasher = hashlib.sha256()
-            hasher.update(str(array_to_write.dtype).encode("ascii"))
-            hasher.update(str(array_to_write.shape).encode("ascii"))
-            hasher.update(np.ascontiguousarray(array_to_write).tobytes())
-            digest = hasher.hexdigest()
+            digest = _payload_digest(array_to_write)
             canonical = payload_hash_to_name.get(digest)
             if canonical is not None:
                 alias_names.append(name)
@@ -3175,7 +3294,6 @@ class LoomGGUFExporter:
             # lets it default to the quantized array's own (correct) byte-shape.
             if raw_dtype is not None:
                 w.add_tensor(name, array_to_write, raw_dtype=raw_dtype)
-                n_quantized += 1
             else:
                 w.add_tensor(name, array_to_write)
 
@@ -3191,12 +3309,21 @@ class LoomGGUFExporter:
 
         suffix = ""
         if self.quantize:
-            covered = 100.0 * quantized_bytes_before / float_bytes_total if float_bytes_total else 0.0
-            saved = quantized_bytes_before - quantized_bytes_after
+            # Summed over every packing that contributed, which for a multi-phase export is one per
+            # phase: each packed its own weights as it converted, so no single call here saw them all.
+            from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
+            block_size, _ = GGML_QUANT_SIZES[GGMLQuantizationType[self.quantize]]
+            n_quantized = packing.n_quantized
+            n_declined_shape = packing.n_declined_shape
+            float_bytes_total = packing.float_bytes_total
+            covered = (100.0 * packing.quantized_bytes_before / float_bytes_total
+                       if float_bytes_total else 0.0)
+            saved = packing.quantized_bytes_before - packing.quantized_bytes_after
             suffix = (f", {n_quantized} tensor(s) quantized to {self.quantize} "
                       f"({covered:.0f}% of float weight bytes, {saved / 1e6:.1f} MB saved)")
-            if n_folded:
-                suffix += f", {n_folded} conv kernel(s) folded to [IC*K, OC] to align their blocks"
+            if packing.n_folded:
+                suffix += (f", {packing.n_folded} conv kernel(s) folded to [IC*K, OC] to align their "
+                           f"blocks")
             # A quantization that covered nothing is the failure mode this reporting exists for: the
             # export succeeds, the file is byte-for-byte the size it was, and nothing said so. What
             # remains ineligible after `PACKED_WEIGHT_FIRST_OPS` gained the convolutions is a weight
