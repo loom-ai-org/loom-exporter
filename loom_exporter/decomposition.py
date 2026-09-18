@@ -280,6 +280,29 @@ class MultiPhase(Decomposition):
     Config hooks: `phases()`, `samplers()`, `driver_components()`, `driver_script_path`,
     `architecture`."""
 
+    # Convert each phase in a child process (BACKLOG.md P5.0's third change). `None` means "ask
+    # `$LOOM_PHASE_ISOLATION`", which is what `--isolate-phases` sets; True/False is a caller
+    # overriding it.
+    #
+    # **The one field on a `Decomposition` that is not a fact about the model.** `Modular.spec` and
+    # `Modular.dummy_seq_len` describe the checkpoint; this describes the machine the export is running
+    # on -- the same model isolates on a 16 GB laptop and has no reason to on a 128 GB workstation, and
+    # on a small one it costs memory rather than saving it (kokoro's tree peak goes 2.74 -> 4.34 GiB,
+    # the framework floor paid twice). It lives here anyway because `export()` is what would have to
+    # read it and there is no other object in the call, and it defaults to `None` so that nothing about
+    # a family's declaration changes by adding it.
+    isolate_phases: Optional[bool] = None
+
+    __unchecked__ = {
+        "isolate_phases": Unchecked(
+            "whether to convert each phase in its own process. A property of the machine's memory, "
+            "not of the model -- there is no declaration in the checkpoint or the family for it to "
+            "agree with. What checks it is the export itself: an isolated run produces the same GGUF "
+            "as a non-isolated one, held by tests/ci/test_phase_isolation.py and confirmed on "
+            "whisper-small, cmp-clean at 969,918,400 bytes."
+        ),
+    }
+
     def driver_builder(self, config):
         """A `MultiPhaseDriverBuilder` around this family's component list (P4.0.6/C.4-C.8).
 
@@ -296,11 +319,19 @@ class MultiPhase(Decomposition):
                                       input_aliases=config.driver_input_aliases())
 
     def export(self, config) -> str:
+        import contextlib
+        import gc
+        import pickle
+
         from .exporter import WeightPacking
         from .phase_conversion import convert_phase
+        from .phase_isolation import (
+            convert_phase_isolated, isolation_requested, release_heap_to_os, spill_root_for,
+        )
         from .spec_protocol import LinkChecker
 
         config.prepare_environment()
+        isolate = isolation_requested(self.isolate_phases)
         # One checker for the whole export (P4.0.5): every spec this config declares shares a single
         # deferral ledger, so `finish()` below is a real statement about the export rather than about
         # whichever call site happened to have context in hand.
@@ -313,6 +344,13 @@ class MultiPhase(Decomposition):
         # per-phase packing rests on, which wants all three -- see `_check_phase_weight_namespaces`.
         phase_outputs = []
         packing = WeightPacking()
+        # Pickled BEFORE `phases()`, which mutates the config: every family reads geometry off the
+        # checkpoint into instance attributes there (the speech-LM family's sample rate, chunk size and
+        # decoder bindings), and several of those attributes reference the loaded model. What a worker
+        # needs is the config as the registry built it -- a few hundred bytes of paths and scalars --
+        # and it calls `phases()` itself. See `phase_isolation` for why this is a respawn and not a
+        # fork.
+        blob = pickle.dumps(config) if isolate else None
         phases = config.phases()
         # Every phase's axis declarations, checked before the first (slow) trace: an axis name outside
         # axes.py's vocabulary, or a declared_axes entry naming an input this phase does not declare.
@@ -328,31 +366,67 @@ class MultiPhase(Decomposition):
         out_kwargs = dict(config.resolved_backend_kwargs())
         quantize = out_kwargs.get("quantize")
 
-        for phase in phases:
-            result = convert_phase(phase, quantize=quantize)
-            phase_topologies.update(result.topologies)
-            phase_outputs.append((phase.name, result.topologies, result.weights))
-            packing.absorb(result.packing)
-            # The cache geometry of whatever this phase fused, so the output exporter can still write
-            # it: that exporter has no program of its own, and until P5.0's first reduction this was
-            # `traced_programs.append(mil_prog)` -- the whole converted program, kept for a handful of
-            # integers. Extracted for every phase rather than only the fused ones, because
-            # `fused_geometry` asks the question and a list that depended on the answer would have to
-            # be rebuilt the day a second geometry is added.
-            for kind, records in result.geometry.items():
-                fused_geometry.setdefault(kind, []).extend(records)
+        with contextlib.ExitStack() as scope:
+            if isolate:
+                # Created only when it is going to be used, and NOT under `$TMPDIR` -- see
+                # `spill_root_for`, where the reason is that /tmp is a tmpfs on a normal Linux box and
+                # spilling to RAM is the one place this mechanism must not put the weights.
+                spill_root = scope.enter_context(spill_root_for(config.output_path))
+                # Everything the parent loaded to answer `phases()` goes now, before the first child
+                # starts: the workers need none of it, and holding it would add the whole checkpoint to
+                # every child's peak. The phase OBJECTS stay -- their names, axes and cache sizes are
+                # what the merge and the driver are built from.
+                blob_path = spill_root / "config.pkl"
+                blob_path.write_bytes(blob)
+                for phase in phases:
+                    for attribute in ("wrapper", "module"):
+                        if getattr(phase, attribute, None) is not None:
+                            setattr(phase, attribute, None)
+                del blob
+                gc.collect()
+                # `gc.collect()` is not enough, and this is where that stops being a detail. glibc
+                # frees to its own arenas, not to the kernel, so a parent holding nothing still sat at
+                # 4.97 GiB on Granite-Speech -- and under isolation that residency is charged against
+                # every child, in parallel, for the whole conversion. `malloc_trim(0)` took the same
+                # process to 1.31 GiB, and the tree's peak from 19.68 GiB to 15.85. See
+                # `release_heap_to_os`.
+                release_heap_to_os()
+                print(f"  isolating {len(phases)} phase(s), one process each; parent released its "
+                      f"own copy of the model:{_rss_note() or ' (rss unknown)'}")
 
-        _check_phase_weight_namespaces(phase_outputs)
-        return self._write(config, checker, phases, phase_topologies, phase_outputs,
-                           fused_geometry, packing, out_kwargs)
+            for index, phase in enumerate(phases):
+                if isolate:
+                    result = convert_phase_isolated(
+                        blob_path, index, spill_root / f"phase-{index}", quantize=quantize,
+                    )
+                    print(f"  {phase.name}: read back {len(result.weights)} packed weight(s) from its "
+                          f"worker's spill{_rss_note()}")
+                else:
+                    result = convert_phase(phase, quantize=quantize)
+                phase_topologies.update(result.topologies)
+                phase_outputs.append((phase.name, result.topologies, result.weights))
+                packing.absorb(result.packing)
+                # The cache geometry of whatever this phase fused, so the output exporter can still
+                # write it: that exporter has no program of its own, and until P5.0's first reduction
+                # this was `traced_programs.append(mil_prog)` -- the whole converted program, kept for
+                # a handful of integers. Extracted for every phase rather than only the fused ones,
+                # because `fused_geometry` asks the question and a list that depended on the answer
+                # would have to be rebuilt the day a second geometry is added.
+                for kind, records in result.geometry.items():
+                    fused_geometry.setdefault(kind, []).extend(records)
+
+            _check_phase_weight_namespaces(phase_outputs)
+            return self._write(config, checker, phases, phase_topologies, phase_outputs,
+                               fused_geometry, packing, out_kwargs)
 
     def _write(self, config, checker, phases, phase_topologies, phase_outputs, fused_geometry,
                packing, out_kwargs) -> str:
         """Merge what the phases produced, build the driver, write the GGUF.
 
-        Split out of `export` because that half is now a loop over `convert_phase` and this half is
-        everything that needs all the phases at once -- and because what a phase hands over is a
-        `PhaseResult` rather than four accumulating locals, the seam is where it can be drawn.
+        Split out of `export` so the whole of it sits inside the spill directory's lifetime: under
+        isolation the merged weights are `np.memmap`s over files in it, and `GGUFWriter` streams them
+        with `tofile` at `write_tensors_to_file` -- so the mapping has to be alive until the artifact
+        is closed, not just until the merge returns.
         """
         from .driver_builder import DriverContext
         from .exporter import LoomGGUFExporter
