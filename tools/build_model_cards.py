@@ -392,6 +392,34 @@ anything.""",
         title="Matcha-TTS (LJSpeech)", summary="Matcha-TTS's LJSpeech flow-matching TTS checkpoint, exported for loom.cpp. Takes phoneme ids, not text.",
     ),
     ModelCard(
+        slug="f5-tts-v1-base", checkpoint=Path("f5-tts/F5TTS_v1_Base"),
+        export_task="text-to-speech", export_model="f5-tts", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="SWivid/F5-TTS", license_id="cc-by-nc-4.0",
+        source_url="https://github.com/SWivid/F5-TTS", source_name="F5-TTS (F5TTS_v1_Base)",
+        language=["en", "zh"],
+        # Declared by the export itself (`f5_tts_export.SAMPLE_RATE`), so this restates one fact rather
+        # than supplying a missing one -- the same relationship Supertonic's entry has to its own.
+        sample_rate=24000,
+        title="F5-TTS v1 Base",
+        summary="F5-TTS's flow-matching voice-cloning TTS model, exported for loom.cpp. Takes a "
+                "reference clip, its transcript and the text to speak; encodes characters itself.",
+        limitations=
+            "**It clones a voice, so it needs one.** Every call takes a reference clip at 24 kHz, the "
+            "transcript of that clip, and the text to speak -- the model in-fills one spectrogram "
+            "whose first frames are the reference, so there is no way to synthesise without a prompt.\n\n"
+            "**Chinese needs pinyin conversion this file cannot do.** F5-TTS's own front end runs "
+            "`rjieba` word segmentation and `pypinyin` before a single id is looked up. What ships "
+            "here is the character table, which reproduces that function exactly for ordinary "
+            "space-separated English prose (2000/2000 generated sentences) and differs by one "
+            "inserted space for text carrying multi-character punctuation runs (`--`, `...`) or "
+            "hyphen-joined digit groups (`2026-09-18`). Text containing CJK is refused by name; pass "
+            "ids from the reference's own `convert_char_to_pinyin` instead.\n\n"
+            "**The default duration is an estimate, not a prediction.** There is no duration model: "
+            "the frame count is the reference clip's own characters-per-frame rate applied to the "
+            "text to speak, and `duration` overrides it when the result is clipped or padded.",
+    ),
+    ModelCard(
         slug="supertonic-2", checkpoint=Path("/home/flavio/Dev/supertonic-tts/assets/pt"),
         export_task="text-to-speech", export_model="supertonic", task_type="text-to-speech",
         takes_text=True,

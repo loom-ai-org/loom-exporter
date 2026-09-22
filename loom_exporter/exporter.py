@@ -2974,6 +2974,11 @@ class LoomGGUFExporter:
             # `tokens.json` is a bare JSON array that several other schemes could also be written as.
             from .funasr_tokenizer_export import write_funasr_vocab
             write_funasr_vocab(w, tokenizer_dir)
+        elif family == "f5":
+            # Family 9's character table, named by the family for the reason "ctc" and "funasr" are:
+            # `vocab.txt` is a bare newline-separated list, and so is half a dozen other schemes'.
+            from .f5_tokenizer_export import write_f5_vocab
+            write_f5_vocab(w, tokenizer_dir)
         elif family == "wordpiece":
             from .wordpiece_tokenizer_export import write_wordpiece_vocab
             write_wordpiece_vocab(w, tokenizer_dir)

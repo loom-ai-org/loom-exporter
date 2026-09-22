@@ -206,6 +206,7 @@ _FAMILY_MODULES = (
     "dia_export",
     "qwen3_tts_export",
     "t5_export",
+    "f5_tts_export",
 )
 
 

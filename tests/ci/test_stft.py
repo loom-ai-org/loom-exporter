@@ -84,5 +84,51 @@ class TestStftExport(unittest.TestCase):
         self.assertLess((ref - got).abs().max().item(), 1e-4)
 
 
+class L2NormModule(torch.nn.Module):
+    """A complex magnitude, spelled the way that reliably reaches `reduce_l2_norm`.
+
+    `torch.stft(...).abs()` lowers through coremltools' complex dialect to the same op, which is how
+    F5-TTS's `power=1` mel front end found that it had no ggml mapping -- but whether it SURVIVES to
+    the emitted program depends on later MIL passes, and on that model it no longer does (its mel is
+    `square/square/add/sqrt` today). So this exercises the rule directly rather than through a
+    spectrogram that may or may not still produce it.
+    """
+
+    def forward(self, x):
+        return torch.linalg.vector_norm(x, ord=2, dim=-1)
+
+
+class TestComplexMagnitude(unittest.TestCase):
+    """`reduce_l2_norm` had no ggml mapping until family 9.
+
+    Whisper's frontend never reached it because it writes `abs() ** 2` -- the square cancels the square
+    root and coremltools emits `reduce_sum_square` instead. F5-TTS's mel is `power=1`
+    (`get_vocos_mel_spectrogram`), the first un-squared complex magnitude in the zoo, and its export
+    stopped with `MIL op 'reduce_l2_norm' is missing a ggml mapping`.
+    """
+
+    def test_an_l2_norm_lowers_to_a_composition_of_existing_ops(self):
+        m = L2NormModule().eval()
+        x = torch.randn(1, 8, 5)
+
+        traced = torch.jit.trace(m, (x,))
+        prog = ct.convert(traced, inputs=[ct.TensorType(name="x", shape=x.shape)],
+                          convert_to="milinternal")
+        self.assertIn("reduce_l2_norm",
+                      {op.op_type for f in prog.functions.values() for op in f.operations})
+
+        exporter = LoomGGUFExporter(prog, output_path="test_l2_output.gguf",
+                                     architecture="l2_norm_test")
+        try:
+            self.assertTrue(Path(exporter.export()).exists())
+            topo = next(iter(exporter.topologies.values()))
+            # Composed, not given a primitive of its own: `sqrt(sum(x**2))` over one axis, three ops
+            # that all already existed. A new engine op would have to be maintained on every backend
+            # for a shape ggml already computes.
+            self.assertEqual([n["op"] for n in topo["nodes"]], ["MUL", "REDUCE_SUM", "SQRT"])
+        finally:
+            Path("test_l2_output.gguf").unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     unittest.main()
