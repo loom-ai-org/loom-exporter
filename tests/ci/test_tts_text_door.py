@@ -29,10 +29,17 @@ from loom_exporter.registry import default_registry
 # Named rather than detected: "does this checkpoint take phonemes" is a fact about the model, and a rule
 # that inferred it from the same declaration it is checking would be circular.
 PHONEME_INPUT = {"kokoro", "matcha", "styletts2", "vits"}
-# ...and the one that does not. Supertonic encodes graphemes itself and its GGUF carries the codepoint
+# ...and the ones that do not. Supertonic encodes graphemes itself and its GGUF carries the codepoint
 # table, so `"vocab"` is the true answer for it and the wrong one for the four above. Here so the rule
-# cannot be satisfied by declaring `"phonemes"` everywhere, which would refuse Supertonic a real door.
-GRAPHEME_INPUT = {"supertonic"}
+# cannot be satisfied by declaring `"phonemes"` everywhere, which would refuse them a real door.
+#
+# F5-TTS joined them with family 9's third leaf: its vocabulary is a CHARACTER table
+# (`tokenizer.ggml.model == "f5"`, `loom::F5Vocab`), not a phoneme one. Its front end is a partial
+# door rather than a complete one -- the reference runs `rjieba` + `pypinyin` before any id, and what
+# ships reproduces that exactly for ordinary English prose and refuses CJK by name -- but partial in
+# the direction these rules care about: the ids are graphemes, so `"vocab"` is the true answer and
+# `"phonemes"` would be the Kokoro mistake this file was written for.
+GRAPHEME_INPUT = {"supertonic", "f5-tts"}
 
 # Families that still declare no `sample_rate`, with the reason it is an EXEMPTION rather than a pass.
 # Each needs its rate taken off its own checkpoint the way Kokoro's and Supertonic's are -- Matcha's and
@@ -46,7 +53,13 @@ NO_SAMPLE_RATE_YET = {"matcha", "styletts2", "vits"}
 # an undeclared default is a door that raises out of Lua. Named rather than detected for the same reason
 # as above, and because the three do not share one marker: Matcha's and Supertonic's step counts come
 # from a `samplers()` spec, StyleTTS2's from a hand-written diffusion driver that no spec describes.
-NEEDS_STEPS = {"matcha", "styletts2", "supertonic"}
+#
+# F5-TTS is the fourth and reaches it a step earlier than the others: its driver builds the SCHEDULE
+# host-side (`sway_times` divides by `n_steps` to walk a linspace before reparameterising it), where
+# the other three hand a count to a sampler that divides. Same consequence -- an undeclared default is
+# an arithmetic-on-nil error out of Lua -- which is why the rule is about the division and not about
+# where it happens.
+NEEDS_STEPS = {"matcha", "styletts2", "supertonic", "f5-tts"}
 
 
 def _tts_configs():

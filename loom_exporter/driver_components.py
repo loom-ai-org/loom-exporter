@@ -2337,6 +2337,16 @@ class FlowMatchingSampler(DriverComponent):
     n_steps: object
     step_inputs: dict
     note: Optional[str] = None
+    # The N+1 time points, for a spec whose schedule is the caller's. Required then and meaningless
+    # otherwise -- `emit` raises either way rather than quietly integrating the other schedule.
+    times: object = None
+    # The unconditional fixed-input table and the guidance weight, for a spec that declares guidance.
+    # Same rule: required then, refused otherwise.
+    uncond_inputs: Optional[dict] = None
+    guidance_scale: object = None
+    # The loop's initial state, for a spec whose noise is the caller's. Required then, refused
+    # otherwise -- the same rule the other two optional pairs follow.
+    state: object = None
     # The IR expression naming which estimator to integrate, for a spec that declares variants.
     # Required then and meaningless otherwise -- `emit` raises rather than defaulting, because a
     # sampler over several graphs with nothing choosing between them is a mis-declaration.
@@ -2366,6 +2376,22 @@ class FlowMatchingSampler(DriverComponent):
             "checked, per name, by the spec's own estimator_specs() through sub_specs(); that it is "
             "PRESENT at all when the spec declares variants is checked by emit(), which raises"
         ),
+        "times": Unchecked(
+            "the N+1 schedule points, as an IR expression over locals earlier components bind; "
+            "validate() is its authority, and emit() raises if it is present without the spec asking "
+            "for it or absent when it does"
+        ),
+        "uncond_inputs": Unchecked(
+            "the DROPPED conditioning, by input name. The names are the conditional table's -- and "
+            "the spec's own TopologyInput link checks that set against the estimator -- so what is "
+            "unchecked here is the expression each maps to, a driver local like any other"
+        ),
+        "guidance_scale": Unchecked("same -- the guidance weight, as an IR expression"),
+        "state": Unchecked(
+            "the loop's initial state, as an IR expression over locals earlier components bind. "
+            "`driver_ir.validate` is its authority; that it is PRESENT when the spec asks for it is "
+            "checked by emit(), which raises"
+        ),
     }
 
     def link_label(self) -> str:
@@ -2383,7 +2409,49 @@ class FlowMatchingSampler(DriverComponent):
         return render_sampler(self.spec).split("\n") + [""]
 
     def emit(self, ctx):
-        args = [self.length, self.n_elems, self.n_steps, TableLit(dict(self.step_inputs))]
+        # The schedule argument is one or the other, never both: a component that supplied `times` to
+        # a uniform spec would have it silently ignored, and one that omitted it from a caller-
+        # scheduled spec would pass `nil` where the engine expects N+1 points and fail inside the
+        # binding instead of here.
+        caller_scheduled = self.spec.schedule == "caller"
+        if caller_scheduled and self.times is None:
+            raise ValueError(
+                f"FlowMatchingSampler({self.spec.func_name!r}): the spec's schedule is 'caller', so "
+                f"this component must supply `times` -- the IR expression producing the N+1 points."
+            )
+        if not caller_scheduled and self.times is not None:
+            raise ValueError(
+                f"FlowMatchingSampler({self.spec.func_name!r}): `times` was supplied but the spec's "
+                f"schedule is {self.spec.schedule!r}, which builds its own. One of the two is wrong."
+            )
+        guided = bool(self.spec.guidance)
+        if guided and (self.uncond_inputs is None or self.guidance_scale is None):
+            raise ValueError(
+                f"FlowMatchingSampler({self.spec.func_name!r}): the spec declares guidance, so this "
+                f"component must supply both `uncond_inputs` and `guidance_scale`."
+            )
+        if not guided and (self.uncond_inputs is not None or self.guidance_scale is not None):
+            raise ValueError(
+                f"FlowMatchingSampler({self.spec.func_name!r}): `uncond_inputs`/`guidance_scale` "
+                f"were supplied but the spec does not declare guidance, so the generated function "
+                f"takes neither."
+            )
+        if self.spec.caller_noise and self.state is None:
+            raise ValueError(
+                f"FlowMatchingSampler({self.spec.func_name!r}): the spec declares caller_noise, so "
+                f"this component must supply `state` -- the IR expression producing the initial "
+                f"value. Without it the generated call passes nil and the engine draws, which is the "
+                f"behaviour the flag exists to replace.")
+        if not self.spec.caller_noise and self.state is not None:
+            raise ValueError(
+                f"FlowMatchingSampler({self.spec.func_name!r}): `state` was supplied but the spec "
+                f"does not declare caller_noise, so the generated function does not take it.")
+        schedule_arg = self.times if caller_scheduled else self.n_steps
+        args = [self.length, self.n_elems, schedule_arg, TableLit(dict(self.step_inputs))]
+        if guided:
+            args += [TableLit(dict(self.uncond_inputs)), self.guidance_scale]
+        if self.spec.caller_noise:
+            args.append(self.state)
         if self.spec.estimator_variants:
             # The generated function takes the estimator's name first when it is computed; this is the
             # expression that produces it. Refusing to guess one is deliberate -- a sampler over
