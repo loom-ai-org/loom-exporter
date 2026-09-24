@@ -15,7 +15,9 @@ that path reads is written here FROM the reference, so `loom::PocketTtsVocab` ho
 | `digits`                           | `str.isdigit()`, the decimal-period rule's test              |
 | `sentence_end_ids`/`clause_end_ids`| `tokenizer(".!...?")[1:]` / `tokenizer(",;:")[1:]`, as there |
 | `max_tokens_per_chunk`             | `default_parameters.MAX_TOKEN_PER_CHUNK`                     |
-| `chunk_separator`                  | `</s>`: never produced by an encode, so free to delimit      |
+| `chunk_header_short`/`_long`       | `<s>` / `</s>`, never produced by an encode: each chunk opens |
+|                                    | with one, saying which tail `prepare_text_prompt` guessed     |
+| `short_chunk_max_words`            | that guess's threshold (`number_of_words <= 4`)               |
 | the two flags                      | the checkpoint's YAML                                         |
 """
 import sys
@@ -26,6 +28,11 @@ from gguf import GGUFWriter
 from .spm_tokenizer_export import write_sentencepiece_vocab
 
 PREFIX = "tokenizer.ggml.pocket_tts."
+# `prepare_text_prompt`: `frames_after_eos_guess = 3 if number_of_words <= 4 else 1`. A literal in the
+# reference's code, so it is restated here and pinned against the function by the CI test.
+SHORT_CHUNK_MAX_WORDS = 4
+SHORT_CHUNK_FRAMES_AFTER_EOS = 3
+LONG_CHUNK_FRAMES_AFTER_EOS = 1
 
 
 def _reference_config(model_dir: Path) -> dict:
@@ -90,9 +97,14 @@ def write_pocket_tts_vocab(w: GGUFWriter, tokenizer_dir: str) -> None:
     w.add_array(PREFIX + "sentence_end_ids", sp.encode(".!...?", out_type=int)[1:])
     w.add_array(PREFIX + "clause_end_ids", sp.encode(",;:", out_type=int)[1:])
     w.add_int32(PREFIX + "max_tokens_per_chunk", MAX_TOKEN_PER_CHUNK)
-    if sp.eos_id() < 0:
-        raise ValueError(f"{model_dir}/tokenizer.model has no </s>, which the chunk separator uses")
-    w.add_int32(PREFIX + "chunk_separator", sp.eos_id())
+    if sp.bos_id() < 0 or sp.eos_id() < 0:
+        raise ValueError(f"{model_dir}/tokenizer.model lacks <s> or </s>, which the chunk headers use")
+    # The chunk headers carry `prepare_text_prompt`'s tail guess, which the driver cannot recompute:
+    # it is `len(text.split())` of the text BEFORE its terminal punctuation is fixed, and the driver
+    # has ids, not text (loom.cpp ADR-044).
+    w.add_int32(PREFIX + "chunk_header_short", sp.bos_id())
+    w.add_int32(PREFIX + "chunk_header_long", sp.eos_id())
+    w.add_int32(PREFIX + "short_chunk_max_words", SHORT_CHUNK_MAX_WORDS)
     w.add_bool(PREFIX + "capitalize_first_letter", bool(config.get("capitalize_first_letter", True)))
     w.add_bool(PREFIX + "append_terminal_punctuation",
                bool(config.get("append_terminal_punctuation", True)))

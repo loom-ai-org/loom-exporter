@@ -1,12 +1,13 @@
     -- ===== The flow LM: text -> latents, one continuous 32-d frame per step, chunk by chunk. =====
     --
     -- `inputs.tokens` is what `loom::PocketTtsVocab::encode` returns: each sentence chunk's prepared
-    -- ids, CHUNK_SEPARATOR between them. Nothing frames the ids: the reference feeds the tokenizer's
-    -- output straight to the conditioner.
+    -- ids, opened by a header saying which tail the reference guessed for it. The header is not fed to
+    -- the model: the reference feeds the tokenizer's output straight to the conditioner.
     if inputs.seed then loom.seed_rng(inputs.seed) end
-    local _chunks = pocket_split_chunks(inputs.tokens, CHUNK_SEPARATOR)
-    if #_chunks == 0 then error('pocket-tts: no text ids') end
     local _starts = loom.get_weight('step_embed', 'word_start')
+    local _chunks = pocket_split_chunks(inputs.tokens, CHUNK_HEADER_SHORT, CHUNK_HEADER_LONG, _starts,
+                                         SHORT_CHUNK_MAX_WORDS)
+    if #_chunks == 0 then error('pocket-tts: no text ids') end
     local _std = math.sqrt(inputs.temperature or DEFAULT_TEMPERATURE)
     local _threshold = inputs.eos_threshold or DEFAULT_EOS_THRESHOLD
     local _n_steps = inputs.n_steps or DEFAULT_DECODE_STEPS
@@ -18,7 +19,7 @@
     wave = {}
 
     for _c = 1, #_chunks do
-        local _text = _chunks[_c]
+        local _text = _chunks[_c].ids
         local _n_text = #_text
         -- The voice is the flow LM's KV cache after its own prefill, so it is WRITTEN into the cache
         -- rather than run: rows [0, n_voice) are the voice, and the text continues at position n_voice.
@@ -36,13 +37,13 @@
         local _n_past = _n_voice + _n_text
 
         -- `TTSModel._estimate_max_gen_len`, and the tail the reference keeps after the EOS head
-        -- fires: `prepare_text_prompt`'s guess (3 frames for a chunk of at most four words, else 1)
-        -- plus 2.
+        -- fires: `prepare_text_prompt`'s guess for the chunk, plus the 2 `generate_audio_stream` adds.
         local _budget = inputs.max_frames or
             math.ceil((_n_text / TOKENS_PER_SECOND_ESTIMATE + GEN_SECONDS_PADDING) * FRAME_RATE)
         _budget = math.min(_budget, LM_MAX_POSITIONS - _n_past)
         local _after = inputs.frames_after_eos or
-            ((pocket_count_words(_text, _starts) <= 4 and 3 or 1) + 2)
+            ((_chunks[_c].short and SHORT_CHUNK_FRAMES_AFTER_EOS or LONG_CHUNK_FRAMES_AFTER_EOS)
+             + FRAMES_AFTER_EOS_PADDING)
 
         -- Step 0's input is the checkpoint's `bos_emb` (the reference feeds NaN and swaps it in).
         local _latent = loom.get_weight('step_embed', 'bos_emb')

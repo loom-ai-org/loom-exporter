@@ -29,7 +29,9 @@ prefilling `[bos_before_voice | speaker_proj(mimi_encoder(audio))]`, saved as sa
 (`export-voice` writes the same format for a user's own clip). Those rows cannot be recovered from the
 cache, so the export ships the CACHE: the default voice's K and V for every layer as a driver weight,
 which the driver writes into `lm`'s cache with `loom.seed_kv` before the text prefill (loom.cpp
-ADR-043). Encoding a new voice from audio needs the Mimi encoder and is not in this export.
+ADR-043). The other voices are separate voice files (`pocket_tts_voices.py`), which the model accepts
+because its contract declares the same weights fingerprint they carry (`loom.voice.compat`). Encoding a
+new voice from audio needs the Mimi encoder and is not in this export.
 
 Usage:
   loom-export ~/Dev/models/pocket-tts/languages/english_2026-09 -o pocket_tts.gguf \\
@@ -49,6 +51,9 @@ import torch.nn.functional as F
 from .decomposition import Decomposition, MultiPhase
 from .export_config import LoomExportConfig
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
+from .pocket_tts_tokenizer_export import (
+    LONG_CHUNK_FRAMES_AFTER_EOS, SHORT_CHUNK_FRAMES_AFTER_EOS, SHORT_CHUNK_MAX_WORDS,
+)
 from .spec_protocol import Axis, Unchecked
 
 # Where the reference checkout lives: `pocket-tts` on PyPI would do too, but the export must read the
@@ -69,6 +74,8 @@ DEFAULT_EOS_THRESHOLD = -4.0
 DEFAULT_DECODE_STEPS = 1
 # The longest text the reference feeds one generation: longer inputs are split into sentences first.
 MAX_TOKEN_PER_CHUNK = 50
+# `generate_audio_stream`: `frames_after_eos_guess += 2` on top of `prepare_text_prompt`'s guess.
+FRAMES_AFTER_EOS_PADDING = 2
 # How many positions `lm`'s KV cache holds: the voice (126 rows for every predefined voice, 30 s = 376
 # at most for a cloned one), a 50-token chunk, and the reference's own frame budget for it,
 # `ceil((50 / 3 + 2) * 12.5) = 234`. 1024 covers the longest voice with room to spare, and costs
@@ -457,7 +464,7 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
     _driver_weights: Optional[Dict[str, np.ndarray]] = field(default=None, init=False, repr=False)
     _temperature: float = field(default=0.7, init=False, repr=False)
     _voice_rows: int = field(default=0, init=False, repr=False)
-    _chunk_separator: int = field(default=-1, init=False, repr=False)
+    _chunk_headers: Tuple[int, int] = field(default=(-1, -1), init=False, repr=False)
 
     __links__ = {"root_axis": Axis()}
     __unchecked__ = {
@@ -473,7 +480,7 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
                                       "weights"),
         "_temperature": Unchecked("the config's `default_temperature`, read during phases()"),
         "_voice_rows": Unchecked("the built-in voice's length, read during phases()"),
-        "_chunk_separator": Unchecked("the SentencePiece `</s>` id, read during phases()"),
+        "_chunk_headers": Unchecked("the SentencePiece `<s>`/`</s>` ids, read during phases()"),
     }
 
     def phases(self) -> List[ExportPhase]:
@@ -482,7 +489,8 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
         tts, config = load_reference(self.model_dir)
         flow_lm, mimi = tts.flow_lm, tts.mimi
         self._temperature = float(tts.temp)
-        self._chunk_separator = int(flow_lm.conditioner.tokenizer.sp.eos_id())
+        sp = flow_lm.conditioner.tokenizer.sp
+        self._chunk_headers = (int(sp.bos_id()), int(sp.eos_id()))
         n_layers = len(flow_lm.transformer.layers)
         voice, self._voice_rows = read_voice(Path(self.model_dir) / "embeddings" / f"{self.voice}.safetensors",
                                              n_layers)
@@ -565,8 +573,14 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
         fragment = self.driver_script_path
         return [
             ExportConstants(values={
-                # `</s>`: what `loom::PocketTtsVocab` puts between sentence chunks.
-                "CHUNK_SEPARATOR": self._chunk_separator,
+                # The ids `loom::PocketTtsVocab` opens each chunk with (`<s>`, `</s>`), and the tails
+                # they stand for: `prepare_text_prompt`'s guess, plus `generate_audio_stream`'s 2.
+                "CHUNK_HEADER_SHORT": self._chunk_headers[0],
+                "CHUNK_HEADER_LONG": self._chunk_headers[1],
+                "SHORT_CHUNK_MAX_WORDS": SHORT_CHUNK_MAX_WORDS,
+                "SHORT_CHUNK_FRAMES_AFTER_EOS": SHORT_CHUNK_FRAMES_AFTER_EOS,
+                "LONG_CHUNK_FRAMES_AFTER_EOS": LONG_CHUNK_FRAMES_AFTER_EOS,
+                "FRAMES_AFTER_EOS_PADDING": FRAMES_AFTER_EOS_PADDING,
                 "LATENT_DIM": 32,
                 "LM_MAX_POSITIONS": LM_MAX_POSITIONS,
                 "MIMI_UPSAMPLE": MIMI_UPSAMPLE,
@@ -584,7 +598,9 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
             LuaFragment(fragment / "00_header.lua", top_level=True,
                         defines=("pocket_count_words", "pocket_split_chunks")),
             LuaFragment(fragment / "01_flow_lm.lua",
-                        reads=("tokens", "CHUNK_SEPARATOR", "LATENT_DIM", "LM_MAX_POSITIONS",
+                        reads=("tokens", "CHUNK_HEADER_SHORT", "CHUNK_HEADER_LONG", "SHORT_CHUNK_MAX_WORDS",
+                               "SHORT_CHUNK_FRAMES_AFTER_EOS", "LONG_CHUNK_FRAMES_AFTER_EOS",
+                               "FRAMES_AFTER_EOS_PADDING", "LATENT_DIM", "LM_MAX_POSITIONS",
                                "MIMI_UPSAMPLE", "FRAME_RATE", "TOKENS_PER_SECOND_ESTIMATE",
                                "GEN_SECONDS_PADDING", "MIN_FRAMES_BEFORE_EOS", "DEFAULT_TEMPERATURE",
                                "DEFAULT_EOS_THRESHOLD", "DEFAULT_DECODE_STEPS"),
@@ -597,6 +613,13 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
         contract["input.kind"] = "text"
         contract["text.frontend"] = "vocab"
         contract["sample_rate"] = SAMPLE_RATE
+        # What a voice file must match to be loaded into this model (`pocket_tts_voices`, loom.cpp
+        # ADR-045): the fingerprint of the weights every voice state is a function of.
+        from .pocket_tts_voices import weights_fingerprint
+
+        contract["voice.compat"] = weights_fingerprint(Path(self.model_dir) / "model.safetensors")
+        # The voice the file carries, which is what `infer` uses when the caller names none.
+        contract["tts.voices"] = [self.voice]
         return contract
 
     def backend_kwargs(self) -> dict:
