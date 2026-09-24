@@ -39,7 +39,11 @@ PHONEME_INPUT = {"kokoro", "matcha", "styletts2", "vits"}
 # ships reproduces that exactly for ordinary English prose and refuses CJK by name -- but partial in
 # the direction these rules care about: the ids are graphemes, so `"vocab"` is the true answer and
 # `"phonemes"` would be the Kokoro mistake this file was written for.
-GRAPHEME_INPUT = {"supertonic", "f5-tts"}
+#
+# Chatterbox (family 9's fourth leaf) is the third: a character-level BPE whose `encode` is the
+# reference's whole text path, `punc_norm` included (`loom::ChatterboxVocab`), and a COMPLETE door --
+# 3000/3000 ids against the reference over six input classes.
+GRAPHEME_INPUT = {"supertonic", "f5-tts", "chatterbox"}
 
 # Families that still declare no `sample_rate`, with the reason it is an EXEMPTION rather than a pass.
 # Each needs its rate taken off its own checkpoint the way Kokoro's and Supertonic's are -- Matcha's and
@@ -59,7 +63,10 @@ NO_SAMPLE_RATE_YET = {"matcha", "styletts2", "vits"}
 # the other three hand a count to a sampler that divides. Same consequence -- an undeclared default is
 # an arithmetic-on-nil error out of Lua -- which is why the rule is about the division and not about
 # where it happens.
-NEEDS_STEPS = {"matcha", "styletts2", "supertonic", "f5-tts"}
+#
+# Chatterbox is the fifth, for F5-TTS's reason: its driver builds the cosine schedule host-side and
+# divides by the count to walk the linspace.
+NEEDS_STEPS = {"matcha", "styletts2", "supertonic", "f5-tts", "chatterbox"}
 
 
 def _tts_configs():

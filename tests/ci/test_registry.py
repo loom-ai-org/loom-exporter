@@ -849,12 +849,13 @@ def test_the_tts_families_share_one_task():
 
     Six since family 9's third leaf: `f5-tts` declares neither base class -- it is a plain
     `BaseMultiPhaseModelExportConfig` whose sampler is a `FlowMatchingSpec` with guidance -- which is
-    exactly the point that the task is one and the decomposition is a field."""
+    exactly the point that the task is one and the decomposition is a field. Seven since the fourth
+    leaf, Chatterbox, which is the same shape with an AR token LM in front of the sampler."""
     from loom_exporter.registry import default_registry
 
     registry = default_registry()
     names = {rec.name for rec in registry._entries["text-to-speech"].recognizers}
-    assert names == {"kokoro", "styletts2", "vits", "matcha", "supertonic", "f5-tts"}
+    assert names == {"kokoro", "styletts2", "vits", "matcha", "supertonic", "f5-tts", "chatterbox"}
     for model in names:
         assert registry.get("text-to-speech", model).name == model
 

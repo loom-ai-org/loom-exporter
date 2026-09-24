@@ -2979,6 +2979,11 @@ class LoomGGUFExporter:
             # `vocab.txt` is a bare newline-separated list, and so is half a dozen other schemes'.
             from .f5_tokenizer_export import write_f5_vocab
             write_f5_vocab(w, tokenizer_dir)
+        elif family == "chatterbox":
+            # Family 9's fourth leaf: a character-level BPE whose `tokenizer.json` would otherwise be
+            # auto-detected as byte-level "gpt2" and mis-tokenize every non-ASCII character.
+            from .chatterbox_tokenizer_export import write_chatterbox_vocab
+            write_chatterbox_vocab(w, tokenizer_dir)
         elif family == "wordpiece":
             from .wordpiece_tokenizer_export import write_wordpiece_vocab
             write_wordpiece_vocab(w, tokenizer_dir)
