@@ -18,19 +18,34 @@ local function pocket_count_words(tokens, starts)
     return n
 end
 
--- The vocabulary's chunks: `tokens` split on `separator`, the id `loom::PocketTtsVocab` puts between
--- the sentence chunks it cut (the reference generates each from a fresh copy of the voice). A host that
--- tokenizes elsewhere sends none, which is one chunk.
-local function pocket_split_chunks(tokens, separator)
-    local chunks, current = {}, {}
+-- The vocabulary's chunks, each with the tail `prepare_text_prompt` guessed for it. `loom::PocketTtsVocab`
+-- opens every chunk with a header id -- `short_id` for a chunk of at most four words, `long_id` otherwise
+-- -- because that guess is `len(text.split())` of TEXT, which the driver never sees (loom.cpp ADR-044).
+-- A host that tokenizes elsewhere sends no header: one chunk, its words counted off the ids, which is
+-- exact for ASCII spaces and misses words separated by a tab or an NBSP.
+local function pocket_split_chunks(tokens, short_id, long_id, starts, max_words)
+    local chunks, current = {}, nil
     for i = 1, #tokens do
-        if tokens[i] == separator then
-            if #current > 0 then chunks[#chunks + 1] = current end
-            current = {}
+        local id = tokens[i]
+        if id == short_id or id == long_id then
+            current = {ids = {}, short = (id == short_id)}
+            chunks[#chunks + 1] = current
         else
-            current[#current + 1] = tokens[i]
+            if current == nil then
+                current = {ids = {}}
+                chunks[#chunks + 1] = current
+            end
+            current.ids[#current.ids + 1] = id
         end
     end
-    if #current > 0 then chunks[#chunks + 1] = current end
-    return chunks
+    local kept = {}
+    for _, chunk in ipairs(chunks) do
+        if #chunk.ids > 0 then
+            if chunk.short == nil then
+                chunk.short = pocket_count_words(chunk.ids, starts) <= max_words
+            end
+            kept[#kept + 1] = chunk
+        end
+    end
+    return kept
 end

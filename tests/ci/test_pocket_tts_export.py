@@ -256,3 +256,92 @@ def test_mimis_positions_are_one_symbol_with_its_frames(phases):
     """16 decoder positions per latent, declared as that multiple, so the window mask the graph builds
     from them and the latents it decodes cannot disagree about the length."""
     assert phases["mimi_decoder"].declared_axes == {"positions": {1: f"{MIMI_UPSAMPLE} * n_codes"}}
+
+
+# -- voice files (loom.cpp ADR-045) and the chunk headers ------------------------------------------
+
+def test_the_fingerprint_follows_the_flow_lm_and_ignores_mimi(tmp_path):
+    """Mimi is excluded because the release without voice cloning zeroes its encoder, and a voice made
+    with either release is the same voice; any `flow_lm` change must change it."""
+    from safetensors.numpy import save_file
+
+    from loom_exporter.pocket_tts_voices import weights_fingerprint
+
+    def fp(flow, mimi):
+        path = tmp_path / f"{flow}_{mimi}.safetensors"
+        save_file({"flow_lm.bos_emb": np.full(4, flow, np.float32),
+                   "mimi.encoder.w": np.full(4, mimi, np.float32)}, str(path))
+        return weights_fingerprint(path)
+
+    assert fp(1, 1) == fp(1, 2)
+    assert fp(1, 1) != fp(2, 1)
+
+
+def test_a_written_voice_file_is_the_seed_layout_under_its_input_name(tmp_path):
+    import gguf
+
+    from loom_exporter.pocket_tts_voices import write_voice
+
+    src = _voice(tmp_path)
+    out = tmp_path / "voices" / "v.gguf"
+    n = write_voice(src, out, name="v", compat="ab" * 16, n_layers=2, license="CC0-1.0", origin="o")
+    assert n == 3
+    reader = gguf.GGUFReader(str(out))
+    fields = {f.name: f.contents() for f in reader.fields.values() if f.name.startswith("loom.voice.")}
+    assert fields == {"loom.voice.architecture": "pocket-tts", "loom.voice.compat": "ab" * 16,
+                      "loom.voice.name": "v", "loom.voice.license": "CC0-1.0",
+                      "loom.voice.origin": "o", "loom.voice.n_rows": 3}
+    tensor, = reader.tensors
+    assert tensor.name == "voice_kv"
+    np.testing.assert_array_equal(np.asarray(tensor.data), read_voice(src, 2)[0])
+
+
+def test_your_own_voice_needs_a_name_and_the_recordings_licence(tmp_path):
+    from loom_exporter.pocket_tts_voices import convert
+
+    with pytest.raises(ValueError, match="--license"):
+        convert(_language_dir(tmp_path), tmp_path / "out", source=_voice(tmp_path), name="me")
+
+
+@needs_reference
+def test_each_predefined_voice_carries_its_recordings_licence():
+    """Per `kyutai/tts-voices`' README: two of them are NON-COMMERCIAL, and two state none."""
+    from loom_exporter.pocket_tts_voices import UNSTATED, origin_and_license
+
+    assert origin_and_license("alba")[1] == "CC-BY-4.0"
+    assert origin_and_license("anna")[1] == "CC-BY-4.0"
+    assert origin_and_license("marius")[1] == "CC0-1.0"
+    assert origin_and_license("estelle")[1] == "CC0-1.0"
+    assert origin_and_license("giovanni")[1] == "CC0-1.0"
+    assert origin_and_license("cosette")[1] == "CC-BY-NC-4.0"
+    assert origin_and_license("jean")[1] == "CC-BY-NC-4.0"
+    assert origin_and_license("juergen")[1] == UNSTATED
+    assert origin_and_license("not_a_voice")[1] == UNSTATED
+
+
+def test_the_contract_declares_the_voice_fingerprint_and_the_builtin_voice(tmp_path):
+    from loom_exporter.pocket_tts_voices import weights_fingerprint
+
+    d = _language_dir(tmp_path)
+    config = PocketTTSExportConfig(output_path=str(tmp_path / "o.gguf"), model_dir=str(d))
+    config.task = "text-to-speech"
+    contract = config.contract()
+    assert contract["voice.compat"] == weights_fingerprint(d / "model.safetensors")
+    assert contract["tts.voices"] == ["alba"]
+
+
+@needs_reference
+def test_the_chunk_header_constants_are_prepare_text_prompts():
+    """The tail the headers stand for, and the word threshold between them, against the function."""
+    sys.path.insert(0, POCKET_TTS_REPO)
+    from pocket_tts.models.text_chunking import prepare_text_prompt
+
+    from loom_exporter.pocket_tts_tokenizer_export import (
+        LONG_CHUNK_FRAMES_AFTER_EOS, SHORT_CHUNK_FRAMES_AFTER_EOS, SHORT_CHUNK_MAX_WORDS,
+    )
+
+    words = " ".join(["word"] * SHORT_CHUNK_MAX_WORDS)
+    assert prepare_text_prompt(words, False, False)[1] == SHORT_CHUNK_FRAMES_AFTER_EOS
+    assert prepare_text_prompt(words + " more", False, False)[1] == LONG_CHUNK_FRAMES_AFTER_EOS
+    # Counted as `str.split()` counts: a tab separates words.
+    assert prepare_text_prompt("\t".join(["w"] * 5), False, False)[1] == LONG_CHUNK_FRAMES_AFTER_EOS
