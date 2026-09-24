@@ -2984,6 +2984,12 @@ class LoomGGUFExporter:
             # auto-detected as byte-level "gpt2" and mis-tokenize every non-ASCII character.
             from .chatterbox_tokenizer_export import write_chatterbox_vocab
             write_chatterbox_vocab(w, tokenizer_dir)
+        elif family == "pocket_tts":
+            # Family 9's fifth leaf: a SentencePiece Unigram wrapped in the reference's text path
+            # (prepare, split into sentence chunks). Named by the family: the `.model` alone would be
+            # detected as plain "sentencepiece_proto", which tokenizes but does not prepare or chunk.
+            from .pocket_tts_tokenizer_export import write_pocket_tts_vocab
+            write_pocket_tts_vocab(w, tokenizer_dir)
         elif family == "wordpiece":
             from .wordpiece_tokenizer_export import write_wordpiece_vocab
             write_wordpiece_vocab(w, tokenizer_dir)
