@@ -562,6 +562,38 @@ Pass `seed` to get the same voice again.""",
             "whole length budget (six patches per text token) is drawn again, up to three times.",
     ),
     ModelCard(
+        slug="fun-cosyvoice3-0.5b", checkpoint=Path("fun-cosyvoice3-0.5b-2512"),
+        export_task="text-to-speech", export_model="cosyvoice3", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="FunAudioLLM/Fun-CosyVoice3-0.5B-2512", license_id="apache-2.0",
+        source_url="https://github.com/FunAudioLLM/CosyVoice", source_name="CosyVoice",
+        language=["zh", "en", "ja", "ko", "de", "es", "fr", "it", "ru"],
+        # Declared by the export (`cosyvoice3_export.SAMPLE_RATE`): CausalHiFT decodes at 24 kHz.
+        sample_rate=24000,
+        title="Fun-CosyVoice3 0.5B",
+        summary="FunAudioLLM's Fun-CosyVoice3-0.5B-2512, exported for loom.cpp: a Qwen2-0.5B speech-token "
+                "LM, a flow-matching DiT and a HiFT vocoder, 9 languages, 24 kHz. Encodes text itself.",
+        limitations=
+            "**One voice is built in, computed when the file was exported.** The release ships no speaker "
+            "table; the file carries the voice every example in the release's README uses "
+            "(`asset/zero_shot_prompt.wav` from the Apache-2.0 CosyVoice repository, a Mandarin speaker, "
+            "with its transcript), encoded ONCE by the release's own ONNX speech tokenizer and speaker "
+            "encoder. English and the other languages are spoken in that voice cross-lingually. **No voice "
+            "cloning in this file**: cloning a new voice needs those two ONNX models, which it does not "
+            "carry.\n\n"
+            "**No text normalisation.** The reference spells numbers out and splits long text into "
+            "sentence-sized pieces before synthesis; this file does neither, so write numbers as words and "
+            "pass a paragraph a sentence or two at a time.\n\n"
+            "**Sampled, so two calls differ.** The LM samples every speech token (top-k 25, top-p 0.8, "
+            "with the reference's repetition-aware redraw). Pass `seed` to reproduce a call. Verified "
+            "against the reference with its draws pinned: the same 76 tokens, and a waveform within the "
+            "reference's own float32-vs-float64 spread.\n\n"
+            "**Needs loom 1.0.0-rc11 or later.** An older engine ignores three sampler options this file "
+            "uses and samples differently without saying so.\n\n"
+            "**Slow on a small CPU.** 3.4 GB at F32; on a 2-core x86 laptop a second of audio takes 16-20 "
+            "seconds.",
+    ),
+    ModelCard(
         slug="supertonic-2", checkpoint=Path("/home/flavio/Dev/supertonic-tts/assets/pt"),
         export_task="text-to-speech", export_model="supertonic", task_type="text-to-speech",
         takes_text=True,

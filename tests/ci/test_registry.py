@@ -858,7 +858,7 @@ def test_the_tts_families_share_one_task():
     registry = default_registry()
     names = {rec.name for rec in registry._entries["text-to-speech"].recognizers}
     assert names == {"kokoro", "styletts2", "vits", "matcha", "supertonic", "f5-tts", "chatterbox",
-                     "pocket-tts", "voxcpm2"}
+                     "pocket-tts", "voxcpm2", "cosyvoice3"}
     for model in names:
         assert registry.get("text-to-speech", model).name == model
 
