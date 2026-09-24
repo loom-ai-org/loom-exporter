@@ -451,6 +451,36 @@ anything.""",
             "the model as the reference passes them.",
     ),
     ModelCard(
+        slug="pocket-tts", checkpoint=Path("pocket-tts/languages/english_2026-09"),
+        export_task="text-to-speech", export_model="pocket-tts", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="kyutai/pocket-tts", license_id="cc-by-4.0",
+        source_url="https://github.com/kyutai-labs/pocket-tts", source_name="Pocket TTS (English, 2026-09)",
+        language=["en"],
+        # Declared by the export (`pocket_tts_export.SAMPLE_RATE`), restated here like Chatterbox's.
+        sample_rate=24000,
+        title="Pocket TTS (English)",
+        summary="Kyutai's Pocket TTS (English, 2026-09 release), exported for loom.cpp: a 100M-parameter "
+                "flow language model over Mimi codec latents. Encodes text itself and has a built-in voice.",
+        limitations=
+            "**Kyutai's use restrictions apply.** The upstream release prohibits, among other things, "
+            "voice impersonation or cloning without explicit and lawful consent, and presenting "
+            "generated audio as a genuine recording of a real person. They travel with the weights.\n\n"
+            "**One voice, built in: `alba`**, the reference's English default -- voice-acted by Alba "
+            "MacKenna and released by Kyutai under CC BY 4.0 (`kyutai/tts-voices`, `alba-mackenna/`). "
+            "A voice is the model's own attention state after hearing the speaker, and the file ships "
+            "that state rather than audio. Another saved state (the reference's other voices, or one "
+            "made with `pocket-tts export-voice`) can be passed as `voice_kv`; cloning a voice from a "
+            "recording needs the Mimi encoder, which this export does not carry.\n\n"
+            "**Sampled by default**, at the checkpoint's own temperature (0.3), so two calls differ; "
+            "pass `seed` to reproduce one. Verified against the reference with its random draws pinned: "
+            "within 1.8e-06 rms of the reference waveform step for step.\n\n"
+            "**Long text is split, as the reference splits it**: into sentence chunks of at most 50 "
+            "tokens, each generated separately from the same voice and joined. A single sentence "
+            "longer than that is cut at its commas.\n\n"
+            "**English only.** Kyutai's other languages are separate checkpoints and are not this file.",
+    ),
+    ModelCard(
         slug="supertonic-2", checkpoint=Path("/home/flavio/Dev/supertonic-tts/assets/pt"),
         export_task="text-to-speech", export_model="supertonic", task_type="text-to-speech",
         takes_text=True,
