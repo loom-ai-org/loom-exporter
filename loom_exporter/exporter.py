@@ -185,6 +185,9 @@ class LoomGGUFExporter:
         "atan": "ATAN",
         "atan2": "ATAN2",
         "floor": "FLOOR",
+        # VoxCPM2's scalar quantizer. ggml's is `roundf` (ties away from zero), torch's ties to even: see
+        # `op_round` in the engine for why no oracle can tell them apart.
+        "round": "ROUND",
         "clamp": "CLAMP",
         "pow": "POW",
         "square": "SQR",  # MIL's dedicated unary x**2 op (e.g. SnakeBeta's torch.pow(x,2)) -- ggml
@@ -515,7 +518,7 @@ class LoomGGUFExporter:
             return self._sub_symbol(dim)
 
         _UNARY_PASSTHROUGH_OPS = {
-            "cast", "log", "exp", "sqrt", "rsqrt", "abs", "neg", "sign", "floor", "clamp", "clip",
+            "cast", "log", "exp", "sqrt", "rsqrt", "abs", "neg", "sign", "floor", "round", "clamp", "clip",
             "tanh", "sigmoid", "relu", "gelu", "softplus", "identity", "softmax", "logical_not", "silu",
             "leaky_relu", "cumsum", "atan", "sin", "cos", "square",
             # `elu` is EnCodec's, and it arrived with the same failure every entry above was added
@@ -2990,6 +2993,12 @@ class LoomGGUFExporter:
             # detected as plain "sentencepiece_proto", which tokenizes but does not prepare or chunk.
             from .pocket_tts_tokenizer_export import write_pocket_tts_vocab
             write_pocket_tts_vocab(w, tokenizer_dir)
+        elif family == "voxcpm2":
+            # Family 9's sixth leaf: a rank-merged character BPE with byte fallback, under the
+            # reference's split of multi-character Chinese pieces. Named by the family: the
+            # `tokenizer.json` alone would be detected as a plain HF BPE, which is none of these.
+            from .voxcpm2_tokenizer_export import write_voxcpm2_vocab
+            write_voxcpm2_vocab(w, tokenizer_dir)
         elif family == "wordpiece":
             from .wordpiece_tokenizer_export import write_wordpiece_vocab
             write_wordpiece_vocab(w, tokenizer_dir)
