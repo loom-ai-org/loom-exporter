@@ -55,6 +55,34 @@ def _rss_note() -> str:
     return f" (rss {pages * resource.getpagesize() / (1 << 30):.1f} GiB)"
 
 
+def offset_cached_attention_layers(topologies: dict, offset: int) -> None:
+    """Shift a phase's cached ATTENTION nodes to the cache slots after every earlier phase's.
+
+    **One KV cache serves every cached phase that is not a private stream**
+    (`loom::register_topologies`), and `_kv_cache_geometry` sizes it for ALL of their blocks -- but
+    `fuse_loom_attention` numbers each phase's blocks densely from 0, because it sees one program. Two
+    cached phases therefore wrote the same slots: VoxCPM2's 8-layer residual LM overwrote its 28-layer
+    base LM's layers 0-7 at every call, and the prefill still matched the reference exactly, because
+    neither stack reads its cache until the first decode step. (loom.cpp Retro-057.) Offsetting the
+    later phase makes the slots disjoint inside the one cache the geometry already declared.
+
+    A no-op for every export with a single cached phase -- all of them before VoxCPM2 -- so their
+    bytes do not move. An alias stream (`extra_streams`) shares its phase's node list and is shifted
+    with it, once: its private cache is sized by the same model-wide geometry, so the slots exist."""
+    if offset == 0:
+        return
+    seen = set()
+    for topo in topologies.values():
+        nodes = topo.get("nodes", [])
+        if id(nodes) in seen:
+            continue
+        seen.add(id(nodes))
+        for node in nodes:
+            attrs = node.get("attrs") or {}
+            if node.get("op") == "ATTENTION" and attrs.get("kv_cache"):
+                attrs["layer"] = int(attrs["layer"]) + offset
+
+
 def _check_phase_weight_namespaces(phase_outputs) -> None:
     """No phase's topology reads a weight another phase produced.
 
@@ -403,6 +431,8 @@ class MultiPhase(Decomposition):
                           f"worker's spill{_rss_note()}")
                 else:
                     result = convert_phase(phase, quantize=quantize)
+                offset_cached_attention_layers(result.topologies,
+                                               len(fused_geometry.get("attention", [])))
                 phase_topologies.update(result.topologies)
                 phase_outputs.append((phase.name, result.topologies, result.weights))
                 packing.absorb(result.packing)
