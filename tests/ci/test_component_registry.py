@@ -171,7 +171,9 @@ class TestUsageIsDerived(unittest.TestCase):
         # Three since family 9's third leaf. F5-TTS reaching the SAME component as the other two is
         # the claim worth pinning here: its sampler is guided, caller-scheduled and caller-seeded, and
         # all three are declarations on the shared template rather than a bespoke loop.
-        self.assertEqual(used["flow_matching_sampler"], ["f5-tts", "matcha", "supertonic"])
+        # Four since the fourth leaf: Chatterbox reaches it too, with the same three declarations.
+        self.assertEqual(used["flow_matching_sampler"],
+                         ["chatterbox", "f5-tts", "matcha", "supertonic"])
         self.assertEqual(used["modular_chain"], ["lfm2-modular"])
         self.assertIn("qwen3", used["monolithic_call"])
         # Supertonic is the one peeled family that declares no loom_lua function, which is a real
