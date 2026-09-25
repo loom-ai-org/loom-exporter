@@ -7,3 +7,7 @@
 -- One frame is one global step and up to twelve local forwards: the local stack decides continue or
 -- stop and draws codebook 0 from the same row, then draws codebooks 1..11 one at a time. Nothing but
 -- integers crosses this boundary inside the loop (ADR-031).
+--
+-- Voice cloning is two inputs, which a voice file sets (`loom_exporter.moss_tts_voices`, ADR-045):
+-- `reference_codes`, every reference clip's codes frame-major, and `reference_frames`, one frame count
+-- per reference. They go into the prompt where the template otherwise says "None".

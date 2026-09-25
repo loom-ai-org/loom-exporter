@@ -34,8 +34,14 @@ binary`). 1.56 GB at F32 that no draw reads.
 **The prompt template ships as ids, pre-encoded here segment by segment.** The processor encodes each
 template piece SEPARATELY and concatenates the ids -- which is not the same as encoding the rendered
 string -- so the export does exactly that with the checkpoint's own tokenizer, once per supported
-language, and the driver wraps the caller's text ids in them. Voice cloning (a reference clip's codes
-in the prompt) needs the codec's ENCODER, which is not exported; this is the reference-free mode.
+language, and the driver wraps the caller's text ids in them.
+
+**Voice cloning takes the reference's CODES, not its audio.** The clone prompt replaces the template's
+"None" under "- Reference(s):" with, per reference, an `<audio_start>` row, one row per frame (the USER
+slot id plus its 12 codes) and an `<audio_end>` row. The codes come from the codec's encoder, which is
+not exported here: `moss_tts_voices` runs it once per voice and writes a voice file (loom.cpp ADR-045),
+and the driver takes its `reference_codes` + `reference_frames`. The contract's `voice.compat` is the
+codec's quantizer fingerprint, since that is what a code means.
 """
 import json
 import math
@@ -85,17 +91,19 @@ def after_reference(language: Optional[str]) -> str:
 
 
 def prompt_segments(tokenizer, config) -> dict:
-    """The ids the driver wraps the caller's text in: `head`, one `after` per language (index 0 is
-    no language), and `tail`. Encoded exactly as `_build_generation_or_voice_clone_codes` does."""
+    """The ids the driver wraps the caller's text in: `head`, then either `no_reference` or the
+    references' audio rows, then one `after` per language (index 0 is no language), then the text, then
+    `tail`. Encoded exactly as `_build_generation_or_voice_clone_codes` does: its clone branch is the
+    same pieces with the references where `enc("None")` is."""
     def enc(text):
         return list(tokenizer.encode(text, add_special_tokens=False))
 
-    head = [int(config.im_start_token_id)] + enc(USER_ROLE_PREFIX) + \
-        enc(USER_TEMPLATE_REFERENCE_PREFIX) + enc("None")
+    head = [int(config.im_start_token_id)] + enc(USER_ROLE_PREFIX) + enc(USER_TEMPLATE_REFERENCE_PREFIX)
+    no_reference = enc("None")
     tail = enc(USER_TEMPLATE_SUFFIX) + [int(config.im_end_token_id)] + enc(ASSISTANT_TURN_PREFIX) + \
         [int(config.im_start_token_id)] + enc(ASSISTANT_ROLE_PREFIX) + [int(config.audio_start_token_id)]
     after = [enc(after_reference(None))] + [enc(after_reference(name)) for _, name in LANGUAGES]
-    return dict(head=head, after=after, tail=tail)
+    return dict(head=head, no_reference=no_reference, after=after, tail=tail)
 
 
 class _EmbedWrapper(nn.Module):
@@ -283,6 +291,10 @@ class TextToCodesMossTTSExportConfig(BaseMultiPhaseModelExportConfig):
     driver_script_path: Path = Path(__file__).resolve().parent / "moss_tts_driver"
     decomposition: Decomposition = field(default_factory=MultiPhase)
 
+    # The codec whose codes this model reads, for the voice fingerprint only (`moss_tts_voices`). Empty:
+    # the directory beside the checkpoint that its config's `audio_tokenizer_name_or_path` names.
+    codec_dir: str = ""
+
     trace_len: int = 7          # not 8: the GQA fusion must tell 8 K/V heads from the sequence axis
     # Prompt + generated frames share one KvCache. 2048 is ~2.5 min of audio after a long prompt; the
     # cache is 36 layers x 2048 x 1024 x K,V x 4 bytes = 604 MB at F32.
@@ -293,11 +305,16 @@ class TextToCodesMossTTSExportConfig(BaseMultiPhaseModelExportConfig):
     _hidden: Optional[int] = None
     _segments: Optional[dict] = None
     _slot_id: Optional[int] = None
+    _user_slot_id: Optional[int] = None
+    _audio_start_id: Optional[int] = None
+    _audio_end_id: Optional[int] = None
+    _voice_compat: Optional[str] = None
     _pad_code: Optional[int] = None
     _sample_rate: Optional[int] = None
 
     __unchecked__ = {
         "model_dir": Unchecked("path to the HF directory; `load_model` raises on anything it cannot load"),
+        "codec_dir": Unchecked("path to the codec's HF directory; `moss_tts_voices.find_codec` raises"),
         "root_axis": Unchecked("`n_tokens` is forced for a KV-cached phase -- qwen3_tts_export says why"),
         "trace_len": Unchecked("the concrete length torch.jit.trace runs at; see the field comment"),
         "max_positions": Unchecked("the ct.RangeDim bound on the cached axis, a memory decision"),
@@ -306,6 +323,10 @@ class TextToCodesMossTTSExportConfig(BaseMultiPhaseModelExportConfig):
         "_hidden": Unchecked("read off config.hidden_size by load_model"),
         "_segments": Unchecked("encoded by load_model with the checkpoint's own tokenizer"),
         "_slot_id": Unchecked("read off config.audio_assistant_slot_token_id by load_model"),
+        "_user_slot_id": Unchecked("read off config.audio_user_slot_token_id by load_model"),
+        "_audio_start_id": Unchecked("read off config.audio_start_token_id by load_model"),
+        "_audio_end_id": Unchecked("read off config.audio_end_token_id by load_model"),
+        "_voice_compat": Unchecked("the codec's quantizer fingerprint, taken by load_model"),
         "_pad_code": Unchecked("read off config.audio_pad_code by load_model"),
         "_sample_rate": Unchecked("read off config.sampling_rate by load_model"),
     }
@@ -315,6 +336,17 @@ class TextToCodesMossTTSExportConfig(BaseMultiPhaseModelExportConfig):
 
         print(f"Loading MOSS-TTS-Local from {self.model_dir}...")
         model, config = load_reference(self.model_dir)
+        self.read_constants(config, transformers.AutoTokenizer.from_pretrained(self.model_dir))
+        hf = as_hf_qwen3(model, config)
+        diff = check_global_equivalence(model, hf)
+        print(f"  transformers Qwen3Model vs MossQwen3Model: max |d| {diff:.2e}")
+        self._model, self._hf = model, hf
+        return model
+
+    def read_constants(self, config, tokenizer) -> None:
+        """Everything the driver and the contract need from the checkpoint that is not a weight: ids,
+        sizes, the pre-encoded template and the voice fingerprint. Split from `load_model` so a driver
+        can be rendered without 9 GB of weights in memory."""
         if str(getattr(config, "local_text_head_mode", "")).lower() != "binary":
             raise NotImplementedError("only the binary continue/stop head (v1.5) is exported")
         sizes = set(int(s) for s in config.audio_codebook_sizes)
@@ -324,17 +356,26 @@ class TextToCodesMossTTSExportConfig(BaseMultiPhaseModelExportConfig):
         self._codebook_size = sizes.pop()
         self._hidden = int(config.hidden_size)
         self._slot_id = int(config.audio_assistant_slot_token_id)
+        self._user_slot_id = int(config.audio_user_slot_token_id)
+        self._audio_start_id = int(config.audio_start_token_id)
+        self._audio_end_id = int(config.audio_end_token_id)
+        if int(config.audio_pad_token_id) != int(config.audio_pad_code):
+            raise NotImplementedError("text rows are filled with audio_pad_token_id and the zero row is at "
+                                      "audio_pad_code; the export assumes they are one id")
         self._pad_code = int(config.audio_pad_code)
         if self._pad_code != self._codebook_size:
             raise NotImplementedError("the zero row is placed at `codebook_size`; the pad code is not there")
         self._sample_rate = int(config.sampling_rate)
-        tokenizer = transformers.AutoTokenizer.from_pretrained(self.model_dir)
         self._segments = prompt_segments(tokenizer, config)
-        hf = as_hf_qwen3(model, config)
-        diff = check_global_equivalence(model, hf)
-        print(f"  transformers Qwen3Model vs MossQwen3Model: max |d| {diff:.2e}")
-        self._model, self._hf = model, hf
-        return model
+        self._voice_compat = self.voice_compat()
+
+    def voice_compat(self) -> str:
+        """The fingerprint a voice file must carry to be loaded into this model: the codec's."""
+        from .moss_tts_voices import codec_fingerprint, find_codec
+
+        codec = find_codec(self.model_dir, self.codec_dir or None)
+        print(f"  voice fingerprint from the codec at {codec}")
+        return codec_fingerprint(codec)
 
     def hparams(self) -> dict:
         if self._n_vq is None:
@@ -354,6 +395,9 @@ class TextToCodesMossTTSExportConfig(BaseMultiPhaseModelExportConfig):
         # Read by `ModelContract` as `loom.text.languages` (the writer adds the prefix) -- the same key
         # SenseVoice declares. Index i+1 of this list is `PROMPT_AFTER` segment i+1 in the driver.
         contract["text.languages"] = [code for code, _ in LANGUAGES]
+        # What a voice file must match (`moss_tts_voices`, loom.cpp ADR-045). No built-in voice: with
+        # none the prompt says "None", which is the reference's own default.
+        contract["voice.compat"] = self._voice_compat or self.voice_compat()
         return contract
 
     def backend_kwargs(self) -> dict:
@@ -421,7 +465,7 @@ class TextToCodesMossTTSExportConfig(BaseMultiPhaseModelExportConfig):
     def driver_components(self) -> List:
         from .driver_components import DriverReturn, ExportConstants, LuaFragment
 
-        seg = self._segments or {"head": [0], "after": [[0]], "tail": [0]}
+        seg = self._segments or {"head": [0], "no_reference": [0], "after": [[0]], "tail": [0]}
         after_flat, after_offsets = [], []
         for ids in seg["after"]:
             after_offsets.append(len(after_flat))
@@ -434,7 +478,11 @@ class TextToCodesMossTTSExportConfig(BaseMultiPhaseModelExportConfig):
                 "CODEBOOK_SIZE": self._codebook_size or 0,
                 "PAD_CODE": self._pad_code or 0,
                 "SLOT_ID": self._slot_id or 0,
+                "USER_SLOT_ID": self._user_slot_id or 0,
+                "AUDIO_START_ID": self._audio_start_id or 0,
+                "AUDIO_END_ID": self._audio_end_id or 0,
                 "PROMPT_HEAD": seg["head"],
+                "PROMPT_NO_REFERENCE": seg["no_reference"],
                 "PROMPT_TAIL": seg["tail"],
                 # One `after` per language, flattened: language i is `[OFFSETS[i+1], OFFSETS[i+2])`
                 # in Lua's 1-based terms, and index 0 is "no language".
@@ -449,7 +497,8 @@ class TextToCodesMossTTSExportConfig(BaseMultiPhaseModelExportConfig):
             }),
             LuaFragment(
                 self.driver_script_path / "01_generate.lua",
-                reads=("N_VQ", "CODEBOOK_SIZE", "PAD_CODE", "SLOT_ID", "PROMPT_HEAD", "PROMPT_TAIL",
+                reads=("N_VQ", "CODEBOOK_SIZE", "PAD_CODE", "SLOT_ID", "USER_SLOT_ID", "AUDIO_START_ID",
+                       "AUDIO_END_ID", "PROMPT_HEAD", "PROMPT_NO_REFERENCE", "PROMPT_TAIL",
                        "PROMPT_AFTER", "PROMPT_AFTER_OFFSETS", "MAX_POSITIONS", "MAX_NEW_TOKENS",
                        "AUDIO_TEMPERATURE", "AUDIO_TOP_K", "AUDIO_TOP_P", "TEXT_TEMPERATURE",
                        "TEXT_TOP_K", "TEXT_TOP_P"),
