@@ -2999,6 +2999,12 @@ class LoomGGUFExporter:
             # `tokenizer.json` alone would be detected as a plain HF BPE, which is none of these.
             from .voxcpm2_tokenizer_export import write_voxcpm2_vocab
             write_voxcpm2_vocab(w, tokenizer_dir)
+        elif family == "cosyvoice3":
+            # Family 9's seventh leaf: Qwen2's byte-level BPE wrapped in the reference's text
+            # normalisation and paragraph split. Named by the family: the `tokenizer.json` alone is
+            # detected as a plain "gpt2" BPE, which tokenizes but neither spells numbers nor chunks.
+            from .cosyvoice3_tokenizer_export import write_cosyvoice3_vocab
+            write_cosyvoice3_vocab(w, tokenizer_dir)
         elif family == "wordpiece":
             from .wordpiece_tokenizer_export import write_wordpiece_vocab
             write_wordpiece_vocab(w, tokenizer_dir)

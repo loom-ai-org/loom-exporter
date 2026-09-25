@@ -538,7 +538,7 @@ def compute_voice(frontend, wav_path: str, prompt_text: str) -> Dict[str, np.nda
     }
 
 
-def stage_tokenizer(model_dir: str, staging: str) -> str:
+def stage_tokenizer(model_dir: str, staging: str) -> int:
     """`CosyVoice3Tokenizer`, written out as a `tokenizer.json` the BPE writer reads.
 
     The checkpoint's `CosyVoice-BlankEN` is a plain Qwen2 tokenizer (vocab.json + merges.txt, three
@@ -546,14 +546,16 @@ def stage_tokenizer(model_dir: str, staging: str) -> str:
     tags (`[breath]`, `<laughter>`), and CMU/pinyin phoneme tokens for pronunciation in-painting -- with
     `add_special_tokens`, so their ids are whatever transformers assigns in list order. The ids are
     taken from transformers doing exactly that, not recomputed, and saved; the writer then treats them
-    as any other added token (split out of the raw text before BPE)."""
+    as any other added token (split out of the raw text before BPE). Returns the chunk header's id."""
     from cosyvoice.tokenizer.tokenizer import CosyVoice3Tokenizer
+
+    from .cosyvoice3_tokenizer_export import CHUNK_HEADER
 
     tok = CosyVoice3Tokenizer(token_path=f"{model_dir}/CosyVoice-BlankEN").tokenizer
     if tok.convert_tokens_to_ids("<|endofprompt|>") != END_OF_PROMPT:
         raise ValueError("CosyVoice3Tokenizer did not put <|endofprompt|> at 151646, the id the LM checks")
     tok.save_pretrained(staging)
-    return staging
+    return int(tok.convert_tokens_to_ids(CHUNK_HEADER))
 
 
 @dataclass(kw_only=True)
@@ -568,6 +570,7 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
     voice_wav: Optional[str] = None
     voice_text: str = DEFAULT_VOICE_TEXT
     _voice: Optional[Dict[str, np.ndarray]] = field(default=None, init=False, repr=False)
+    _chunk_header: Optional[int] = field(default=None, init=False, repr=False)
     _staging: Optional[tempfile.TemporaryDirectory] = field(default=None, init=False, repr=False)
 
     __links__ = {"root_axis": Axis()}
@@ -582,6 +585,7 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
         "voice_wav": Unchecked("the default voice's clip; None means the checkout's zero_shot_prompt.wav"),
         "voice_text": Unchecked("the default voice's prompt text, <|endofprompt|> checked in compute_voice"),
         "_voice": Unchecked("computed from the clip during phases() and shipped as driver weights"),
+        "_chunk_header": Unchecked("the chunk separator's id, read off the staged tokenizer in phases()"),
         "_staging": Unchecked("a temporary directory holding the staged tokenizer.json"),
     }
 
@@ -596,7 +600,7 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
         self._voice = compute_voice(frontend, self.voice_wav or f"{COSYVOICE_REPO}/{DEFAULT_VOICE_WAV}",
                                     self.voice_text)
         self._staging = tempfile.TemporaryDirectory(prefix="cosyvoice3_tok_")
-        stage_tokenizer(self.model_dir, self._staging.name)
+        self._chunk_header = stage_tokenizer(self.model_dir, self._staging.name)
         del frontend
 
         hidden = llm.llm_input_size
@@ -698,6 +702,8 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
         fragment = self.driver_script_path
         n_frames, n_gen = Var("n_frames"), Var("n_gen_frames")
         constants = {
+            # What `loom::CosyVoice3Vocab` opens each chunk with (`<|endoftext|>`, read off the tokenizer).
+            "CHUNK_HEADER": self._chunk_header,
             "SOS": SOS, "TASK_ID": TASK_ID, "END_OF_PROMPT": END_OF_PROMPT,
             "LM_MAX_POSITIONS": LM_MAX_POSITIONS,
             "RAS_TOP_K": RAS_TOP_K, "RAS_TOP_P": RAS_TOP_P, "RAS_WIN": RAS_WIN, "RAS_TAU": RAS_TAU,
@@ -709,10 +715,11 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
         return [
             LuaFragment(fragment / "00_header.lua", top_level=True,
                         defines=("cosyvoice3_voice", "cosyvoice3_cosine_times", "cosyvoice3_zeros",
-                                 "COSYVOICE3_SILENT")),
+                                 "COSYVOICE3_SILENT", "cosyvoice3_split_chunks")),
             ExportConstants(values=constants),
             # The text's ids are the one required input; the voice, the knobs and the draws are optional.
             DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
+            LuaFragment(fragment / "00_chunks.lua", reads=("tokens", "CHUNK_HEADER")),
             LuaFragment(fragment / "01_lm.lua",
                         reads=("tokens", "SOS", "TASK_ID", "END_OF_PROMPT",
                                "LM_MAX_POSITIONS", "RAS_TOP_K", "RAS_TOP_P", "RAS_WIN", "RAS_TAU",
@@ -763,13 +770,22 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
         contract["text.frontend"] = "vocab"
         contract["sample_rate"] = SAMPLE_RATE
         contract["tts.default_steps"] = FLOW_STEPS
+        # What a voice file must match to be loaded into this model (`cosyvoice3_voices`, loom.cpp
+        # ADR-045): the LM and flow weights, the two that read a voice's arrays.
+        from .cosyvoice3_voices import DEFAULT_VOICE_NAME, weights_fingerprint
+
+        contract["voice.compat"] = weights_fingerprint(self.model_dir)
+        # The voice the file carries, which is what `infer` uses when the caller names none.
+        contract["tts.voices"] = [DEFAULT_VOICE_NAME]
         return contract
 
     def backend_kwargs(self) -> dict:
         kwargs = dict(flat_namespace=False, root_axis=self.root_axis, hparams=self.hparams())
         if self._staging is not None:
-            # A byte-level Qwen2 BPE with CosyVoice3's added tokens; auto-detected as "bpe"/"qwen2".
+            # A byte-level Qwen2 BPE with CosyVoice3's added tokens, under the reference's text path
+            # (`cosyvoice3_tokenizer_export`): numbers spelled out, paragraphs split into chunks.
             kwargs["tokenizer_dir"] = self._staging.name
+            kwargs["tokenizer_family"] = "cosyvoice3"
         if self._voice is not None:
             kwargs["driver_weights"] = dict(self._voice)
         return kwargs
