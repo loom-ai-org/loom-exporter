@@ -7,23 +7,67 @@
         error('language ' .. _language .. ' is not one this file declares (0 .. ' ..
               (#PROMPT_AFTER_OFFSETS - 2) .. ')')
     end
-    local _ids = {}
-    for _i = 1, #PROMPT_HEAD do _ids[#_ids + 1] = PROMPT_HEAD[_i] end
-    for _i = PROMPT_AFTER_OFFSETS[_language + 1] + 1, PROMPT_AFTER_OFFSETS[_language + 2] do
-        _ids[#_ids + 1] = PROMPT_AFTER[_i]
-    end
-    for _i = 1, #inputs.tokens do _ids[#_ids + 1] = inputs.tokens[_i] end
-    for _i = 1, #PROMPT_TAIL do _ids[#_ids + 1] = PROMPT_TAIL[_i] end
 
     -- One row per prompt id: the text id, then twelve pad codes. The pad code's embedding row is zero
     -- in the export, which is the reference's mask.
-    local _width = N_VQ + 1
     local _rows = {}
-    for _i = 1, #_ids do
-        _rows[#_rows + 1] = _ids[_i]
-        for _g = 1, N_VQ do _rows[#_rows + 1] = PAD_CODE end
+    local _n_prompt = 0
+    local function _text_rows(_list, _lo, _hi)
+        for _i = _lo or 1, _hi or #_list do
+            _rows[#_rows + 1] = _list[_i]
+            for _g = 1, N_VQ do _rows[#_rows + 1] = PAD_CODE end
+            _n_prompt = _n_prompt + 1
+        end
     end
-    local _n_prompt = #_ids
+
+    -- THE REFERENCES (voice cloning): where the template says "None", each reference as an
+    -- `<audio_start>` row, one row per frame -- the USER slot id and its twelve codes -- and an
+    -- `<audio_end>` row, back to back with no separator (the reference's direct clone path). A voice
+    -- file sets both inputs; `reference_frames` absent means one reference of every frame given.
+    local _ref = inputs.reference_codes
+    _text_rows(PROMPT_HEAD)
+    if _ref == nil or #_ref == 0 then
+        _text_rows(PROMPT_NO_REFERENCE)
+    else
+        if #_ref % N_VQ ~= 0 then
+            error('reference_codes holds ' .. #_ref .. ' codes, not a whole number of ' .. N_VQ ..
+                  '-code frames')
+        end
+        local _frames = inputs.reference_frames or {#_ref / N_VQ}
+        local _total = 0
+        for _r = 1, #_frames do _total = _total + _frames[_r] end
+        if _total * N_VQ ~= #_ref then
+            error('reference_frames adds up to ' .. _total .. ' frames and reference_codes holds ' ..
+                  (#_ref / N_VQ))
+        end
+        local _at = 0
+        for _r = 1, #_frames do
+            _text_rows({AUDIO_START_ID})
+            for _f = 1, _frames[_r] do
+                _rows[#_rows + 1] = USER_SLOT_ID
+                for _g = 1, N_VQ do
+                    local _code = _ref[_at + _g]
+                    -- The pad code is a real row of the table (zero), so a code outside the codebook
+                    -- would be read as "absent" or as another codebook's row, not refused.
+                    if _code < 0 or _code >= CODEBOOK_SIZE or _code ~= math.floor(_code) then
+                        error('reference code ' .. _code .. ' (frame ' .. (_at / N_VQ + 1) ..
+                              ', codebook ' .. (_g - 1) .. ') is not in [0, ' .. CODEBOOK_SIZE .. ')')
+                    end
+                    _rows[#_rows + 1] = _code
+                end
+                _at = _at + N_VQ
+                _n_prompt = _n_prompt + 1
+            end
+            _text_rows({AUDIO_END_ID})
+        end
+    end
+    _text_rows(PROMPT_AFTER, PROMPT_AFTER_OFFSETS[_language + 1] + 1, PROMPT_AFTER_OFFSETS[_language + 2])
+    _text_rows(inputs.tokens)
+    _text_rows(PROMPT_TAIL)
+    if _n_prompt >= MAX_POSITIONS then
+        error('the prompt is ' .. _n_prompt .. ' rows and this file caches ' .. MAX_POSITIONS ..
+              ' positions; shorten the references or the text')
+    end
 
     loom.run_subgraph_and_retain('embed', {n_tokens = _n_prompt, n_past = 0}, {rows = _rows})
     loom.run_subgraph_and_retain('global', {n_tokens = _n_prompt, n_past = 0},
