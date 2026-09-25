@@ -1,0 +1,9 @@
+-- MOSS-TTS-Local-Transformer-v1.5: text in, `audio_codes` out, frame-major and 12 wide.
+--
+-- The codes are what `moss-audio-tokenizer-v2` decodes -- two GGUFs by ADR-022. That codec has 32
+-- codebooks and this model emits the first 12; the codec declares `codec.absent_code` for exactly
+-- that, and a host pads each row with it (ADR-050).
+--
+-- One frame is one global step and up to twelve local forwards: the local stack decides continue or
+-- stop and draws codebook 0 from the same row, then draws codebooks 1..11 one at a time. Nothing but
+-- integers crosses this boundary inside the loop (ADR-031).

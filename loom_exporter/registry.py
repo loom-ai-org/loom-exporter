@@ -211,6 +211,7 @@ _FAMILY_MODULES = (
     "pocket_tts_export",
     "voxcpm2_export",
     "cosyvoice3_export",
+    "moss_tts_export",
 )
 
 

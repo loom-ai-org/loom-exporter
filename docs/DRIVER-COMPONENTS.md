@@ -82,13 +82,13 @@ differs is entirely what the host does with the one output. The family names its
 | `token_labels_epilogue` | `TokenLabelsEpilogue` | statements | 1 | 0 | funasr-paraformer, hf-token-classifier |
 | `cif_boundary` | `CifBoundary` | statements | 1 | 6 | funasr-paraformer |
 | `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 4 | hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
-| `export_constants` | `ExportConstants` | statements | 0 | 1 | chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, styletts2, supertonic, t5, vits, voxcpm2, whisper |
+| `export_constants` | `ExportConstants` | statements | 0 | 1 | chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, matcha, moss-tts-local, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, styletts2, supertonic, t5, vits, voxcpm2, whisper |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
-| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 4 | chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, styletts2, supertonic, t5, vits, voxcpm2, whisper |
+| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 4 | chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, matcha, moss-tts-local, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, styletts2, supertonic, t5, vits, voxcpm2, whisper |
 | `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | chatterbox, cosyvoice3, dia, encodec, f5-tts, funasr-paraformer, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
 | `recurrent_call` | `RecurrentCall` | statements | 1 | 8 | encodec |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 11 | chatterbox, cosyvoice3, f5-tts, matcha, supertonic |
-| `driver_return` | `DriverReturn` | statements | 0 | 1 | chatterbox, cosyvoice3, dac, dia, encodec, f5-tts, kokoro, matcha, moss-audio-tokenizer, pocket-tts, qwen3-tts, qwen3-tts-tokenizer-12hz, snac, styletts2, supertonic, vits, voxcpm2 |
+| `driver_return` | `DriverReturn` | statements | 0 | 1 | chatterbox, cosyvoice3, dac, dia, encodec, f5-tts, kokoro, matcha, moss-audio-tokenizer, moss-tts-local, pocket-tts, qwen3-tts, qwen3-tts-tokenizer-12hz, snac, styletts2, supertonic, vits, voxcpm2 |
 | `lua_library` | `LuaLibrary` | prelude | 1 | 0 | f5-tts, funasr-paraformer, kokoro, matcha, styletts2, vits |
 
 ### `driver_inputs` — `DriverInputs`
@@ -202,7 +202,7 @@ Returns the next token rather than the raw logits: argmax over the active row, r
 
 Values only the checkpoint knows (a blank id, a duration set, a hidden width), bound as ordinary locals so every read of them is checked by driver_ir.validate -- rather than interpolated into hand-written Lua through a marker, where a misspelled read is a silent nil (BACKLOG.md P4.0.18).
 
-*Emits:* statements. *Used by:* chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, styletts2, supertonic, t5, vits, voxcpm2, whisper.
+*Emits:* statements. *Used by:* chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, matcha, moss-tts-local, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, styletts2, supertonic, t5, vits, voxcpm2, whisper.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -224,7 +224,7 @@ A hand-written `.lua` adopted whole -- prelude, one verbatim body block, postlud
 
 One hand-written block of a peeled driver, kept as its own `.lua` file, declaring what it reads and defines (and, since D.2, which topologies its computed call sites drive).
 
-*Emits:* prelude, statements. *Used by:* chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, styletts2, supertonic, t5, vits, voxcpm2, whisper.
+*Emits:* prelude, statements. *Used by:* chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, matcha, moss-tts-local, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, styletts2, supertonic, t5, vits, voxcpm2, whisper.
 
 * `drives` — ConfigDerived(needs=[])
   <br>*says:* {label} has computed call site(s) {detail} that no `drives` declaration covers, so the topologies they run are checked by nothing.
@@ -264,7 +264,7 @@ A `FlowMatchingSpec`'s generated Euler-CFM sampler function, plus the line that 
 
 What the entry function hands back to the host.
 
-*Emits:* statements. *Used by:* chatterbox, cosyvoice3, dac, dia, encodec, f5-tts, kokoro, matcha, moss-audio-tokenizer, pocket-tts, qwen3-tts, qwen3-tts-tokenizer-12hz, snac, styletts2, supertonic, vits, voxcpm2.
+*Emits:* statements. *Used by:* chatterbox, cosyvoice3, dac, dia, encodec, f5-tts, kokoro, matcha, moss-audio-tokenizer, moss-tts-local, pocket-tts, qwen3-tts, qwen3-tts-tokenizer-12hz, snac, styletts2, supertonic, vits, voxcpm2.
 
 * nothing — every field is `__unchecked__`, with its reason
 
