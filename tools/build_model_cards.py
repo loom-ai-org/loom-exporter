@@ -105,6 +105,11 @@ class ModelCard:
     # through one door, and what a caller has to supply is not implied by the task. Dia picks a voice
     # from its seed; Qwen3-TTS has no speaker table at all and clones from audio.
     clones_voice: bool = False
+    # An explicit `USAGE_SNIPPETS` key, for a model whose door differs from its task's usual card in a
+    # way no flag above describes. MOSS-TTS is the case: a `text-to-codes` model like Dia, but with a
+    # different codec, a `language=` argument and none of Dia's guidance -- so the shared snippet
+    # would publish calls this file does not answer. Wins over everything `snippet_key` derives.
+    snippet: Optional[str] = None
     # `--task`/`--model` for loom-export; empty means auto-detection resolves both.
     export_task: Optional[str] = None
     export_model: Optional[str] = None
@@ -926,6 +931,94 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         ),
     ),
     ModelCard(
+        slug="moss-tts-local-transformer-v1.5", checkpoint=Path("moss-tts-local-transformer-v1.5"),
+        task_type="text-to-codes", pipeline_tag="text-to-speech",
+        snippet="text-to-codes-moss",
+        # Exported on the workstation: the F32 conversion peaks at 34.2 GB, over this dev box's RAM.
+        base_repo="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5", license_id="apache-2.0",
+        language=["zh", "yue", "en", "ar", "cs", "da", "de", "nl", "es", "fr", "fi", "el", "he", "hi",
+                  "hu", "ja", "it", "ko", "mk", "ms", "ru", "fa", "pl", "pt", "sv", "ro", "sw", "tl",
+                  "th", "tr", "vi"],
+        title="MOSS-TTS Local Transformer v1.5",
+        summary="OpenMOSS's multilingual TTS model, exported for loom.cpp. Family 10: text in, "
+                "neural-codec tokens out -- pair it with `moss-audio-tokenizer-v2-loom` for 48 kHz "
+                "stereo audio.",
+        limitations=(
+            "**This model does not produce audio.** It emits 12 streams of MOSS-Audio-Tokenizer "
+            "codec tokens, and the codec turns those into a waveform -- "
+            "[`moss-audio-tokenizer-v2-loom`](https://huggingface.co/loom-ai-org/moss-audio-tokenizer-v2-loom). "
+            "They stay separate because the codec is shared across the MOSS family and because the "
+            "codes are the useful intermediate.\n\n"
+            "**12 codebooks into a 32-codebook codec, and nothing to do about it.** The codec is a "
+            "residual quantizer, and decoding the first 12 of its 32 codebooks is what upstream's own "
+            "processor asks for. The codec file declares an id meaning \"this codebook is absent\", "
+            "and `codes2speech.infer` fills each 12-wide row out with it, so the usage above passes "
+            "the codes straight across.\n\n"
+            "**`language=` is a code from the contract**: the 31 languages this model supports, "
+            "`model.contract[\"languages\"]`. It selects the prompt's language line, which upstream "
+            "recommends setting; omitted, the line says `None`, which upstream's README says can "
+            "regress some languages slightly.\n\n"
+            "**It samples by default, at upstream's recommended settings** -- audio temperature 1.7, "
+            "top-k 25, top-p 0.8 -- so two runs of a sentence give two takes, and `seed=` pins one. "
+            "`temperature=0, text_temperature=0` decodes greedily and reproduces upstream's "
+            "`generate(do_sample=False)` **exactly**: every code of 38 and 40 frames identical, and "
+            "the same frame chosen to stop on. The sampled decode is verified the same way, with its "
+            "random draws pinned on both sides.\n\n"
+            "**No voice cloning in this export.** Upstream clones from a reference clip by putting "
+            "the clip's codec tokens in the prompt, which needs the codec's ENCODER; this repo and the "
+            "codec's carry the decode halves only. Without a reference the model picks a voice, and "
+            "the seed decides which. The template's other optional lines (a duration in tokens, a "
+            "free-form instruction, quality, sound events) are left at `None` too.\n\n"
+            "**`max_new_tokens` counts audio frames at 12.5 per second.** One frame is one pass of the "
+            "36-layer backbone plus twelve of a one-layer local transformer that draws the codebooks "
+            "in turn; the model decides for itself when to stop.\n\n"
+            "**It is a big download, and slow on a CPU**: 16.8 GB, F32, like the rest of this "
+            "collection (4.55B parameters, less the 1.56 GB text head this release never reads). A "
+            "24-core workstation generates about 3 frames per second, against the 12.5 real time "
+            "needs."
+        ),
+    ),
+    ModelCard(
+        slug="moss-audio-tokenizer-v2", checkpoint=Path("moss-audio-tokenizer-v2"),
+        task_type="audio-codec", pipeline_tag="text-to-audio",
+        base_repo="OpenMOSS-Team/MOSS-Audio-Tokenizer-v2", license_id="apache-2.0", language=[],
+        language_note="a codec, not a language model: it carries no vocabulary and no language.",
+        title="MOSS-Audio-Tokenizer v2 (decoder)",
+        summary="OpenMOSS's 48 kHz stereo audio tokenizer, decode half, exported for loom.cpp. "
+                "Family 11: codec tokens in, interleaved stereo out -- and the family's first leaf "
+                "with no convolution at all.",
+        usage_extra=(
+            "The audio is **interleaved stereo**: `audio.channels` is 2, `audio.samples` runs "
+            "`L R L R ...`, `audio.duration` accounts for it, `audio.save()` writes a two-channel WAV "
+            "and `numpy.asarray(audio)` is `[frames, 2]`.\n\n"
+            "Rows **narrower** than 32 decode as a prefix of the codebooks: the rest of each row is "
+            "filled with the id the file declares as absent. That is how "
+            "[`moss-tts-local-transformer-v1.5-loom`](https://huggingface.co/loom-ai-org/moss-tts-local-transformer-v1.5-loom)'s "
+            "12 codebooks decode:\n\n"
+            "```python\n"
+            "print(model.hparam(\"codec.absent_code\"), audio.channels)\n"
+            "audio = model.codes2speech.infer([[0] * 12 for _ in range(frames)])   # 12 of 32\n"
+            "```"
+        ),
+        limitations=(
+            "**This is the DECODE half only**, like every codec in this collection: `encode` is "
+            "audio-in/codes-out, a different contract, and no model that decodes through this codec "
+            "calls it. It is also what voice cloning with MOSS-TTS would need, so cloning is not "
+            "available through these two repos.\n\n"
+            "**A clip is decoded in ONE call, never in chunks**, because nothing else is exact here. "
+            "The decoder is six causal transformer stacks (12.5 Hz up to 400 Hz) with windowed "
+            "attention, and 92 layers of windows reach further back than any chunk could carry: a "
+            "chunked decode with 8 s of overlap is still 48% away from the model's own answer. The "
+            "attention is computed in blocks, so memory grows linearly with the clip rather than "
+            "quadratically. The ceiling is 4096 frames, 5.5 minutes, which is upstream's own "
+            "generation budget. Verified against upstream's decode at 1.2e-06 relative RMS on 30 s of "
+            "speech.\n\n"
+            "**Feed it frame-major rows of up to 32 codes at 12.5 frames per second**; one frame is "
+            "3840 samples per channel at 48 kHz. On a 2-core CPU a 30 s clip takes about two "
+            "minutes."
+        ),
+    ),
+    ModelCard(
         slug="flan-t5-small", checkpoint=Path("flan-t5-small"),
         # `text2text-generation` is this export's task and is NOT a tag HuggingFace recognizes -- it
         # was retired from their list, which now splits that space into `summarization`,
@@ -1311,6 +1404,30 @@ print(model.hparam("codec.n_codebooks"), "==", codec.hparam("codec.n_codebooks")
 print(model.hparam("sampling.temperature", "f32"),
       model.hparam("sampling.repetition_penalty", "f32"))
 """,
+    # MOSS-TTS: Dia's two-file shape with a different codec, a `language=` and no guidance. The codec
+    # is 32 codebooks wide and this model emits 12; the codec declares an absent id and
+    # `codes2speech` fills the rows with it, so nothing goes between the two calls here either.
+    "text-to-codes-moss": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# What comes back is codec TOKENS, not audio -- frame-major, one row per frame, 12 codebooks wide, at
+# 12.5 frames per second. `language=` is one of the codes in model.contract["languages"].
+codes = model.text2codes.infer("The quick brown fox jumps over the lazy dog.", language="en", seed=1)
+print(len(codes), "frames x", len(codes[0]), "codebooks")
+
+# The second half of the pair, in a repo of its own. The codec has 32 codebooks and decodes the first
+# 12 as a prefix: it declares which id means "absent", and codes2speech fills each row out with it.
+codec = loom.Model.from_pretrained("loom-ai-org/moss-audio-tokenizer-v2-loom")
+audio = codec.codes2speech.infer(codes)
+print(audio.channels, "channels at", audio.sample_rate, "Hz =", round(audio.duration, 2), "s")
+audio.save("out.wav")                         # 48 kHz stereo
+
+# This model SAMPLES by default, at upstream's recommended settings; `seed=` pins a take. Greedy
+# (both draws) reproduces upstream's generate(do_sample=False) exactly:
+greedy = model.text2codes.infer("Hello there.", language="en", temperature=0, text_temperature=0,
+                                max_new_tokens=20)
+""",
     "text-to-speech-with-vocab": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
@@ -1360,6 +1477,8 @@ def repo_id(card: ModelCard) -> str:
 def snippet_key(card: ModelCard) -> str:
     """Which `USAGE_SNIPPETS` entry this model's card gets. The task decides it for every family except
     TTS, where whether the GGUF carries a vocabulary is a per-model fact -- see `takes_text`."""
+    if card.snippet:
+        return card.snippet
     if card.task_type == "text-generation" and card.chat:
         return "text-generation-chat"
     if card.task_type == "text-to-speech" and card.takes_text:
