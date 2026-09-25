@@ -127,7 +127,7 @@ def _entries() -> Tuple[ComponentEntry, ...]:
     a module that imports this one's `DriverComponent` -- importing them at module scope would make the
     registry and the components a cycle."""
     from .driver_components import (
-        ArgmaxEpilogue, ChunkedCodecCall, CifBoundary, CtcGreedyEpilogue, DriverInputs, DriverReturn,
+        ArgmaxEpilogue, ChunkedCodecCall, PaddedCodecCall, CifBoundary, CtcGreedyEpilogue, DriverInputs, DriverReturn,
         ExportConstants,
         FlowMatchingSampler,
         LuaFragment, ModularChain,
@@ -168,6 +168,20 @@ def _entries() -> Tuple[ComponentEntry, ...]:
                 "same reason the leaf is not on the Hub yet, and the row will fill in when the pair "
                 "lands. Verified meanwhile against the reference's own `chunked_decode` at 42 and 700 "
                 "frames (max abs difference 4.2e-06 and 1.7e-05), which is [ADR-034]"
+            ),
+        ),
+        ComponentEntry(
+            "padded_codec_call", PaddedCodecCall, (STATEMENTS,),
+            "ONE `run_subgraph` over the whole code sequence, padded at the end to a whole number of "
+            "blocks with the codec's absent id and trimmed back -- family 11's third call shape. For a "
+            "codec whose graph BLOCKS its attention (MOSS-Audio-Tokenizer), so the blocks must tile "
+            "the sequence and the graph cannot pad its own dynamic axis. Exact because the decoder is "
+            "causal end to end; chosen over `chunked_codec_call` because that loop is exact only when "
+            "a chunk's context covers the receptive field, and here 8 s of context is still 48% away.",
+            no_user_reason=(
+                "its leaf, `moss-audio-tokenizer-v2`, is the codec half of MOSS-TTS, whose family-10 "
+                "half is not exported yet; the sweep lists shipped models, so the row fills in when "
+                "the pair lands"
             ),
         ),
         ComponentEntry(

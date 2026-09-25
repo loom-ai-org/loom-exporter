@@ -1105,6 +1105,81 @@ class TokenLabelsBuilder(DriverBuilder):
 
 
 @dataclass
+class PaddedCodecCall(DriverComponent):
+    """ONE call over the whole code sequence, padded at the end to a whole number of blocks and
+    trimmed back -- family 11's third call shape.
+
+    MOSS-Audio-Tokenizer's attention is blocked (`moss_audio_tokenizer_export`): the graph cuts every
+    stack's sequence into blocks of `frames_per_block` frames, and a reshape into blocks needs the
+    blocks to tile it. The graph cannot pad its own dynamic axis -- coremltools refuses dynamic
+    padding -- so the driver does it here, with the codec's ABSENT id so a padded row decodes to the
+    quantizer's bias and nothing else. It is exact, not approximate: the decoder is causal end to end,
+    so frames appended after the last real one reach no sample before it, and those samples are cut.
+
+    Why this is not `ChunkedCodecCall`: that loop is exact only when a chunk's left context covers the
+    receptive field, and here it cannot -- 8 s of context is still 48% away. One call is the model's
+    answer; the blocking is what makes one call affordable.
+    """
+
+    topology: str = "main_topology"
+    inputs: Tuple[str, ...] = ()
+    codes_var: str = "codes"
+    codes_per_frame: int = 0
+    frames_per_block: int = 0
+    # Floats the graph emits per frame -- `hop * channels`, since stereo arrives interleaved.
+    samples_per_frame: int = 0
+    pad_code: int = 0
+    out_var: str = "_wav"
+
+    __links__ = {
+        "topology": TopologyName(),
+        "inputs": TopologyInput(FieldRef("topology"), exact=True),
+    }
+    __unchecked__ = {
+        "codes_var": Unchecked("the declared input this call pads, bound by `DriverInputs` earlier in "
+                               "the function; `driver_ir.validate` is the authority on it"),
+        "codes_per_frame": Unchecked("the codes axis the EXPORT declared; `TopologyInput` checks the "
+                                     "call against the graph's own input shape"),
+        "frames_per_block": Unchecked("the export's block size, the same attribute the graph's "
+                                      "reshapes were traced with -- one value read twice"),
+        "samples_per_frame": Unchecked("`hop * channels`, read off the checkpoint by "
+                                       "`CodecFamily.geometry`"),
+        "pad_code": Unchecked("the id `fold_quantizer` gave a zero row: `codebook_size`, derived"),
+        "out_var": Unchecked("a local this component binds rather than one it refers to"),
+    }
+
+    def emit(self, ctx: DriverContext) -> List:
+        width, block = Lit(self.codes_per_frame), Lit(self.frames_per_block)
+        n_frames, padded = Var("_n_frames"), Var("_padded_frames")
+        codes, raw, shape, i = Var("_padded_codes"), Var("_padded_wav"), Var("_padded_shape"), Var("_i")
+        return [
+            # `math.floor`, never `//`: LuaJIT is Lua 5.1 (see `ChunkedCodecCall`).
+            Local(n_frames.name, BinOp("floordiv", Len(Var(self.codes_var)), width)),
+            Local(padded.name, BinOp("*", BinOp("floordiv",
+                                                BinOp("+", n_frames, BinOp("-", block, Lit(1))),
+                                                block), block)),
+            # A copy, so the caller's table is not lengthened behind its back.
+            Local(codes.name, Call("array_slice", [Var(self.codes_var), Lit(1),
+                                                   BinOp("*", n_frames, width)])),
+            NumericFor(var=i.name, start=BinOp("+", BinOp("*", n_frames, width), Lit(1)),
+                       stop=BinOp("*", padded, width), body=[
+                IndexAssign(table=codes, idx=i, expr=Lit(self.pad_code)),
+            ]),
+            SubgraphCall(
+                outputs=[raw.name],
+                extra_outputs=[shape.name],
+                module=self.topology,
+                axes={ctx.root_axis(self.topology): padded, "n_past": Lit(0)},
+                inputs={name: (codes if name == self.codes_var else Var(name))
+                        for name in self.inputs},
+            ),
+            Local(self.out_var, Call("array_slice", [raw, Lit(1),
+                                                     BinOp("*", n_frames,
+                                                           Lit(self.samples_per_frame))])),
+        ]
+
+
+@dataclass
 class CodecDecodeBuilder(DriverBuilder):
     """One traced graph over the codes, and the output IS the answer -- family 11's shape.
 
