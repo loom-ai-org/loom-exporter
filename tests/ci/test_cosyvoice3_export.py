@@ -36,7 +36,12 @@ def _release(tmp_path: Path, missing=()) -> Path:
     d = tmp_path / "cosyvoice3"
     d.mkdir()
     for name in RELEASE_FILES:
-        if name not in missing:
+        if name in missing:
+            continue
+        if name in ("llm.pt", "flow.pt"):
+            # Real (tiny) checkpoints: the contract fingerprints these two.
+            torch.save({"w": torch.arange(4, dtype=torch.float32)}, d / name)
+        else:
             (d / name).write_bytes(b"")
     if "CosyVoice-BlankEN" not in missing:
         (d / "CosyVoice-BlankEN").mkdir()
@@ -91,6 +96,16 @@ def test_the_contract_declares_a_text_door(tmp_path):
     assert contract["text.frontend"] == "vocab"
     assert contract["sample_rate"] == 24000
     assert contract["tts.default_steps"] == FLOW_STEPS
+
+
+def test_the_contract_declares_the_voice_fingerprint_and_the_builtin_voice(tmp_path):
+    from loom_exporter.cosyvoice3_voices import DEFAULT_VOICE_NAME, weights_fingerprint
+
+    config = _config(tmp_path)
+    config.task = "text-to-speech"
+    contract = config.contract()
+    assert contract["voice.compat"] == weights_fingerprint(config.model_dir)
+    assert contract["tts.voices"] == [DEFAULT_VOICE_NAME]
 
 
 def test_the_sampling_constants_are_the_references_own():
@@ -184,3 +199,58 @@ def test_the_staged_tokenizer_carries_every_added_token(tmp_path):
     for token in reference.special_tokens["additional_special_tokens"]:
         assert added[token] == reference.tokenizer.convert_tokens_to_ids(token)
     assert added["<|endofprompt|>"] == END_OF_PROMPT
+
+
+# -- voices ----------------------------------------------------------------------------------------
+
+def test_the_fingerprint_follows_the_lm_and_the_flow_and_ignores_hift(tmp_path):
+    """A voice's tokens and mel are read by the LM and the flow; HiFT never sees one."""
+    from loom_exporter.cosyvoice3_voices import weights_fingerprint
+
+    d = _release(tmp_path)
+    base = weights_fingerprint(d)
+    (d / "hift.pt").write_bytes(b"anything")
+    assert weights_fingerprint(d) == base
+    for part in ("llm.pt", "flow.pt"):
+        saved = (d / part).read_bytes()
+        torch.save({"w": torch.arange(4, dtype=torch.float32) + 1}, d / part)
+        assert weights_fingerprint(d) != base, part
+        (d / part).write_bytes(saved)
+    assert weights_fingerprint(d) == base
+
+
+def test_a_voice_file_is_the_four_driver_inputs_by_name(tmp_path):
+    import gguf
+    import numpy as np
+    from loom_exporter.cosyvoice3_voices import VOICE_INPUTS, write_voice
+
+    arrays = {"prompt_text": np.arange(5), "prompt_speech_tokens": np.arange(3),
+              "prompt_feat": np.ones((6, 80)), "embedding": np.zeros(192)}
+    out = tmp_path / "me.gguf"
+    assert write_voice(arrays, out, name="me", compat="ab" * 16, license="CC0-1.0", origin="me.wav") == 3
+    r = gguf.GGUFReader(str(out))
+    fields = {k: r.fields[k].contents() for k in r.fields if k.startswith("loom.voice.")}
+    assert fields == {"loom.voice.architecture": "cosyvoice3", "loom.voice.compat": "ab" * 16,
+                      "loom.voice.name": "me", "loom.voice.license": "CC0-1.0", "loom.voice.origin": "me.wav",
+                      "loom.voice.n_prompt_tokens": 3}
+    assert sorted(t.name for t in r.tensors) == sorted(VOICE_INPUTS)
+    feat = next(t for t in r.tensors if t.name == "prompt_feat")
+    assert feat.data.dtype == np.float32 and feat.data.size == 480
+    with pytest.raises(ValueError, match="embedding"):
+        write_voice({k: v for k, v in arrays.items() if k != "embedding"}, tmp_path / "x.gguf",
+                    name="x", compat="c", license="l", origin="o")
+
+
+def test_a_clip_of_your_own_needs_a_transcript_a_name_and_a_licence(tmp_path):
+    from loom_exporter.cosyvoice3_voices import convert
+
+    with pytest.raises(ValueError, match="--license"):
+        convert(tmp_path, tmp_path, wav="me.wav", text="hi", name="me")
+
+
+def test_the_transcript_gets_the_references_system_prompt_unless_it_has_one():
+    from loom_exporter.cosyvoice3_voices import SYSTEM_PROMPT, prompt_text
+
+    assert prompt_text("Hello.") == SYSTEM_PROMPT + "Hello."
+    assert prompt_text("Speak slowly.<|endofprompt|>Hello.") == "Speak slowly.<|endofprompt|>Hello."
+    assert SYSTEM_PROMPT.endswith("<|endofprompt|>")

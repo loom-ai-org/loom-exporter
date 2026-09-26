@@ -131,7 +131,9 @@ def _tokenizer_json_text(tok_dir: Path) -> str:
 
 
 def write_bpe_vocab(writer: GGUFWriter, tokenizer_dir: str, pre_type: str = "qwen2",
-                    eos_token_ids: list[int] | None = None) -> None:
+                    eos_token_ids: list[int] | None = None, tokenizer_model: str = "gpt2") -> None:
+    """`tokenizer_model` names the scheme for a front end that WRAPS this byte-level BPE and so has a
+    tag of its own ("cosyvoice3", whose `loom::CosyVoice3Vocab` reads everything below unchanged)."""
     tok_dir = Path(tokenizer_dir)
     tokenizer_json = json.loads(_tokenizer_json_text(tok_dir))
     config_path = tok_dir / "tokenizer_config.json"
@@ -187,7 +189,7 @@ def write_bpe_vocab(writer: GGUFWriter, tokenizer_dir: str, pre_type: str = "qwe
         fallback = _token_id(config.get("eos_token"))
         eos_ids = [fallback] if fallback >= 0 else []
 
-    writer.add_tokenizer_model("gpt2")
+    writer.add_tokenizer_model(tokenizer_model)
     writer.add_tokenizer_pre(pre_type)
     writer.add_token_list(tokens)
     writer.add_token_types(token_types)
