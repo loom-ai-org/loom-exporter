@@ -70,9 +70,10 @@ differs is entirely what the host does with the one output. The family names its
 
 | component | class | emits | links | unchecked | used by |
 |---|---|---|---|---|---|
-| `driver_inputs` | `DriverInputs` | statements | 0 | 5 | chatterbox, conformer-ctc, cosyvoice3, dac, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, pocket-tts, qwen3, qwen3-tts-tokenizer-12hz, snac, voxcpm2 |
+| `driver_inputs` | `DriverInputs` | statements | 0 | 5 | chatterbox, conformer-ctc, cosyvoice3, dac, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, moss-audio-tokenizer, pocket-tts, qwen3, qwen3-tts-tokenizer-12hz, snac, voxcpm2 |
 | `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, qwen3 |
 | `chunked_codec_call` | `ChunkedCodecCall` | statements | 2 | 6 | *nobody* (see below) |
+| `padded_codec_call` | `PaddedCodecCall` | statements | 2 | 6 | *nobody* (see below) |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
 | `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 16 | granite-speech, hf-causal-lm, lfm2-monolithic, qwen3, qwen3-asr, t5, whisper |
 | `waveform_valid_length` | `WaveformValidLength` | statements | 0 | 5 | granite-speech, qwen3-asr |
@@ -87,14 +88,14 @@ differs is entirely what the host does with the one output. The family names its
 | `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | chatterbox, cosyvoice3, dia, encodec, f5-tts, funasr-paraformer, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
 | `recurrent_call` | `RecurrentCall` | statements | 1 | 8 | encodec |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 11 | chatterbox, cosyvoice3, f5-tts, matcha, supertonic |
-| `driver_return` | `DriverReturn` | statements | 0 | 1 | chatterbox, cosyvoice3, dac, dia, encodec, f5-tts, kokoro, matcha, pocket-tts, qwen3-tts, qwen3-tts-tokenizer-12hz, snac, styletts2, supertonic, vits, voxcpm2 |
+| `driver_return` | `DriverReturn` | statements | 0 | 1 | chatterbox, cosyvoice3, dac, dia, encodec, f5-tts, kokoro, matcha, moss-audio-tokenizer, pocket-tts, qwen3-tts, qwen3-tts-tokenizer-12hz, snac, styletts2, supertonic, vits, voxcpm2 |
 | `lua_library` | `LuaLibrary` | prelude | 1 | 0 | f5-tts, funasr-paraformer, kokoro, matcha, styletts2, vits |
 
 ### `driver_inputs` — `DriverInputs`
 
 Binds every name the topologies below are called with: read from the caller's `inputs` table, or computed host-side (`cache_position` via loom.range, `attention_mask` via loom.causal_mask).
 
-*Emits:* statements. *Used by:* chatterbox, conformer-ctc, cosyvoice3, dac, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, pocket-tts, qwen3, qwen3-tts-tokenizer-12hz, snac, voxcpm2.
+*Emits:* statements. *Used by:* chatterbox, conformer-ctc, cosyvoice3, dac, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, moss-audio-tokenizer, pocket-tts, qwen3, qwen3-tts-tokenizer-12hz, snac, voxcpm2.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -117,6 +118,17 @@ The same `run_subgraph` a codec decoder makes, run over BOUNDED WINDOWS of the c
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
 
 > No model uses it today: its leaf is exported and verified but is not yet in the model sweep this column is computed from -- `qwen3-tts-tokenizer-12hz` is the codec half of a pair whose family-10 half is unwritten, and the sweep lists shipped models. So this reads as unused for the same reason the leaf is not on the Hub yet, and the row will fill in when the pair lands. Verified meanwhile against the reference's own `chunked_decode` at 42 and 700 frames (max abs difference 4.2e-06 and 1.7e-05), which is [ADR-034].
+
+### `padded_codec_call` — `PaddedCodecCall`
+
+ONE `run_subgraph` over the whole code sequence, padded at the end to a whole number of blocks with the codec's absent id and trimmed back -- family 11's third call shape. For a codec whose graph BLOCKS its attention (MOSS-Audio-Tokenizer), so the blocks must tile the sequence and the graph cannot pad its own dynamic axis. Exact because the decoder is causal end to end; chosen over `chunked_codec_call` because that loop is exact only when a chunk's context covers the receptive field, and here 8 s of context is still 48% away.
+
+*Emits:* statements. *Used by:* **no model** — see below.
+
+* `topology` — TopologyName
+* `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
+
+> No model uses it today: its leaf, `moss-audio-tokenizer-v2`, is the codec half of MOSS-TTS, whose family-10 half is not exported yet; the sweep lists shipped models, so the row fills in when the pair lands.
 
 ### `modular_chain` — `ModularChain`
 
@@ -252,7 +264,7 @@ A `FlowMatchingSpec`'s generated Euler-CFM sampler function, plus the line that 
 
 What the entry function hands back to the host.
 
-*Emits:* statements. *Used by:* chatterbox, cosyvoice3, dac, dia, encodec, f5-tts, kokoro, matcha, pocket-tts, qwen3-tts, qwen3-tts-tokenizer-12hz, snac, styletts2, supertonic, vits, voxcpm2.
+*Emits:* statements. *Used by:* chatterbox, cosyvoice3, dac, dia, encodec, f5-tts, kokoro, matcha, moss-audio-tokenizer, pocket-tts, qwen3-tts, qwen3-tts-tokenizer-12hz, snac, styletts2, supertonic, vits, voxcpm2.
 
 * nothing — every field is `__unchecked__`, with its reason
 

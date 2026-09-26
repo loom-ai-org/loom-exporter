@@ -1716,6 +1716,26 @@ class LoomGGUFExporter:
             ).build(self._driver_context())
             return
 
+        if chunk.get("frames_per_block"):
+            # One call, padded to whole blocks and trimmed (MOSS-Audio-Tokenizer is the first).
+            from .driver_components import PaddedCodecCall
+            from .lua_library import LuaLibrary
+
+            call = PaddedCodecCall(
+                topology="main_topology", inputs=input_names,
+                codes_var=input_names[0],
+                codes_per_frame=int(chunk["codes_per_frame"]),
+                frames_per_block=int(chunk["frames_per_block"]),
+                samples_per_frame=int(chunk["samples_per_frame"]),
+                pad_code=int(chunk["pad_code"]),
+            )
+            self.driver_script = SYNTHESIZED_BUILDERS["CodecDecode"](
+                inputs=inputs, call=call,
+                library=LuaLibrary(uses=("array_slice",)),
+                epilogue=DriverReturn(values=(call.out_var,)),
+            ).build(self._driver_context())
+            return
+
         self.driver_script = SYNTHESIZED_BUILDERS["CodecDecode"](
             inputs=inputs,
             call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr,
