@@ -525,6 +525,43 @@ dataset each recording comes from; every file also records its own (`loom.voice.
             "**English only.** Kyutai's other languages are separate checkpoints and are not this file.",
     ),
     ModelCard(
+        slug="voxcpm2", checkpoint=Path("voxcpm2"),
+        export_task="text-to-speech", export_model="voxcpm2", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="openbmb/VoxCPM2", license_id="apache-2.0",
+        source_url="https://github.com/OpenBMB/VoxCPM", source_name="VoxCPM2",
+        language=["en", "zh", "ar", "my", "da", "nl", "fi", "fr", "de", "el", "he", "hi", "id", "it", "ja", "km",
+                  "ko", "lo", "ms", "no", "pl", "pt", "ru", "es", "sw", "sv", "tl", "th", "tr", "vi"],
+        # Declared by the export (`voxcpm2_export.SAMPLE_RATE`): the AudioVAE decodes at 48 kHz.
+        sample_rate=48000,
+        title="VoxCPM2",
+        summary="OpenBMB's VoxCPM2, exported for loom.cpp: a 2B diffusion-autoregressive TTS over "
+                "continuous AudioVAE latents, 30 languages, 48 kHz. Encodes text itself.",
+        usage_extra="""### Designing a voice
+
+VoxCPM2 has no built-in speaker: every call invents a voice to fit the text. To steer it, describe the
+voice in parentheses at the start of the text -- the description is not spoken:
+
+```python
+audio = model.text2speech.infer("(A calm older man, speaking slowly)Welcome back. The results are in.")
+audio.save("designed.wav")
+```
+
+Pass `seed` to get the same voice again.""",
+        limitations=
+            "**No voice cloning in this file.** The reference clones a voice from a recording through its "
+            "AudioVAE's encoder, which this export does not carry. Voices are zero-shot or designed in the "
+            "text (see above).\n\n"
+            "**Sampled, so two calls differ.** Each 160 ms patch of audio starts from a random draw, "
+            "integrated over 10 guided steps (CFG-Zero\\*, guidance 2.0). Pass `seed` to reproduce a call. "
+            "Verified against the reference with its draws pinned: within 1.2e-06 rms of its latents step "
+            "for step.\n\n"
+            "**Large, and slow on a small CPU.** 2.3B parameters: 9.3 GB at F32. On a 2-core x86 laptop a "
+            "second of 48 kHz audio takes about 20 seconds.\n\n"
+            "**A run that never stops is retried**, as the reference retries it: a generation that uses its "
+            "whole length budget (six patches per text token) is drawn again, up to three times.",
+    ),
+    ModelCard(
         slug="supertonic-2", checkpoint=Path("/home/flavio/Dev/supertonic-tts/assets/pt"),
         export_task="text-to-speech", export_model="supertonic", task_type="text-to-speech",
         takes_text=True,
