@@ -210,6 +210,7 @@ _FAMILY_MODULES = (
     "chatterbox_export",
     "pocket_tts_export",
     "voxcpm2_export",
+    "voxtral_tts_export",
     "cosyvoice3_export",
     "moss_tts_export",
 )

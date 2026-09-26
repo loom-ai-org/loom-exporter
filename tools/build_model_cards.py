@@ -599,6 +599,76 @@ Pass `seed` to get the same voice again.""",
             "seconds.",
     ),
     ModelCard(
+        slug="voxtral-4b-tts-2603", checkpoint=Path("voxtral-4b-tts-2603"),
+        export_task="text-to-speech", export_model="voxtral-tts", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="mistralai/Voxtral-4B-TTS-2603", license_id="cc-by-nc-4.0",
+        source_url="https://github.com/vllm-project/vllm-omni", source_name="Voxtral TTS (vLLM-Omni)",
+        language=["en", "fr", "es", "pt", "it", "nl", "de", "ar", "hi"],
+        # Declared by the export (`voxtral_tts_export.SAMPLE_RATE`): the codec decodes at 24 kHz.
+        sample_rate=24000,
+        title="Voxtral 4B TTS",
+        summary="Mistral's Voxtral-4B-TTS-2603, exported for loom.cpp: a 3.4B Ministral backbone over frames "
+                "of audio codes, a flow-matching acoustic head and a causal codec, 9 languages, 24 kHz. "
+                "Encodes text itself and has a built-in voice.",
+        usage_extra="""### Choosing a voice
+
+The file carries one voice, `casual_male`, and uses it when you name none. Mistral's other 19 preset
+voices ship in this repo as voice files under `voices/`, and a name is enough -- it is fetched from this
+repo the first time:
+
+```python
+print(model.voices)                          # the built-in one first, then the voice files
+
+audio = model.text2speech.infer("Hello world.", voice="neutral_female")
+audio.save("neutral_female.wav")
+```
+
+Pick a voice in the language you are speaking (`voice="fr_female"` for French, and so on): each preset
+was recorded in one. A voice is the rows the
+model reads in place of a reference recording, stamped with a fingerprint of these weights, so it only
+fits this model and loom refuses one made for another.
+
+| voices | language |
+|---|---|
+| `casual_male` (built in), `casual_female`, `cheerful_female`, `neutral_male`, `neutral_female` | English |
+| `fr_male`, `fr_female` | French |
+| `es_male`, `es_female` | Spanish |
+| `de_male`, `de_female` | German |
+| `it_male`, `it_female` | Italian |
+| `pt_male`, `pt_female` | Portuguese |
+| `nl_male`, `nl_female` | Dutch |
+| `ar_male` | Arabic |
+| `hi_male`, `hi_female` | Hindi |
+
+Every voice is **CC BY-NC 4.0**, like the model: Mistral's card says the references come from the EARS,
+CML-TTS, IndicVoices-R and Arabic Natural Audio datasets.""",
+        extra_files=[
+            "`voices/*.gguf` -- Mistral's other preset voices as loom voice files, converted unchanged from "
+            "`mistralai/Voxtral-4B-TTS-2603`'s `voice_embedding/*.pt` by `loom_exporter.voxtral_tts_voices`. "
+            "Only needed to pick a voice other than `casual_male`.",
+        ],
+        limitations=
+            "**Non-commercial (CC BY-NC 4.0).** The weights and every voice carry the licence of the "
+            "voice recordings they were built from, per Mistral's own card.\n\n"
+            "**Preset voices only; no voice cloning.** Mistral's open checkpoint ships no codec encoder, "
+            "which is what turns a recording into a voice, so this file has none either (upstream says "
+            "the same of its own release). The 20 presets are the built-in `casual_male` and 19 voice "
+            "files under `voices/`.\n\n"
+            "**Sampled, so two calls differ.** Each 80 ms frame's acoustic half starts from a random "
+            "draw, integrated over 7 guided steps (classifier-free guidance 1.2, the reference's "
+            "default); its semantic half is the most likely code. Pass `seed` to reproduce a call. "
+            "Verified against the reference (vLLM-Omni's own flow head and codec) with its draws pinned: "
+            "the same codes for all 142 frames of an 11 s sentence, and a waveform within 2e-08 rms. "
+            "Like the reference, it occasionally keeps talking after the sentence; another `seed` "
+            "fixes it.\n\n"
+            "**Large, and slow on a CPU.** 4B parameters: 16 GB at F32, about 17 GB of RAM to run. On a "
+            "24-core x86 desktop a second of audio takes about 5.5 seconds; a 4-bit build is not "
+            "published yet. One call speaks up to 2048 frames (164 s), and long text is not split.\n\n"
+            "**Needs loom 1.0.0-rc11 or later.** The text front end is Mistral's Tekken tokenizer, which "
+            "older engines refuse by name rather than tokenize differently.",
+    ),
+    ModelCard(
         slug="supertonic-2", checkpoint=Path("/home/flavio/Dev/supertonic-tts/assets/pt"),
         export_task="text-to-speech", export_model="supertonic", task_type="text-to-speech",
         takes_text=True,
