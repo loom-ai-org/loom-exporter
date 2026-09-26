@@ -30,7 +30,11 @@ the exclusion set at all, and doesn't list algorithmic Hangul decompositions -- 
    general categories P*/M* -- needed by WordPieceVocab's word-splitting (`\\p{P}` isolation) and by the
    qwen35-family BPE pretokenizer shape (`[\\p{L}\\p{M}]+`, marks attach to letters rather than splitting
    the letter run).
-6. `kLowercaseMap`: sparse codepoint -> single-codepoint lowercase mapping, non-identity entries only.
+6. `kUpperTitleRanges`/`kLowercaseLetterRanges`: general categories Lu+Lt and Ll, the two halves of
+   `\\p{L}` that Tekken's pretokenizer regex (Mistral) tells apart -- `[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*
+   [\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+` splits "HelloWorld" at the case change. Lm and Lo are in BOTH classes,
+   so they are `L - (Lu|Lt) - Ll` and need no table of their own.
+7. `kLowercaseMap`: sparse codepoint -> single-codepoint lowercase mapping, non-identity entries only.
    Needed by WordPieceVocab's `do_lower_case` normalization step. Multi-codepoint expansions (a handful of
    `str.lower()` special-casings, e.g. some ligatures) are deliberately skipped -- WordPiece's own
    lowercasing (mirroring llama.cpp's `unicode_tolower`) is a single-codepoint substitution, not a general
@@ -83,6 +87,22 @@ HANGUL_SYLLABLE_START = 0xAC00
 HANGUL_SYLLABLE_END = 0xD7A3
 
 
+def compute_subcategory_ranges(categories: set) -> list[tuple[int, int]]:
+    """`compute_category_ranges` for an exact set of two-letter general categories ({"Lu", "Lt"})."""
+    ranges: list[tuple[int, int]] = []
+    run_start = None
+    for cp in range(MAX_CODEPOINT):
+        matches = unicodedata.category(chr(cp)) in categories
+        if matches and run_start is None:
+            run_start = cp
+        elif not matches and run_start is not None:
+            ranges.append((run_start, cp - 1))
+            run_start = None
+    if run_start is not None:
+        ranges.append((run_start, MAX_CODEPOINT - 1))
+    return ranges
+
+
 def compute_canonical_decomp() -> dict[int, list[int]]:
     decomp: dict[int, list[int]] = {}
     for cp in range(MAX_CODEPOINT):
@@ -117,7 +137,8 @@ def compute_lowercase_map() -> dict[int, int]:
 
 
 def emit_header(letter_ranges, number_ranges, canonical_decomp, combining_class, exclusions,
-                 punctuation_ranges, mark_ranges, lowercase_map) -> str:
+                 punctuation_ranges, mark_ranges, lowercase_map, upper_title_ranges=(),
+                 lowercase_letter_ranges=()) -> str:
     lines = []
     lines.append("// GENERATED FILE -- do not hand-edit. Produced by tools/codegen/gen_unicode_tables.py")
     lines.append(f"// against Python's stdlib `unicodedata` (Unicode Character Database version {UNICODE_VERSION})")
@@ -220,6 +241,16 @@ def emit_header(letter_ranges, number_ranges, canonical_decomp, combining_class,
     lines.append("};")
     lines.append(f"inline constexpr size_t kLowercaseMapCount = {len(lowercase_map)};")
     lines.append("")
+    # 7. Lu+Lt and Ll ranges (Tekken's case-transition pretokenizer)
+    for name, what, table in (("kUpperTitleRanges", "Lu + Lt", upper_title_ranges),
+                              ("kLowercaseLetterRanges", "Ll", lowercase_letter_ranges)):
+        lines.append(f"// {len(table)} ranges, general categories {what}.")
+        lines.append(f"inline constexpr CpRange {name}[] = {{")
+        for lo, hi in table:
+            lines.append(f"    {{0x{lo:06X}, 0x{hi:06X}}},")
+        lines.append("};")
+        lines.append(f"inline constexpr size_t {name}Count = {len(table)};")
+        lines.append("")
     lines.append("} // namespace unicode_data")
     lines.append("} // namespace loom")
     lines.append("")
@@ -252,8 +283,11 @@ def main() -> None:
     sys.stderr.write("Computing lowercase map...\n")
     lowercase_map = compute_lowercase_map()
     sys.stderr.write(f"  {len(lowercase_map)} entries\n")
+    upper_title = compute_subcategory_ranges({"Lu", "Lt"})
+    lowercase_letters = compute_subcategory_ranges({"Ll"})
+    sys.stderr.write(f"  Lu+Lt {len(upper_title)} ranges, Ll {len(lowercase_letters)} ranges\n")
     sys.stdout.write(emit_header(letter_ranges, number_ranges, decomp, comb, exclusions,
-                                  punctuation_ranges, mark_ranges, lowercase_map))
+                                  punctuation_ranges, mark_ranges, lowercase_map, upper_title, lowercase_letters))
 
 
 if __name__ == "__main__":
