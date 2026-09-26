@@ -620,11 +620,12 @@ repo the first time:
 ```python
 print(model.voices)                          # the built-in one first, then the voice files
 
-audio = model.text2speech.infer("Bonjour, comment allez-vous ?", voice="fr_female")
-audio.save("bonjour.wav")
+audio = model.text2speech.infer("Hello world.", voice="neutral_female")
+audio.save("neutral_female.wav")
 ```
 
-Pick a voice in the language you are speaking: each preset was recorded in one. A voice is the rows the
+Pick a voice in the language you are speaking (`voice="fr_female"` for French, and so on): each preset
+was recorded in one. A voice is the rows the
 model reads in place of a reference recording, stamped with a fingerprint of these weights, so it only
 fits this model and loom refuses one made for another.
 
