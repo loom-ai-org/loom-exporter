@@ -451,6 +451,80 @@ anything.""",
             "the model as the reference passes them.",
     ),
     ModelCard(
+        slug="pocket-tts", checkpoint=Path("pocket-tts/languages/english_2026-09"),
+        export_task="text-to-speech", export_model="pocket-tts", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="kyutai/pocket-tts", license_id="cc-by-4.0",
+        source_url="https://github.com/kyutai-labs/pocket-tts", source_name="Pocket TTS (English, 2026-09)",
+        language=["en"],
+        # Declared by the export (`pocket_tts_export.SAMPLE_RATE`), restated here like Chatterbox's.
+        sample_rate=24000,
+        title="Pocket TTS (English)",
+        summary="Kyutai's Pocket TTS (English, 2026-09 release), exported for loom.cpp: a 100M-parameter "
+                "flow language model over Mimi codec latents. Encodes text itself and has a built-in voice.",
+        usage_extra="""### Choosing a voice
+
+The file carries one voice, `alba`, and uses it when you name none. The other 25 of Kyutai's voices
+ship in this repo as voice files under `voices/`, and a name is enough -- it is fetched from this repo
+the first time:
+
+```python
+print(model.voices)                          # the built-in one first, then the voice files
+
+audio = model.text2speech.infer("Hello there.", voice="marius")
+audio.save("marius.wav")
+```
+
+A voice file is the model's own state after hearing the speaker, stamped with a fingerprint of these
+weights, so it only fits this model: loom refuses one made for a different release rather than
+producing speech that never stops. `voice=` also takes a path to a voice file of your own.
+
+| voice | licence of the recording | voice | licence of the recording |
+|---|---|---|---|
+| `alba` (built in) | CC-BY-4.0 | `javert` | CC0-1.0 |
+| `anna` | CC-BY-4.0 | `jean` | **CC-BY-NC-4.0 (non-commercial)** |
+| `azelma` | CC-BY-4.0 | `juergen` | not stated by Kyutai |
+| `bill_boerst` | CC0-1.0 | `lola` | CC0-1.0 |
+| `caro_davy` | CC0-1.0 | `marius` | CC0-1.0 |
+| `charles` | CC-BY-4.0 | `mary` | CC-BY-4.0 |
+| `cosette` | **CC-BY-NC-4.0 (non-commercial)** | `michael` | CC-BY-4.0 |
+| `eponine` | CC-BY-4.0 | `paul` | CC-BY-4.0 |
+| `estelle` | CC0-1.0 | `peter_yearsley` | CC0-1.0 |
+| `eve` | CC-BY-4.0 | `rafael` | not stated by Kyutai |
+| `fantine` | CC-BY-4.0 | `stuart_bell` | CC0-1.0 |
+| `george` | CC-BY-4.0 | `vera` | CC-BY-4.0 |
+| `giovanni` | CC0-1.0 | | |
+| `jane` | CC-BY-4.0 | | |
+
+Licences are per [`kyutai/tts-voices`](https://huggingface.co/kyutai/tts-voices)' README, by the
+dataset each recording comes from; every file also records its own (`loom.voice.license`,
+`loom.voice.origin`). CC-BY voices need attribution to their source dataset or speaker.""",
+        extra_files=[
+            "`voices/*.gguf` -- Kyutai's other predefined voices as loom voice files, converted "
+            "unchanged from `kyutai/pocket-tts`'s `languages/english_2026-09/embeddings/` by "
+            "`loom_exporter.pocket_tts_voices`. Only needed to pick a voice other than `alba`.",
+        ],
+        limitations=
+            "**Kyutai's use restrictions apply.** The upstream release prohibits, among other things, "
+            "voice impersonation or cloning without explicit and lawful consent, and presenting "
+            "generated audio as a genuine recording of a real person. They travel with the weights.\n\n"
+            "**One voice is built in (`alba`); the other 25 are voice files** under `voices/`, "
+            "selected with `voice=` (see above). A voice is the model's own attention state after "
+            "hearing the speaker, so a voice file only fits these weights, and loom refuses one made "
+            "for another release. Each voice's licence is its RECORDING's, not the model's -- two are "
+            "non-commercial -- and the table above lists them. Cloning a voice from a recording needs "
+            "the Mimi encoder, which this export does not carry; a state you saved yourself with "
+            "`pocket-tts export-voice` converts with `python -m loom_exporter.pocket_tts_voices "
+            "--from`.\n\n"
+            "**Sampled by default**, at the checkpoint's own temperature (0.3), so two calls differ; "
+            "pass `seed` to reproduce one. Verified against the reference with its random draws pinned: "
+            "within 1.8e-06 rms of the reference waveform step for step.\n\n"
+            "**Long text is split, as the reference splits it**: into sentence chunks of at most 50 "
+            "tokens, each generated separately from the same voice and joined. A single sentence "
+            "longer than that is cut at its commas.\n\n"
+            "**English only.** Kyutai's other languages are separate checkpoints and are not this file.",
+    ),
+    ModelCard(
         slug="supertonic-2", checkpoint=Path("/home/flavio/Dev/supertonic-tts/assets/pt"),
         export_task="text-to-speech", export_model="supertonic", task_type="text-to-speech",
         takes_text=True,

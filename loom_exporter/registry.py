@@ -208,6 +208,7 @@ _FAMILY_MODULES = (
     "t5_export",
     "f5_tts_export",
     "chatterbox_export",
+    "pocket_tts_export",
 )
 
 
