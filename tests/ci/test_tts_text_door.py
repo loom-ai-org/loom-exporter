@@ -43,7 +43,11 @@ PHONEME_INPUT = {"kokoro", "matcha", "styletts2", "vits"}
 # Chatterbox (family 9's fourth leaf) is the third: a character-level BPE whose `encode` is the
 # reference's whole text path, `punc_norm` included (`loom::ChatterboxVocab`), and a COMPLETE door --
 # 3000/3000 ids against the reference over six input classes.
-GRAPHEME_INPUT = {"supertonic", "f5-tts", "chatterbox"}
+#
+# The four since are all text-in through a vocabulary the GGUF carries, and so graphemes: Pocket-TTS
+# (SentencePiece), VoxCPM2 (character BPE), CosyVoice3 (Qwen2 byte-level BPE) and Voxtral-TTS (Tekken,
+# Mistral's tiktoken BPE).
+GRAPHEME_INPUT = {"supertonic", "f5-tts", "chatterbox", "pocket-tts", "voxcpm2", "cosyvoice3", "voxtral-tts"}
 
 # Families that still declare no `sample_rate`, with the reason it is an EXEMPTION rather than a pass.
 # Each needs its rate taken off its own checkpoint the way Kokoro's and Supertonic's are -- Matcha's and
@@ -66,7 +70,11 @@ NO_SAMPLE_RATE_YET = {"matcha", "styletts2", "vits"}
 #
 # Chatterbox is the fifth, for F5-TTS's reason: its driver builds the cosine schedule host-side and
 # divides by the count to walk the linspace.
-NEEDS_STEPS = {"matcha", "styletts2", "supertonic", "f5-tts", "chatterbox"}
+#
+# CosyVoice3 is the sixth, for the same reason (`cosyvoice3_cosine_times` divides by it). Pocket-TTS and
+# VoxCPM2 default their counts inside their own drivers (`inputs.n_steps or DEFAULT_DECODE_STEPS`), so
+# a caller naming none still gets audio; Voxtral-TTS's seven steps are unrolled into one graph.
+NEEDS_STEPS = {"matcha", "styletts2", "supertonic", "f5-tts", "chatterbox", "cosyvoice3"}
 
 
 def _tts_configs():

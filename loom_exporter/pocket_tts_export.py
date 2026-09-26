@@ -464,6 +464,7 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
     _driver_weights: Optional[Dict[str, np.ndarray]] = field(default=None, init=False, repr=False)
     _temperature: float = field(default=0.7, init=False, repr=False)
     _voice_rows: int = field(default=0, init=False, repr=False)
+    _voice_compat: Optional[str] = field(default=None, init=False, repr=False)
     _chunk_headers: Tuple[int, int] = field(default=(-1, -1), init=False, repr=False)
 
     __links__ = {"root_axis": Axis()}
@@ -480,6 +481,7 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
                                       "weights"),
         "_temperature": Unchecked("the config's `default_temperature`, read during phases()"),
         "_voice_rows": Unchecked("the built-in voice's length, read during phases()"),
+        "_voice_compat": Unchecked("the flow LM weights' fingerprint, read once by contract()"),
         "_chunk_headers": Unchecked("the SentencePiece `<s>`/`</s>` ids, read during phases()"),
     }
 
@@ -614,16 +616,22 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
         contract["text.frontend"] = "vocab"
         contract["sample_rate"] = SAMPLE_RATE
         # What a voice file must match to be loaded into this model (`pocket_tts_voices`, loom.cpp
-        # ADR-045): the fingerprint of the weights every voice state is a function of.
+        # ADR-045): the fingerprint of the weights every voice state is a function of. A fact about
+        # THESE weights, so it is read only when there are weights to read -- an architecture-only
+        # query (test_tts_text_door's nonexistent path) opens nothing.
         from .pocket_tts_voices import weights_fingerprint
 
-        contract["voice.compat"] = weights_fingerprint(Path(self.model_dir) / "model.safetensors")
+        weights = Path(self.model_dir) / "model.safetensors"
+        if self._voice_compat is None and weights.is_file():
+            self._voice_compat = weights_fingerprint(weights)
+        if self._voice_compat is not None:
+            contract["voice.compat"] = self._voice_compat
         # The voice the file carries, which is what `infer` uses when the caller names none.
         contract["tts.voices"] = [self.voice]
         return contract
 
     def backend_kwargs(self) -> dict:
-        kwargs = dict(flat_namespace=False, root_axis=self.root_axis,
+        kwargs = dict(flat_namespace=False, root_axis=self.root_axis, hparams=self.hparams(),
                       tokenizer_dir=self.model_dir, tokenizer_family="pocket_tts")
         if self._driver_weights is not None:
             kwargs["driver_weights"] = dict(self._driver_weights)

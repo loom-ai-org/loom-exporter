@@ -572,6 +572,7 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
     _voice: Optional[Dict[str, np.ndarray]] = field(default=None, init=False, repr=False)
     _chunk_header: Optional[int] = field(default=None, init=False, repr=False)
     _staging: Optional[tempfile.TemporaryDirectory] = field(default=None, init=False, repr=False)
+    _voice_compat: Optional[str] = field(default=None, init=False, repr=False)
 
     __links__ = {"root_axis": Axis()}
     __unchecked__ = {
@@ -587,6 +588,7 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
         "_voice": Unchecked("computed from the clip during phases() and shipped as driver weights"),
         "_chunk_header": Unchecked("the chunk separator's id, read off the staged tokenizer in phases()"),
         "_staging": Unchecked("a temporary directory holding the staged tokenizer.json"),
+        "_voice_compat": Unchecked("the LM and flow weights' fingerprint, read once by contract()"),
     }
 
     def phases(self) -> List[ExportPhase]:
@@ -771,10 +773,15 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
         contract["sample_rate"] = SAMPLE_RATE
         contract["tts.default_steps"] = FLOW_STEPS
         # What a voice file must match to be loaded into this model (`cosyvoice3_voices`, loom.cpp
-        # ADR-045): the LM and flow weights, the two that read a voice's arrays.
+        # ADR-045): the LM and flow weights, the two that read a voice's arrays. A fact about THESE
+        # weights, so it is read only when there are weights to read -- an architecture-only query
+        # (test_tts_text_door's nonexistent path) opens nothing.
         from .cosyvoice3_voices import DEFAULT_VOICE_NAME, weights_fingerprint
 
-        contract["voice.compat"] = weights_fingerprint(self.model_dir)
+        if self._voice_compat is None and Path(self.model_dir).is_dir():
+            self._voice_compat = weights_fingerprint(self.model_dir)
+        if self._voice_compat is not None:
+            contract["voice.compat"] = self._voice_compat
         # The voice the file carries, which is what `infer` uses when the caller names none.
         contract["tts.voices"] = [DEFAULT_VOICE_NAME]
         return contract

@@ -625,7 +625,7 @@ class VoxCPM2ExportConfig(BaseMultiPhaseModelExportConfig):
         return contract
 
     def backend_kwargs(self) -> dict:
-        kwargs = dict(flat_namespace=False, root_axis=self.root_axis,
+        kwargs = dict(flat_namespace=False, root_axis=self.root_axis, hparams=self.hparams(),
                       tokenizer_dir=self.model_dir, tokenizer_family="voxcpm2")
         if self._driver_weights is not None:
             kwargs["driver_weights"] = dict(self._driver_weights)
