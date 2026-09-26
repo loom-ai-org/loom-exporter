@@ -943,6 +943,39 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         summary="OpenMOSS's multilingual TTS model, exported for loom.cpp. Family 10: text in, "
                 "neural-codec tokens out -- pair it with `moss-audio-tokenizer-v2-loom` for 48 kHz "
                 "stereo audio.",
+        # The cloning block needs a voice file the reader makes, so the card gate stops at it as a
+        # reader-supplied precondition (FileNotFoundError), after the first block's audio is bound.
+        usage_extra="""### Cloning a voice
+
+Upstream clones a voice from one or more reference clips by putting their codec tokens in the prompt.
+loom takes those tokens from a **voice file**: the clips already encoded, made once per voice with
+[loom-exporter](https://github.com/loom-ai-org/loom-exporter). Making one runs upstream's own
+processor and the MOSS-Audio-Tokenizer-v2 encoder in PyTorch, so it needs `torch`, `torchaudio` and
+`transformers` and both upstream checkpoints on disk -- this repo and the codec's carry decoders only.
+Using one needs nothing but loom.
+
+```sh
+git clone https://github.com/loom-ai-org/loom-exporter && cd loom-exporter
+# Looks for the codec beside the TTS checkpoint (a directory named MOSS-Audio-Tokenizer-v2, any case),
+# or pass --codec <dir>. --license is the RECORDING's, which only you know.
+python -m loom_exporter.moss_tts_voices ~/models/MOSS-TTS-Local-Transformer-v1.5 -o voices \\
+    --wav me.wav --name me --license "CC0-1.0"
+```
+
+```python
+# A voice file is a path (or a name, for one under `voices/` beside the model file).
+codes = model.text2codes.infer("The quick brown fox jumps over the lazy dog.", language="en",
+                               voice="voices/me.gguf", seed=1)
+codec.codes2speech.infer(codes).save("cloned.wav")
+```
+
+**Several speakers are one voice file**: repeat `--wav`, one clip per speaker in order, and write the
+text as `[S1] ... [S2] ...`. A few clear seconds per clip is enough; a clip's frames count against the
+2048 positions a prompt and its audio share, at 12.5 per second.
+
+A voice file holds codec tokens, so it is stamped with a fingerprint of the codec's quantizer and fits
+any model that reads this codec's codes; loom refuses one made with a different codec. The voice's
+licence is its recording's, and so is the consent: clone only voices you have the right to use.""",
         limitations=(
             "**This model does not produce audio.** It emits 12 streams of MOSS-Audio-Tokenizer "
             "codec tokens, and the codec turns those into a waveform -- "
@@ -964,11 +997,14 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
             "`generate(do_sample=False)` **exactly**: every code of 38 and 40 frames identical, and "
             "the same frame chosen to stop on. The sampled decode is verified the same way, with its "
             "random draws pinned on both sides.\n\n"
-            "**No voice cloning in this export.** Upstream clones from a reference clip by putting "
-            "the clip's codec tokens in the prompt, which needs the codec's ENCODER; this repo and the "
-            "codec's carry the decode halves only. Without a reference the model picks a voice, and "
-            "the seed decides which. The template's other optional lines (a duration in tokens, a "
-            "free-form instruction, quality, sound events) are left at `None` too.\n\n"
+            "**Cloning takes a voice file, not a clip.** Upstream clones by putting a reference clip's "
+            "codec tokens in the prompt, which needs the codec's ENCODER; neither this repo nor the "
+            "codec's carries it, so the clip is encoded once, in Python, into a voice file (see "
+            "above), and the prompt it builds is upstream's exactly -- verified code for code with one "
+            "reference and with two. Without a voice the model picks one, and the seed decides which. "
+            "Upstream's continuation mode (a prompt clip continued as the model's own speech) and the "
+            "template's other optional lines (a duration in tokens, a free-form instruction, quality, "
+            "sound events) are not exposed.\n\n"
             "**`max_new_tokens` counts audio frames at 12.5 per second.** One frame is one pass of the "
             "36-layer backbone plus twelve of a one-layer local transformer that draws the codebooks "
             "in turn; the model decides for itself when to stop.\n\n"
