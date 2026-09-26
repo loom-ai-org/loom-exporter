@@ -3025,6 +3025,11 @@ class LoomGGUFExporter:
             # detected as a plain "gpt2" BPE, which tokenizes but neither spells numbers nor chunks.
             from .cosyvoice3_tokenizer_export import write_cosyvoice3_vocab
             write_cosyvoice3_vocab(w, tokenizer_dir)
+        elif family == "tekken":
+            # Mistral's tiktoken vocabulary (Voxtral-4B-TTS): byte-level BPE under the `tekken`
+            # pretokenizer shape. Named by the family: `tekken.json` is no HF tokenizer directory.
+            from .tekken_tokenizer_export import write_tekken_vocab
+            write_tekken_vocab(w, tokenizer_dir)
         elif family == "wordpiece":
             from .wordpiece_tokenizer_export import write_wordpiece_vocab
             write_wordpiece_vocab(w, tokenizer_dir)
