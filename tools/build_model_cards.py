@@ -420,6 +420,37 @@ anything.""",
             "text to speak, and `duration` overrides it when the result is clipped or padded.",
     ),
     ModelCard(
+        slug="chatterbox", checkpoint=Path("chatterbox"),
+        export_task="text-to-speech", export_model="chatterbox", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="ResembleAI/chatterbox", license_id="mit",
+        source_url="https://github.com/resemble-ai/chatterbox", source_name="Chatterbox (English)",
+        language=["en"],
+        # Declared by the export (`chatterbox_export.SAMPLE_RATE`), restated here like F5-TTS's.
+        sample_rate=24000,
+        title="Chatterbox (English)",
+        summary="Resemble AI's Chatterbox TTS (English), exported for loom.cpp: a Llama token model "
+                "and a flow-matching decoder in one file. Encodes text itself and has a built-in voice.",
+        limitations=
+            "**No watermark.** Resemble AI's own package runs every output through Perth, an "
+            "imperceptible neural watermark that lets synthetic speech be detected later. This export "
+            "does NOT include it, deliberately: Perth is a separate neural model applied after "
+            "synthesis, and this build targets local inference and small devices, where a smaller, "
+            "faster model is the point. Audio from this file therefore carries no watermark and "
+            "cannot be identified as synthetic by Perth's detector. If you distribute generated "
+            "speech, disclose that it is synthetic yourself.\n\n"
+            "**One voice, built in.** Synthesis uses the checkpoint's own default voice (`conds.pt`). "
+            "Cloning a new voice needs the voice encoder, the S3 speech tokenizer and CAMPPlus, which "
+            "this export does not carry.\n\n"
+            "**Sampled by default.** Like the reference, the speech-token model samples (temperature "
+            "0.8, min_p 0.05, repetition penalty 1.2, classifier-free guidance 0.5), so two calls "
+            "differ; pass `seed` to reproduce one, or `temperature=0` for the deterministic guided "
+            "decode the export is verified with (waveform within 2.5e-05 of the reference).\n\n"
+            "**English only.** The multilingual and Turbo checkpoints are different models and are "
+            "not this file. Event tags such as `[laughter]` and `[sigh]` in the text are passed to "
+            "the model as the reference passes them.",
+    ),
+    ModelCard(
         slug="supertonic-2", checkpoint=Path("/home/flavio/Dev/supertonic-tts/assets/pt"),
         export_task="text-to-speech", export_model="supertonic", task_type="text-to-speech",
         takes_text=True,
@@ -1150,7 +1181,8 @@ print(model.tokenizer)                       # kind, vocabulary size, default la
 audio = model.text2speech.infer("hello world", sample_rate={sample_rate})
 audio.save("out.wav")
 
-# That uses whatever voice the file itself defaults to. See below for choosing another.
+# That uses the voice the file itself defaults to. Whether it carries others is under "Known
+# limitations" (and, where it does, a section below says how to pick one).
 """,
 }
 

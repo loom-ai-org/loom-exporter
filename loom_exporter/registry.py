@@ -207,6 +207,7 @@ _FAMILY_MODULES = (
     "qwen3_tts_export",
     "t5_export",
     "f5_tts_export",
+    "chatterbox_export",
 )
 
 
