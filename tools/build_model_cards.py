@@ -886,18 +886,31 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
             "which ships inside this same checkpoint upstream. They stay separate because one codec "
             "serves every size and variant of this talker, and because the codes are the useful "
             "intermediate.\n\n"
-            "**The voice comes from a reference clip, and there is no speaker table.** This "
-            "checkpoint's `spk_id` is empty, so cloning is the only mode: pass `waveform=` and the "
-            "speaker encoder extracts an x-vector from it. Pass `x_vector=` instead to reuse one you "
-            "already have -- it is 1024 floats and it is the whole of what the voice contributes.\n\n"
+            "**The voice is an x-vector, and there is no speaker table.** This checkpoint's `spk_id` "
+            "is empty, so cloning is the only mode: pass `x_vector=`, 1024 floats that are the whole "
+            "of what the voice contributes. **Making one from a clip inside loom is temporarily "
+            "withdrawn:** this file's speaker encoder (`waveform=`) currently aborts the process -- a "
+            "native assertion, not a Python exception -- so do not pass `waveform=` until a release "
+            "notes the fix. Until then make the x-vector once with the upstream `qwen-tts` package "
+            "and save it: `spk = Qwen3TTSForConditionalGeneration.from_pretrained(\"Qwen/Qwen3-TTS-12Hz-0.6B-Base\")"
+            ".extract_speaker_embedding(audio=wav, sr=24000)` on a few clear seconds of the voice "
+            "resampled to 24 kHz, then `np.savetxt(\"x_vector.txt\", spk.float().numpy().reshape(-1))`. "
+            "The same file serves every later call.\n\n"
+            "**Pass the text in the model's prompt format, as the example does.** The talker was "
+            "trained on `<|im_start|>assistant\\n{text}<|im_end|>\\n<|im_start|>assistant\\n`, and "
+            "this file does not declare that template, so `text2codes` sends exactly what you give "
+            "it. Spelled out, the prompt tokenizes to upstream's ids and a greedy run "
+            "(`temperature=0, subtalker_temperature=0`) matches `transformers` on every code; the "
+            "bare sentence makes the model stop after a word or two, or run to `max_new_tokens`.\n\n"
             "**The reference TEXT is used if you pass it -- that is ICL mode.** Upstream's "
             "higher-fidelity clone mode conditions on a transcript of the reference clip plus the "
             "clip's own codec tokens, replayed as if the model had just spoken it. Pass `ref_audio=` "
             "(the same clip, 24 kHz) and `ref_tokens=` (its transcript, tokenized with this model's "
-            "own tokenizer and template) and this file draws those codes itself: the codec's ENCODE "
-            "half rides inside this GGUF, since the prompt is its only caller. Pass `ref_code=` "
-            "instead if you already hold them, frame-major and sixteen wide. Omit both and you get "
-            "the x-vector mode above, which is what the rest of this card describes.\n\n"
+            "own tokenizer and template) alongside `x_vector=`, and this file draws those codes "
+            "itself: the codec's ENCODE half rides inside this GGUF, since the prompt is its only "
+            "caller, and it is unaffected by the speaker encoder's abort. Pass `ref_code=` instead if "
+            "you already hold them, frame-major and sixteen wide. Omit both and you get the x-vector "
+            "mode above, which is what the rest of this card describes.\n\n"
             "**A reference clip is used in whole codec frames.** 1920 samples at 24 kHz, 80 ms: the "
             "driver trims to a multiple of that before encoding, so up to 79 ms of the clip's tail is "
             "not heard. Every convolution in the encode stack pads by a length-derived amount that "
@@ -1475,20 +1488,28 @@ print(model.hparam("codec.n_codebooks"), "==", codec.hparam("codec.n_codebooks")
 # answer every time -- greedy is much flatter, and not what this checkpoint was tuned for.
 print(model.hparam("sampling.temperature", "f32"), model.hparam("sampling.guidance_scale", "f32"))
 """,
+    # The clip-in door (`waveform=`, the speaker encoder) is WITHDRAWN from this snippet until the abort
+    # it hits is fixed -- loom.cpp's hub item "Qwen3-TTS's speaker encoder aborts the process" holds the
+    # removed lines and the prose to restore. The voice comes in as an x-vector the reader made upstream.
     "text-to-codes-voice-clone": """import loom
-import librosa
+import numpy as np
 
 model = loom.Model.from_pretrained("{repo_id}")
 
-# The voice is a REFERENCE CLIP, not a speaker id -- this checkpoint carries no speaker table. A few
-# clear seconds is enough. 24 kHz is what the speaker encoder expects, so resample on the way in.
-reference, _ = librosa.load("reference.wav", sr=24000)
+# The voice is an X-VECTOR -- 1024 floats -- not a speaker id: this checkpoint carries no speaker
+# table. Making one from a reference clip inside loom is temporarily withdrawn (see "Known
+# limitations", which also gives the upstream recipe that wrote this file).
+x_vector = np.loadtxt("x_vector.txt", dtype=np.float32)
+
+# The text goes in the prompt format this model was trained on, spelled out: the file declares no
+# chat template, and the bare sentence makes it stop early or ramble (see "Known limitations").
+role = "<|im_start|>assistant\\n"
 
 # What comes back is codec TOKENS, not audio -- frame-major, one row per frame, 16 codebooks wide.
 # `max_new_tokens` counts AUDIO FRAMES, at 12.5 per second.
 codes = model.text2codes.infer(
-    "The quick brown fox jumps over the lazy dog.",
-    waveform=reference.tolist(),
+    f"{role}The quick brown fox jumps over the lazy dog.<|im_end|>\\n{role}",
+    x_vector=x_vector.tolist(),
     language_id=2050,          # English; see "Known limitations" for the rest
     max_new_tokens=200, seed=1234,
 )
