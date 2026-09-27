@@ -206,6 +206,13 @@ _FAMILY_MODULES = (
     "dia_export",
     "qwen3_tts_export",
     "t5_export",
+    "f5_tts_export",
+    "chatterbox_export",
+    "pocket_tts_export",
+    "voxcpm2_export",
+    "voxtral_tts_export",
+    "cosyvoice3_export",
+    "moss_tts_export",
 )
 
 

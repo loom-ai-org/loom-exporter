@@ -38,9 +38,17 @@ copied it. `loom_exporter/paths.py` holds the answer: `REPO_ROOT`, `CONVERTERS`,
 
 ```sh
 ./loom-export /path/to/checkpoint -o model.gguf     # task/architecture auto-detected
+./loom-export ... --isolate-phases                  # if a multi-phase export OOMs; see below
 pytest tests/ci      # 511 hermetic tests, no checkpoint. What CI runs.
 pytest tests/gate    # the byte-identity sweep: needs real models and hours
 ```
+
+**Peak RSS during conversion is what decides which checkpoints are exportable at all**, not the family
+template — Granite-Speech peaks at 22.9 GB. A multi-phase export packs each phase's weights as it
+converts, and `--isolate-phases` converts each phase in a child process that spills them for the
+parent to memory-map, which makes the peak a max over phases instead of a sum. It costs a checkpoint
+load per phase, so it is off by default. **ADR-039** in `loom.cpp/docs/adrs/` has the measurements,
+including why isolation is a respawn and not a fork.
 
 **A test's directory is which class it is in.** `tests/ci/` traces toy modules through the real
 compiler; `tests/gate/` exports real checkpoints, snapshots each GGUF's structure and diffs it against

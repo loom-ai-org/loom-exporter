@@ -29,10 +29,25 @@ from loom_exporter.registry import default_registry
 # Named rather than detected: "does this checkpoint take phonemes" is a fact about the model, and a rule
 # that inferred it from the same declaration it is checking would be circular.
 PHONEME_INPUT = {"kokoro", "matcha", "styletts2", "vits"}
-# ...and the one that does not. Supertonic encodes graphemes itself and its GGUF carries the codepoint
+# ...and the ones that do not. Supertonic encodes graphemes itself and its GGUF carries the codepoint
 # table, so `"vocab"` is the true answer for it and the wrong one for the four above. Here so the rule
-# cannot be satisfied by declaring `"phonemes"` everywhere, which would refuse Supertonic a real door.
-GRAPHEME_INPUT = {"supertonic"}
+# cannot be satisfied by declaring `"phonemes"` everywhere, which would refuse them a real door.
+#
+# F5-TTS joined them with family 9's third leaf: its vocabulary is a CHARACTER table
+# (`tokenizer.ggml.model == "f5"`, `loom::F5Vocab`), not a phoneme one. Its front end is a partial
+# door rather than a complete one -- the reference runs `rjieba` + `pypinyin` before any id, and what
+# ships reproduces that exactly for ordinary English prose and refuses CJK by name -- but partial in
+# the direction these rules care about: the ids are graphemes, so `"vocab"` is the true answer and
+# `"phonemes"` would be the Kokoro mistake this file was written for.
+#
+# Chatterbox (family 9's fourth leaf) is the third: a character-level BPE whose `encode` is the
+# reference's whole text path, `punc_norm` included (`loom::ChatterboxVocab`), and a COMPLETE door --
+# 3000/3000 ids against the reference over six input classes.
+#
+# The four since are all text-in through a vocabulary the GGUF carries, and so graphemes: Pocket-TTS
+# (SentencePiece), VoxCPM2 (character BPE), CosyVoice3 (Qwen2 byte-level BPE) and Voxtral-TTS (Tekken,
+# Mistral's tiktoken BPE).
+GRAPHEME_INPUT = {"supertonic", "f5-tts", "chatterbox", "pocket-tts", "voxcpm2", "cosyvoice3", "voxtral-tts"}
 
 # Families that still declare no `sample_rate`, with the reason it is an EXEMPTION rather than a pass.
 # Each needs its rate taken off its own checkpoint the way Kokoro's and Supertonic's are -- Matcha's and
@@ -46,7 +61,20 @@ NO_SAMPLE_RATE_YET = {"matcha", "styletts2", "vits"}
 # an undeclared default is a door that raises out of Lua. Named rather than detected for the same reason
 # as above, and because the three do not share one marker: Matcha's and Supertonic's step counts come
 # from a `samplers()` spec, StyleTTS2's from a hand-written diffusion driver that no spec describes.
-NEEDS_STEPS = {"matcha", "styletts2", "supertonic"}
+#
+# F5-TTS is the fourth and reaches it a step earlier than the others: its driver builds the SCHEDULE
+# host-side (`sway_times` divides by `n_steps` to walk a linspace before reparameterising it), where
+# the other three hand a count to a sampler that divides. Same consequence -- an undeclared default is
+# an arithmetic-on-nil error out of Lua -- which is why the rule is about the division and not about
+# where it happens.
+#
+# Chatterbox is the fifth, for F5-TTS's reason: its driver builds the cosine schedule host-side and
+# divides by the count to walk the linspace.
+#
+# CosyVoice3 is the sixth, for the same reason (`cosyvoice3_cosine_times` divides by it). Pocket-TTS and
+# VoxCPM2 default their counts inside their own drivers (`inputs.n_steps or DEFAULT_DECODE_STEPS`), so
+# a caller naming none still gets audio; Voxtral-TTS's seven steps are unrolled into one graph.
+NEEDS_STEPS = {"matcha", "styletts2", "supertonic", "f5-tts", "chatterbox", "cosyvoice3"}
 
 
 def _tts_configs():

@@ -842,15 +842,25 @@ def test_every_registered_task_is_canonical():
     ]
 
 
-def test_the_five_tts_families_now_share_one_task():
+def test_the_tts_families_share_one_task():
     """`tts-multi-phase` + `tts-flow-matching` were one task whose members differ by a field, ever since
     P4.0.3 made decomposition a field. Flow-matching models register their `TTSFlowMatchingModelExportConfig`
-    subclass under the same `text-to-speech` task as the plain multi-phase ones."""
+    subclass under the same `text-to-speech` task as the plain multi-phase ones.
+
+    Six since family 9's third leaf: `f5-tts` declares neither base class -- it is a plain
+    `BaseMultiPhaseModelExportConfig` whose sampler is a `FlowMatchingSpec` with guidance -- which is
+    exactly the point that the task is one and the decomposition is a field. Seven since the fourth
+    leaf, Chatterbox, which is the same shape with an AR token LM in front of the sampler. Eight since
+    the fifth, Pocket-TTS, whose AR loop carries latents and has no ODE sampler at all. Nine since the
+    sixth, VoxCPM2, whose loop carries latents too and integrates each patch in its own driver. Eleven
+    since the eighth, Voxtral-TTS, whose loop carries CODE frames and integrates each frame's acoustic
+    half in one graph (CosyVoice3, the seventh, is the tenth)."""
     from loom_exporter.registry import default_registry
 
     registry = default_registry()
     names = {rec.name for rec in registry._entries["text-to-speech"].recognizers}
-    assert names == {"kokoro", "styletts2", "vits", "matcha", "supertonic"}
+    assert names == {"kokoro", "styletts2", "vits", "matcha", "supertonic", "f5-tts", "chatterbox",
+                     "pocket-tts", "voxcpm2", "cosyvoice3", "voxtral-tts"}
     for model in names:
         assert registry.get("text-to-speech", model).name == model
 

@@ -105,6 +105,11 @@ class ModelCard:
     # through one door, and what a caller has to supply is not implied by the task. Dia picks a voice
     # from its seed; Qwen3-TTS has no speaker table at all and clones from audio.
     clones_voice: bool = False
+    # An explicit `USAGE_SNIPPETS` key, for a model whose door differs from its task's usual card in a
+    # way no flag above describes. MOSS-TTS is the case: a `text-to-codes` model like Dia, but with a
+    # different codec, a `language=` argument and none of Dia's guidance -- so the shared snippet
+    # would publish calls this file does not answer. Wins over everything `snippet_key` derives.
+    snippet: Optional[str] = None
     # `--task`/`--model` for loom-export; empty means auto-detection resolves both.
     export_task: Optional[str] = None
     export_model: Optional[str] = None
@@ -390,6 +395,278 @@ anything.""",
         # `Matcha-TTS/configs/data/ljspeech.yaml`: `sample_rate: 22050`.
         sample_rate=22050,
         title="Matcha-TTS (LJSpeech)", summary="Matcha-TTS's LJSpeech flow-matching TTS checkpoint, exported for loom.cpp. Takes phoneme ids, not text.",
+    ),
+    ModelCard(
+        slug="f5-tts-v1-base", checkpoint=Path("f5-tts/F5TTS_v1_Base"),
+        export_task="text-to-speech", export_model="f5-tts", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="SWivid/F5-TTS", license_id="cc-by-nc-4.0",
+        source_url="https://github.com/SWivid/F5-TTS", source_name="F5-TTS (F5TTS_v1_Base)",
+        language=["en", "zh"],
+        # Declared by the export itself (`f5_tts_export.SAMPLE_RATE`), so this restates one fact rather
+        # than supplying a missing one -- the same relationship Supertonic's entry has to its own.
+        sample_rate=24000,
+        title="F5-TTS v1 Base",
+        summary="F5-TTS's flow-matching voice-cloning TTS model, exported for loom.cpp. Takes a "
+                "reference clip, its transcript and the text to speak; encodes characters itself.",
+        limitations=
+            "**It clones a voice, so it needs one.** Every call takes a reference clip at 24 kHz, the "
+            "transcript of that clip, and the text to speak -- the model in-fills one spectrogram "
+            "whose first frames are the reference, so there is no way to synthesise without a prompt.\n\n"
+            "**Chinese needs pinyin conversion this file cannot do.** F5-TTS's own front end runs "
+            "`rjieba` word segmentation and `pypinyin` before a single id is looked up. What ships "
+            "here is the character table, which reproduces that function exactly for ordinary "
+            "space-separated English prose (2000/2000 generated sentences) and differs by one "
+            "inserted space for text carrying multi-character punctuation runs (`--`, `...`) or "
+            "hyphen-joined digit groups (`2026-09-18`). Text containing CJK is refused by name; pass "
+            "ids from the reference's own `convert_char_to_pinyin` instead.\n\n"
+            "**The default duration is an estimate, not a prediction.** There is no duration model: "
+            "the frame count is the reference clip's own characters-per-frame rate applied to the "
+            "text to speak, and `duration` overrides it when the result is clipped or padded.",
+    ),
+    ModelCard(
+        slug="chatterbox", checkpoint=Path("chatterbox"),
+        export_task="text-to-speech", export_model="chatterbox", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="ResembleAI/chatterbox", license_id="mit",
+        source_url="https://github.com/resemble-ai/chatterbox", source_name="Chatterbox (English)",
+        language=["en"],
+        # Declared by the export (`chatterbox_export.SAMPLE_RATE`), restated here like F5-TTS's.
+        sample_rate=24000,
+        title="Chatterbox (English)",
+        summary="Resemble AI's Chatterbox TTS (English), exported for loom.cpp: a Llama token model "
+                "and a flow-matching decoder in one file. Encodes text itself and has a built-in voice.",
+        limitations=
+            "**No watermark.** Resemble AI's own package runs every output through Perth, an "
+            "imperceptible neural watermark that lets synthetic speech be detected later. This export "
+            "does NOT include it, deliberately: Perth is a separate neural model applied after "
+            "synthesis, and this build targets local inference and small devices, where a smaller, "
+            "faster model is the point. Audio from this file therefore carries no watermark and "
+            "cannot be identified as synthetic by Perth's detector. If you distribute generated "
+            "speech, disclose that it is synthetic yourself.\n\n"
+            "**One voice, built in.** Synthesis uses the checkpoint's own default voice (`conds.pt`). "
+            "Cloning a new voice needs the voice encoder, the S3 speech tokenizer and CAMPPlus, which "
+            "this export does not carry.\n\n"
+            "**Sampled by default.** Like the reference, the speech-token model samples (temperature "
+            "0.8, min_p 0.05, repetition penalty 1.2, classifier-free guidance 0.5), so two calls "
+            "differ; pass `seed` to reproduce one, or `temperature=0` for the deterministic guided "
+            "decode the export is verified with (waveform within 2.5e-05 of the reference).\n\n"
+            "**English only.** The multilingual and Turbo checkpoints are different models and are "
+            "not this file. Event tags such as `[laughter]` and `[sigh]` in the text are passed to "
+            "the model as the reference passes them.",
+    ),
+    ModelCard(
+        slug="pocket-tts", checkpoint=Path("pocket-tts/languages/english_2026-09"),
+        export_task="text-to-speech", export_model="pocket-tts", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="kyutai/pocket-tts", license_id="cc-by-4.0",
+        source_url="https://github.com/kyutai-labs/pocket-tts", source_name="Pocket TTS (English, 2026-09)",
+        language=["en"],
+        # Declared by the export (`pocket_tts_export.SAMPLE_RATE`), restated here like Chatterbox's.
+        sample_rate=24000,
+        title="Pocket TTS (English)",
+        summary="Kyutai's Pocket TTS (English, 2026-09 release), exported for loom.cpp: a 100M-parameter "
+                "flow language model over Mimi codec latents. Encodes text itself and has a built-in voice.",
+        usage_extra="""### Choosing a voice
+
+The file carries one voice, `alba`, and uses it when you name none. The other 25 of Kyutai's voices
+ship in this repo as voice files under `voices/`, and a name is enough -- it is fetched from this repo
+the first time:
+
+```python
+print(model.voices)                          # the built-in one first, then the voice files
+
+audio = model.text2speech.infer("Hello there.", voice="marius")
+audio.save("marius.wav")
+```
+
+A voice file is the model's own state after hearing the speaker, stamped with a fingerprint of these
+weights, so it only fits this model: loom refuses one made for a different release rather than
+producing speech that never stops. `voice=` also takes a path to a voice file of your own.
+
+| voice | licence of the recording | voice | licence of the recording |
+|---|---|---|---|
+| `alba` (built in) | CC-BY-4.0 | `javert` | CC0-1.0 |
+| `anna` | CC-BY-4.0 | `jean` | **CC-BY-NC-4.0 (non-commercial)** |
+| `azelma` | CC-BY-4.0 | `juergen` | not stated by Kyutai |
+| `bill_boerst` | CC0-1.0 | `lola` | CC0-1.0 |
+| `caro_davy` | CC0-1.0 | `marius` | CC0-1.0 |
+| `charles` | CC-BY-4.0 | `mary` | CC-BY-4.0 |
+| `cosette` | **CC-BY-NC-4.0 (non-commercial)** | `michael` | CC-BY-4.0 |
+| `eponine` | CC-BY-4.0 | `paul` | CC-BY-4.0 |
+| `estelle` | CC0-1.0 | `peter_yearsley` | CC0-1.0 |
+| `eve` | CC-BY-4.0 | `rafael` | not stated by Kyutai |
+| `fantine` | CC-BY-4.0 | `stuart_bell` | CC0-1.0 |
+| `george` | CC-BY-4.0 | `vera` | CC-BY-4.0 |
+| `giovanni` | CC0-1.0 | | |
+| `jane` | CC-BY-4.0 | | |
+
+Licences are per [`kyutai/tts-voices`](https://huggingface.co/kyutai/tts-voices)' README, by the
+dataset each recording comes from; every file also records its own (`loom.voice.license`,
+`loom.voice.origin`). CC-BY voices need attribution to their source dataset or speaker.""",
+        extra_files=[
+            "`voices/*.gguf` -- Kyutai's other predefined voices as loom voice files, converted "
+            "unchanged from `kyutai/pocket-tts`'s `languages/english_2026-09/embeddings/` by "
+            "`loom_exporter.pocket_tts_voices`. Only needed to pick a voice other than `alba`.",
+        ],
+        limitations=
+            "**Kyutai's use restrictions apply.** The upstream release prohibits, among other things, "
+            "voice impersonation or cloning without explicit and lawful consent, and presenting "
+            "generated audio as a genuine recording of a real person. They travel with the weights.\n\n"
+            "**One voice is built in (`alba`); the other 25 are voice files** under `voices/`, "
+            "selected with `voice=` (see above). A voice is the model's own attention state after "
+            "hearing the speaker, so a voice file only fits these weights, and loom refuses one made "
+            "for another release. Each voice's licence is its RECORDING's, not the model's -- two are "
+            "non-commercial -- and the table above lists them. Cloning a voice from a recording needs "
+            "the Mimi encoder, which this export does not carry; a state you saved yourself with "
+            "`pocket-tts export-voice` converts with `python -m loom_exporter.pocket_tts_voices "
+            "--from`.\n\n"
+            "**Sampled by default**, at the checkpoint's own temperature (0.3), so two calls differ; "
+            "pass `seed` to reproduce one. Verified against the reference with its random draws pinned: "
+            "within 1.8e-06 rms of the reference waveform step for step.\n\n"
+            "**Long text is split, as the reference splits it**: into sentence chunks of at most 50 "
+            "tokens, each generated separately from the same voice and joined. A single sentence "
+            "longer than that is cut at its commas.\n\n"
+            "**English only.** Kyutai's other languages are separate checkpoints and are not this file.",
+    ),
+    ModelCard(
+        slug="voxcpm2", checkpoint=Path("voxcpm2"),
+        export_task="text-to-speech", export_model="voxcpm2", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="openbmb/VoxCPM2", license_id="apache-2.0",
+        source_url="https://github.com/OpenBMB/VoxCPM", source_name="VoxCPM2",
+        language=["en", "zh", "ar", "my", "da", "nl", "fi", "fr", "de", "el", "he", "hi", "id", "it", "ja", "km",
+                  "ko", "lo", "ms", "no", "pl", "pt", "ru", "es", "sw", "sv", "tl", "th", "tr", "vi"],
+        # Declared by the export (`voxcpm2_export.SAMPLE_RATE`): the AudioVAE decodes at 48 kHz.
+        sample_rate=48000,
+        title="VoxCPM2",
+        summary="OpenBMB's VoxCPM2, exported for loom.cpp: a 2B diffusion-autoregressive TTS over "
+                "continuous AudioVAE latents, 30 languages, 48 kHz. Encodes text itself.",
+        usage_extra="""### Designing a voice
+
+VoxCPM2 has no built-in speaker: every call invents a voice to fit the text. To steer it, describe the
+voice in parentheses at the start of the text -- the description is not spoken:
+
+```python
+audio = model.text2speech.infer("(A calm older man, speaking slowly)Welcome back. The results are in.")
+audio.save("designed.wav")
+```
+
+Pass `seed` to get the same voice again.""",
+        limitations=
+            "**No voice cloning in this file.** The reference clones a voice from a recording through its "
+            "AudioVAE's encoder, which this export does not carry. Voices are zero-shot or designed in the "
+            "text (see above).\n\n"
+            "**Sampled, so two calls differ.** Each 160 ms patch of audio starts from a random draw, "
+            "integrated over 10 guided steps (CFG-Zero\\*, guidance 2.0). Pass `seed` to reproduce a call. "
+            "Verified against the reference with its draws pinned: within 1.2e-06 rms of its latents step "
+            "for step.\n\n"
+            "**Large, and slow on a small CPU.** 2.3B parameters: 9.3 GB at F32. On a 2-core x86 laptop a "
+            "second of 48 kHz audio takes about 20 seconds.\n\n"
+            "**A run that never stops is retried**, as the reference retries it: a generation that uses its "
+            "whole length budget (six patches per text token) is drawn again, up to three times.",
+    ),
+    ModelCard(
+        slug="fun-cosyvoice3-0.5b", checkpoint=Path("fun-cosyvoice3-0.5b-2512"),
+        export_task="text-to-speech", export_model="cosyvoice3", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="FunAudioLLM/Fun-CosyVoice3-0.5B-2512", license_id="apache-2.0",
+        source_url="https://github.com/FunAudioLLM/CosyVoice", source_name="CosyVoice",
+        language=["zh", "en", "ja", "ko", "de", "es", "fr", "it", "ru"],
+        # Declared by the export (`cosyvoice3_export.SAMPLE_RATE`): CausalHiFT decodes at 24 kHz.
+        sample_rate=24000,
+        title="Fun-CosyVoice3 0.5B",
+        summary="FunAudioLLM's Fun-CosyVoice3-0.5B-2512, exported for loom.cpp: a Qwen2-0.5B speech-token "
+                "LM, a flow-matching DiT and a HiFT vocoder, 9 languages, 24 kHz. Encodes text itself.",
+        limitations=
+            "**One voice is built in, computed when the file was exported.** The release ships no speaker "
+            "table; the file carries the voice every example in the release's README uses "
+            "(`asset/zero_shot_prompt.wav` from the Apache-2.0 CosyVoice repository, a Mandarin speaker, "
+            "with its transcript), encoded ONCE by the release's own ONNX speech tokenizer and speaker "
+            "encoder. English and the other languages are spoken in that voice cross-lingually. **No voice "
+            "cloning in this file**: cloning a new voice needs those two ONNX models, which it does not "
+            "carry.\n\n"
+            "**No text normalisation.** The reference spells numbers out and splits long text into "
+            "sentence-sized pieces before synthesis; this file does neither, so write numbers as words and "
+            "pass a paragraph a sentence or two at a time.\n\n"
+            "**Sampled, so two calls differ.** The LM samples every speech token (top-k 25, top-p 0.8, "
+            "with the reference's repetition-aware redraw). Pass `seed` to reproduce a call. Verified "
+            "against the reference with its draws pinned: the same 76 tokens, and a waveform within the "
+            "reference's own float32-vs-float64 spread.\n\n"
+            "**Needs loom 1.0.0-rc11 or later.** An older engine ignores three sampler options this file "
+            "uses and samples differently without saying so.\n\n"
+            "**Slow on a small CPU.** 3.4 GB at F32; on a 2-core x86 laptop a second of audio takes 16-20 "
+            "seconds.",
+    ),
+    ModelCard(
+        slug="voxtral-4b-tts-2603", checkpoint=Path("voxtral-4b-tts-2603"),
+        export_task="text-to-speech", export_model="voxtral-tts", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="mistralai/Voxtral-4B-TTS-2603", license_id="cc-by-nc-4.0",
+        source_url="https://github.com/vllm-project/vllm-omni", source_name="Voxtral TTS (vLLM-Omni)",
+        language=["en", "fr", "es", "pt", "it", "nl", "de", "ar", "hi"],
+        # Declared by the export (`voxtral_tts_export.SAMPLE_RATE`): the codec decodes at 24 kHz.
+        sample_rate=24000,
+        title="Voxtral 4B TTS",
+        summary="Mistral's Voxtral-4B-TTS-2603, exported for loom.cpp: a 3.4B Ministral backbone over frames "
+                "of audio codes, a flow-matching acoustic head and a causal codec, 9 languages, 24 kHz. "
+                "Encodes text itself and has a built-in voice.",
+        usage_extra="""### Choosing a voice
+
+The file carries one voice, `casual_male`, and uses it when you name none. Mistral's other 19 preset
+voices ship in this repo as voice files under `voices/`, and a name is enough -- it is fetched from this
+repo the first time:
+
+```python
+print(model.voices)                          # the built-in one first, then the voice files
+
+audio = model.text2speech.infer("Hello world.", voice="neutral_female")
+audio.save("neutral_female.wav")
+```
+
+Pick a voice in the language you are speaking (`voice="fr_female"` for French, and so on): each preset
+was recorded in one. A voice is the rows the
+model reads in place of a reference recording, stamped with a fingerprint of these weights, so it only
+fits this model and loom refuses one made for another.
+
+| voices | language |
+|---|---|
+| `casual_male` (built in), `casual_female`, `cheerful_female`, `neutral_male`, `neutral_female` | English |
+| `fr_male`, `fr_female` | French |
+| `es_male`, `es_female` | Spanish |
+| `de_male`, `de_female` | German |
+| `it_male`, `it_female` | Italian |
+| `pt_male`, `pt_female` | Portuguese |
+| `nl_male`, `nl_female` | Dutch |
+| `ar_male` | Arabic |
+| `hi_male`, `hi_female` | Hindi |
+
+Every voice is **CC BY-NC 4.0**, like the model: Mistral's card says the references come from the EARS,
+CML-TTS, IndicVoices-R and Arabic Natural Audio datasets.""",
+        extra_files=[
+            "`voices/*.gguf` -- Mistral's other preset voices as loom voice files, converted unchanged from "
+            "`mistralai/Voxtral-4B-TTS-2603`'s `voice_embedding/*.pt` by `loom_exporter.voxtral_tts_voices`. "
+            "Only needed to pick a voice other than `casual_male`.",
+        ],
+        limitations=
+            "**Non-commercial (CC BY-NC 4.0).** The weights and every voice carry the licence of the "
+            "voice recordings they were built from, per Mistral's own card.\n\n"
+            "**Preset voices only; no voice cloning.** Mistral's open checkpoint ships no codec encoder, "
+            "which is what turns a recording into a voice, so this file has none either (upstream says "
+            "the same of its own release). The 20 presets are the built-in `casual_male` and 19 voice "
+            "files under `voices/`.\n\n"
+            "**Sampled, so two calls differ.** Each 80 ms frame's acoustic half starts from a random "
+            "draw, integrated over 7 guided steps (classifier-free guidance 1.2, the reference's "
+            "default); its semantic half is the most likely code. Pass `seed` to reproduce a call. "
+            "Verified against the reference (vLLM-Omni's own flow head and codec) with its draws pinned: "
+            "the same codes for all 142 frames of an 11 s sentence, and a waveform within 2e-08 rms. "
+            "Like the reference, it occasionally keeps talking after the sentence; another `seed` "
+            "fixes it.\n\n"
+            "**Large, and slow on a CPU.** 4B parameters: 16 GB at F32, about 17 GB of RAM to run. On a "
+            "24-core x86 desktop a second of audio takes about 5.5 seconds; a 4-bit build is not "
+            "published yet. One call speaks up to 2048 frames (164 s), and long text is not split.\n\n"
+            "**Needs loom 1.0.0-rc11 or later.** The text front end is Mistral's Tekken tokenizer, which "
+            "older engines refuse by name rather than tokenize differently.",
     ),
     ModelCard(
         slug="supertonic-2", checkpoint=Path("/home/flavio/Dev/supertonic-tts/assets/pt"),
@@ -721,6 +998,130 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
             "`loom-export --quantize Q8_0` on the upstream checkpoint packs the eligible weights to "
             "about 1.8 GB if you would rather have that -- it moves the logits slightly, which for a "
             "sampler means a different take rather than a worse one."
+        ),
+    ),
+    ModelCard(
+        slug="moss-tts-local-transformer-v1.5", checkpoint=Path("moss-tts-local-transformer-v1.5"),
+        task_type="text-to-codes", pipeline_tag="text-to-speech",
+        snippet="text-to-codes-moss",
+        # Exported on the workstation: the F32 conversion peaks at 34.2 GB, over this dev box's RAM.
+        base_repo="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5", license_id="apache-2.0",
+        language=["zh", "yue", "en", "ar", "cs", "da", "de", "nl", "es", "fr", "fi", "el", "he", "hi",
+                  "hu", "ja", "it", "ko", "mk", "ms", "ru", "fa", "pl", "pt", "sv", "ro", "sw", "tl",
+                  "th", "tr", "vi"],
+        title="MOSS-TTS Local Transformer v1.5",
+        summary="OpenMOSS's multilingual TTS model, exported for loom.cpp. Family 10: text in, "
+                "neural-codec tokens out -- pair it with `moss-audio-tokenizer-v2-loom` for 48 kHz "
+                "stereo audio.",
+        # The cloning block needs a voice file the reader makes, so the card gate stops at it as a
+        # reader-supplied precondition (FileNotFoundError), after the first block's audio is bound.
+        usage_extra="""### Cloning a voice
+
+Upstream clones a voice from one or more reference clips by putting their codec tokens in the prompt.
+loom takes those tokens from a **voice file**: the clips already encoded, made once per voice with
+[loom-exporter](https://github.com/loom-ai-org/loom-exporter). Making one runs upstream's own
+processor and the MOSS-Audio-Tokenizer-v2 encoder in PyTorch, so it needs `torch`, `torchaudio` and
+`transformers` and both upstream checkpoints on disk -- this repo and the codec's carry decoders only.
+Using one needs nothing but loom.
+
+```sh
+git clone https://github.com/loom-ai-org/loom-exporter && cd loom-exporter
+# Looks for the codec beside the TTS checkpoint (a directory named MOSS-Audio-Tokenizer-v2, any case),
+# or pass --codec <dir>. --license is the RECORDING's, which only you know.
+python -m loom_exporter.moss_tts_voices ~/models/MOSS-TTS-Local-Transformer-v1.5 -o voices \\
+    --wav me.wav --name me --license "CC0-1.0"
+```
+
+```python
+# A voice file is a path (or a name, for one under `voices/` beside the model file).
+codes = model.text2codes.infer("The quick brown fox jumps over the lazy dog.", language="en",
+                               voice="voices/me.gguf", seed=1)
+codec.codes2speech.infer(codes).save("cloned.wav")
+```
+
+**Several speakers are one voice file**: repeat `--wav`, one clip per speaker in order, and write the
+text as `[S1] ... [S2] ...`. A few clear seconds per clip is enough; a clip's frames count against the
+2048 positions a prompt and its audio share, at 12.5 per second.
+
+A voice file holds codec tokens, so it is stamped with a fingerprint of the codec's quantizer and fits
+any model that reads this codec's codes; loom refuses one made with a different codec. The voice's
+licence is its recording's, and so is the consent: clone only voices you have the right to use.""",
+        limitations=(
+            "**This model does not produce audio.** It emits 12 streams of MOSS-Audio-Tokenizer "
+            "codec tokens, and the codec turns those into a waveform -- "
+            "[`moss-audio-tokenizer-v2-loom`](https://huggingface.co/loom-ai-org/moss-audio-tokenizer-v2-loom). "
+            "They stay separate because the codec is shared across the MOSS family and because the "
+            "codes are the useful intermediate.\n\n"
+            "**12 codebooks into a 32-codebook codec, and nothing to do about it.** The codec is a "
+            "residual quantizer, and decoding the first 12 of its 32 codebooks is what upstream's own "
+            "processor asks for. The codec file declares an id meaning \"this codebook is absent\", "
+            "and `codes2speech.infer` fills each 12-wide row out with it, so the usage above passes "
+            "the codes straight across.\n\n"
+            "**`language=` is a code from the contract**: the 31 languages this model supports, "
+            "`model.contract[\"languages\"]`. It selects the prompt's language line, which upstream "
+            "recommends setting; omitted, the line says `None`, which upstream's README says can "
+            "regress some languages slightly.\n\n"
+            "**It samples by default, at upstream's recommended settings** -- audio temperature 1.7, "
+            "top-k 25, top-p 0.8 -- so two runs of a sentence give two takes, and `seed=` pins one. "
+            "`temperature=0, text_temperature=0` decodes greedily and reproduces upstream's "
+            "`generate(do_sample=False)` **exactly**: every code of 38 and 40 frames identical, and "
+            "the same frame chosen to stop on. The sampled decode is verified the same way, with its "
+            "random draws pinned on both sides.\n\n"
+            "**Cloning takes a voice file, not a clip.** Upstream clones by putting a reference clip's "
+            "codec tokens in the prompt, which needs the codec's ENCODER; neither this repo nor the "
+            "codec's carries it, so the clip is encoded once, in Python, into a voice file (see "
+            "above), and the prompt it builds is upstream's exactly -- verified code for code with one "
+            "reference and with two. Without a voice the model picks one, and the seed decides which. "
+            "Upstream's continuation mode (a prompt clip continued as the model's own speech) and the "
+            "template's other optional lines (a duration in tokens, a free-form instruction, quality, "
+            "sound events) are not exposed.\n\n"
+            "**`max_new_tokens` counts audio frames at 12.5 per second.** One frame is one pass of the "
+            "36-layer backbone plus twelve of a one-layer local transformer that draws the codebooks "
+            "in turn; the model decides for itself when to stop.\n\n"
+            "**It is a big download, and slow on a CPU**: 16.8 GB, F32, like the rest of this "
+            "collection (4.55B parameters, less the 1.56 GB text head this release never reads). A "
+            "24-core workstation generates about 3 frames per second, against the 12.5 real time "
+            "needs."
+        ),
+    ),
+    ModelCard(
+        slug="moss-audio-tokenizer-v2", checkpoint=Path("moss-audio-tokenizer-v2"),
+        task_type="audio-codec", pipeline_tag="text-to-audio",
+        base_repo="OpenMOSS-Team/MOSS-Audio-Tokenizer-v2", license_id="apache-2.0", language=[],
+        language_note="a codec, not a language model: it carries no vocabulary and no language.",
+        title="MOSS-Audio-Tokenizer v2 (decoder)",
+        summary="OpenMOSS's 48 kHz stereo audio tokenizer, decode half, exported for loom.cpp. "
+                "Family 11: codec tokens in, interleaved stereo out -- and the family's first leaf "
+                "with no convolution at all.",
+        usage_extra=(
+            "The audio is **interleaved stereo**: `audio.channels` is 2, `audio.samples` runs "
+            "`L R L R ...`, `audio.duration` accounts for it, `audio.save()` writes a two-channel WAV "
+            "and `numpy.asarray(audio)` is `[frames, 2]`.\n\n"
+            "Rows **narrower** than 32 decode as a prefix of the codebooks: the rest of each row is "
+            "filled with the id the file declares as absent. That is how "
+            "[`moss-tts-local-transformer-v1.5-loom`](https://huggingface.co/loom-ai-org/moss-tts-local-transformer-v1.5-loom)'s "
+            "12 codebooks decode:\n\n"
+            "```python\n"
+            "print(model.hparam(\"codec.absent_code\"), audio.channels)\n"
+            "audio = model.codes2speech.infer([[0] * 12 for _ in range(frames)])   # 12 of 32\n"
+            "```"
+        ),
+        limitations=(
+            "**This is the DECODE half only**, like every codec in this collection: `encode` is "
+            "audio-in/codes-out, a different contract, and no model that decodes through this codec "
+            "calls it. It is also what voice cloning with MOSS-TTS would need, so cloning is not "
+            "available through these two repos.\n\n"
+            "**A clip is decoded in ONE call, never in chunks**, because nothing else is exact here. "
+            "The decoder is six causal transformer stacks (12.5 Hz up to 400 Hz) with windowed "
+            "attention, and 92 layers of windows reach further back than any chunk could carry: a "
+            "chunked decode with 8 s of overlap is still 48% away from the model's own answer. The "
+            "attention is computed in blocks, so memory grows linearly with the clip rather than "
+            "quadratically. The ceiling is 4096 frames, 5.5 minutes, which is upstream's own "
+            "generation budget. Verified against upstream's decode at 1.2e-06 relative RMS on 30 s of "
+            "speech.\n\n"
+            "**Feed it frame-major rows of up to 32 codes at 12.5 frames per second**; one frame is "
+            "3840 samples per channel at 48 kHz. On a 2-core CPU a 30 s clip takes about two "
+            "minutes."
         ),
     ),
     ModelCard(
@@ -1109,6 +1510,30 @@ print(model.hparam("codec.n_codebooks"), "==", codec.hparam("codec.n_codebooks")
 print(model.hparam("sampling.temperature", "f32"),
       model.hparam("sampling.repetition_penalty", "f32"))
 """,
+    # MOSS-TTS: Dia's two-file shape with a different codec, a `language=` and no guidance. The codec
+    # is 32 codebooks wide and this model emits 12; the codec declares an absent id and
+    # `codes2speech` fills the rows with it, so nothing goes between the two calls here either.
+    "text-to-codes-moss": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# What comes back is codec TOKENS, not audio -- frame-major, one row per frame, 12 codebooks wide, at
+# 12.5 frames per second. `language=` is one of the codes in model.contract["languages"].
+codes = model.text2codes.infer("The quick brown fox jumps over the lazy dog.", language="en", seed=1)
+print(len(codes), "frames x", len(codes[0]), "codebooks")
+
+# The second half of the pair, in a repo of its own. The codec has 32 codebooks and decodes the first
+# 12 as a prefix: it declares which id means "absent", and codes2speech fills each row out with it.
+codec = loom.Model.from_pretrained("loom-ai-org/moss-audio-tokenizer-v2-loom")
+audio = codec.codes2speech.infer(codes)
+print(audio.channels, "channels at", audio.sample_rate, "Hz =", round(audio.duration, 2), "s")
+audio.save("out.wav")                         # 48 kHz stereo
+
+# This model SAMPLES by default, at upstream's recommended settings; `seed=` pins a take. Greedy
+# (both draws) reproduces upstream's generate(do_sample=False) exactly:
+greedy = model.text2codes.infer("Hello there.", language="en", temperature=0, text_temperature=0,
+                                max_new_tokens=20)
+""",
     "text-to-speech-with-vocab": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
@@ -1122,7 +1547,8 @@ print(model.tokenizer)                       # kind, vocabulary size, default la
 audio = model.text2speech.infer("hello world", sample_rate={sample_rate})
 audio.save("out.wav")
 
-# That uses whatever voice the file itself defaults to. See below for choosing another.
+# That uses the voice the file itself defaults to. Whether it carries others is under "Known
+# limitations" (and, where it does, a section below says how to pick one).
 """,
 }
 
@@ -1157,6 +1583,8 @@ def repo_id(card: ModelCard) -> str:
 def snippet_key(card: ModelCard) -> str:
     """Which `USAGE_SNIPPETS` entry this model's card gets. The task decides it for every family except
     TTS, where whether the GGUF carries a vocabulary is a per-model fact -- see `takes_text`."""
+    if card.snippet:
+        return card.snippet
     if card.task_type == "text-generation" and card.chat:
         return "text-generation-chat"
     if card.task_type == "text-to-speech" and card.takes_text:

@@ -168,7 +168,13 @@ class TestUsageIsDerived(unittest.TestCase):
 
     def test_the_tts_half_comes_from_the_real_component_lists(self):
         used, _ = cr.usage()
-        self.assertEqual(used["flow_matching_sampler"], ["matcha", "supertonic"])
+        # Three since family 9's third leaf. F5-TTS reaching the SAME component as the other two is
+        # the claim worth pinning here: its sampler is guided, caller-scheduled and caller-seeded, and
+        # all three are declarations on the shared template rather than a bespoke loop.
+        # Four since the fourth leaf: Chatterbox reaches it too, with the same three declarations.
+        # Five since the seventh: CosyVoice3's flow is Chatterbox's solver, declared identically.
+        self.assertEqual(used["flow_matching_sampler"],
+                         ["chatterbox", "cosyvoice3", "f5-tts", "matcha", "supertonic"])
         self.assertEqual(used["modular_chain"], ["lfm2-modular"])
         self.assertIn("qwen3", used["monolithic_call"])
         # Supertonic is the one peeled family that declares no loom_lua function, which is a real
