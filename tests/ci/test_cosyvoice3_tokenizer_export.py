@@ -83,8 +83,11 @@ def test_the_budgets_are_text_normalizes_arguments(utils):
 
 def test_the_number_words_reproduce_inflect():
     """A direct transcription of `enword` over the shipped tables agrees with inflect itself on the
-    shapes the engine test pins -- a guard on the TABLES (the algorithm is the engine's)."""
-    import inflect
+    shapes the engine test pins -- a guard on the TABLES (the algorithm is the engine's).
+
+    `pytest.importorskip`, as for SNAC in test_audio_codec_export: inflect is an optional dependency
+    of this one family's export (`number_words` reads its tables), not of the ci install."""
+    inflect = pytest.importorskip("inflect")
 
     w = number_words()
     engine = inflect.engine()
