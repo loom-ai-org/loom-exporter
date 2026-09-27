@@ -63,12 +63,13 @@ def companion_output(output_path: str, companion) -> str:
 
 
 def main_export(model_path: str, output_path: str, task: str = None, model: str = None,
-                quantize: str = None, companions: bool = False) -> str:
+                quantize: str = None, companions: bool = False, isolate_phases: bool = None) -> str:
     """Exports whatever `model_path` names to `output_path`. `task`/`model` are optional overrides --
     with neither, both axes are auto-detected; with `task` alone, detection is restricted to that task's
     recognizers; `model` requires `task` (it names one specific recognizer within it). `quantize` names
-    a GGML type for the weights that are eligible for one; unset falls back to $LOOM_QUANTIZE. Returns
-    `output_path`."""
+    a GGML type for the weights that are eligible for one; unset falls back to $LOOM_QUANTIZE.
+    `isolate_phases` converts each phase of a multi-phase model in its own process; unset falls back to
+    $LOOM_PHASE_ISOLATION. Returns `output_path`."""
     if model is not None and task is None:
         raise ValueError("--model requires --task (which family's recognizer to look up)")
     if quantize:
@@ -90,6 +91,15 @@ def main_export(model_path: str, output_path: str, task: str = None, model: str 
     # the ones whose own `backend_kwargs` never learned about quantization.
     if quantize:
         config.quantize = quantize
+    # Onto the DECOMPOSITION rather than the config, because that is what reads it -- and only one of
+    # the three has phases to isolate. A request for it against a single-graph model is accepted and
+    # does nothing rather than raising: detection picks the decomposition, so a caller exporting a
+    # directory of checkpoints cannot know in advance which of them are multi-phase.
+    if isolate_phases is not None:
+        from .decomposition import MultiPhase
+
+        if isinstance(getattr(config, "decomposition", None), MultiPhase):
+            config.decomposition.isolate_phases = isolate_phases
     primary = config.export()
 
     # **Off by default, and the default is the load-bearing half.** `tools/build_model_cards.py` calls
@@ -101,7 +111,11 @@ def main_export(model_path: str, output_path: str, task: str = None, model: str 
             destination = companion_output(output_path, companion)
             print(f"\nAlso in this checkpoint: {companion.name} -- {companion.why}.")
             print(f"  exporting it to {destination}")
-            main_export(str(companion.checkpoint), destination, quantize=quantize, companions=True)
+            # `isolate_phases` travels with it: a companion is its own multi-phase export (family
+            # 10's talker ships a codec that is one), so a caller who needed the flag for the primary
+            # needs it for what the primary drags along.
+            main_export(str(companion.checkpoint), destination, quantize=quantize, companions=True,
+                        isolate_phases=isolate_phases)
     return primary
 
 
@@ -121,6 +135,13 @@ def main():
              "the coverage it achieved, which for convolutional models is a fraction of the file.",
     )
     parser.add_argument(
+        "--isolate-phases", action="store_true",
+        help="Convert each phase of a multi-phase model in its own process, so the peak memory of an "
+             "export is one phase's conversion rather than the sum of all of them (BACKLOG.md P5.0). "
+             "Costs a checkpoint load per phase, so it is off unless asked for -- turn it on for a "
+             "model that OOMs. Default: $LOOM_PHASE_ISOLATION.",
+    )
+    parser.add_argument(
         "--no-companions", action="store_true",
         help="Do not export the other models this checkpoint contains. A family-10 talker ships its "
              "own codec (Qwen3-TTS does; Dia's is a separate repo), and by default that second GGUF "
@@ -130,7 +151,8 @@ def main():
     args = parser.parse_args()
 
     output_path = main_export(args.model_path, args.output, task=args.task, model=args.model,
-                              quantize=args.quantize, companions=not args.no_companions)
+                              quantize=args.quantize, companions=not args.no_companions,
+                              isolate_phases=args.isolate_phases or None)
     print(f"SUCCESS! Exported to: {output_path}")
 
 

@@ -223,3 +223,162 @@ class TestSpecProtocolRetrofit(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+F5 = FlowMatchingSpec(func_name="sample_estimator", estimator="estimator", carried_input="x",
+                      fixed_inputs=["cond", "text_embed"], schedule="caller", guidance=True)
+# The shape F5-TTS actually ships: all three declarations at once.
+F5_NOISE = FlowMatchingSpec(func_name="sample_estimator", estimator="estimator", carried_input="x",
+                            fixed_inputs=["cond", "text_embed"], schedule="caller", guidance=True,
+                            caller_noise=True)
+
+
+class TestCallerSchedule(unittest.TestCase):
+    """Family 9's third leaf: F5-TTS integrates a schedule the DRIVER builds.
+
+    `t + coef*(cos(pi/2 * t) - 1 + t)` over a linspace -- "sway sampling", which spends more steps
+    near t=0 -- and for low step counts an empirically pruned table instead. Neither is a property of
+    the estimator, so the loop is unchanged and only the source of `times` moves.
+    """
+
+    def test_the_caller_supplies_times_instead_of_a_step_count(self):
+        lua = render_sampler(F5)
+        self.assertIn("local function sample_estimator(length, n_elems, times, step_inputs, "
+                      "uncond_inputs, cfg_scale)", lua)
+        # The uniform branch's own two lines must be GONE, not merely unreached: an emitted
+        # `for step = 0, n_steps` would shadow the caller's array with a linspace.
+        self.assertNotIn("times[step + 1] = step / n_steps", lua)
+        self.assertIn("times = times,", lua)
+
+    def test_the_uniform_default_is_unchanged(self):
+        """Every model that already shipped declares no schedule, and its Lua must not move."""
+        lua = render_sampler(MATCHA)
+        self.assertIn("local function sample_decoder(length, n_elems, n_steps, step_inputs)", lua)
+        self.assertIn("for step = 0, n_steps do times[step + 1] = step / n_steps end", lua)
+        self.assertNotIn("uncond_inputs", lua)
+        # The CALL, not the generated header comment, which now records `guidance=false`.
+        self.assertNotIn("guidance = {", lua)
+
+    def test_an_unknown_schedule_is_refused_rather_than_defaulted(self):
+        spec = FlowMatchingSpec(func_name="s", estimator="e", carried_input="x", schedule="swayy")
+        with self.assertRaises(ValueError) as ctx:
+            render_sampler(spec)
+        self.assertIn("'swayy'", str(ctx.exception))
+
+
+class TestGuidance(unittest.TestCase):
+    def test_the_unconditional_table_carries_the_same_input_names(self):
+        """Guidance drops a conditioning signal's VALUE, not its existence.
+
+        That is why `guidance` is a bool rather than a list of inputs: `supplied_inputs` already
+        describes both tables, so the existing `TopologyInput` link checks the unconditional call by
+        checking the conditional one.
+        """
+        lua = render_sampler(F5)
+        self.assertIn("scale = cfg_scale,", lua)
+        for name in ("cond", "text_embed"):
+            self.assertIn(f"{name} = step_inputs.{name},", lua)
+            self.assertIn(f"{name} = uncond_inputs.{name},", lua)
+
+    def test_the_spec_still_checks_against_the_real_topology(self):
+        # `_check` returns the links it DEFERRED (func_name is a DriverSymbol), so a clean run is
+        # "it did not raise" rather than an empty list.
+        _check(F5, estimator=_topology("x", "cond", "text_embed", "t"))
+        with self.assertRaises(Exception):
+            _check(F5, estimator=_topology("x", "cond", "t"))
+
+
+class TestCallerNoise(unittest.TestCase):
+    """The initial state as a driver input, which is what makes a flow-matching export gradeable.
+
+    Flow matching starts from a Gaussian draw. torch's RNG and the engine's are different algorithms,
+    so handing both sides the same SEED hands them different NOISE, and a different draw is a different
+    valid sample -- F5-TTS's gate measured max |d| 1.25 on audio that was intelligible and correctly
+    voiced. Absent a value the engine still draws, so `infer(text)` keeps working.
+    """
+
+    def test_the_state_is_the_last_argument_and_reaches_the_opts(self):
+        spec = FlowMatchingSpec(func_name="s", estimator="estimator", carried_input="x",
+                                fixed_inputs=["cond"], caller_noise=True)
+        lua = render_sampler(spec)
+        self.assertIn("local function s(length, n_elems, n_steps, step_inputs, state)", lua)
+        self.assertIn("state = state,", lua)
+
+    def test_it_composes_with_guidance_and_a_caller_schedule(self):
+        lua = render_sampler(F5_NOISE)
+        self.assertIn("local function sample_estimator(length, n_elems, times, step_inputs, "
+                      "uncond_inputs, cfg_scale, state)", lua)
+        self.assertIn("state = state,", lua)
+        self.assertIn("scale = cfg_scale,", lua)
+
+    def test_a_spec_without_it_emits_no_state_at_all(self):
+        """Every shipped flow-matching model declares none, and its driver text must not move."""
+        lua = render_sampler(MATCHA)
+        self.assertNotIn("state", lua)
+
+
+class TestSamplerComponentArguments(unittest.TestCase):
+    """`FlowMatchingSampler` refuses a declaration that does not match its spec, in BOTH directions.
+
+    The failure this prevents is silent: a component that supplies `times` to a uniform spec has it
+    ignored and integrates a linspace, and one that omits it from a caller-scheduled spec passes `nil`
+    where the engine wants N+1 points -- which fails inside the binding, two layers from the line that
+    got it wrong.
+    """
+
+    def _sampler(self, spec, **kwargs):
+        from loom_exporter.driver_components import FlowMatchingSampler
+        from loom_exporter.driver_ir import Lit, Var
+
+        defaults = dict(spec=spec, result="_z", length=Var("n"), n_elems=Var("m"),
+                        n_steps=Lit(10), step_inputs={})
+        defaults.update(kwargs)
+        return FlowMatchingSampler(**defaults)
+
+    def _emit(self, component):
+        return component.emit(None)
+
+    def test_a_caller_scheduled_spec_without_times_is_refused(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._emit(self._sampler(F5, uncond_inputs={}, guidance_scale=None))
+        self.assertIn("times", str(ctx.exception))
+
+    def test_times_against_a_uniform_spec_is_refused(self):
+        from loom_exporter.driver_ir import Var
+
+        with self.assertRaises(ValueError) as ctx:
+            self._emit(self._sampler(MATCHA, times=Var("times")))
+        self.assertIn("builds its own", str(ctx.exception))
+
+    def test_guidance_needs_both_halves(self):
+        from loom_exporter.driver_ir import Var
+
+        with self.assertRaises(ValueError) as ctx:
+            self._emit(self._sampler(F5, times=Var("times"), uncond_inputs={"cond": Var("z")}))
+        self.assertIn("guidance_scale", str(ctx.exception))
+
+    def test_guidance_arguments_against_an_unguided_spec_are_refused(self):
+        from loom_exporter.driver_ir import Lit, Var
+
+        with self.assertRaises(ValueError) as ctx:
+            self._emit(self._sampler(MATCHA, uncond_inputs={"mu": Var("z")}, guidance_scale=Lit(2)))
+        self.assertIn("does not declare guidance", str(ctx.exception))
+
+    def test_a_caller_noise_spec_without_state_is_refused(self):
+        """Passing nil would make the engine draw, which is the behaviour the flag exists to replace --
+        and it would be SILENT: a gate comparing against a reference draw would simply go red with no
+        indication that the declaration, not the model, was the problem."""
+        from loom_exporter.driver_ir import Var
+
+        with self.assertRaises(ValueError) as ctx:
+            self._emit(self._sampler(F5_NOISE, times=Var("times"),
+                                      uncond_inputs={"cond": Var("z"), "text_embed": Var("te")},
+                                      guidance_scale=Var("cfg")))
+        self.assertIn("caller_noise", str(ctx.exception))
+
+    def test_state_against_a_drawing_spec_is_refused(self):
+        from loom_exporter.driver_ir import Var
+
+        with self.assertRaises(ValueError) as ctx:
+            self._emit(self._sampler(MATCHA, state=Var("noise")))
+        self.assertIn("does not declare caller_noise", str(ctx.exception))

@@ -266,8 +266,19 @@ class CodecFamily(Enum):
     DAC = "dac"
     SNAC = "snac"
     QWEN3_TTS_12HZ = "qwen3_tts_tokenizer_12hz"
+    MOSS_AUDIO_TOKENIZER = "moss-audio-tokenizer"
 
-    def load(self, model_dir: str):
+    def load(self, model_dir: str, frames_per_block: int = 0):
+        if self is CodecFamily.MOSS_AUDIO_TOKENIZER:
+            # Remote code from the checkpoint itself; see `moss_audio_tokenizer_export.load`. The
+            # blocked decoder is built HERE, once, rather than per forward: it folds the quantizer
+            # into a table, which is 67 MB of arithmetic that does not depend on the input.
+            from . import moss_audio_tokenizer_export as moss
+
+            model = moss.load(model_dir)
+            model._loom_decoder = moss.MossCodecDecoder(model, frames_per_block)
+            return model
+
         if self is CodecFamily.QWEN3_TTS_12HZ:
             try:
                 from qwen_tts.core.tokenizer_12hz import (
@@ -329,6 +340,11 @@ class CodecFamily(Enum):
         What it left behind is this method's SIGNATURE -- the second leaf is what made the caller's
         layout a per-codec question rather than one shared transpose.
         """
+        if self is CodecFamily.MOSS_AUDIO_TOKENIZER:
+            # Not the model's own `decode`: its attention is masked-dense (or flash, or a ring cache),
+            # and this is the same arithmetic blocked -- see `moss_audio_tokenizer_export`.
+            return model._loom_decoder(codes)
+
         if self is CodecFamily.QWEN3_TTS_12HZ:
             # This one does NOT call the model's own `decoder.forward`, and the prepared mask is why:
             # that forward lets the pre-transformer build its own, which is the `vmap` path that does
@@ -417,6 +433,10 @@ class CodecFamily(Enum):
         than its codebook count. A uniform codec reports `[1] * n_codebooks`, which is not a special
         case anywhere downstream: every derived quantity falls out of the same formula.
         """
+        if self is CodecFamily.MOSS_AUDIO_TOKENIZER:
+            from . import moss_audio_tokenizer_export as moss
+
+            return moss.geometry(model)
         if self is CodecFamily.QWEN3_TTS_12HZ:
             # Two configs, because this checkpoint states the two halves in different places: the
             # quantizer's width and codebook size belong to the decoder, while the sample rate and the
@@ -494,6 +514,11 @@ class AudioCodecExportConfig(LoomExportConfig):
     # `chunked_decode` and `_build_qwen3_tts_tokenizer` for why this family gained a chunked member.
     chunk_frames: int = 0
     left_context_frames: int = 0
+    # How many frames the driver pads the codes to a multiple of before the one call, or 0 for a leaf
+    # whose graph takes any length. MOSS-Audio-Tokenizer's attention is BLOCKED, `frames_per_block`
+    # frames to a block at every stage, and the blocks must tile the sequence -- see
+    # `moss_audio_tokenizer_export`, which is also where padding at the END is shown to be exact.
+    frames_per_block: int = 0
     # Read off the checkpoint by `load_model`, never declared: see `__unchecked__`.
     _resolved_architecture: Optional[str] = None
     _n_codebooks: Optional[int] = None
@@ -502,6 +527,8 @@ class AudioCodecExportConfig(LoomExportConfig):
     _hop_length: Optional[int] = None
     _vq_strides: Optional[list] = None
     _noise_multiples: Optional[list] = None
+    _channels: int = 1
+    _absent_code: Optional[int] = None
 
     __unchecked__ = {
         "family": Unchecked(
@@ -534,6 +561,18 @@ class AudioCodecExportConfig(LoomExportConfig):
             "the function signature is what `test_qwen3_tts_chunking_matches_reference` does instead."
         ),
         "left_context_frames": Unchecked("same: `chunked_decode`'s `left_context_size` default"),
+        "frames_per_block": Unchecked(
+            "a property of the EXPORT's attention layout, not of the checkpoint: any positive value "
+            "computes the same function (the window mask is exact at every block size), and the "
+            "choice only trades padding granularity against gathered-key memory. "
+            "`_build_moss_audio_tokenizer` says why 4."
+        ),
+        "_channels": Unchecked(
+            "read off the checkpoint's own `number_channels` / `enable_channel_interleave` by "
+            "`CodecFamily.geometry`; 1 for every codec that is not MOSS's"),
+        "_absent_code": Unchecked(
+            "the id `moss_audio_tokenizer_export.fold_quantizer` gives a zero row, which is "
+            "`codebook_size` by construction there -- so it is derived, never declared"),
         "_resolved_architecture": Unchecked("load_model()'s output, cached so export_architecture() "
                                             "can read it back. A field only because this is a dataclass"),
         "_n_codebooks": Unchecked(
@@ -591,7 +630,7 @@ class AudioCodecExportConfig(LoomExportConfig):
 
     def load_model(self):
         print(f"Loading {self.family.value} codec from {self.model_dir}...")
-        model = self.family.load(self.model_dir)
+        model = self.family.load(self.model_dir, self.frames_per_block)
         geometry = self.family.geometry(model)
         config = getattr(model, "config", None)
         self._resolved_architecture = self.architecture or getattr(config, "model_type", None)
@@ -601,6 +640,9 @@ class AudioCodecExportConfig(LoomExportConfig):
         self._hop_length = geometry["hop_length"]
         self._vq_strides = geometry["vq_strides"]
         self._noise_multiples = self.family.noise_multiples(model)
+        self._channels = int(geometry.get("channels", 1))
+        if self.family is CodecFamily.MOSS_AUDIO_TOKENIZER:
+            self._absent_code = self._codebook_size
         if self._noise_multiples:
             print(f"  {len(self._noise_multiples)} stochastic leaves, at "
                   f"{self._noise_multiples} samples per frame -- drawn by the driver")
@@ -673,6 +715,17 @@ class AudioCodecExportConfig(LoomExportConfig):
                                  / float(self._coarse_stride)),
             "sample_rate": self._sample_rate,
         }
+        # Both written only where they say something, so the mono codecs' GGUFs do not move: a
+        # reader defaults `channels` to 1, and a codec with no absent id is one whose rows are always
+        # full. `channels` is not a `codec.` key because it describes the WAVEFORM, and a TTS model
+        # that emitted stereo would declare it too.
+        if self._channels != 1:
+            hparams["channels"] = self._channels
+        # The id a caller may put in a column to say "this codebook is not in the row" -- how an LM
+        # that emits fewer codebooks than the codec has is decoded through it. See
+        # `moss_audio_tokenizer_export.fold_quantizer`.
+        if self._absent_code is not None:
+            hparams["codec.absent_code"] = self._absent_code
         return hparams
 
     def contract(self) -> dict:
@@ -696,7 +749,11 @@ class AudioCodecExportConfig(LoomExportConfig):
             codec_chunk=dict(chunk_frames=self.chunk_frames,
                              left_context_frames=self.left_context_frames,
                              codes_per_frame=self._codes_per_frame if self._n_codebooks else 0,
-                             hop_length=self._hop_length or 0),
+                             hop_length=self._hop_length or 0,
+                             frames_per_block=self.frames_per_block,
+                             # Floats the graph emits per frame: interleaved channels count twice.
+                             samples_per_frame=(self._hop_length or 0) * self._channels,
+                             pad_code=self._absent_code if self._absent_code is not None else 0),
         )
 
 
@@ -794,6 +851,32 @@ def _build_qwen3_tts_tokenizer_12hz(path: Path, output_path: str) -> LoomExportC
                                   max_frames=chunk + context)
 
 
+def _is_moss_audio_tokenizer(path: Path) -> bool:
+    """MOSS-Audio-Tokenizer-v2, which declares `model_type == "moss-audio-tokenizer"`: the codec
+    MOSS-TTS emits codes for. Specific, like every recognizer here, because its decode is a
+    re-spelling (`moss_audio_tokenizer_export`) rather than the model's own call."""
+    from .moss_audio_tokenizer_export import is_moss_audio_tokenizer
+
+    return is_moss_audio_tokenizer(_hf_config(path))
+
+
+def _build_moss_audio_tokenizer(path: Path, output_path: str) -> LoomExportConfig:
+    """One call over the whole sequence, attention blocked in 4-frame blocks.
+
+    **Why 4.** Any block size computes the same function; what it trades is how far the driver pads
+    (up to `m - 1` frames, 0.24 s at m = 4) against how many keys each block gathers. At m = 4 the
+    400 Hz stack's blocks are 128 positions wide and gather 640 keys for a 400-wide window (1.6x the
+    window), and the 12.5 Hz stack's are 4 wide and gather 128 for 125.
+
+    **`max_frames` is the reference's own generation budget**, 4096 frames (5.5 min): MOSS-TTS's
+    `generate` defaults `max_new_frames` to it. Memory is linear in the clip, and at that ceiling the
+    400 Hz stack's scores are ~4 GB; a clip of the lengths TTS produces is a fraction of that.
+    """
+    return AudioCodecExportConfig(architecture=None, output_path=output_path, model_dir=str(path),
+                                  family=CodecFamily.MOSS_AUDIO_TOKENIZER, frames_per_block=4,
+                                  n_frames=16, max_frames=4096)
+
+
 def _build_dac(path: Path, output_path: str) -> LoomExportConfig:
     return AudioCodecExportConfig(architecture=None, output_path=output_path, model_dir=str(path),
                                   family=CodecFamily.DAC)
@@ -824,5 +907,7 @@ def register(registry) -> None:
             ModelRecognizer(name="qwen3-tts-tokenizer-12hz",
                             detect=_is_qwen3_tts_tokenizer_12hz,
                             build_config=_build_qwen3_tts_tokenizer_12hz),
+            ModelRecognizer(name="moss-audio-tokenizer", detect=_is_moss_audio_tokenizer,
+                            build_config=_build_moss_audio_tokenizer),
         ],
     ))

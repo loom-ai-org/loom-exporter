@@ -185,6 +185,9 @@ class LoomGGUFExporter:
         "atan": "ATAN",
         "atan2": "ATAN2",
         "floor": "FLOOR",
+        # VoxCPM2's scalar quantizer. ggml's is `roundf` (ties away from zero), torch's ties to even: see
+        # `op_round` in the engine for why no oracle can tell them apart.
+        "round": "ROUND",
         "clamp": "CLAMP",
         "pow": "POW",
         "square": "SQR",  # MIL's dedicated unary x**2 op (e.g. SnakeBeta's torch.pow(x,2)) -- ggml
@@ -515,7 +518,7 @@ class LoomGGUFExporter:
             return self._sub_symbol(dim)
 
         _UNARY_PASSTHROUGH_OPS = {
-            "cast", "log", "exp", "sqrt", "rsqrt", "abs", "neg", "sign", "floor", "clamp", "clip",
+            "cast", "log", "exp", "sqrt", "rsqrt", "abs", "neg", "sign", "floor", "round", "clamp", "clip",
             "tanh", "sigmoid", "relu", "gelu", "softplus", "identity", "softmax", "logical_not", "silu",
             "leaky_relu", "cumsum", "atan", "sin", "cos", "square",
             # `elu` is EnCodec's, and it arrived with the same failure every entry above was added
@@ -1705,6 +1708,26 @@ class LoomGGUFExporter:
                 hop_length=int(chunk["hop_length"]),
                 chunk_frames=int(chunk["chunk_frames"]),
                 left_context_frames=int(chunk["left_context_frames"]),
+            )
+            self.driver_script = SYNTHESIZED_BUILDERS["CodecDecode"](
+                inputs=inputs, call=call,
+                library=LuaLibrary(uses=("array_slice",)),
+                epilogue=DriverReturn(values=(call.out_var,)),
+            ).build(self._driver_context())
+            return
+
+        if chunk.get("frames_per_block"):
+            # One call, padded to whole blocks and trimmed (MOSS-Audio-Tokenizer is the first).
+            from .driver_components import PaddedCodecCall
+            from .lua_library import LuaLibrary
+
+            call = PaddedCodecCall(
+                topology="main_topology", inputs=input_names,
+                codes_var=input_names[0],
+                codes_per_frame=int(chunk["codes_per_frame"]),
+                frames_per_block=int(chunk["frames_per_block"]),
+                samples_per_frame=int(chunk["samples_per_frame"]),
+                pad_code=int(chunk["pad_code"]),
             )
             self.driver_script = SYNTHESIZED_BUILDERS["CodecDecode"](
                 inputs=inputs, call=call,
@@ -2974,6 +2997,39 @@ class LoomGGUFExporter:
             # `tokens.json` is a bare JSON array that several other schemes could also be written as.
             from .funasr_tokenizer_export import write_funasr_vocab
             write_funasr_vocab(w, tokenizer_dir)
+        elif family == "f5":
+            # Family 9's character table, named by the family for the reason "ctc" and "funasr" are:
+            # `vocab.txt` is a bare newline-separated list, and so is half a dozen other schemes'.
+            from .f5_tokenizer_export import write_f5_vocab
+            write_f5_vocab(w, tokenizer_dir)
+        elif family == "chatterbox":
+            # Family 9's fourth leaf: a character-level BPE whose `tokenizer.json` would otherwise be
+            # auto-detected as byte-level "gpt2" and mis-tokenize every non-ASCII character.
+            from .chatterbox_tokenizer_export import write_chatterbox_vocab
+            write_chatterbox_vocab(w, tokenizer_dir)
+        elif family == "pocket_tts":
+            # Family 9's fifth leaf: a SentencePiece Unigram wrapped in the reference's text path
+            # (prepare, split into sentence chunks). Named by the family: the `.model` alone would be
+            # detected as plain "sentencepiece_proto", which tokenizes but does not prepare or chunk.
+            from .pocket_tts_tokenizer_export import write_pocket_tts_vocab
+            write_pocket_tts_vocab(w, tokenizer_dir)
+        elif family == "voxcpm2":
+            # Family 9's sixth leaf: a rank-merged character BPE with byte fallback, under the
+            # reference's split of multi-character Chinese pieces. Named by the family: the
+            # `tokenizer.json` alone would be detected as a plain HF BPE, which is none of these.
+            from .voxcpm2_tokenizer_export import write_voxcpm2_vocab
+            write_voxcpm2_vocab(w, tokenizer_dir)
+        elif family == "cosyvoice3":
+            # Family 9's seventh leaf: Qwen2's byte-level BPE wrapped in the reference's text
+            # normalisation and paragraph split. Named by the family: the `tokenizer.json` alone is
+            # detected as a plain "gpt2" BPE, which tokenizes but neither spells numbers nor chunks.
+            from .cosyvoice3_tokenizer_export import write_cosyvoice3_vocab
+            write_cosyvoice3_vocab(w, tokenizer_dir)
+        elif family == "tekken":
+            # Mistral's tiktoken vocabulary (Voxtral-4B-TTS): byte-level BPE under the `tekken`
+            # pretokenizer shape. Named by the family: `tekken.json` is no HF tokenizer directory.
+            from .tekken_tokenizer_export import write_tekken_vocab
+            write_tekken_vocab(w, tokenizer_dir)
         elif family == "wordpiece":
             from .wordpiece_tokenizer_export import write_wordpiece_vocab
             write_wordpiece_vocab(w, tokenizer_dir)

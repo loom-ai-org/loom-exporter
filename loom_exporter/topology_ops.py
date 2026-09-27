@@ -1648,6 +1648,48 @@ def _op_reduce_sum(self, op, ctx):
     })
 
 
+@topology_rule('reduce_l2_norm')
+def _op_reduce_l2_norm(self, op, ctx):
+    """`sqrt(sum(x**2))` over one axis, as three ggml nodes.
+
+    **This is what a complex magnitude lowers to.** `torch.stft(...).abs()` reaches coremltools'
+    complex dialect, which stacks the real and imaginary parts on a new trailing axis and takes the
+    L2 norm along it -- so every `power=1` spectrogram in the zoo arrives here. Whisper's frontend
+    does not, because it writes `abs() ** 2` and the square cancels the square root: coremltools emits
+    `reduce_sum_square` for that one and the op never appears. F5-TTS's mel is `power=1`
+    (`get_vocos_mel_spectrogram`), which is the first time the un-squared form has been exported.
+
+    Composed rather than given a primitive of its own for `lower_reduce_mean`'s reason: the three ops
+    it is made of all exist, the composition is exact, and a new engine op would have to be maintained
+    on every backend for a shape ggml already computes.
+    """
+    x_var = op.inputs.get("x")
+    axes_obj = op.inputs.get("axes")
+    if x_var is None:
+        return
+    in_rank = len(self.get_var_info(x_var)["shape"])
+    axes_val = static_value(axes_obj)
+    keep_dims_val = bool(static_value(op.inputs.get("keep_dims"), False))
+    if axes_val is None or len(axes_val) != 1:
+        raise NotImplementedError(
+            f"reduce_l2_norm op '{op.name}': only a single reduction axis is supported (got "
+            f"axes={axes_val!r}). A complex magnitude reduces exactly one axis -- the real/imaginary "
+            "pair -- so more than one means this is a different computation.")
+    axis = int(axes_val[0])
+    if axis < 0:
+        axis += in_rank
+    ne_axis = in_rank - 1 - axis
+
+    out_name = self.safe_name(op.outputs[0].name)
+    x_name = ctx.resolve(self.safe_name(x_var.name))
+    sq_name = f"{out_name}_l2_sq"
+    sum_name = f"{out_name}_l2_sum"
+    ctx.nodes.append({"op": "MUL", "inputs": [x_name, x_name], "outputs": [sq_name]})
+    ctx.nodes.append({"op": "REDUCE_SUM", "inputs": [sq_name], "outputs": [sum_name],
+                      "attrs": {"axis": ne_axis, "keep_dims": keep_dims_val}})
+    ctx.nodes.append({"op": "SQRT", "inputs": [sum_name], "outputs": [out_name]})
+
+
 @topology_rule('clip')
 def _op_clip(self, op, ctx):
     # MIL's `clip` is what `torch.clamp(x, min=..., max=...)` becomes, and it carries its two bounds as

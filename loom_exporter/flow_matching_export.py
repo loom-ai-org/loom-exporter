@@ -165,6 +165,37 @@ class FlowMatchingSpec:
     # The point of moving the loop: a CFM sampler's state is the model's whole mel spectrogram, and its
     # only reader is the next graph.
     retain: bool = True
+    # Where the time schedule comes from. `"uniform"` is `t_k = k/n_steps`, which is what Matcha and
+    # Supertonic integrate and what this template emitted when it had no choice to offer. `"caller"`
+    # takes the N+1 points as an argument instead, because F5-TTS's schedule is not uniform: it applies
+    # a "sway" reparameterisation `t + coef*(cos(pi/2*t) - 1 + t)` to a linspace, and for low step
+    # counts substitutes an empirically pruned table outright. Neither is a property of the ESTIMATOR,
+    # which is why it is the driver that computes them and this field that says so.
+    #
+    # The engine takes `times` either way -- it has never had a notion of a uniform step -- so what
+    # changes here is only which side builds the array.
+    schedule: str = "uniform"
+    # Take the loop's INITIAL STATE from the caller instead of drawing it from the engine's RNG.
+    #
+    # **This is what makes a flow-matching export gradeable at all**, and it is `DriverInputs`'s own
+    # NOISE argument one layer up: a stochastic graph whose randomness only ever comes from inside it
+    # cannot be compared tensor-for-tensor against its reference, because the two RNGs are different
+    # algorithms. Handing both sides the same SEED does not hand them the same NOISE -- which is what
+    # a waveform comparison of F5-TTS against `f5_tts_reference.py` measured: max |d| 1.25 on audio
+    # that is intelligible, correctly voiced and simply a different draw.
+    #
+    # A fallback, not a requirement: absent a value the engine draws, at the same point in the stream
+    # `loom.gaussian_array` occupied. Defaults False so no shipped model's driver text moves.
+    caller_noise: bool = False
+    # Classifier-free guidance: evaluate the estimator twice per stage, on the caller's conditioning
+    # and on a dropped one, and integrate `v_cond + scale * (v_cond - v_uncond)`.
+    #
+    # A bool rather than a list of inputs, deliberately. The two runs supply the SAME input names --
+    # guidance drops a conditioning signal's VALUE, not its existence -- so `supplied_inputs` already
+    # describes both tables and the existing `TopologyInput` link checks both by checking one. A
+    # declaration that could name a different set would let the unconditional table drift from the
+    # graph with nothing to catch it.
+    guidance: bool = False
 
     __links__ = {
         "estimator": [
@@ -211,6 +242,26 @@ class FlowMatchingSpec:
             "driver_ir.check_subgraph_calls"
         ),
         "note": Unchecked("cosmetic: rendered as a comment above the generated sampler."),
+        "schedule": Unchecked(
+            "which side builds the time array. Both values emit a call the ENGINE validates the same "
+            "way -- `times` needs at least two points and nothing else -- so there is no topology "
+            "fact to check it against; what it selects is this module's own codegen, and "
+            "`render_sampler` raises on a value it does not know rather than falling through to the "
+            "uniform one"
+        ),
+        "caller_noise": Unchecked(
+            "whether the loop's initial state is supplied rather than drawn. Not a claim about the "
+            "topology -- the estimator is identical either way -- and what checks it is the same "
+            "thing that checks every other driver expression: `driver_ir.validate` over the "
+            "assembled function, plus emit()'s own refusal to leave it half-declared"
+        ),
+        "guidance": Unchecked(
+            "whether the estimator is evaluated twice per stage. Not a claim about the topology: the "
+            "graph is identical either way and the two runs differ only in the VALUES of inputs "
+            "`supplied_inputs` already checks. What it changes is the generated signature, and the "
+            "call site handing it an unconditional table is IR like any other -- driver_ir.validate "
+            "is its authority"
+        ),
     }
 
     @property
@@ -265,12 +316,28 @@ def render_sampler(spec: FlowMatchingSpec) -> str:
     bit-identically against the Lua loop it replaces -- which is what keeps every model that already
     shipped unchanged.
     """
+    if spec.schedule not in ("uniform", "caller"):
+        raise ValueError(
+            f"FlowMatchingSpec({spec.func_name!r}): schedule {spec.schedule!r} is neither 'uniform' "
+            f"nor 'caller'. Refusing to fall through to the uniform one: a misspelled schedule would "
+            f"silently integrate a DIFFERENT model."
+        )
     fixed = ", ".join(f'"{n}"' for n in spec.fixed_inputs)
     # A computed estimator arrives as the function's first argument rather than as a literal in the
     # call -- see FlowMatchingSpec.estimator_variants.
     computed = bool(spec.estimator_variants)
-    params = "estimator, length, n_elems, n_steps, step_inputs" if computed \
-        else "length, n_elems, n_steps, step_inputs"
+    # The schedule is either built here from a step count or handed in whole; guidance adds the
+    # unconditional table and its weight. Both are appended rather than interleaved so a reader can
+    # tell which options a sampler was generated with from its signature alone.
+    params = ["length", "n_elems",
+              "n_steps" if spec.schedule == "uniform" else "times",
+              "step_inputs"]
+    if computed:
+        params.insert(0, "estimator")
+    if spec.guidance:
+        params += ["uncond_inputs", "cfg_scale"]
+    if spec.caller_noise:
+        params.append("state")
     estimator_desc = (f'estimator=one of [{", ".join(chr(34) + n + chr(34) for n in spec.estimator_variants)}]'
                       if computed else f'estimator="{spec.estimator}"')
     lines = []
@@ -282,20 +349,47 @@ def render_sampler(spec: FlowMatchingSpec) -> str:
     lines += [
         "-- Generated from FlowMatchingSpec (loom_exporter/flow_matching_export.py):",
         f'--   {estimator_desc}, carried="{spec.carried_input}", '
-        f'time="{spec.time_input}", fixed=[{fixed}], method="{spec.method}"',
-        f"local function {spec.func_name}({params})",
-        "    -- The schedule, and nothing else host-side: N+1 points is N steps of 1/n_steps each,",
-        "    -- which is the `t_k = k/n_steps` this used to walk in Lua.",
-        "    local times = {}",
-        "    for step = 0, n_steps do times[step + 1] = step / n_steps end",
-        f"    return {binding}({name_expr}, {{n_tokens = length, n_past = 0}}, {{",
+        f'time="{spec.time_input}", fixed=[{fixed}], method="{spec.method}",',
+        f'--   schedule="{spec.schedule}", guidance={str(spec.guidance).lower()}, '
+        f'caller_noise={str(spec.caller_noise).lower()}',
+        f"local function {spec.func_name}({', '.join(params)})",
     ]
+    if spec.schedule == "uniform":
+        lines += [
+            "    -- The schedule, and nothing else host-side: N+1 points is N steps of 1/n_steps each,",
+            "    -- which is the `t_k = k/n_steps` this used to walk in Lua.",
+            "    local times = {}",
+            "    for step = 0, n_steps do times[step + 1] = step / n_steps end",
+        ]
+    else:
+        lines += [
+            "    -- The schedule is the CALLER's: N+1 points, so N steps, and the spacing between them",
+            "    -- is this model's own reparameterisation rather than anything this template knows.",
+        ]
+    lines.append(f"    return {binding}({name_expr}, {{n_tokens = length, n_past = 0}}, {{")
     for name in spec.fixed_inputs:
         lines.append(f"        {name} = step_inputs.{name},")
     lines += [
         "    }, {",
         f'        carried = "{spec.carried_input}", time = "{spec.time_input}",',
         f'        method = "{spec.method}", times = times, n_elems = n_elems,',
+    ]
+    if spec.caller_noise:
+        # `state` wins when it is there and the engine draws `n_elems` gaussians when it is nil, which
+        # is `loom.run_ode`'s own contract -- so this is one line rather than a branch.
+        lines.append("        state = state,")
+    if spec.guidance:
+        lines += [
+            "        -- Classifier-free guidance: the same graph, the same state and the same time,",
+            "        -- run a second time on the dropped conditioning. The engine combines them.",
+            "        guidance = {",
+            "            scale = cfg_scale,",
+            "            inputs = {",
+        ]
+        for name in spec.fixed_inputs:
+            lines.append(f"                {name} = uncond_inputs.{name},")
+        lines += ["            },", "        },"]
+    lines += [
         "    })",
         "end",
     ]

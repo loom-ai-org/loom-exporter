@@ -217,7 +217,8 @@ def read_hf_id_layout(tokenizer_dir) -> Optional[HfIdLayout]:
 def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: Optional[bytes], *,
                                hf_ids: Optional[HfIdLayout] = None,
                                bos_token_id: int | None = None, eos_token_id: int | None = None,
-                               add_bos_token: bool = False, add_eos_token: bool = False) -> None:
+                               add_bos_token: bool = False, add_eos_token: bool = False,
+                               tokenizer_model: Optional[str] = None) -> None:
     """Writes a SentencePiece vocabulary, from the protobuf where there is one and from
     `tokenizer.json` where there is not.
 
@@ -240,6 +241,9 @@ def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: Optiona
     segments on scores, and treats every non-NORMAL piece as un-segmentable alike -- so a two-way split
     is faithful there. It would NOT be for a BPE model with byte-fallback pieces, which is why this
     path refuses anything but Unigram rather than guessing.
+
+    `tokenizer_model` overrides the tag for a front end that WRAPS a Unigram vocabulary and names its
+    own scheme (`pocket_tts_tokenizer_export`); the arrays are the same either way.
 
     AND THE FAIRSEQ REMAP IS A NO-OP HERE, which is the happy part: the reason `read_hf_id_layout`
     exists at all is that a proto's piece order and a fairseq checkpoint's ids disagree. A checkpoint
@@ -296,9 +300,9 @@ def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: Optiona
     if m is not None:
         model_type = m.trainer_spec.model_type
         if model_type == m.trainer_spec.UNIGRAM:
-            tokenizer_model = "t5"
+            tokenizer_model_tag = "t5"
         elif model_type == m.trainer_spec.BPE:
-            tokenizer_model = "llama"
+            tokenizer_model_tag = "llama"
         else:
             raise NotImplementedError(f"SentencePiece model_type {model_type} (WORD/CHAR) is not "
                                        "implemented on the C++ side (loom::Vocab only supports "
@@ -309,9 +313,12 @@ def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: Optiona
         # faithful for Unigram and a BPE checkpoint arriving here would be silently mis-typed.
         if hf_ids is None:
             raise ValueError("no protobuf and no HfIdLayout")
-        tokenizer_model = "t5"
+        tokenizer_model_tag = "t5"
 
-    writer.add_tokenizer_model(tokenizer_model)
+    if tokenizer_model is not None and tokenizer_model_tag != "t5":
+        raise ValueError(f"tokenizer_model={tokenizer_model!r} wraps a Unigram vocabulary, and this "
+                         f"one is {tokenizer_model_tag!r}")
+    writer.add_tokenizer_model(tokenizer_model or tokenizer_model_tag)
     writer.add_token_list(pieces)
     writer.add_token_scores(scores)
     writer.add_token_types(types)
@@ -326,6 +333,13 @@ def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: Optiona
         charsmap = hf_ids.precompiled_charsmap
     if charsmap:
         writer.add_precompiled_charsmap(charsmap)
+    # SentencePiece's byte fallback: an uncovered codepoint becomes its UTF-8 bytes' `<0xNN>` pieces
+    # rather than `<unk>`. Written only when true, so every file that predates it is byte-identical;
+    # and only for Unigram, whose encode honours it -- `loom::Vocab` REFUSES a BPE file carrying it,
+    # since its BPE encode has no fallback and would mis-tokenize silently. No shipped checkpoint had it
+    # on when this landed (2026-09-24: SenseVoice, flan-t5, Parakeet all false); Pocket-TTS is the first.
+    if m is not None and m.trainer_spec.byte_fallback and tokenizer_model_tag == "t5":
+        writer.add_bool("tokenizer.ggml.byte_fallback", True)
 
     if bos_token_id is not None:
         writer.add_bos_token_id(bos_token_id)
