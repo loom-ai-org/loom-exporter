@@ -55,6 +55,64 @@ def _rss_note() -> str:
     return f" (rss {pages * resource.getpagesize() / (1 << 30):.1f} GiB)"
 
 
+def _check_phase_weight_namespaces(phase_outputs) -> None:
+    """No phase's topology reads a weight another phase produced.
+
+    `phase_outputs` is `[(phase name, {topology name: topology}, {weight name: array}), ...]` -- what
+    each `convert_phase` returned, in order.
+
+    **This is what makes packing a phase's weights early equal to packing them at the end**
+    (BACKLOG.md P5.0). Both quantization gates are questions about ALL topologies -- `name in
+    _collect_mul_mat_weight_names()` and the fold's `usage[name] == {(op, 0)}` -- and a phase exporter
+    can only see its own. The answers coincide because a multi-phase export leaves `flat_namespace`
+    False and every weight is therefore written as `{func_name}.{weight}`, so no other phase's graph
+    can name this phase's tensors.
+
+    That is a property of the naming convention rather than of anything a family declares, which is
+    exactly why it is checked rather than assumed: a family that ever writes weights some other way
+    would get a *plausible* artifact -- a conv kernel folded for a consumer that wanted its declared
+    shape, or a weight packed for an op the other phase reads it with -- and the failure would be a
+    wrong tensor, not an error.
+
+    **Ownership is by PHASE, not by topology name**, which is the whole reason this takes three
+    columns instead of comparing a weight's owner against the name of the topology reading it. One
+    phase routinely owns several topologies under names that are not its own: an `extra_streams` alias
+    (`decoder` and `decoder_uncond` are one graph run as two streams, family 10's CFG pair), and a
+    `RecurrentPhase`'s cells (`text_encoder_lstm` emits `..._fwd` and `..._bwd`, or `..._l0_fwd` for a
+    stack). Keyed on the topology's name, every one of those reads as a violation and would have to be
+    excused by a rule that also excuses the thing being looked for.
+    """
+    owner_of_weight, owner_of_topology = {}, {}
+    for phase_name, topologies, weights in phase_outputs:
+        for name in weights:
+            owner_of_weight[name] = phase_name
+        for name in topologies:
+            owner_of_topology[name] = phase_name
+
+    trespass = {}
+    for phase_name, topologies, _ in phase_outputs:
+        for topology_name, topo in topologies.items():
+            for node in topo.get("nodes", []):
+                for input_name in node.get("inputs") or []:
+                    producer = owner_of_weight.get(input_name)
+                    # A topology reads plenty of names no phase produced -- its own graph inputs,
+                    # intermediate values, the driver's tensors. Only a name some phase DID produce
+                    # can be read by the wrong one.
+                    if producer is not None and producer != phase_name:
+                        trespass.setdefault((producer, topology_name), set()).add(input_name)
+
+    if trespass:
+        (producer, reader), names = sorted(trespass.items())[0]
+        raise ValueError(
+            f"topology {reader!r} (phase {owner_of_topology[reader]!r}) reads weight(s) "
+            f"{sorted(names)[:4]} that phase {producer!r} produced. Multi-phase weights carry their "
+            f"own phase's `{{func_name}}.` prefix precisely so this cannot happen, and each phase "
+            f"packs its own weights (quantization eligibility, the conv-kernel fold) from its own "
+            f"topology alone -- which is only the same answer as the merged one while that holds. "
+            f"See BACKLOG.md P5.0."
+        )
+
+
 class Decomposition:
     """Base for the three real shapes. Subclasses implement `export(config)` and document which hooks
     they read off `config`."""
@@ -238,14 +296,8 @@ class MultiPhase(Decomposition):
                                       input_aliases=config.driver_input_aliases())
 
     def export(self, config) -> str:
-        import gc
-
-        import coremltools as ct
-        import torch
-
-        from .driver_builder import DriverContext
-        from .exporter import LoomGGUFExporter
-        from .multi_phase_export import RecurrentPhase, merge_phase_weights
+        from .exporter import WeightPacking
+        from .phase_conversion import convert_phase
         from .spec_protocol import LinkChecker
 
         config.prepare_environment()
@@ -255,78 +307,56 @@ class MultiPhase(Decomposition):
         checker = LinkChecker()
         checker.check(config)
         phase_topologies = {}
-        named_weights = []
         fused_geometry = {}
+        # `(phase name, its topologies, its weights)` per phase, in order. Two things read it: the
+        # weight merge, which wants the first and third columns, and the namespace invariant that
+        # per-phase packing rests on, which wants all three -- see `_check_phase_weight_namespaces`.
+        phase_outputs = []
+        packing = WeightPacking()
         phases = config.phases()
         # Every phase's axis declarations, checked before the first (slow) trace: an axis name outside
         # axes.py's vocabulary, or a declared_axes entry naming an input this phase does not declare.
         # Both are answerable from the declaration alone, which is why they run here and not after.
         for phase in phases:
             checker.check(phase, f"{type(phase).__name__}({phase.name!r})")
+        # Resolved ONCE, here, and for two reasons beyond not doing the work twice. It is where the
+        # quantize type each phase packs to comes from (P5.0's second change), so a phase and the
+        # artifact cannot disagree about it -- `LoomGGUFExporter` applies the `$LOOM_QUANTIZE` fallback
+        # at both ends, and the child inherits the environment. And `contract()`/`hparams()` read what
+        # `phases()` left on the config, so asking for them before the model is released is the order
+        # that stays correct for a family whose answer ever needs more than an attribute.
+        out_kwargs = dict(config.resolved_backend_kwargs())
+        quantize = out_kwargs.get("quantize")
+
         for phase in phases:
-            # A RecurrentPhase produces its topologies without a static trace at all: ggml has no LSTM
-            # op, so an nn.LSTM becomes four per-timestep CELL topologies plus a host-side loop. See
-            # multi_phase_export.RecurrentPhase, and LoomGGUFExporter.generate_graph_topology's own
-            # raise, which named this as the missing wiring.
-            if isinstance(phase, RecurrentPhase):
-                cells, weights = phase.topologies()
-                print(f"  {phase.name}: {len(cells)} recurrent cell topolog(ies), "
-                      f"{len(weights)} weights")
-                phase_topologies.update(cells)
-                named_weights.append((phase.name, weights))
-                continue
-            traced = torch.jit.trace(phase.wrapper, phase.dummy_inputs)
-            mil_prog = ct.convert(
-                traced, inputs=phase.mil_inputs, convert_to="milinternal",
-                compute_precision=ct.precision.FLOAT32,
-            )
-            exporter = LoomGGUFExporter(
-                mil_prog, root_axis=phase.root_axis, declared_axes=phase.declared_axes,
-                # Per-phase, not per-export: an encoder-decoder model caches its decoder's attention
-                # and must not cache its encoder's. See ExportPhase.fuse_attention.
-                fuse_attention=phase.fuse_attention, kv_cache_size=phase.kv_cache_size,
-            )
-            main_func = mil_prog.functions["main"]
-            topo = exporter.generate_graph_topology(main_func, phase.name)
-            if phase.topology_rewrite is not None:
-                # See ExportPhase.topology_rewrite: the one thing a wrapper cannot express is a
-                # transform of a graph input that is invariant across the DRIVER's calls. A rewrite
-                # raises if its pattern is absent; nothing here checks it, because there is nothing
-                # here that knows what it was looking for.
-                before = len(topo["nodes"])
-                phase.topology_rewrite(topo)
-                print(f"  {phase.name}: topology rewrite removed {before - len(topo['nodes'])} node(s)")
-            print(f"  {phase.name}: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights"
-                  f"{_rss_note()}")
-            phase_topologies[phase.name] = topo
-            # See ExportPhase.extra_streams. A second stream of one topology, declared so the engine
-            # gives it its own KV cache and its own retained output rather than sharing this one's.
-            for alias in phase.extra_streams:
-                phase_topologies[alias] = dict(topo, kv_cache_scope="private")
-            named_weights.append((phase.name, exporter.weights))
+            result = convert_phase(phase, quantize=quantize)
+            phase_topologies.update(result.topologies)
+            phase_outputs.append((phase.name, result.topologies, result.weights))
+            packing.absorb(result.packing)
             # The cache geometry of whatever this phase fused, so the output exporter can still write
             # it: that exporter has no program of its own, and until P5.0's first reduction this was
             # `traced_programs.append(mil_prog)` -- the whole converted program, kept for a handful of
             # integers. Extracted for every phase rather than only the fused ones, because
-            # `fused_geometry` asks the question and a list that depended on the answer would have to be
-            # rebuilt the day a second geometry is added.
-            for kind, records in exporter.fused_geometry().items():
+            # `fused_geometry` asks the question and a list that depended on the answer would have to
+            # be rebuilt the day a second geometry is added.
+            for kind, records in result.geometry.items():
                 fused_geometry.setdefault(kind, []).extend(records)
-            # **Everything this phase needed is now extracted, and holding any of it is what decides
-            # which models can be exported at all** (BACKLOG.md P5.0). Three things die here together,
-            # and they have to die together because they are the same memory: `phase.wrapper` holds the
-            # submodule's torch parameters, `torch.jit.trace` holds a module beside it, and the
-            # converted MIL program's constants are those same arrays again. Releasing any one of them
-            # alone frees nothing -- measured, not assumed: dropping the torch half while the program
-            # lived moved the peak by 0.2 GB.
-            #
-            # What the code below this loop wants from `phases` is `name`, `root_axis` and
-            # `kv_cache_size`; what it wants from this phase's conversion is `topo`, `exporter.weights`
-            # and the geometry above, all of which are ordinary Python data by now.
-            del traced, main_func, mil_prog, exporter
-            phase.wrapper = None
-            gc.collect()
-            print(f"    released {phase.name}'s torch and MIL halves:{_rss_note() or ' (rss unknown)'}")
+
+        _check_phase_weight_namespaces(phase_outputs)
+        return self._write(config, checker, phases, phase_topologies, phase_outputs,
+                           fused_geometry, packing, out_kwargs)
+
+    def _write(self, config, checker, phases, phase_topologies, phase_outputs, fused_geometry,
+               packing, out_kwargs) -> str:
+        """Merge what the phases produced, build the driver, write the GGUF.
+
+        Split out of `export` because that half is now a loop over `convert_phase` and this half is
+        everything that needs all the phases at once -- and because what a phase hands over is a
+        `PhaseResult` rather than four accumulating locals, the seam is where it can be drawn.
+        """
+        from .driver_builder import DriverContext
+        from .exporter import LoomGGUFExporter
+        from .multi_phase_export import RecurrentPhase, merge_phase_weights
 
         # A cached phase's capacity reaches the writer from the phase that declared it, not from a
         # second `backend_kwargs()` entry a family would have to keep in step: `_kv_cache_geometry`
@@ -342,15 +372,21 @@ class MultiPhase(Decomposition):
         # `backend_kwargs()` reaches the OUTPUT exporter, not just the per-phase ones -- which is where
         # anything about the artifact as a whole belongs (the tokenizer vocab, notably). It was dropped
         # entirely before, so a multi-phase family had no way to say anything about its own GGUF.
-        out_kwargs = dict(config.resolved_backend_kwargs())
+        # Resolved by `export` while the model was still loaded; see there.
         if capacities:
             out_kwargs["kv_cache_size"] = capacities.pop()
         out_exporter = LoomGGUFExporter(
             None, output_path=config.output_path, architecture=config.architecture, **out_kwargs,
         )
         out_exporter.topologies = phase_topologies
-        out_exporter.weights = merge_phase_weights(named_weights)
+        out_exporter.weights = merge_phase_weights(
+            [(name, weights) for name, _, weights in phase_outputs])
         out_exporter.phase_geometry = fused_geometry
+        # The phases packed their own weights, so the writer's job is to hash, alias and add -- and
+        # this is where it learns which GGML type each name was packed to. `write_gguf` still calls
+        # `pack_weights` after it, which now finds only the driver's own `loom.get_weight` tensors
+        # unpacked (Kokoro's and Supertonic's default voice styles) and packs those.
+        out_exporter.packing = packing
 
         # Every check this used to route through `render_driver` now runs inside the builder, over the
         # same `checker` (P4.0.18): a `FlowMatchingSpec` reaches it as `FlowMatchingSampler.sub_specs`,
