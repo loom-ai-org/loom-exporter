@@ -399,7 +399,7 @@ anything.""",
     ModelCard(
         slug="f5-tts-v1-base", checkpoint=Path("f5-tts/F5TTS_v1_Base"),
         export_task="text-to-speech", export_model="f5-tts", task_type="text-to-speech",
-        takes_text=True,
+        takes_text=True, snippet="text-to-speech-voice-clone",
         base_repo="SWivid/F5-TTS", license_id="cc-by-nc-4.0",
         source_url="https://github.com/SWivid/F5-TTS", source_name="F5-TTS (F5TTS_v1_Base)",
         language=["en", "zh"],
@@ -413,6 +413,14 @@ anything.""",
             "**It clones a voice, so it needs one.** Every call takes a reference clip at 24 kHz, the "
             "transcript of that clip, and the text to speak -- the model in-fills one spectrogram "
             "whose first frames are the reference, so there is no way to synthesise without a prompt.\n\n"
+            "**`text2speech.infer(text)` does not work for this model yet; use `infer` as the example "
+            "does.** The high-level door has no way to pass a reference clip and its transcript, so "
+            "the example calls the file's own inputs directly: `waveform` (the clip, mono, 24 kHz), "
+            "`text_ids` (the transcript's ids, a space, then the text's) and `n_ref_text` (how many of "
+            "those ids are the transcript -- the duration estimate is a ratio of the two lengths, and "
+            "nothing in the ids marks the join). `loom_cli --wav ref.wav --ref-text \"...\" --prompt "
+            "\"...\" --out out.wav` does the same from the shell. Optional knobs: `n_steps`, "
+            "`cfg_scale`, `sway_coef`, `speed`, `duration` (total frames), `seed`.\n\n"
             "**Chinese needs pinyin conversion this file cannot do.** F5-TTS's own front end runs "
             "`rjieba` word segmentation and `pypinyin` before a single id is looked up. What ships "
             "here is the character table, which reproduces that function exactly for ordinary "
@@ -548,8 +556,8 @@ VoxCPM2 has no built-in speaker: every call invents a voice to fit the text. To 
 voice in parentheses at the start of the text -- the description is not spoken:
 
 ```python
-audio = model.text2speech.infer("(A calm older man, speaking slowly)Welcome back. The results are in.")
-audio.save("designed.wav")
+designed = "(A calm older man, speaking slowly)Welcome back. The results are in."
+model.text2speech.infer(designed, seed=7).save("designed.wav")
 ```
 
 Pass `seed` to get the same voice again.""",
@@ -578,17 +586,42 @@ Pass `seed` to get the same voice again.""",
         title="Fun-CosyVoice3 0.5B",
         summary="FunAudioLLM's Fun-CosyVoice3-0.5B-2512, exported for loom.cpp: a Qwen2-0.5B speech-token "
                 "LM, a flow-matching DiT and a HiFT vocoder, 9 languages, 24 kHz. Encodes text itself.",
+        # The cloning example loads the reader's own voice file, so the model-card gate stops at it as a
+        # file the reader supplies -- after grading the default voice's audio above, which is the point
+        # of putting it second. It binds no `audio`, so what the gate grades stays "hello world".
+        usage_extra="""### Cloning a voice
+
+A voice is a few seconds of a speaker plus what they say, turned ONCE into a small voice file by the
+reference's own front end -- that step needs two ONNX models this GGUF does not carry, so it runs in
+Python with the upstream checkpoint:
+
+```sh
+python -m loom_exporter.cosyvoice3_voices Fun-CosyVoice3-0.5B-2512 -o voices \\
+    --wav me.wav --text "What the clip says, word for word." --name me --license "CC0-1.0"
+```
+
+Then pass it by path (or by name, for a file under `voices/` beside the model):
+
+```python
+model.text2speech.infer("hello world", voice="voices/me.gguf", seed=7).save("me.wav")
+```
+
+A voice file is stamped with a fingerprint of the weights it was made for, and a file made for other
+weights is refused by name. The clip must be 16 kHz or more and at most 30 s; the licence is the
+recording's, which is why `--license` is required.""",
         limitations=
             "**One voice is built in, computed when the file was exported.** The release ships no speaker "
             "table; the file carries the voice every example in the release's README uses "
             "(`asset/zero_shot_prompt.wav` from the Apache-2.0 CosyVoice repository, a Mandarin speaker, "
             "with its transcript), encoded ONCE by the release's own ONNX speech tokenizer and speaker "
-            "encoder. English and the other languages are spoken in that voice cross-lingually. **No voice "
-            "cloning in this file**: cloning a new voice needs those two ONNX models, which it does not "
-            "carry.\n\n"
-            "**No text normalisation.** The reference spells numbers out and splits long text into "
-            "sentence-sized pieces before synthesis; this file does neither, so write numbers as words and "
-            "pass a paragraph a sentence or two at a time.\n\n"
+            "encoder. English and the other languages are spoken in that voice cross-lingually. Other "
+            "voices are voice files (see \"Cloning a voice\"): making one needs those ONNX models and "
+            "Python once, using one needs neither.\n\n"
+            "**Text is normalised by the reference's rules, not its FST normaliser.** Digits are spelled "
+            "out, Chinese punctuation is mapped, and a paragraph is split into sentence-sized pieces that "
+            "are generated one after another and joined -- matching the reference's own `text_normalize` "
+            "id for id when `wetext` is not installed. With `wetext` installed the reference reads dates, "
+            "money and units as words; this file spells their digits one number at a time.\n\n"
             "**Sampled, so two calls differ.** The LM samples every speech token (top-k 25, top-p 0.8, "
             "with the reference's repetition-aware redraw). Pass `seed` to reproduce a call. Verified "
             "against the reference with its draws pinned: the same 76 tokens, and a waveform within the "
@@ -1570,6 +1603,35 @@ audio.save("out.wav")
 
 # That uses the voice the file itself defaults to. Whether it carries others is under "Known
 # limitations" (and, where it does, a section below says how to pick one).
+""",
+    # F5-TTS: a voice-cloning TTS with no voice of its own, so every call takes a reference clip AND its
+    # transcript. `Text2Speech.infer` cannot pass either yet (loom.cpp's hub item "F5-TTS has no working
+    # high-level door"), so this goes through `infer` with the driver's own inputs -- which works on the
+    # released runtime, where a new door would not until the release after it. The join and
+    # `n_ref_text` are `loom_cli --ref-text`'s. The example clip is JFK's (public domain), the same one
+    # the model-card gate stands in for the reader's recording, so the transcript below is its own.
+    "text-to-speech-voice-clone": """import loom
+import librosa
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# The voice is a REFERENCE CLIP plus WHAT IT SAYS, word for word -- this model has no voice of its own.
+# A few clear seconds (at most ~12) is enough. It reads audio at {sample_rate} Hz, so resample on the way in.
+reference, _ = librosa.load("reference.wav", sr={sample_rate})
+reference_text = ("And so, my fellow Americans, ask not what your country can do for you; "
+                  "ask what you can do for your country.")
+
+# The model in-fills ONE spectrogram whose first frames are the reference, so its text is the
+# transcript followed by the text to speak, joined by a space, and it is told where the join is.
+prompt = reference_text if reference_text.endswith(" ") else reference_text + " "
+text_ids = model.tokenize(prompt + "hello world")
+n_ref_text = len(model.tokenize(prompt))
+
+# No high-level door takes a reference yet, so this is `infer` with the file's own inputs. It returns
+# the GENERATED samples only (the reference's frames are sliced off), at {sample_rate} Hz.
+samples = model.infer(waveform=reference.tolist(), text_ids=text_ids, n_ref_text=n_ref_text, seed=42)
+audio = loom.Audio(samples, sample_rate={sample_rate})
+audio.save("out.wav")
 """,
 }
 
