@@ -1,3 +1,25 @@
+    -- The template. The talker only ever saw `<|im_start|>assistant\n{text}<|im_end|>\n` and, for
+    -- the target, a second `<|im_start|>assistant\n` -- and everything below strips `TEXT_HEAD` /
+    -- `TEXT_TAIL` ids off the ends as if they were that scaffolding. `text2codes(text)` sends the
+    -- sentence alone, so ids that do not open with the template head are wrapped in it here. Ids
+    -- that already do are the caller's own rendering and pass through unchanged; a sentence cannot
+    -- open with `<|im_start|>`, which only the special-token string encodes to.
+    local function _templated(ids, tail)
+        if ids == nil then return nil end
+        local wrapped = #ids >= #TEMPLATE_HEAD
+        for _i = 1, #TEMPLATE_HEAD do
+            if wrapped and ids[_i] ~= TEMPLATE_HEAD[_i] then wrapped = false end
+        end
+        if wrapped then return ids end
+        local out = {}
+        for _i = 1, #TEMPLATE_HEAD do out[#out + 1] = TEMPLATE_HEAD[_i] end
+        for _i = 1, #ids do out[#out + 1] = ids[_i] end
+        for _i = 1, #tail do out[#out + 1] = tail[_i] end
+        return out
+    end
+    inputs.tokens = _templated(inputs.tokens, TEXT_TEMPLATE_TAIL)
+    inputs.ref_tokens = _templated(inputs.ref_tokens, REF_TEMPLATE_TAIL)
+
     -- The voice. Either the caller's own x-vector -- 1024 floats it got from a previous call, or
     -- from anywhere else -- or one extracted here from a reference clip at 24 kHz. A topology input
     -- takes an array or a reference indifferently, so the two paths differ only in this assignment.
