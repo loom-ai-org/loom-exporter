@@ -1243,7 +1243,26 @@ def _op_tile(self, op, ctx):
     # special-casing is needed here anymore.
     # Map tile to REPEAT by calculating the target shape
     x_var = self.safe_name(op.inputs["x"].name)
-    reps = static_value(op.inputs.get("reps"), [1])
+    reps = static_value(op.inputs.get("reps"))
+    if reps is None:
+        # Live reps. `expand_as` has another tensor's shape as its target (see
+        # `ValueFacts.tile_target_exprs`), and treating its reps as ones made the REPEAT an identity:
+        # harmless wherever a broadcasting op consumed it, a process abort where a CONCAT did.
+        target = self.facts.tile_target_exprs(op)
+    else:
+        target = None
+    if target is not None:
+        nodes.append({
+            "op": "REPEAT",
+            "inputs": [resolve(x_var)],
+            "outputs": [self.safe_name(op.outputs[0].name)],
+            "attrs": {"shape": [render(d) for d in reversed(target)]},
+        })
+        return
+    if reps is None:
+        # Any other live reps keep the identity they always had. The talker's decorative mrope
+        # `position_ids.expand(3, ...)` is one, and every reader of it takes row 0.
+        reps = [1]
 
     # Retrieve input shape info (ne-reversed shape)
     x_info = self.get_var_info(op.inputs["x"])
