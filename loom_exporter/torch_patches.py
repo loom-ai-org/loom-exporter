@@ -102,3 +102,32 @@ def apply_torch_frontend_patches() -> None:
         # program handed an fp32 const here fails type inference rather than casting.
         epsilon = types.nptype_from_builtin(inputs[0].dtype)(0.0)
         context.add(mb.inverse(x=inputs[0], epsilon=epsilon, name=node.name))
+
+    # 4. The DFT basis `torch.stft` lowers to must be the DFT's, to f32 precision.
+    #
+    #    coremltools' `lower_complex_dialect_ops` builds it as `cos(outer(k, n) * 2*pi / N)` with every
+    #    step in fp32. `k*n` reaches (N/2)*(N-1) -- 523,776 at N=1024 -- so once it is multiplied by
+    #    2*pi the product's ulp is 0.25 rad, and dividing by N afterwards cannot give the precision back:
+    #    the folded basis is off by up to 1.4e-4 where an f32 one is good to 6e-8. The error is a leak,
+    #    ~1e-5 of each frame's energy spread across its other bins, so it is invisible in loud bins and
+    #    dominates quiet ones -- and a log-mel then reads it as a 0.4 error on the floor bins.
+    #
+    #    FOUND ON QWEN3-TTS's SPEAKER ENCODER, whose x-vector sat 7.5e-4 from the reference at f64
+    #    where the reference's own f32 run sat 1.3e-6. The same bound applies to every other model
+    #    that traces a `torch.stft`. The replacement reduces `k*n` modulo N in integers first, so the
+    #    angle is formed from a number below N, and takes the cosine at f64 before casting.
+    from coremltools.converters.mil.mil.passes.defs import lower_complex_dialect_ops as _complex
+    _original_dft_matrix = _complex._calculate_dft_matrix
+
+    def _exact_dft_matrix(n_fft, onesided=False):
+        size = getattr(n_fft, "val", None)
+        if size is None:
+            return _original_dft_matrix(n_fft, onesided)
+        size = int(np.asarray(size).reshape(-1)[0])
+        rows = size // 2 + 1 if onesided else size
+        phase = np.outer(np.arange(rows, dtype=np.int64), np.arange(size, dtype=np.int64)) % size
+        angle = (2.0 * np.pi / size) * phase
+        return (mb.const(val=np.cos(angle).astype(np.float32)),
+                mb.const(val=np.sin(angle).astype(np.float32)))
+
+    _complex._calculate_dft_matrix = _exact_dft_matrix

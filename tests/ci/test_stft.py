@@ -8,6 +8,7 @@ hand-derived path (the way Kokoro's own STFT/ISTFT does today, outside this comp
 """
 import unittest
 
+import numpy as np
 import torch
 import coremltools as ct
 
@@ -82,6 +83,49 @@ class TestStftExport(unittest.TestCase):
 
         self.assertEqual(ref.shape, got.shape)
         self.assertLess((ref - got).abs().max().item(), 1e-4)
+
+
+class MagnitudeModule(torch.nn.Module):
+    """`|stft(x)|` at N=1024, the Qwen3-TTS speaker encoder's front end without its mel."""
+
+    def __init__(self, n_fft=1024, hop_length=256):
+        super().__init__()
+        self.n_fft, self.hop_length = n_fft, hop_length
+
+    def forward(self, x):
+        spec = torch.stft(x, self.n_fft, hop_length=self.hop_length, window=None, center=False,
+                          return_complex=True)
+        return torch.view_as_real(spec).pow(2).sum(-1)
+
+
+class TestDftBasisPrecision(unittest.TestCase):
+    """coremltools folds the DFT basis from `outer(k, n) * 2*pi / N` in fp32, and `k*n` is large enough
+    by N=1024 that the angle has lost ~0.25 rad of precision before the divide: the basis came out
+    1.4e-4 from the true one. `torch_patches` rebuilds it from `k*n mod N` at f64."""
+
+    def test_the_folded_basis_is_the_dft_to_f32_precision(self):
+        n_fft = 1024
+        x = torch.randn(1, 4 * n_fft)
+        prog = ct.convert(torch.jit.trace(MagnitudeModule(n_fft).eval(), (x,)),
+                          inputs=[ct.TensorType(name="x", shape=x.shape)], convert_to="milinternal",
+                          compute_precision=ct.precision.FLOAT32)
+        exporter = LoomGGUFExporter(prog, output_path="test_dft_basis.gguf", architecture="dft_test")
+        try:
+            exporter.export()
+        finally:
+            Path("test_dft_basis.gguf").unlink(missing_ok=True)
+
+        rows = n_fft // 2 + 1
+        k, n = np.arange(rows)[:, None], np.arange(n_fft)[None]
+        angle = 2 * np.pi * ((k * n) % n_fft) / n_fft
+        bases = [np.asarray(w, dtype=np.float64).reshape(rows, n_fft)
+                 for w in exporter.weights.values() if np.asarray(w).size == rows * n_fft]
+        self.assertEqual(len(bases), 2, "expected one cos and one sin kernel")
+        for basis in bases:
+            err = min(np.abs(basis - np.cos(angle)).max(), np.abs(basis - np.sin(angle)).max(),
+                      np.abs(basis + np.sin(angle)).max())
+            # f32 rounding of a unit-magnitude value is 6e-8; the unpatched basis is 1.4e-4 out.
+            self.assertLess(err, 1e-7)
 
 
 class L2NormModule(torch.nn.Module):
