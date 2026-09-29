@@ -525,6 +525,54 @@ class ValueFacts:
         self._reshape_shape[key] = (op, result)
         return result
 
+    def whole_shape_exprs(self, real_var):
+        """`real_var`'s shape, torch-order, one sympy expression per axis -- or None if any axis
+        cannot be derived. Static axes are the literals they already are; a symbolic one goes through
+        `_infer_dynamic_dim_expr`, the same walk `range_scalar` reaches one axis at a time."""
+        if real_var is None or real_var.shape is None:
+            return None
+        resolved = []
+        for axis, dim in enumerate(real_var.shape):
+            if isinstance(dim, (int, np.integer)):
+                resolved.append(as_expr(int(dim)))
+                continue
+            derived = self.exporter._infer_dynamic_dim_expr(real_var, axis)
+            if derived is None:
+                return None
+            resolved.append(as_expr(derived))
+        return resolved
+
+    def tile_target_exprs(self, op):
+        """The output shape of a `tile` whose `reps` MIL did not fold, torch-order, or None.
+
+        coremltools lowers `x.expand(shape)` / `x.expand_as(t)` to
+
+            reps = real_div(select(equal(S, -1), a=x.shape, b=S), y=x.shape)
+            tile(x, reps)
+
+        with `S` the target shape. When `S` is `shape(t)` -- `expand_as`, or `expand(*t.shape)` -- the
+        reps are live because `t`'s shape is, and the output is simply `t`'s shape wherever `x` is 1
+        and `x`'s own extent elsewhere. Reading `reps` as a literal instead (it has none) made such a
+        tile an identity: ECAPA's attentive pooling concatenated a one-frame mean onto a T-frame
+        hidden state and ggml_concat aborted the process.
+        """
+        x_var, reps = op.inputs.get("x"), op.inputs.get("reps")
+        if x_var is None or x_var.shape is None or reps is None or reps.op is None:
+            return None
+        if reps.op.op_type != "real_div" or self.value(reps.op.inputs.get("y")) is None:
+            return None
+        chosen = reps.op.inputs.get("x")
+        if chosen is None or chosen.op is None or chosen.op.op_type != "select":
+            return None
+        target = chosen.op.inputs.get("b")
+        if target is None or target.op is None or target.op.op_type != "shape":
+            return None
+        full = self.whole_shape_exprs(target.op.inputs.get("x"))
+        if full is None or len(full) != len(x_var.shape):
+            return None
+        return [as_expr(int(d)) if isinstance(d, (int, np.integer)) and int(d) != 1 else full[i]
+                for i, d in enumerate(x_var.shape)]
+
     def _reshape_shape_uncached(self, op):
         shape_var = op.inputs.get("shape")
         if shape_var is None:
@@ -547,19 +595,7 @@ class ValueFacts:
             #    the literals they already are rather than re-derived. A single axis the walk cannot
             #    resolve returns None for the whole shape, so a fill this cannot explain keeps the
             #    behaviour it had.
-            real_var = shape_var.op.inputs.get("x")
-            if real_var is None or real_var.shape is None:
-                return None
-            resolved = []
-            for axis, dim in enumerate(real_var.shape):
-                if isinstance(dim, (int, np.integer)):
-                    resolved.append(as_expr(int(dim)))
-                    continue
-                derived = self.exporter._infer_dynamic_dim_expr(real_var, axis)
-                if derived is None:
-                    return None
-                resolved.append(as_expr(derived))
-            return resolved
+            return self.whole_shape_exprs(shape_var.op.inputs.get("x"))
         if shape_var.op is None or shape_var.op.op_type not in ("concat", "stack"):
             return None
         values = shape_var.op.inputs.get("values")
