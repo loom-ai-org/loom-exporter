@@ -788,6 +788,9 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
     _conv_stride: Optional[int] = None
     _encode_stride: Optional[int] = None
     _ref_codebook: Optional[int] = None
+    _template_head: Optional[list] = None
+    _text_tail: Optional[list] = None
+    _ref_tail: Optional[list] = None
 
     __unchecked__ = {
         "model_dir": Unchecked("path to the HF directory; `load_model` raises on anything it cannot "
@@ -825,6 +828,11 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
                                     "downsampling convolution's own"),
         "_ref_codebook": Unchecked("the CODEC's codebook size, read off its own quantizer; not the "
                                    "code predictor's, which is a different 2048"),
+        "_template_head": Unchecked("`<|im_start|>assistant\\n`'s ids, read off the checkpoint's "
+                                    "tokenizer by load_model and checked against the rendered template"),
+        "_text_tail": Unchecked("the target text's closing template ids; same source, same check"),
+        "_ref_tail": Unchecked("the reference transcript's closing template ids; same source, same "
+                               "check"),
     }
 
     def load_model(self):
@@ -867,6 +875,7 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
         self._sample_rate = int(model.config.speaker_encoder_config.sample_rate)
         self._tts_pad_id = int(model.config.tts_pad_token_id)
         self._tts_eos_id = int(model.config.tts_eos_token_id)
+        self._template_head, self._text_tail, self._ref_tail = _template_ids(self.model_dir)
 
         codec = load_reference_encoder(self.model_dir)
         self._encoder = codec.encoder
@@ -1218,6 +1227,11 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
                 # three and two, because its template has no trailing `<|im_start|>assistant\n`.
                 "TEXT_HEAD": TEXT_HEAD, "TEXT_TAIL": TEXT_TAIL,
                 "REF_HEAD": REF_HEAD, "REF_TAIL": REF_TAIL,
+                # The same scaffolding as ids, so a bare sentence can be wrapped in it. See
+                # `_template_ids`: `text2codes(text)` hands the driver the sentence alone.
+                "TEMPLATE_HEAD": self._template_head or [],
+                "TEXT_TEMPLATE_TAIL": self._text_tail or [],
+                "REF_TEMPLATE_TAIL": self._ref_tail or [],
                 # The two ids the driver pads and terminates the interleaved stream with.
                 "TTS_PAD_ID": self._tts_pad_id or 0,
                 "TTS_EOS_ID": self._tts_eos_id or 0,
@@ -1249,6 +1263,7 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
                        "MAX_NEW_TOKENS", "DEFAULT_LANGUAGE_ID", "TEMPERATURE", "TOP_K", "TOP_P",
                        "REPETITION_PENALTY", "SUB_TEMPERATURE", "SUB_TOP_K", "SUB_TOP_P",
                        "ICL_HEAD_LEN", "TEXT_HEAD", "TEXT_TAIL", "REF_HEAD", "REF_TAIL",
+                       "TEMPLATE_HEAD", "TEXT_TEMPLATE_TAIL", "REF_TEMPLATE_TAIL",
                        "TTS_PAD_ID", "TTS_EOS_ID", "ENCODE_STRIDE", "CONV_STRIDE",
                        "REF_SAMPLE_RATE", "REF_CODEBOOK"),
                 defines=("_codes",),
@@ -1267,6 +1282,46 @@ PREFILL_LEN = 10
 # `input_id[:, 3:-5]` and `ref_ids[:, 3:-2]`, and they are counted from an END, so no length is baked.
 TEXT_HEAD, TEXT_TAIL = 3, 5
 REF_HEAD, REF_TAIL = 3, 2
+# The two renderings above, spelled as the reference spells them (`_build_assistant_text` and
+# `_build_ref_text` in `qwen_tts`'s inference wrapper).
+ASSISTANT_ROLE = "<|im_start|>assistant\n"
+TEXT_TEMPLATE = ASSISTANT_ROLE + "{text}<|im_end|>\n" + ASSISTANT_ROLE
+REF_TEMPLATE = ASSISTANT_ROLE + "{text}<|im_end|>\n"
+
+
+def _template_ids(model_dir: str, probe: str = "The quick brown fox jumps over the lazy dog."):
+    """`(head, text_tail, ref_tail)`: the template's scaffolding as ids, for the driver to wrap a bare
+    sentence in.
+
+    **The talker was trained on the templated prompt and nothing else.** `text2codes(text)` tokenizes
+    the sentence alone, and the GGUF declares no chat template for anything to apply, so the driver
+    was handed bare ids and read them as if the template were there: it stripped three ids off the
+    front and five off the back of the SENTENCE, and the model stopped after a word or ran to the cap
+    (Whisper heard "Fox jumps", "(farting)"). Read off the tokenizer here rather than written as
+    literals, and checked by rendering the reference's own template around `probe`: wrapping the
+    sentence's ids must give exactly the ids of the rendered string, or the counts `TEXT_HEAD` /
+    `TEXT_TAIL` / `REF_HEAD` / `REF_TAIL` describe a different template than this checkpoint's.
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+
+    def ids(s):
+        return tok(s, add_special_tokens=False)["input_ids"]
+
+    head, text_tail, ref_tail = ids(ASSISTANT_ROLE), ids("<|im_end|>\n" + ASSISTANT_ROLE), \
+        ids("<|im_end|>\n")
+    body = ids(probe)
+    for name, got, want in (("head", len(head), TEXT_HEAD), ("text tail", len(text_tail), TEXT_TAIL),
+                            ("ref tail", len(ref_tail), REF_TAIL),
+                            ("text", head + body + text_tail, ids(TEXT_TEMPLATE.format(text=probe))),
+                            ("ref", head + body + ref_tail, ids(REF_TEMPLATE.format(text=probe)))):
+        if got != want:
+            raise ValueError(f"the checkpoint's template {name} is {got}, where the driver assumes "
+                             f"{want}; the prompt layout does not match this tokenizer")
+    return head, text_tail, ref_tail
+
+
 # `generation_config.json` does not state it; `Qwen3TTSForConditionalGeneration.generate` passes
 # `min_new_tokens: 2` in `talker_kwargs`, so the authority is that call site.
 MIN_NEW_TOKENS = 2
