@@ -47,7 +47,8 @@ PHONEME_INPUT = {"kokoro", "matcha", "styletts2", "vits"}
 # The four since are all text-in through a vocabulary the GGUF carries, and so graphemes: Pocket-TTS
 # (SentencePiece), VoxCPM2 (character BPE), CosyVoice3 (Qwen2 byte-level BPE) and Voxtral-TTS (Tekken,
 # Mistral's tiktoken BPE).
-GRAPHEME_INPUT = {"supertonic", "f5-tts", "chatterbox", "pocket-tts", "voxcpm2", "cosyvoice3", "voxtral-tts"}
+GRAPHEME_INPUT = {"supertonic", "f5-tts", "chatterbox", "pocket-tts", "voxcpm2", "cosyvoice3", "voxtral-tts",
+                  "speecht5"}
 
 # Families that still declare no `sample_rate`, with the reason it is an EXEMPTION rather than a pass.
 # Each needs its rate taken off its own checkpoint the way Kokoro's and Supertonic's are -- Matcha's and
