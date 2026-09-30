@@ -284,6 +284,7 @@ class SpeechT5ExportConfig(BaseMultiPhaseModelExportConfig):
     architecture: str = "speecht5"
     model_dir: str
     voice: str = DEFAULT_VOICE
+    normalize_numbers: bool = True
     root_axis: str = "n_tokens"
     decomposition: Decomposition = field(default_factory=MultiPhase)
     driver_script_path: Path = Path(__file__).resolve().parent / "speecht5_driver"
@@ -305,6 +306,8 @@ class SpeechT5ExportConfig(BaseMultiPhaseModelExportConfig):
         "model_dir": Unchecked("path to the speecht5_tts directory; the recognizer read its config.json"),
         "voice": Unchecked("a CMU ARCTIC speaker (`speecht5_voices.SPEAKERS`); read and shape-checked by "
                            "`speecht5_voices.read_xvector`"),
+        "normalize_numbers": Unchecked("whether the file carries the reference's number speller; a "
+                                       "front-end choice, not a claim about the weights"),
         "decomposition": Unchecked("MultiPhase by construction -- five graphs and a hand-written loop"),
         "driver_script_path": Unchecked("the hand-written fragments are still parsed and checked "
                                         "against the traced topologies by LuaFragment"),
@@ -489,6 +492,12 @@ class SpeechT5ExportConfig(BaseMultiPhaseModelExportConfig):
         # protobuf records no such flag, so the export states it (t5_export's reason).
         kwargs = dict(flat_namespace=False, root_axis=self.root_axis, hparams=self.hparams(),
                       tokenizer_dir=self.model_dir, add_eos_token=True, eos_token_id=self._eos_token_id)
+        # The vocabulary has no digits, so numbers are spelled first: the reference's own
+        # `SpeechT5Tokenizer(normalize=True)` path, ON here where upstream defaults it off -- off, every
+        # number is one `<unk>` (loom.cpp ADR-059).
+        if self.normalize_numbers:
+            from .number_normalizer_export import english_number_normalizer_kv
+            kwargs["number_normalizer"] = english_number_normalizer_kv()
         if self._driver_weights is not None:
             kwargs["driver_weights"] = dict(self._driver_weights)
         return kwargs

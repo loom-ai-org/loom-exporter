@@ -2257,11 +2257,11 @@ class LoomGGUFExporter:
                 indices_val_obj = op.inputs.get("indices")
                 if x_val_obj and indices_val_obj:
                     # `ggml_get_rows` is a lookup per ROW of the index: for a 2-D table every index
-                    # axis but the innermost must be 1 AT RUN TIME, or it asserts `a->ne[2] ==
-                    # b->ne[1]` and aborts the process -- after export, write and load have passed
-                    # (SpeechT5's `pe_k([n, n])`, Retro-066). Warned, not refused: Dia's multi-channel
-                    # embedding gathers a `(1, T, C)` index and runs only because its loop never calls
-                    # it with T > 1, which no export-time check can see.
+                    # axis but the innermost must be 1, or it asserts `a->ne[2] == b->ne[1]` and aborts
+                    # the process at the first call (SpeechT5's `pe_k([n, n])`, Retro-066). The engine's
+                    # GET_ROWS now flattens such an index itself, but engines up to 1.0.0-rc11 do not, so
+                    # a file relying on it is a file those wheels cannot run. Warned, not refused: Dia's
+                    # multi-channel embedding has this shape and runs on every engine at T = 1.
                     x_shape = getattr(x_val_obj, "shape", None)
                     idx_shape = getattr(indices_val_obj, "shape", None)
                     if (x_shape is not None and idx_shape is not None and len(x_shape) == 2
@@ -2269,9 +2269,10 @@ class LoomGGUFExporter:
                         import warnings
                         warnings.warn(
                             f"gather '{op.name}': a {len(idx_shape)}-D index {tuple(idx_shape)} into a "
-                            f"2-D table lowers to a batched ggml_get_rows, which aborts unless every "
-                            f"index axis but the innermost is 1 when it runs. Flatten the index in the "
-                            f"wrapper, gather, and reshape the rows back.", stacklevel=2)
+                            f"2-D table. Engines up to loom 1.0.0-rc11 abort on it unless every index "
+                            f"axis but the innermost is 1 when it runs; later ones flatten it. To run on "
+                            f"the released wheels, flatten the index in the wrapper, gather, and reshape "
+                            f"the rows back.", stacklevel=2)
                     indices_name = resolve(self.safe_name(indices_val_obj.name))
                     # An index Var traced through elementwise arithmetic (e.g. HF's `zeros_like(input_ids)`
                     # idiom, which coremltools decomposes to `input_ids - input_ids` rather than a plain
@@ -3290,6 +3291,13 @@ class LoomGGUFExporter:
         tokenizer_dir = self.kwargs.get("tokenizer_dir") or os.environ.get("LOOM_TOKENIZER_DIR")
         if tokenizer_dir:
             self._write_tokenizer(w, tokenizer_dir)
+        # A number speller the vocabulary applies before it segments (loom.cpp ADR-059): its words and
+        # character tables as data, `number_normalizer_export`'s keys. Only with a vocabulary to feed.
+        if self.kwargs.get("number_normalizer"):
+            if not tokenizer_dir:
+                raise ValueError("number_normalizer without a tokenizer: there is no encode to run it in")
+            from .number_normalizer_export import write_number_normalizer
+            write_number_normalizer(w, self.kwargs["number_normalizer"])
 
         # Embed the Lua driver orchestration script
         w.add_string("model.driver_script", driver_script)
