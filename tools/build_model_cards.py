@@ -702,6 +702,71 @@ CML-TTS, IndicVoices-R and Arabic Natural Audio datasets.""",
             "older engines refuse by name rather than tokenize differently.",
     ),
     ModelCard(
+        slug="speecht5-tts", checkpoint=Path("speecht5-tts"),
+        export_task="text-to-speech", export_model="speecht5", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="microsoft/speecht5_tts", license_id="mit",
+        source_url="https://github.com/microsoft/SpeechT5", source_name="SpeechT5 (TTS)",
+        language=["en"],
+        # Declared by the export (`speecht5_export.SAMPLE_RATE`): HiFi-GAN decodes at 16 kHz.
+        sample_rate=16000,
+        title="SpeechT5 TTS",
+        summary="Microsoft's SpeechT5 text-to-speech model with its HiFi-GAN vocoder, exported for loom.cpp: "
+                "a text encoder and an autoregressive decoder that predicts mel-spectrogram frames, 16 kHz. "
+                "Encodes text itself and has a built-in voice.",
+        usage_extra="""### Choosing a voice
+
+The file carries one voice, `slt` (CMU ARCTIC, US female), and uses it when you name none. All seven
+CMU ARCTIC speakers ship in this repo as voice files under `voices/` (`slt.gguf` is the same x-vector
+the file carries), and a name is enough -- it is fetched from this repo the first time:
+
+```python
+print(model.voices)                          # the built-in one first, then the voice files
+
+audio = model.text2speech.infer("Hello world.", voice="bdl")
+audio.save("bdl.wav")
+```
+
+| voice | speaker |
+|---|---|
+| `slt` (built in) | US female |
+| `clb` | US female |
+| `bdl` | US male |
+| `rms` | US male |
+| `awb` | Scottish male |
+| `jmk` | Canadian male |
+| `ksp` | Indian male |
+
+A SpeechT5 voice is a 512-number speaker embedding (an x-vector from SpeechBrain's
+`spkrec-xvect-voxceleb`), so any x-vector from that extractor works, including one of your own voice.
+Save it with numpy and convert it:
+
+```bash
+python -m loom_exporter.speecht5_voices microsoft/speecht5_tts -o voices \\
+    --from my_xvector.npy --name me --license "CC0-1.0"
+```
+
+Then pass `voice="voices/me.gguf"`. The CMU ARCTIC recordings are "free for use for any purpose
+(commercial or otherwise)" provided Carnegie Mellon University's copyright notice is kept; every voice
+file records its licence and origin (`loom.voice.license`, `loom.voice.origin`).""",
+        extra_files=[
+            "`voices/*.gguf` -- the seven CMU ARCTIC speakers' x-vectors as loom voice files, from "
+            "`Matthijs/cmu-arctic-xvectors` (each speaker's `arctic_a0508` utterance) by "
+            "`loom_exporter.speecht5_voices`. Only needed to pick a voice other than the built-in `slt`.",
+        ],
+        limitations=
+            "**One file holds both models.** SpeechT5 predicts mel spectrograms; the waveform comes "
+            "from `microsoft/speecht5_hifigan`, which this export carries in the same GGUF. Both are MIT.\n\n"
+            "**Every frame depends on a random draw.** SpeechT5 keeps its decoder prenet's dropout ON "
+            "at inference (a Tacotron 2 choice). loom-py seeds it with 0 unless you pass `seed`, so the "
+            "same call gives the same audio and another `seed` gives another take. Verified against transformers' `generate_speech` with the draws pinned: "
+            "the same number of frames and a waveform within 6e-06 rms.\n\n"
+            "**Numbers are not spoken.** The vocabulary has no digits, so `2026` reaches the model as "
+            "an unknown token, exactly as it does upstream; spell numbers out first.\n\n"
+            "**English only**, trained on LibriTTS. Stops on the model's own stop head, at most ten "
+            "decoder steps (20 frames, 0.32 s) per input character.",
+    ),
+    ModelCard(
         slug="supertonic-2", checkpoint=Path("/home/flavio/Dev/supertonic-tts/assets/pt"),
         export_task="text-to-speech", export_model="supertonic", task_type="text-to-speech",
         takes_text=True,
