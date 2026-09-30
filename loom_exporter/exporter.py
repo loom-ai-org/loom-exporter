@@ -2256,6 +2256,22 @@ class LoomGGUFExporter:
                 x_val_obj = op.inputs.get("x") or op.inputs.get("params")
                 indices_val_obj = op.inputs.get("indices")
                 if x_val_obj and indices_val_obj:
+                    # `ggml_get_rows` is a lookup per ROW of the index: for a 2-D table every index
+                    # axis but the innermost must be 1 AT RUN TIME, or it asserts `a->ne[2] ==
+                    # b->ne[1]` and aborts the process -- after export, write and load have passed
+                    # (SpeechT5's `pe_k([n, n])`, Retro-066). Warned, not refused: Dia's multi-channel
+                    # embedding gathers a `(1, T, C)` index and runs only because its loop never calls
+                    # it with T > 1, which no export-time check can see.
+                    x_shape = getattr(x_val_obj, "shape", None)
+                    idx_shape = getattr(indices_val_obj, "shape", None)
+                    if (x_shape is not None and idx_shape is not None and len(x_shape) == 2
+                            and any(d != 1 for d in idx_shape[:-1])):
+                        import warnings
+                        warnings.warn(
+                            f"gather '{op.name}': a {len(idx_shape)}-D index {tuple(idx_shape)} into a "
+                            f"2-D table lowers to a batched ggml_get_rows, which aborts unless every "
+                            f"index axis but the innermost is 1 when it runs. Flatten the index in the "
+                            f"wrapper, gather, and reshape the rows back.", stacklevel=2)
                     indices_name = resolve(self.safe_name(indices_val_obj.name))
                     # An index Var traced through elementwise arithmetic (e.g. HF's `zeros_like(input_ids)`
                     # idiom, which coremltools decomposes to `input_ids - input_ids` rather than a plain
