@@ -302,3 +302,19 @@ def test_the_two_divergent_classes_are_a_single_inserted_space(text):
     assert want != got
     assert want.replace(" ", "") == got.replace(" ", "")
     assert len(want) == len(got) + 1
+
+
+def test_neither_input_falls_back_to_tokens(tmp_path):
+    """The clip and the character ids are two inputs of different kinds, so neither is the `tokens` a
+    host sends by default. With the alias, a bare `text2speech.infer("hello world")` handed the
+    sentence's ids to the mel front end as audio samples; now the driver refuses by name."""
+    from loom_exporter.driver_components import REQUIRED, DriverInputs
+
+    inputs, = [c for c in _config(tmp_path).driver_components() if isinstance(c, DriverInputs)]
+    assert inputs.bindings == (("waveform", REQUIRED), ("text_ids", REQUIRED))
+
+
+def test_the_file_declares_how_a_host_builds_a_reference(tmp_path):
+    """`loom.tts.reference = "infill"` is what loom-py's `reference=` door checks before joining the
+    transcript to the text. Declared, because a model that does not in-fill would ignore the clip."""
+    assert _config(tmp_path).hparams()["tts.reference"] == "infill"

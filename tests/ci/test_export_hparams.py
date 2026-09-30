@@ -36,6 +36,21 @@ class TestHparamsAreWritten(unittest.TestCase):
         self.assertEqual(int(out["loom.style_dim"]), 128)
         self.assertAlmostEqual(float(out["loom.sample_rate"]), 44100.0, places=1)
 
+    def test_a_string_is_a_string(self):
+        """`hparam_str` reads it back. F5-TTS's `tts.reference` is the first: a word saying how a host
+        builds its reference inputs."""
+        from gguf import GGUFReader
+
+        from loom_exporter.exporter import LoomGGUFExporter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "hparams.gguf")
+            LoomGGUFExporter(None, output_path=out, architecture="test",
+                             hparams={"tts.reference": "infill"}).write_gguf("-- driver")
+            field = GGUFReader(out).fields["loom.tts.reference"]
+            # A string field's data part is the whole byte run, not one scalar like the helper reads.
+            self.assertEqual(bytes(field.parts[field.data[0]]).decode(), "infill")
+
     def test_declaring_none_writes_none(self):
         """The absence is a real property, not a nicety: `hparam_u32` raises naming the missing key, so
         a family that declares nothing produces a file that says so rather than one carrying zeros."""

@@ -747,9 +747,10 @@ flatten = lambda entry: [v for row in entry["data"][0] for v in row]
 style_ttl = flatten(style["style_ttl"])   # 50 * 256 = 12800 floats
 style_dp = flatten(style["style_dp"])     #  8 *  16 =   128 floats
 
-# A specific voice is a knob the high-level door does not name, so this goes through `infer`.
-txt_ids = model.tokenize("hello world")
-audio = model.infer(txt_ids=txt_ids, style_ttl=style_ttl, style_dp=style_dp, n_steps=4, seed=1234)
+# The door passes any input it does not name straight to the model, so a style rides along with the
+# text -- and what comes back is still `loom.Audio`, at the file's own rate.
+audio = model.text2speech.infer("hello world", style_ttl=style_ttl, style_dp=style_dp, seed=1234)
+audio.save("m1.wav")
 ```
 
 The two arguments travel together: pass neither for the built-in voice, or both to select another. A
@@ -906,6 +907,32 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
     ModelCard(
         slug="qwen3-tts-12hz-0.6b", checkpoint=Path("qwen3-tts-12hz-0.6b"),
         task_type="text-to-codes", pipeline_tag="text-to-speech", clones_voice=True,
+        # The ICL block continues the snippet above (same `model`, `codec`, `reference`) and rebinds
+        # `audio`, so the model-card gate grades ICL's audio; the x-vector block above still runs. The
+        # transcript is jfk.wav's, the clip the gate stands in for the reader's `reference.wav`.
+        usage_extra="""### Cloning with the transcript (ICL)
+
+Upstream's higher-fidelity mode: the clip's transcript and the clip's own codec tokens go into the
+prompt, as if the model had just said it. This file draws those tokens itself -- the codec's encoder
+rides inside it -- so what you add is the clip again as `ref_audio=` and what it says as `ref_tokens=`.
+
+```python
+# What reference.wav says, word for word (this one is JFK's inaugural address, public domain).
+reference_text = ("And so, my fellow Americans, ask not what your country can do for you; "
+                  "ask what you can do for your country.")
+codes = model.text2codes.infer(
+    "The quick brown fox jumps over the lazy dog.",
+    waveform=reference.tolist(),                  # the speaker's x-vector, as above
+    ref_audio=reference.tolist(),                 # the same clip, encoded to codes by this file
+    ref_tokens=model.tokenize(reference_text),    # and what it says
+    language_id=2050, max_new_tokens=200, seed=1234,
+)
+audio = codec.codes2speech.infer(codes)
+audio.save("icl.wav")
+```
+
+A few clear seconds is enough. The clip is used in whole 80 ms codec frames, and those frames count
+against the prompt at 12.5 per second.""",
         base_repo="Qwen/Qwen3-TTS-12Hz-0.6B-Base", license_id="apache-2.0",
         language=["zh", "en", "ja", "ko", "de", "fr", "ru", "pt", "es", "it"],
         title="Qwen3-TTS 12Hz 0.6B Base",
@@ -1591,9 +1618,9 @@ audio.save("out.wav")
 # limitations" (and, where it does, a section below says how to pick one).
 """,
     # F5-TTS: a voice-cloning TTS with no voice of its own, so every call takes a reference clip AND its
-    # transcript. `Text2Speech.infer` cannot pass either yet (loom.cpp's hub item "F5-TTS has no working
-    # high-level door"), so this goes through `infer` with the driver's own inputs -- which works on the
-    # released runtime, where a new door would not until the release after it. The join and
+    # transcript. `Text2Speech.infer(text, reference=, reference_text=)` passes both (ADR-056), but no
+    # released loom-py carries it yet, so this goes through `infer` with the driver's own inputs -- which
+    # works on the released runtime -- until one does (loom.cpp's Host API item). The join and
     # `n_ref_text` are `loom_cli --ref-text`'s. The example clip is JFK's (public domain), the same one
     # the model-card gate stands in for the reader's recording, so the transcript below is its own.
     "text-to-speech-voice-clone": """import loom
