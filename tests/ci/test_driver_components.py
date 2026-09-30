@@ -22,8 +22,8 @@ from loom_exporter.driver_components import (
     CALLER, MASK, POSITION, ArgmaxEpilogue, ChainStage, CtcGreedyBuilder, CtcGreedyEpilogue,
     DriverInputs, ExportConstants, ModularChain,
     FlowMatchingSampler, LuaFragment, ModularChainBuilder, MonolithicCall, MultiPhaseDriverBuilder,
-    PrefillArgmaxBuilder, PrefillDecodeLoop, RawLuaDriver, SubgraphCallComponent, caller_input,
-    parse_run_subgraph_calls,
+    PrefillArgmaxBuilder, PrefillDecodeLoop, REQUIRED, RawLuaDriver, SubgraphCallComponent,
+    caller_input, parse_run_subgraph_calls, required_input,
 )
 from loom_exporter.driver_ir import (
     BinOp, DriverIRError, Len, Lit, LuaCodegen, OutputRef, SubgraphCall, Var,
@@ -54,6 +54,27 @@ class TestCallerInput(unittest.TestCase):
         """`inputs.tokens or inputs.tokens` -- the same expression on both sides of the `or` -- is what
         every causal LM's driver read like before this case existed."""
         self.assertEqual(caller_input("tokens").render(), "inputs.tokens")
+
+
+class TestRequiredInput(unittest.TestCase):
+    def test_a_required_input_has_no_alias_and_fails_by_name(self):
+        """F5-TTS's two inputs are a clip and character ids. With the `tokens` alias a bare sentence's
+        ids reached the mel front end as audio samples; without it, the missing input is the error."""
+        rendered = required_input("waveform").render()
+        self.assertTrue(rendered.startswith("(inputs.waveform or error('"), rendered)
+        self.assertNotIn("inputs.tokens", rendered)
+        self.assertIn("`waveform`", rendered)
+        # A Lua single-quoted string: the message must not close it early.
+        self.assertEqual(rendered.count("'"), 2, rendered)
+
+    def test_the_binding_kind_emits_it(self):
+        inputs = DriverInputs(bindings=(("waveform", REQUIRED), ("text_ids", REQUIRED)),
+                              n_tokens=Len("waveform"))
+        text = "\n".join(line for stmt in inputs.emit(None)
+                         for line in LuaCodegen()._emit_stmt(stmt, 0))
+        self.assertIn("local waveform = (inputs.waveform or error(", text)
+        self.assertIn("local text_ids = (inputs.text_ids or error(", text)
+        self.assertNotIn("inputs.tokens", text)
 
 
 class TestPrefillArgmaxBuilder(unittest.TestCase):
