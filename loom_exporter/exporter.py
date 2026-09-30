@@ -923,6 +923,12 @@ class LoomGGUFExporter:
             reps_var = op.inputs.get("reps")
             x_var = op.inputs.get("x")
             reps_val = static_value(reps_var)
+            # Live reps whose target the facts can derive (`expand_as`, or `repeat` with a shape-read
+            # rep) are answered from the same derivation `_op_tile` emits the REPEAT from, so the walk
+            # and the node cannot disagree about an axis.
+            live_target = self.facts.tile_target_exprs(op) if reps_val is None else None
+            if live_target is not None and torch_axis < len(live_target):
+                return live_target[torch_axis]
             if reps_val is not None and x_var is not None and torch_axis < len(reps_val):
                 rep = int(reps_val[torch_axis])
                 in_expr = self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
