@@ -413,14 +413,16 @@ anything.""",
             "**It clones a voice, so it needs one.** Every call takes a reference clip at 24 kHz, the "
             "transcript of that clip, and the text to speak -- the model in-fills one spectrogram "
             "whose first frames are the reference, so there is no way to synthesise without a prompt.\n\n"
-            "**`text2speech.infer(text)` does not work for this model yet; use `infer` as the example "
-            "does.** The high-level door has no way to pass a reference clip and its transcript, so "
-            "the example calls the file's own inputs directly: `waveform` (the clip, mono, 24 kHz), "
-            "`text_ids` (the transcript's ids, a space, then the text's) and `n_ref_text` (how many of "
-            "those ids are the transcript -- the duration estimate is a ratio of the two lengths, and "
-            "nothing in the ids marks the join). `loom_cli --wav ref.wav --ref-text \"...\" --prompt "
-            "\"...\" --out out.wav` does the same from the shell. Optional knobs: `n_steps`, "
-            "`cfg_scale`, `sway_coef`, `speed`, `duration` (total frames), `seed`.\n\n"
+            "**The door is `text2speech.infer(text, reference=, reference_text=)`, which needs a "
+            "loom-py-rt release after 1.0.0rc11.** It joins the transcript to the text and passes the "
+            "file's own inputs: `waveform` (the clip, mono, 24 kHz), `text_ids` (the transcript's ids, a "
+            "space, then the text's) and `n_ref_text` (how many of those ids are the transcript -- the "
+            "duration estimate is a ratio of the two lengths, and nothing in the ids marks the join). "
+            "On 1.0.0rc11 call `model.infer(waveform=, text_ids=, n_ref_text=)` with that join spelled "
+            "out; the audio is identical. Text alone is refused: this model has no voice of its own. "
+            "`loom_cli --wav ref.wav --ref-text \"...\" --prompt \"...\" --out out.wav` does the same "
+            "from the shell. Optional knobs: `n_steps`, `cfg_scale`, `sway_coef`, `speed`, `duration` "
+            "(total frames), `seed`.\n\n"
             "**Chinese needs pinyin conversion this file cannot do.** F5-TTS's own front end runs "
             "`rjieba` word segmentation and `pypinyin` before a single id is looked up. What ships "
             "here is the character table, which reproduces that function exactly for ordinary "
@@ -1618,11 +1620,11 @@ audio.save("out.wav")
 # limitations" (and, where it does, a section below says how to pick one).
 """,
     # F5-TTS: a voice-cloning TTS with no voice of its own, so every call takes a reference clip AND its
-    # transcript. `Text2Speech.infer(text, reference=, reference_text=)` passes both (ADR-056), but no
-    # released loom-py carries it yet, so this goes through `infer` with the driver's own inputs -- which
-    # works on the released runtime -- until one does (loom.cpp's Host API item). The join and
-    # `n_ref_text` are `loom_cli --ref-text`'s. The example clip is JFK's (public domain), the same one
-    # the model-card gate stands in for the reader's recording, so the transcript below is its own.
+    # transcript, through `Text2Speech`'s `reference=` door (loom.cpp ADR-056), which joins them the way
+    # `loom_cli --ref-text` does. That door is newer than 1.0.0rc11, so this card must not be published
+    # before a loom-py-rt release carries it (loom.cpp's Host API item). The example clip is JFK's
+    # (public domain), the one the model-card gate stands in for the reader's recording, so the
+    # transcript below is its own.
     "text-to-speech-voice-clone": """import loom
 import librosa
 
@@ -1634,16 +1636,10 @@ reference, _ = librosa.load("reference.wav", sr={sample_rate})
 reference_text = ("And so, my fellow Americans, ask not what your country can do for you; "
                   "ask what you can do for your country.")
 
-# The model in-fills ONE spectrogram whose first frames are the reference, so its text is the
-# transcript followed by the text to speak, joined by a space, and it is told where the join is.
-prompt = reference_text if reference_text.endswith(" ") else reference_text + " "
-text_ids = model.tokenize(prompt + "hello world")
-n_ref_text = len(model.tokenize(prompt))
-
-# No high-level door takes a reference yet, so this is `infer` with the file's own inputs. It returns
-# the GENERATED samples only (the reference's frames are sliced off), at {sample_rate} Hz.
-samples = model.infer(waveform=reference.tolist(), text_ids=text_ids, n_ref_text=n_ref_text, seed=42)
-audio = loom.Audio(samples, sample_rate={sample_rate})
+# The model in-fills ONE spectrogram whose first frames are the reference; the door joins the transcript
+# to the text and returns only the GENERATED speech, at {sample_rate} Hz.
+audio = model.text2speech.infer("hello world", reference=reference.tolist(),
+                                reference_text=reference_text, seed=42)
 audio.save("out.wav")
 """,
 }
