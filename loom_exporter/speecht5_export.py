@@ -30,8 +30,9 @@ continuous frame, a stop head read back, nothing sampled.
   loom.cpp ADR-042's rule -- the driver draws graph-input noise -- and what lets a caller pin them
   (`inputs.masks`) for a gate. Each mask is `{0, 1}` and the graph applies the `1 / (1 - p)` scale.
 * **The voice is a 512-d x-vector** (SpeechBrain `spkrec-xvect-voxceleb`), L2-normalised in the graph.
-  The default ships as a driver weight: `Matthijs/cmu-arctic-xvectors`'s `slt` utterance that every
-  published SpeechT5 example uses. A caller's own x-vector is `inputs.speaker`.
+  The default ships as a driver weight: CMU ARCTIC `slt`, the utterance every published SpeechT5
+  example uses. The other six CMU speakers are voice files (`speecht5_voices`), and a caller's own
+  x-vector is `inputs.speaker`.
 
 The postnet's batch norms are applied as explicit affine ops (eval statistics), and the speaker
 projection `Linear(cat(h, spk))` is split into `W_h h + W_s spk` so the speaker row broadcasts instead
@@ -42,10 +43,8 @@ Usage:
 (the directory must hold the vocoder under `hifigan/` and the voice set under
 `xvectors/spkrec-xvect.zip`, F5-TTS's precedent for a second checkpoint the export needs.)
 """
-import io
 import json
 import math
-import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -59,6 +58,7 @@ from .decomposition import Decomposition, MultiPhase
 from .export_config import LoomExportConfig
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .spec_protocol import Axis, Unchecked
+from .speecht5_voices import compat as voice_compat, read_xvector
 
 SAMPLE_RATE = 16000
 # The vocoder's total upsampling (4 x 4 x 4 x 4): waveform samples per mel frame.
@@ -67,9 +67,9 @@ HOP_LENGTH = 256
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_MINLENRATIO = 0.0
 DEFAULT_MAXLENRATIO = 20.0
-# The utterance whose x-vector every published SpeechT5 example uses (`embeddings_dataset[7306]`).
-DEFAULT_VOICE = "cmu_us_slt_arctic-wav-arctic_a0508"
-XVECTOR_ZIP = Path("xvectors") / "spkrec-xvect.zip"
+# The built-in voice: CMU ARCTIC `slt`, whose `arctic_a0508` x-vector every published SpeechT5 example
+# uses (`embeddings_dataset[7306]`). The other six speakers are voice files (`speecht5_voices`).
+DEFAULT_VOICE = "slt"
 
 # Trace lengths: odd, distinct from each other and from every static dimension.
 TRACE_TOKENS = 13
@@ -277,26 +277,6 @@ def _check_fused_attention(topo: dict, n_layers: int) -> int:
     return n_layers
 
 
-def read_xvector(model_dir: Path, name: str, dim: int = 512) -> np.ndarray:
-    """One x-vector out of `<model>/xvectors/spkrec-xvect.zip` (`Matthijs/cmu-arctic-xvectors`), by
-    utterance name."""
-    path = Path(model_dir) / XVECTOR_ZIP
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"{path} does not exist. SpeechT5 needs a speaker x-vector and its checkpoint ships none; "
-            f"download `spkrec-xvect.zip` from the `Matthijs/cmu-arctic-xvectors` dataset into "
-            f"{path.parent}/ (do not unzip it: 7931 files).")
-    with zipfile.ZipFile(path) as z:
-        member = f"spkrec-xvect/{name}.npy"
-        if member not in z.namelist():
-            raise KeyError(f"{path.name} has no {member}")
-        x = np.load(io.BytesIO(z.read(member))).astype(np.float32)
-    if x.shape != (dim,) or not np.isfinite(x).all():
-        raise ValueError(f"{member}: expected {dim} finite floats (the checkpoint's "
-                         f"`speaker_embedding_dim`), got {x.shape}")
-    return x
-
-
 @dataclass(kw_only=True)
 class SpeechT5ExportConfig(BaseMultiPhaseModelExportConfig):
     """A `microsoft/speecht5_tts` directory (with `hifigan/` and `xvectors/`) -> one Loom GGUF."""
@@ -316,13 +296,15 @@ class SpeechT5ExportConfig(BaseMultiPhaseModelExportConfig):
     _reduction: int = field(default=2, init=False, repr=False)
     _prenet_units: int = field(default=256, init=False, repr=False)
     _eos_token_id: int = field(default=2, init=False, repr=False)
+    _speaker_dim: int = field(default=512, init=False, repr=False)
     cross_kv_names: tuple = field(default=(), init=False, repr=False)
 
     __links__ = {"root_axis": Axis()}
     __unchecked__ = {
         "architecture": Unchecked("the GGUF's architecture string; it names this export"),
         "model_dir": Unchecked("path to the speecht5_tts directory; the recognizer read its config.json"),
-        "voice": Unchecked("an utterance name in the x-vector zip; read and shape-checked by read_xvector"),
+        "voice": Unchecked("a CMU ARCTIC speaker (`speecht5_voices.SPEAKERS`); read and shape-checked by "
+                           "`speecht5_voices.read_xvector`"),
         "decomposition": Unchecked("MultiPhase by construction -- five graphs and a hand-written loop"),
         "driver_script_path": Unchecked("the hand-written fragments are still parsed and checked "
                                         "against the traced topologies by LuaFragment"),
@@ -337,6 +319,7 @@ class SpeechT5ExportConfig(BaseMultiPhaseModelExportConfig):
         "_reduction": Unchecked("READ: `config.reduction_factor`"),
         "_prenet_units": Unchecked("READ: `config.speech_decoder_prenet_units`"),
         "_eos_token_id": Unchecked("READ: `config.eos_token_id`, which the tokenizer appends"),
+        "_speaker_dim": Unchecked("READ: `config.speaker_embedding_dim`, the x-vector width a voice must have"),
         "cross_kv_names": Unchecked("derived in phases() by `cross_kv_input_names`, which also orders "
                                     "`CrossKvPhase`'s outputs"),
     }
@@ -370,6 +353,7 @@ class SpeechT5ExportConfig(BaseMultiPhaseModelExportConfig):
         self._reduction = int(cfg.reduction_factor)
         self._prenet_units = int(cfg.speech_decoder_prenet_units)
         self._eos_token_id = int(cfg.eos_token_id)
+        self._speaker_dim = int(cfg.speaker_embedding_dim)
         if int(cfg.speech_decoder_prenet_layers) != 2:
             raise NotImplementedError(f"the decoder takes one mask input per prenet layer and declares "
                                       f"two; this checkpoint has {cfg.speech_decoder_prenet_layers}")
@@ -495,6 +479,9 @@ class SpeechT5ExportConfig(BaseMultiPhaseModelExportConfig):
         contract["text.frontend"] = "vocab"
         contract["sample_rate"] = SAMPLE_RATE
         contract["tts.voices"] = [self.voice]
+        # What a voice file must match to be loaded into this model (loom.cpp ADR-045, ADR-058): the
+        # x-vector's embedding space, which is a fact about the checkpoint's CONFIG, not its weights.
+        contract["voice.compat"] = voice_compat(self._speaker_dim)
         return contract
 
     def backend_kwargs(self) -> dict:

@@ -22,9 +22,8 @@ import numpy as np
 import pytest
 
 from loom_exporter.registry import default_registry
-from loom_exporter.speecht5_export import (
-    DEFAULT_VOICE, SpeechT5ExportConfig, _build_speecht5, _is_speecht5_tts, read_xvector,
-)
+from loom_exporter.speecht5_export import DEFAULT_VOICE, SpeechT5ExportConfig, _build_speecht5, _is_speecht5_tts
+from loom_exporter.speecht5_voices import SPEAKERS, compat, convert, read_xvector, utterance
 
 torch = pytest.importorskip("torch")
 
@@ -129,7 +128,8 @@ def checkpoint(tmp_path_factory):
     np.save(buf, np.linspace(-1, 1, SPEAKER_DIM, dtype=np.float32))
     (out / "xvectors").mkdir()
     with zipfile.ZipFile(out / "xvectors" / "spkrec-xvect.zip", "w") as z:
-        z.writestr(f"spkrec-xvect/{DEFAULT_VOICE}.npy", buf.getvalue())
+        for speaker in SPEAKERS:
+            z.writestr(f"spkrec-xvect/{utterance(speaker)}.npy", buf.getvalue())
     return out
 
 
@@ -252,7 +252,8 @@ def test_the_tokenizer_and_the_voice_travel_with_the_model(exported):
     assert fields["tokenizer.ggml.model"].contents() == "t5"      # the CHAR model, written as Unigram
     assert fields["loom.output.kind"].contents() == "audio"
     assert fields["loom.sample_rate"].contents() == 16000
-    assert fields["loom.tts.voices"].contents() == [DEFAULT_VOICE]
+    assert fields["loom.tts.voices"].contents() == [DEFAULT_VOICE] == ["slt"]
+    assert fields["loom.voice.compat"].contents() == compat(SPEAKER_DIM)
 
 
 def test_the_traced_lengths_do_not_reach_the_graph(checkpoint, tmp_path, monkeypatch):
@@ -265,3 +266,45 @@ def test_the_traced_lengths_do_not_reach_the_graph(checkpoint, tmp_path, monkeyp
     second = _export(checkpoint, tmp_path / "b.gguf")["topo"]
     for name in first:
         assert json.dumps(first[name], sort_keys=True) == json.dumps(second[name], sort_keys=True), name
+
+
+# -- voice files (loom.cpp ADR-045, ADR-058) --------------------------------------------------------
+
+def test_the_seven_speakers_become_voice_files_the_model_accepts(checkpoint, tmp_path):
+    """Each file's one tensor is the driver input it becomes, and its stamp is the one the model
+    declares -- `loom::load_voice` compares the two strings and nothing else."""
+    from gguf import GGUFReader
+
+    written = convert(checkpoint, tmp_path, dim=SPEAKER_DIM)
+    assert sorted(written) == sorted(SPEAKERS)
+    for speaker in SPEAKERS:
+        reader = GGUFReader(str(tmp_path / f"{speaker}.gguf"))
+        assert reader.fields["loom.voice.architecture"].contents() == "speecht5"
+        assert reader.fields["loom.voice.compat"].contents() == compat(SPEAKER_DIM)
+        assert reader.fields["loom.voice.name"].contents() == speaker
+        assert "commercial or otherwise" in reader.fields["loom.voice.license"].contents()
+        (tensor,) = reader.tensors
+        assert tensor.name == "speaker" and tensor.n_elements == SPEAKER_DIM
+
+
+def test_the_stamp_names_the_embedding_space_not_the_weights():
+    """An x-vector is the extractor's output, so it fits every SpeechT5 trained on that extractor --
+    and a different width is a different space."""
+    assert compat(512) == "xvector:speechbrain/spkrec-xvect-voxceleb:512"
+    assert compat(512) != compat(192)
+
+
+def test_your_own_xvector_needs_a_name_and_the_recordings_licence(checkpoint, tmp_path):
+    own = tmp_path / "me.npy"
+    np.save(own, np.ones((1, SPEAKER_DIM), dtype=np.float32))   # a batched extractor's [1, dim]
+    with pytest.raises(ValueError, match="--license"):
+        convert(checkpoint, tmp_path, source=own, name="me", dim=SPEAKER_DIM)
+    assert list(convert(checkpoint, tmp_path, source=own, name="me", license="CC0-1.0",
+                        dim=SPEAKER_DIM)) == ["me"]
+
+
+def test_an_unknown_speaker_or_a_wrong_width_is_refused(checkpoint, tmp_path):
+    with pytest.raises(KeyError, match="bdl"):
+        convert(checkpoint, tmp_path, only=["xyz"], dim=SPEAKER_DIM)
+    with pytest.raises(ValueError, match="speaker_embedding_dim"):
+        convert(checkpoint, tmp_path, only=["slt"], dim=SPEAKER_DIM + 1)
