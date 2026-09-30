@@ -254,6 +254,9 @@ def test_the_tokenizer_and_the_voice_travel_with_the_model(exported):
     assert fields["loom.sample_rate"].contents() == 16000
     assert fields["loom.tts.voices"].contents() == [DEFAULT_VOICE] == ["slt"]
     assert fields["loom.voice.compat"].contents() == compat(SPEAKER_DIM)
+    # The reference's number speller rides with the vocabulary, because the vocabulary has no digits.
+    assert fields["tokenizer.ggml.numbers.scheme"].contents() == "english_number_normalizer"
+    assert fields["tokenizer.ggml.numbers.symbol_chain"].contents()[:2] == ["-", "$"]
 
 
 def test_the_traced_lengths_do_not_reach_the_graph(checkpoint, tmp_path, monkeypatch):

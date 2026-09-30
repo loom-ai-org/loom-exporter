@@ -761,8 +761,11 @@ file records its licence and origin (`loom.voice.license`, `loom.voice.origin`).
             "at inference (a Tacotron 2 choice). loom-py seeds it with 0 unless you pass `seed`, so the "
             "same call gives the same audio and another `seed` gives another take. Verified against transformers' `generate_speech` with the draws pinned: "
             "the same number of frames and a waveform within 6e-06 rms.\n\n"
-            "**Numbers are not spoken.** The vocabulary has no digits, so `2026` reaches the model as "
-            "an unknown token, exactly as it does upstream; spell numbers out first.\n\n"
+            "**Numbers are spelled out for you** (`$15,000.50` is read \"fifteen thousand point five zero "
+            "dollars\"): the vocabulary has no digits, so the file carries the reference's own number "
+            "normaliser (`SpeechT5Tokenizer(normalize=True)`), which loom runs before tokenizing. It "
+            "needs a loom release after 1.0.0-rc11; on rc11 and earlier a number reaches the model as "
+            "an unknown token, as it does upstream by default.\n\n"
             "**English only**, trained on LibriTTS. Stops on the model's own stop head, at most ten "
             "decoder steps (20 frames, 0.32 s) per input character.",
     ),
