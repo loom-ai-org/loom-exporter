@@ -559,6 +559,8 @@ class ValueFacts:
         x_var, reps = op.inputs.get("x"), op.inputs.get("reps")
         if x_var is None or x_var.shape is None or reps is None or reps.op is None:
             return None
+        if reps.op.op_type == "concat":
+            return self._repeat_target_exprs(x_var, reps.op.inputs.get("values"))
         if reps.op.op_type != "real_div" or self.value(reps.op.inputs.get("y")) is None:
             return None
         chosen = reps.op.inputs.get("x")
@@ -572,6 +574,26 @@ class ValueFacts:
             return None
         return [as_expr(int(d)) if isinstance(d, (int, np.integer)) and int(d) != 1 else full[i]
                 for i, d in enumerate(x_var.shape)]
+
+    def _repeat_target_exprs(self, x_var, values):
+        """`x.repeat(*reps)` with a live rep: coremltools packs the reps as `concat` of one scalar per
+        axis, literals beside `gather(shape(t), i)`. The output is `x`'s extent times the rep, axis by
+        axis. Every rep must be a real derivation, not the root-axis guess `scalar_expr` falls back to.
+
+        NeMo's `pad_mask.unsqueeze(1).repeat([1, T, 1])` is the case. Read as ones, the REPEAT was an
+        identity, so `pad ∧ padᵀ` became a MUL of `[T,1,1]` by `[1,T,1]`. Those do not broadcast, the
+        engine's layout healer permuted one onto the other, and the attention mask covered the padded
+        query row but not the padded key column (Retro-065)."""
+        dims = self.whole_shape_exprs(x_var)
+        if values is None or dims is None or len(values) != len(dims):
+            return None
+        target = []
+        for dim, rep in zip(dims, values):
+            expr = self.scalar_expr(rep)
+            if expr is None or self.scalar_expr_is_guess(rep):
+                return None
+            target.append(as_expr(dim) * as_expr(expr))
+        return target
 
     def _reshape_shape_uncached(self, op):
         shape_var = op.inputs.get("shape")

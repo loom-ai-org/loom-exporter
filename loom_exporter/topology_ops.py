@@ -2421,141 +2421,50 @@ def _op_loom_conv_transpose_dw(self, op, ctx):
 
 
 # `less` is the one op type whose rule is genuinely conditional on a *derivation*, not on a static
-# attribute: only a NeMo-style length-validity comparison that provably compares a quantity against
-# itself gets replaced by a baked all-true mask; every other `less` must stay a real comparison and is
-# therefore left to the generic OP_MAP path (which maps it to the LESS primitive). Expressing that as a
-# guard is what makes the fall-through explicit -- before this table it was an `if` the block simply ran
-# off the end of, the single easiest thing in the whole dispatcher to misread as "handled".
+# attribute: only a length-validity comparison that provably compares a quantity against itself gets
+# replaced by a baked all-true mask; every other `less` must stay a real comparison and is therefore left
+# to the generic OP_MAP path (which maps it to the LESS primitive). Expressing that as a guard is what
+# makes the fall-through explicit -- before this table it was an `if` the block simply ran off the end
+# of, the single easiest thing in the whole dispatcher to misread as "handled".
 
 def _less_is_always_valid_mask(self, op):
-    """True iff this `less` is the length-validity mask idiom whose result is all-true by
-    construction. See the derivation below for why that is a correctness fix rather than an
-    optimization."""
-    # Recognize NeMo-style length-validity masking (`torch.arange(T) < length`, comparing a
-    # bare position index against a value derived from the graph's own "length" input) and
-    # bake its result as a constant all-true (1.0) tensor instead of translating the real
-    # comparison -- rather than a shape-derivation fix, this sidesteps a genuine, deeply
-    # rooted correctness bug in the traced MIL graph itself: NeMo's own `calc_length()`
-    # formula (used to compute the comparison's RHS bound) traces with a wrong constant baked
-    # in for `all_paddings` (confirmed directly by reading the exported GGUF's own stored
-    # weight values and reconstructing the exact arithmetic: `all_paddings - kernel_size`
-    # computes as `1 - 3` instead of the real `2 - 3`, since coremltools' own optimizer had
-    # ALSO already eliminated every standalone `torch.floor()` call in this chain as a
-    # provable no-op for the specific dummy trace length used -- confirmed via `grep`, there
-    # are zero raw `FLOOR` ops anywhere in the exported topology -- so the wrong constant
-    # can't be fixed by recovering a dropped floor, the arithmetic itself is wrong). See
-    # BACKLOG.md for the full derivation.
-    #
-    # Rather than reverse-engineer and re-derive NeMo's exact (buggy-under-tracing) formula,
-    # this exploits an invariant this WHOLE exporter already assumes everywhere else (the
-    # always-1 batch axis, the "single utterance" driver-script shape): every model this
-    # exporter targets is run with `length` set to the REAL, exact length of `waveform` --
-    # there is never any actual padding. Under that guarantee, `torch.arange(T) < length` is
-    # true for every position BY CONSTRUCTION (T is itself derived from that same real
-    # length), regardless of what value NeMo's own traced arithmetic computes for the
-    # comparison's RHS. Scoped narrowly (only "less", the one comparison op actually seen in
-    # this exact idiom) rather than every comparison type, matching this file's own
-    # "not implemented since nothing here has needed it yet" convention -- extend if/when a
-    # different comparison op is found doing the same thing.
-    # NOT every `arange(T) < f(length)` this narrow structural pattern matches is actually
-    # this bug: NeMo's real mel-frontend (`FilterbankFeatures.forward`/`normalize_batch`,
-    # traced for real here -- unlike Conformer-CTC-small's own MIL export, which never had a
-    # test comparing its numeric output against a reference and so never caught this) uses
-    # the IDENTICAL `arange(T) < f(length)` shape for a DELIBERATELY different comparison:
-    # `get_seq_len()`'s `floor((length + pad_amount - n_fft) / hop_length)` is genuinely ONE
-    # LESS than the real STFT frame count (`T`, the same "last frame is always invalid"
-    # off-by-one already root-caused and hand-replicated in convert_conformer_ctc.py/
-    # convert_parakeet_tdt.py's own CMVN section -- see valid_frames_expr() there) -- NOT a
-    # tracing artifact, a real, intentional NeMo convention that must NOT be forced to
-    # all-true. Structurally this looks IDENTICAL to the genuine calc_length tracing bug
-    # (both are "arange(T) < floor((length + C1 - C2) / C3)"), so telling them apart needs an
-    # actual identity check: derive T's own real formula (`_find_range_1d_var` + the
-    # `range_1d` case of `_infer_dynamic_dim_expr`, the SAME resolution RANGE_1D's own node
-    # emission uses) and the comparison bound's real formula (`facts.scalar_expr`, walking
-    # through the exact `select`/arithmetic chain `get_seq_len` traces to) and compare them AS
-    # STRINGS -- only bypass when they're the identical expression (proving T and the bound
-    # are the SAME quantity, so any real length must make the comparison true by construction
-    # -- the calc_length case). When they differ (the CMVN case: T is the raw STFT frame
-    # count, the bound is deliberately T-1), leave the real comparison/select chain in place
-    # instead -- every primitive it needs (FLOOR_DIV, promote_i32_to_f32, op_select's
-    # mul_broadcast) already exists, proven by Conformer-CTC's OWN encoder needing them for
-    # other parts of its graph.
-    # A pure STRING-equality check here (an earlier version of this fix) turned out to be
-    # too CONSERVATIVE, not too permissive: Conformer-CTC-small's own encoder/subsampling-
-    # level masks (MaskedConvSequential's per-stage `_create_mask`, and the encoder's own
-    # top-level `_create_masks`) are fed a "length" that ALREADY passes through the mel-
-    # frontend's own `get_seq_len` (T-1) convention, so their OWN "T vs. bound" formulas
-    # come out structurally unequal too (propagated through further conv-shape arithmetic,
-    # off by exactly 1 at SOME lengths and by 0 at others depending on integer-halving
-    # parity) -- structurally indistinguishable from CMVN's own case by pure string
-    # comparison, but NOT the same thing to force-bypass or not: confirmed empirically (via
-    # a real, controlled experiment: force-bypassing EVERY "less" match here, including this
-    # one, dropped Conformer-CTC-small's own encoder-output max abs diff from 2.09 to 0.13 --
-    # i.e. leaving these encoder-level comparisons real, un-bypassed, was making things WORSE,
-    # not more faithful, presumably because they still route through NeMo's own separately-
-    # documented `calc_length`/`all_paddings` tracing bug). Only CMVN's own comparison is
-    # reliably, structurally DIFFERENT in a way worth preserving: unlike the encoder-level
-    # case, it's off by EXACTLY 1 at every possible length, never 0, because it's the raw
-    # "T vs T-1" relationship itself, not something derived further from it. Distinguish via a
-    # numeric probe (several concrete `n_tokens` values, not just one, so a coincidental match
-    # at a single probe can't fool this) rather than a syntactic one: only refuse to bypass
-    # when range == length + 1 at EVERY probe; default to bypass otherwise (matching the
-    # empirically-correct, more permissive behavior for everything else, including the
-    # structurally-similar-looking but NOT-off-by-exactly-1-always encoder-level case).
-    def _eval_expr(expr, n_tokens_value):
-        """`expr` at a concrete sequence length. Substituting into the sympy expression evaluates it
-        exactly, where the previous version round-tripped the expression through a string and `eval`
-        with `/` as float division. The decision this feeds is unchanged on every current model -- the
-        snapshot diff across all 12 shows no LESS node appearing or disappearing -- but there is no
-        re-parsing and no `eval` any more.
+    """True iff this `less` is `arange(T) < bound` with `bound` derived from the graph's "length" input
+    and provably equal to `T`, so the mask is all-true at every length and can be baked.
 
-        Substitutes EVERY free symbol in `expr` with `n_tokens_value`, not just the literal `N_TOKENS`
-        (as an earlier version of this did) -- needed once a topology's root axis can be named
-        something other than "n_tokens" (EXPORT-ROADMAP.md R1, axes.py): Conformer-CTC/Parakeet, the
-        one family this exact bypass exists for, now declares its root axis "n_samples". Hardcoding
-        `N_TOKENS` here would silently substitute nothing for those models, making every probe evaluate
-        to a still-symbolic (non-numeric) expression -- `float()` would then raise, `_eval_expr` would
-        return None for every probe, and the caller's loop reads that as "not always off by exactly
-        one", flipping this bypass from correctly refused (the CMVN case) to wrongly permitted. Sound
-        for the same reason `compare_snapshots.py`'s own probe substitution is: this whole exporter
-        targets models with exactly one true dynamic quantity per topology, so any free symbol reaching
-        here IS that topology's one true axis, whatever it happens to be named."""
-        if expr is None:
-            return None
-        try:
-            expr = as_expr(expr)
-            return float(expr.subs({s: n_tokens_value for s in expr.free_symbols}))
-        except (TypeError, ValueError):
-            return None
+    The one comparison this matches is the NeMo wrapper's waveform mask: range and bound are both
+    `n_samples`. Every other length-validity mask in a NeMo encoder is NOT all-true and stays a real
+    comparison:
 
+    * the mel front end's `get_seq_len` bound is `floor(n/160)`, one less than the STFT frame count, at
+      every length;
+    * `MaskedConvSequential` re-masks after each stride-2 conv with `floor((L - 1)/2) + 1`, and the
+      tensor is one frame longer than that whenever the valid length going into the conv is even. The
+      encoder's `pad_mask` inherits the last stage's length, so it is one short when every stage's input
+      was even (`floor(n/160) % 4 == 0` for a factor-4 model).
+
+    An earlier version baked every such mask all-true on the argument that "a single utterance is never
+    padded" (Retro-013). That was false: the padding is manufactured INSIDE the model by the
+    convolutions, and at about half of all lengths NeMo zeroes a frame that loom kept (Retro-065). The
+    same retro records why the bypass once measured better: the NeMo of the day traced `calc_length`
+    with a wrong constant, so the real comparison was wrong too. The shipped NeMo derives each stage
+    with `calculate_conv_output_size`, and the facts below derive the right bound from it.
+
+    Equality is checked on the symbolic expressions, not at probe lengths, so a match is a proof. Two
+    expressions that are equal but spelled differently fall through to a real LESS, which is still
+    correct -- just not folded. The comparison must also point the right way: `length < arange(T)` is
+    no validity mask."""
     x_var = op.inputs.get("x")
     y_var = op.inputs.get("y")
-    x_is_length = isinstance(x_var, Var) and self._traces_to_length_input(x_var)
-    y_is_length = isinstance(y_var, Var) and self._traces_to_length_input(y_var)
-    range_var = None
-    length_side_var = None
-    if isinstance(x_var, Var) and y_is_length:
-        range_var = self._find_range_1d_var(x_var)
-        length_side_var = y_var
-    elif isinstance(y_var, Var) and x_is_length:
-        range_var = self._find_range_1d_var(y_var)
-        length_side_var = x_var
-    bypass_ok = False
-    if range_var is not None and length_side_var is not None:
-        range_expr = self._infer_dynamic_dim_expr(range_var, 0)
-        length_expr = self.facts.scalar_expr(length_side_var)
-        bypass_ok = True
-        if range_expr is not None and length_expr is not None:
-            always_off_by_exactly_one = True
-            for probe in (1600, 8000, 10240, 16000, 16001, 20000, 31999, 320000):
-                r = _eval_expr(range_expr, probe)
-                l = _eval_expr(length_expr, probe)
-                if r is None or l is None or r != l + 1:
-                    always_off_by_exactly_one = False
-                    break
-            if always_off_by_exactly_one:
-                bypass_ok = False
-    return bypass_ok
+    if not (isinstance(x_var, Var) and isinstance(y_var, Var) and self._traces_to_length_input(y_var)):
+        return False
+    range_var = self._find_range_1d_var(x_var)
+    if range_var is None:
+        return False
+    range_expr = self._infer_dynamic_dim_expr(range_var, 0)
+    bound_expr = self.facts.scalar_expr(y_var)
+    if range_expr is None or bound_expr is None:
+        return False
+    return as_expr(range_expr) - as_expr(bound_expr) == 0
 
 
 @topology_rule('less', guard=_less_is_always_valid_mask,
