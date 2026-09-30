@@ -271,3 +271,52 @@ def test_no_protobuf_and_no_layout_is_refused(tmp_path):
     from loom_exporter.spm_tokenizer_export import write_sentencepiece_vocab
     with pytest.raises(ValueError, match="protobuf"):
         write_sentencepiece_vocab(GGUFWriter(str(tmp_path / "x.gguf"), "x"), None)
+
+
+# -- a CHAR model (SpeechT5's `spm_char.model`) ----------------------------------------------------
+
+def _char_proto(pieces) -> bytes:
+    m = spm_pb2.ModelProto()
+    m.trainer_spec.model_type = m.trainer_spec.CHAR
+    m.normalizer_spec.add_dummy_prefix = True
+    m.normalizer_spec.precompiled_charsmap = b"\x00\x00\x00\x00charsmap"
+    for piece, kind in [("<s>", 3), ("<pad>", 3), ("</s>", 3), ("<unk>", 2)] + [(p, 1) for p in pieces]:
+        entry = m.pieces.add()
+        entry.piece, entry.score, entry.type = piece, -1.0, kind
+    return m.SerializeToString()
+
+
+def test_a_char_model_of_single_characters_is_written_as_unigram():
+    """Every matchable piece is one character, so the Unigram lattice has exactly one path -- the
+    CHAR model's split. SentencePiece merges an unknown run into one `<unk>` in both models."""
+    writer = _RecordingWriter()
+    write_sentencepiece_vocab(writer, _char_proto(["▁", "a", "b", "̄"]))
+    assert writer.kv["tokenizer_model"] == "t5"
+    assert writer.kv["token_list"] == ["<s>", "<pad>", "</s>", "<unk>", "▁", "a", "b", "̄"]
+
+
+def test_the_char_split_is_the_unigram_split_in_sentencepiece_itself():
+    """The claim the mapping rests on, measured on SentencePiece rather than argued: the same pieces
+    re-typed UNIGRAM encode every string -- unknown runs included -- identically."""
+    import random
+
+    import sentencepiece as spm
+
+    raw = _char_proto(list("▁abcde.,"))
+    m = spm_pb2.ModelProto()
+    m.ParseFromString(raw)
+    m.normalizer_spec.precompiled_charsmap = b""          # identity normalisation for both
+    char = spm.SentencePieceProcessor(model_proto=m.SerializeToString())
+    m.trainer_spec.model_type = m.trainer_spec.UNIGRAM
+    uni = spm.SentencePieceProcessor(model_proto=m.SerializeToString())
+    rng = random.Random(0)
+    alphabet = list("abcde., xyz09")
+    for _ in range(2000):
+        s = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 24)))
+        assert char.encode(s) == uni.encode(s), repr(s)
+
+
+def test_a_char_model_with_a_multi_character_piece_is_refused():
+    """With a two-character piece the lattice has a second path, and Unigram would take it."""
+    with pytest.raises(NotImplementedError, match="multi-character"):
+        write_sentencepiece_vocab(_RecordingWriter(), _char_proto(["▁", "a", "ab"]))

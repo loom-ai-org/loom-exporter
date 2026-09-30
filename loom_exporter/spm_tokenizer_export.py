@@ -71,6 +71,13 @@ from sentencepiece import sentencepiece_model_pb2 as spm_pb2
 _TYPE_NORMAL = 1
 _TYPE_UNKNOWN = 2
 _TYPE_CONTROL = 3
+_TYPE_USER_DEFINED = 4
+
+
+def _every_piece_is_one_character(m) -> bool:
+    """True when every piece text can match (NORMAL and USER_DEFINED) is a single code point -- the
+    condition under which a CHAR model's split is the only path through a Unigram lattice."""
+    return all(len(p.piece) == 1 for p in m.pieces if p.type in (_TYPE_NORMAL, _TYPE_USER_DEFINED))
 
 # The roles read out of `special_tokens_map.json` / `tokenizer_config.json`, as the keys both files
 # spell them with. TWO, not four: `bos_token`/`eos_token` are named by tokenizers that do not add them
@@ -303,10 +310,19 @@ def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: Optiona
             tokenizer_model_tag = "t5"
         elif model_type == m.trainer_spec.BPE:
             tokenizer_model_tag = "llama"
+        elif model_type == m.trainer_spec.CHAR and _every_piece_is_one_character(m):
+            # A CHAR model (SpeechT5's `spm_char.model`) splits the normalised text into characters
+            # and looks each one up. When every matchable piece IS one character, a Unigram lattice
+            # over the same pieces has exactly one path -- that split -- so the Unigram encoder is the
+            # CHAR encoder, unknown runs included: SentencePiece merges consecutive unknowns into one
+            # `<unk>` in both models (`2026` is one id, 3, not four). Measured, not argued: the
+            # protobuf re-typed UNIGRAM encodes 20000/20000 random strings identically to the CHAR
+            # original and to `SpeechT5Tokenizer` (`tests/ci/test_spm_tokenizer_export.py`).
+            tokenizer_model_tag = "t5"
         else:
-            raise NotImplementedError(f"SentencePiece model_type {model_type} (WORD/CHAR) is not "
-                                       "implemented on the C++ side (loom::Vocab only supports "
-                                       "UNIGRAM and BPE)")
+            raise NotImplementedError(f"SentencePiece model_type {model_type} (WORD, or CHAR with a "
+                                       "multi-character piece) is not implemented on the C++ side "
+                                       "(loom::Vocab only supports UNIGRAM and BPE)")
     else:
         # `read_hf_id_layout` returns None for anything but Unigram, so reaching here without a proto
         # means Unigram -- but assert it rather than assume, because the type split above is only
