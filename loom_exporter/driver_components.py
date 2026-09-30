@@ -74,6 +74,8 @@ GENERIC_PRIMARY_INPUT = "tokens"
 
 # `DriverInputs.bindings` kinds.
 CALLER, POSITION, MASK, NOISE, DEFAULTED = "caller", "position", "mask", "noise", "defaulted"
+# A caller input read by its OWN name only, with no `tokens` alias -- see `required_input`.
+REQUIRED = "required"
 
 # The seed a driver draws its noise from when the caller names none.
 #
@@ -95,6 +97,19 @@ def caller_input(name: str):
     if name == GENERIC_PRIMARY_INPUT:
         return field_access
     return BinOp("or", field_access, FieldAccess("inputs", GENERIC_PRIMARY_INPUT))
+
+
+def required_input(name: str):
+    """Reads one input from the driver's `inputs` table by its own name, and fails by name without it.
+
+    For a driver with no single primary input, where the `tokens` alias `caller_input` offers is
+    WRONG rather than merely unused. F5-TTS takes a reference clip (`waveform`) and character ids
+    (`text_ids`); aliasing both to `tokens` meant a bare `text2speech.infer("hello world")` handed the
+    sentence's ids to the mel front end AS AUDIO SAMPLES, and the call died somewhere past it with an
+    error about neither. Here the missing input is the error, and it names what to pass."""
+    return BinOp("or", FieldAccess("inputs", name), Call("error", [Lit(
+        f"this model needs the input `{name}`, passed by that name -- it has no single primary "
+        f"input, so `tokens` does not stand in for it")]))
 
 
 @dataclass
@@ -210,6 +225,8 @@ class DriverInputs(DriverComponent):
                 # a call.
                 out.append(Local(name, BinOp("or", FieldAccess("inputs", name),
                                              ArrayLit([Lit(v) for v in self.defaults[name]]))))
+            elif kind == REQUIRED:
+                out.append(Local(name, required_input(name)))
             else:
                 out.append(Local(name, caller_input(name)))
         return out

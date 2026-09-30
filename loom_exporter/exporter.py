@@ -3297,14 +3297,19 @@ class LoomGGUFExporter:
         # struct. Unlike those two this is DECLARED by the config rather than derived from the emitted
         # graph -- the two geometries answer "what did this export produce", these answer "what does a
         # caller have to know", and only the config knows the second.
+        # A string is a scalar too (`hparam_str`): F5-TTS's `tts.reference` names how a host builds
+        # its reference inputs, which is a word rather than a number.
         for key, value in (self.kwargs.get("hparams") or {}).items():
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
+            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
                 raise TypeError(
                     f"hparams[{key!r}] is {value!r} ({type(value).__name__}). `hparams()` writes GGUF "
-                    f"scalars a host reads back with hparam_u32/hparam_f32, so only int and float are "
-                    f"representable -- anything structured belongs in a topology or in the driver."
+                    f"scalars a host reads back with hparam_u32/hparam_f32/hparam_str, so only int, "
+                    f"float and str are representable -- anything structured belongs in a topology or "
+                    f"in the driver."
                 )
-            if isinstance(value, int):
+            if isinstance(value, str):
+                w.add_string(f"loom.{key}", value)
+            elif isinstance(value, int):
                 w.add_uint32(f"loom.{key}", value)
             else:
                 w.add_float32(f"loom.{key}", float(value))

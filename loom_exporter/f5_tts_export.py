@@ -114,6 +114,10 @@ DIT_ARCH = dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, text_mask
 # a dynamic axis feeding an `outer` -- is the shape the exporter's own walk is worst at.
 MAX_POS = 8192
 
+# What `loom.tts.reference` says: the reference clip's transcript is PREFIXED to the text, and the model
+# in-fills one spectrogram whose first frames are the clip.
+REFERENCE_MODE = "infill"
+
 # `infer_batch_process`'s own defaults, which are the numbers every published F5-TTS sample was
 # produced with. `sway_sampling_coef = -1` is not a tuning knob in disguise: the reference passes it
 # unconditionally and the checkpoint was evaluated under it.
@@ -597,7 +601,7 @@ class F5TTSExportConfig(BaseMultiPhaseModelExportConfig):
 
     def driver_components(self) -> List:
         from .driver_components import (
-            CALLER, DriverInputs, DriverReturn, ExportConstants, FlowMatchingSampler, LuaFragment,
+            DriverInputs, DriverReturn, ExportConstants, FlowMatchingSampler, LuaFragment, REQUIRED,
             SubgraphCallComponent,
         )
         from .lua_library import LuaLibrary
@@ -621,7 +625,9 @@ class F5TTSExportConfig(BaseMultiPhaseModelExportConfig):
                 "DEFAULT_SPEED": 1.0,
             }),
             LuaLibrary(uses=("array_slice",)),
-            DriverInputs(bindings=(("waveform", CALLER), ("text_ids", CALLER)),
+            # REQUIRED, not CALLER: two inputs of different kinds and neither is primary, so the
+            # `tokens` alias would hand a bare sentence's ids to the mel front end as samples.
+            DriverInputs(bindings=(("waveform", REQUIRED), ("text_ids", REQUIRED)),
                          n_tokens=Len("waveform")),
             LuaFragment(fragment / "01_reference.lua",
                         reads=("waveform", "TARGET_RMS"),
@@ -675,7 +681,12 @@ class F5TTSExportConfig(BaseMultiPhaseModelExportConfig):
     def hparams(self) -> dict:
         # NOT `sample_rate`: `contract()` already writes `loom.sample_rate`, and declaring it here as
         # well made the writer log a duplicate-key overwrite. One fact, one writer.
-        return {"n_mel": N_MEL, "hop_length": HOP_LENGTH}
+        #
+        # `tts.reference`: this model clones by IN-FILLING, so a host's `reference=` door joins the
+        # transcript to the text and passes the clip as `waveform`, the ids as `text_ids` and the join as
+        # `n_ref_text` (loom-py `Text2Speech._reference_inputs`, `loom_cli --ref-text`). Declared rather
+        # than inferred: a model that does not in-fill would ignore the clip and speak in its own voice.
+        return {"n_mel": N_MEL, "hop_length": HOP_LENGTH, "tts.reference": REFERENCE_MODE}
 
     def contract(self) -> dict:
         contract = super().contract()
