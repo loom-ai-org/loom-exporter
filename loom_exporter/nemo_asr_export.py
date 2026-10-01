@@ -181,9 +181,15 @@ class EncoderOutput(Enum):
         the traced value after the Python name it is bound to, so binding one here renames this
         topology's declared output (confirmed against the golden snapshot -- naming the local `selected`
         turned Parakeet's output from `var_4640` into `selected`, an otherwise byte-identical export).
-        Validation therefore inspects the model's own outputs, never this result."""
+        Validation therefore inspects the model's own outputs, never this result.
+
+        **CTC log-probs are cut to `encoded_len`**, the frames NeMo itself decodes. The tensor can be one
+        frame longer: the mel front end counts `floor(n/160)` valid frames out of `floor(n/160) + 1`, and
+        each stride-2 stage rounds the two counts apart again (Citrinet: 39 frames, 38 counted, for
+        48777 samples). That frame is computed from masked context and NeMo never reads it; the CTC
+        driver reads every row, so it is cut here, in the graph, rather than trusted to decode blank."""
         if self is EncoderOutput.CTC_LOG_PROBS:
-            return outputs[0]
+            return outputs[0][:, :outputs[1][0]]
         return outputs[0].transpose(1, 2)
 
     def validate(self, model, outputs):
@@ -418,7 +424,122 @@ def load_model(spec: ASRNemoEncoderExportConfig):
     print(f"Loading NeMo model from {spec.checkpoint}...")
     model = nemo_asr.models.ASRModel.restore_from(spec.checkpoint, map_location="cpu")
     model.eval()
+    if isinstance(model.encoder, nemo_asr.modules.ConvASREncoder):
+        prepare_conv_asr_encoder_for_trace(model)
     return model
+
+
+# Seconds of probe audio `prepare_conv_asr_encoder_for_trace` compares the model on, before and after.
+# The odd sample count is the point: it makes the mel frame count neither a multiple of `pad_to` nor
+# one the strided convolutions divide evenly, which are the two cases the preparation changes.
+CONV_ASR_CHECK_SAMPLES = 5 * 16000 + 777
+# Relative to max |log-prob|. Citrinet-1024 measures 3.3e-5 absolute on JFK, against an f32-vs-f64 spread
+# of NeMo's own unpatched forward of 1.5e-4: the patched forward sits nearer the f64 one than the
+# original does. A real defect in the masks moves a frame by whole nats.
+CONV_ASR_CHECK_TOLERANCE = 1e-5
+
+
+def prepare_conv_asr_encoder_for_trace(model) -> None:
+    """Makes a `ConvASREncoder` (Citrinet, QuartzNet, Jasper) trace to ONE graph, then checks it is
+    still the same model on the frames NeMo decodes.
+
+    Three things in NeMo's eval forward are Python-side state, and `torch.jit.trace` bakes each one:
+
+    1. **The masks slice a cached `seq_range` buffer.** `MaskedConv1d.mask_input` and
+       `SqueezeExcite.make_pad_mask` read `self.seq_range[:T]`, and `ConvASREncoder` regrows that buffer
+       (to 2x the longest input seen) at the start of every forward. The trace records the buffer as a
+       constant, so its size depends on the trace's own length, and two trace runs record different
+       graphs (`Graphs differed across invocations`). Rebuilt here from `arange(T)`, the value
+       `seq_range[:T]` holds anyway, so the comparison stays live and the shape walk can still prove
+       when it is all-true.
+    2. **Squeeze-excite's average is masked** (a sum over the valid frames divided by the valid count),
+       and the replacement keeps that. Only the global-context form (`context_window < 0`) is
+       reproduced; a limited window is a different reduction and raises rather than being approximated.
+    3. **`pad_to` pads the mel frames to a multiple of 16 behind a Python `if`.** The trace would bake
+       the 1 s trace clip's pad (11 frames) into every length. Padding is turned off instead: the
+       padded frames are masked out of every convolution, so they change how many frames come out
+       past the valid length and nothing inside it.
+
+    `CONV_ASR_CHECK_SAMPLES` of a chirp runs through the model before and after, and the log-probs of
+    the frames NeMo itself counts (`encoded_len`) must agree within `CONV_ASR_CHECK_TOLERANCE`.
+    """
+    from nemo.collections.asr.parts.submodules.jasper import MaskedConv1d, SqueezeExcite
+
+    featurizer = model.preprocessor.featurizer
+    if featurizer.pad_to == "max":
+        raise ValueError(
+            "prepare_conv_asr_encoder_for_trace: this checkpoint pads every mel to its preprocessor's "
+            "max_duration (`pad_to: max`). That is a fixed frame count, not a rounding; reproduce it "
+            "rather than dropping it."
+        )
+    sample_rate = int(model.cfg.preprocessor.sample_rate)
+    t = torch.arange(CONV_ASR_CHECK_SAMPLES, dtype=torch.float32) / sample_rate
+    seconds = CONV_ASR_CHECK_SAMPLES / sample_rate
+    probe = torch.sin(2.0 * torch.pi * (200.0 + 1500.0 * t / seconds) * t).unsqueeze(0)
+    probe_len = torch.tensor([CONV_ASR_CHECK_SAMPLES])
+    with torch.no_grad():
+        want, want_len, _ = model(input_signal=probe, input_signal_length=probe_len)
+
+    featurizer.pad_to = 0
+    model.encoder.update_max_sequence_length = lambda seq_length, device: None
+    for module in model.encoder.modules():
+        if isinstance(module, MaskedConv1d):
+            module.forward = types.MethodType(_masked_conv1d_forward, module)
+        elif isinstance(module, SqueezeExcite):
+            if module.context_window >= 0:
+                raise ValueError(
+                    f"prepare_conv_asr_encoder_for_trace: a SqueezeExcite with context_window="
+                    f"{module.context_window} pools a limited window, and only the global average "
+                    f"(context_window < 0) is reproduced."
+                )
+            module.forward = types.MethodType(_squeeze_excite_forward, module)
+
+    with torch.no_grad():
+        got, got_len, _ = model(input_signal=probe, input_signal_length=probe_len)
+    n = int(want_len[0])
+    if int(got_len[0]) != n or got.shape[1] < n:
+        raise ValueError(
+            f"prepare_conv_asr_encoder_for_trace: NeMo counts {n} encoder frames for "
+            f"{CONV_ASR_CHECK_SAMPLES} samples; the prepared model counts {int(got_len[0])} and emits "
+            f"{got.shape[1]}."
+        )
+    scale = max(want[0, :n].abs().max().item(), 1.0)
+    deviation = (want[0, :n] - got[0, :n]).abs().max().item()
+    if deviation > CONV_ASR_CHECK_TOLERANCE * scale:
+        raise ValueError(
+            f"prepare_conv_asr_encoder_for_trace: the prepared model's log-probs differ from NeMo's own "
+            f"by {deviation} (max |log-prob| = {scale}) over the {n} frames NeMo decodes. The "
+            f"preparation exists to be the same model, so this is a defect in it, not a tolerance."
+        )
+
+
+def _masked_conv1d_forward(self, x, lens):
+    """`MaskedConv1d.forward` with its mask built from `arange(T)` instead of the cached `seq_range`
+    buffer (see `prepare_conv_asr_encoder_for_trace`). Everything after the mask is NeMo's own."""
+    if self.use_mask:
+        valid = torch.arange(x.size(2), device=x.device).unsqueeze(0) < lens.unsqueeze(1)
+        x = x * valid.unsqueeze(1).to(x.dtype)
+    lens = self.get_seq_len(lens)
+    if self.pad_layer is not None:
+        x = self.pad_layer(x)
+    sh = x.shape
+    if self.heads != -1:
+        x = x.view(-1, self.heads, sh[-1])
+    out = self.conv(x)
+    if self.heads != -1:
+        out = out.view(sh[0], self.real_out_channels, -1)
+    return out, lens
+
+
+def _squeeze_excite_forward(self, x, lengths):
+    """`SqueezeExcite.forward_for_export` for the global context, with the mask built from `arange(T)`.
+    NeMo's `masked_fill(pad, 0)` is a multiply by the valid mask here: the same values for finite `x`,
+    and the form the masked convolutions already lower through."""
+    valid = (torch.arange(x.shape[-1], device=x.device).unsqueeze(0) < lengths.unsqueeze(-1)).unsqueeze(1)
+    x = x * valid.to(x.dtype)
+    y = torch.sum(x, dim=-1, keepdim=True) / valid.sum(dim=-1, keepdim=True).to(x.dtype)
+    y = self.fc(y.transpose(1, -1)).transpose(1, -1)
+    return x * torch.sigmoid(y), lengths
 
 
 def build_trace(spec, model, sample_rate: int):
@@ -497,14 +618,31 @@ def _is_nemo_archive(path: Path) -> bool:
     return path.is_file() and path.suffix == ".nemo"
 
 
+def _is_ctc_bpe(cfg: dict) -> bool:
+    return str(cfg.get("target", "")).endswith("EncDecCTCModelBPE")
+
+
+def _is_conv_asr_encoder(cfg: dict) -> bool:
+    """Citrinet restores through the same `EncDecCTCModelBPE` as Conformer-CTC; what differs is the
+    encoder, a stack of 1-D Jasper blocks (`ConvASREncoder`) rather than a Conformer."""
+    return str((cfg.get("encoder") or {}).get("_target_", "")).endswith("ConvASREncoder")
+
+
 def _is_conformer_ctc(path: Path) -> bool:
-    """Real structural check (BACKLOG.md P3.2): `target` is unambiguous for this family --
-    `EncDecCTCModelBPE`, confirmed against the real checkpoint (see this module's own docstring: the
-    restore class doesn't vary, `ASRModel.restore_from` dispatches on this same field)."""
+    """Real structural check (BACKLOG.md P3.2): `target` is `EncDecCTCModelBPE`, confirmed against the
+    real checkpoint (see this module's own docstring: the restore class doesn't vary,
+    `ASRModel.restore_from` dispatches on this same field), and the encoder is not Citrinet's."""
     if not _is_nemo_archive(path):
         return False
     cfg = _read_nemo_model_config(path)
-    return str(cfg.get("target", "")).endswith("EncDecCTCModelBPE")
+    return _is_ctc_bpe(cfg) and not _is_conv_asr_encoder(cfg)
+
+
+def _is_citrinet(path: Path) -> bool:
+    if not _is_nemo_archive(path):
+        return False
+    cfg = _read_nemo_model_config(path)
+    return _is_ctc_bpe(cfg) and _is_conv_asr_encoder(cfg)
 
 
 def _is_parakeet_tdt(path: Path) -> bool:
@@ -536,6 +674,13 @@ def _build_conformer_ctc(path: Path, output_path: str):
     )
 
 
+def _build_citrinet(path: Path, output_path: str):
+    return ASRNemoEncoderExportConfig(
+        checkpoint=str(path), output=EncoderOutput.CTC_LOG_PROBS,
+        architecture="citrinet", output_path=output_path,
+    )
+
+
 def _build_parakeet_tdt(path: Path, output_path: str):
     # The WHOLE model, not just the encoder (BACKLOG.md P4.0.17 step 2): encoder + embedding +
     # prediction LSTM + joint, in one GGUF with a driver that decodes. The encoder-only
@@ -564,6 +709,7 @@ def register(registry) -> None:
         config_class=ASRNemoEncoderExportConfig,
         recognizers=[
             ModelRecognizer(name="conformer-ctc", detect=_is_conformer_ctc, build_config=_build_conformer_ctc),
+            ModelRecognizer(name="citrinet", detect=_is_citrinet, build_config=_build_citrinet),
             ModelRecognizer(name="parakeet-tdt", detect=_is_parakeet_tdt, build_config=_build_parakeet_tdt),
             ModelRecognizer(name="parakeet-rnnt", detect=_is_parakeet_rnnt, build_config=_build_parakeet_rnnt),
         ],
