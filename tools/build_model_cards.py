@@ -1451,11 +1451,12 @@ model = loom.Model.from_pretrained("{repo_id}")
 
 # Audio is a mono float list at 16 kHz, up to 40 s (longer clips are not chunked).
 # `language` is what the audio is in; it is not detected, and defaults to English.
-# `target_language` is what to write; it defaults to English, so German audio with no
-# arguments comes back translated into English.
-print(model.speech2text.infer(audio, language="de", target_language="de").text)   # transcript
-print(model.speech2text.infer(audio, language="de").text)                         # into English
-print(model.speech2text.infer(audio, language="en", target_language="fr").text)   # English into French
+result = model.speech2text.infer(audio)
+print(result.text)
+
+# `target_language` is what to WRITE, and it defaults to English: German audio with no target comes
+# back translated, and language="de", target_language="de" keeps it German.
+print(model.speech2text.infer(audio, language="en", target_language="fr").text)
 """,
     # Two TTS snippets, because "TTS" is not one answer. Which one a model gets is `takes_text` below,
     # a per-model fact read off the export rather than assumed from the task -- the single phoneme-ids
