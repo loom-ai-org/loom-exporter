@@ -1277,6 +1277,10 @@ SYNTHESIZED_BUILDERS = {
     # common case: what a host does with a flattened graph's one output is simply not implied by how
     # the graph was decomposed.
     "CodecDecode": CodecDecodeBuilder,
+    # The same builder for family 13 (an embedding, or class probabilities), under the name that says
+    # what it does there: nothing to reduce, the output is the answer. A second key rather than family
+    # 13 asking for "CodecDecode", so the catalogue attributes it to what the models are.
+    "ReturnOutput": CodecDecodeBuilder,
 }
 
 
@@ -2169,6 +2173,53 @@ class RecurrentCall(DriverComponent):
         return _note_block(self.note) + [Local(self.out_var, Call(binding, [
             Lit(self.topology), self.sequence, self.seq_len,
             Lit(self.input_dim), Lit(self.hidden_dim), Lit(self.reverse),
+        ]))]
+
+
+@dataclass
+class BiRecurrentCall(DriverComponent):
+    """One `loom.run_bi_recurrent_and_retain` call: a BIDIRECTIONAL LSTM layer, both directions swept in
+    C++ and retained as one `[h_fwd | h_bwd]` row per timestep in the forward cell's store.
+
+    `RecurrentCall` covers a unidirectional stack; this is its bidirectional sibling, and the binding it
+    calls predates it (the TTS families reach it through `run_bi_lstm.lua`). A component of its own
+    rather than a `reverse=True` pair of `RecurrentCall`s because the interleave is the point: two
+    stores cannot be concatenated by naming them, so a pair would hand the next layer two halves it has
+    no way to join without marshalling both. Family 13's pyannote segmentation is the first synthesized
+    driver to need it -- a four-layer BiLSTM, each layer reading the previous one's retained rows.
+
+    The `rows` layout, `[2 * hidden_dim, seq_len]`, is what both of its consumers read: the next
+    layer's sequence and a time-major graph input.
+    """
+
+    forward_topology: str
+    backward_topology: str
+    out_var: str
+    sequence: object
+    seq_len: object
+    input_dim: int
+    hidden_dim: int
+    note: Optional[str] = None
+
+    __links__ = {"forward_topology": TopologyName(), "backward_topology": TopologyName()}
+    __unchecked__ = {
+        "note": _NOTE_IS_COSMETIC,
+        "out_var": Unchecked("the local this call binds (the store generation); reads of it are "
+                             "checked by driver_ir.validate over the assembled function"),
+        "sequence": Unchecked("a driver_ir expression -- as RecurrentCall's own `sequence`"),
+        "seq_len": Unchecked("same. The binding checks it against the sequence's real size"),
+        "input_dim": Unchecked("the cell's input width, from the traced `lstm` op via RecurrentPhase; "
+                               "the binding checks it against the sequence and the cell topology"),
+        "hidden_dim": Unchecked("same, for the h/c width each direction's cell declares"),
+    }
+
+    def link_label(self) -> str:
+        return f"loom.run_bi_recurrent_and_retain({self.forward_topology!r}, {self.backward_topology!r})"
+
+    def emit(self, ctx):
+        return _note_block(self.note) + [Local(self.out_var, Call("loom.run_bi_recurrent_and_retain", [
+            Lit(self.forward_topology), Lit(self.backward_topology), self.sequence, self.seq_len,
+            Lit(self.input_dim), Lit(self.hidden_dim), Lit("rows"),
         ]))]
 
 
