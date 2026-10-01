@@ -1,0 +1,12 @@
+-- Canary (canary_export.py): a FastConformer encoder run once over the whole clip, then a KV-cached
+-- cross-attention decode loop.
+--
+-- Three traced topologies: `encoder` takes the waveform and its length (NeMo's mel front end is inside
+-- the graph) and emits the encoder states already cut to NeMo's `encoded_len`; `cross_kv` projects them
+-- into every decoder layer's cross-attention K/V, once; `decoder` is one cached step.
+--
+-- inputs: waveform, length (one element: the sample count), and four optional ones -- language (the
+-- SOURCE language's token id; omitted means the checkpoint's default, since canary2 has no language
+-- detection), target_language (a token id; omitted means English), task (0 = "the source language",
+-- i.e. a transcript; else a target id), max_new_tokens. Returns the generated ids, `<|endoftext|>`
+-- included when it was reached.

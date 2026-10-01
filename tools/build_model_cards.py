@@ -300,6 +300,19 @@ CATALOG = [
         title="Paraformer-large (Chinese/English)",
         summary="Alibaba's Paraformer-large non-autoregressive ASR model, exported for loom.cpp.",
     ),
+    # FastConformer + transformer decoder; transcribes AND translates. Its own snippet because the
+    # multilingual one says "omit language= to detect it", and canary2 has no detection: the source
+    # defaults to English, and the language WRITTEN is its own argument (ADR-061), defaulting to English.
+    ModelCard(
+        slug="canary-1b-v2", checkpoint=Path("canary-1b-v2/canary-1b-v2.nemo"),
+        export_task="automatic-speech-recognition", export_model="canary",
+        task_type="automatic-speech-recognition", selects_language=True,
+        base_repo="nvidia/canary-1b-v2", license_id="cc-by-4.0",
+        language=["bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it", "lv",
+                  "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk"],
+        title="Canary 1B v2", summary="NVIDIA NeMo's Canary 1B v2 speech recognition and translation model (25 languages), exported for loom.cpp.",
+        snippet="automatic-speech-recognition-canary",
+    ),
     ModelCard(
         slug="parakeet-tdt-0.6b", checkpoint=Path("parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo"),
         export_task="automatic-speech-recognition", export_model="parakeet-tdt",
@@ -1430,6 +1443,19 @@ result = model.speech2text.infer(audio, language="en", timestamps=True)
 print(result.text)
 for segment in result.segments:
     print(segment.start, segment.end, segment.text)
+""",
+    # Canary's door: no language detection, and a target language of its own (ADR-061).
+    "automatic-speech-recognition-canary": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# Audio is a mono float list at 16 kHz, up to 40 s (longer clips are not chunked).
+# `language` is what the audio is in; it is not detected, and defaults to English.
+# `target_language` is what to write; it defaults to English, so German audio with no
+# arguments comes back translated into English.
+print(model.speech2text.infer(audio, language="de", target_language="de").text)   # transcript
+print(model.speech2text.infer(audio, language="de").text)                         # into English
+print(model.speech2text.infer(audio, language="en", target_language="fr").text)   # English into French
 """,
     # Two TTS snippets, because "TTS" is not one answer. Which one a model gets is `takes_text` below,
     # a per-model fact read off the export rather than assumed from the task -- the single phoneme-ids
