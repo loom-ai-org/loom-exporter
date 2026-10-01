@@ -534,6 +534,12 @@ class LoomGGUFExporter:
             # axis. Family 5 found it: `x.mean(dim=2, keepdim=True)` one op upstream of a position
             # table, where the answer came out as one row per audio SAMPLE.
             "loom_scale",
+            # `batch_norm` is per-channel affine, so every axis passes through. It is absent from every
+            # export before family 13 because coremltools folds a batch norm into the convolution that
+            # feeds it -- and speechbrain's `TDNNBlock` is conv -> ReLU -> batch norm, so its norms
+            # survive as ops. ECAPA's first export lost the frame count at the first one and every
+            # downstream frame axis, the Res2Net split's included, came out as `n_samples`.
+            "batch_norm",
         }
         if op.op_type in _UNARY_PASSTHROUGH_OPS:
             # Pure unary, shape-preserving ops -- the axis's real expression is whatever its single
@@ -713,6 +719,23 @@ class LoomGGUFExporter:
             if in_expr is None:
                 return None
             return floor_div(in_expr + (pad_before + pad_after) - eff_kernel, stride) + 1
+
+        if op.op_type == "max_pool":
+            # `[batch, channels, time]` -> `floor((time - k) / s) + 1` on the time axis, the other two
+            # passed through -- the unpadded floor-mode pool `topology_ops`' rule is the only one that
+            # lowers (pyannote's SincNet). Without this case the walk falls back to the root axis and
+            # every frame count after the first pool reads as a sample count.
+            x_var = op.inputs.get("x")
+            kernel = static_value(op.inputs.get("kernel_sizes"))
+            strides = static_value(op.inputs.get("strides"))
+            if x_var is not None and kernel is not None and len(kernel) == 1 and len(var.shape) == 3:
+                if torch_axis < 2:
+                    return self._infer_dynamic_dim_expr(x_var, torch_axis, _seen)
+                in_expr = self._infer_dynamic_dim_expr(x_var, 2, _seen)
+                if in_expr is not None:
+                    k = int(kernel[0])
+                    s_ = int(strides[0]) if strides is not None and len(strides) else k
+                    return floor_div(in_expr - k, s_) + 1
 
         if op.op_type in ("upsample_nearest_neighbor", "upsample_bilinear"):
             # MIL's `upsample_nearest_neighbor`/`upsample_bilinear` (core ops, see the matching op_type
@@ -1643,7 +1666,8 @@ class LoomGGUFExporter:
             return
 
         # And family 11's, which reduces nothing at all: a codec decoder's output is the waveform.
-        if self.kwargs.get("driver_builder") == "CodecDecode":
+        # Family 13's embeddings and class probabilities are the same shape of driver.
+        if self.kwargs.get("driver_builder") in ("CodecDecode", "ReturnOutput"):
             self.apply_codec_decode_export(bindings, input_names, n_tokens_expr)
             return
 

@@ -248,6 +248,10 @@ class LoomExportConfig:
             # ship the WordPiece vocabulary that encodes it, so a host can offer a text door with no
             # step happening outside the engine.
             "token-classification": ("text", "class"),
+            # Family 13. Its config writes its own contract (the granularity and frame rate are
+            # per-leaf), so these two are what a config built outside it would declare.
+            "audio-classification": ("audio", "class"),
+            "audio-embedding": ("audio", "embeddings"),
             # `audio_codes` rather than `token_ids`, and ADR-020 is the argument: the latter folds
             # onto "text" in `ModelContract::interface_side`, so a codec would declare itself
             # `text2speech` and be offered a text door it has no vocabulary for.

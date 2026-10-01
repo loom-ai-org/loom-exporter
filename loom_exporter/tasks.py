@@ -125,6 +125,29 @@ TASKS: Dict[str, TaskSpec] = {
             base_config="token_classification_export:TokenClassificationExportConfig",
         ),
         TaskSpec(
+            name="audio-classification",
+            summary=(
+                "Audio-in/class-distribution-out, once per clip (language id) or once per encoder "
+                "frame (voice activity, speaker segmentation) -- EXPORT-ROADMAP.md's family 13. One "
+                "traced graph whose output is the answer; how many answers there are is the contract's "
+                "`output.granularity` (loom.cpp ADR-062), not a second task."
+            ),
+            # `LoomExportConfig`, for the reason `automatic-speech-recognition` gives: TitaNet,
+            # MarbleNet and ECAPA are one traced graph (`AudioClassificationExportConfig`), pyannote's
+            # segmentation is three phases around a BiLSTM (`PyannoteSegmentationExportConfig`, a
+            # `BaseMultiPhaseModelExportConfig`). One contract, two export shapes.
+            base_config=None,
+        ),
+        TaskSpec(
+            name="audio-embedding",
+            summary=(
+                "Audio-in/one-vector-out: a speaker (or audio) embedding per clip -- family 13's other "
+                "contract. Distinct from `audio-classification` because the output is a point in a "
+                "space with no labels, which a host compares rather than reads."
+            ),
+            base_config="audio_classification_export:AudioClassificationExportConfig",
+        ),
+        TaskSpec(
             name="text2text-generation",
             summary=(
                 "Text-in/text-out through an ENCODER-DECODER: the source is read once by a "

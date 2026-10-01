@@ -439,9 +439,11 @@ def load_model(spec: ASRNemoEncoderExportConfig):
 # The odd sample count is the point: it makes the mel frame count neither a multiple of `pad_to` nor
 # one the strided convolutions divide evenly, which are the two cases the preparation changes.
 CONV_ASR_CHECK_SAMPLES = 5 * 16000 + 777
-# Relative to max |log-prob|. Citrinet-1024 measures 3.3e-5 absolute on JFK, against an f32-vs-f64 spread
-# of NeMo's own unpatched forward of 1.5e-4: the patched forward sits nearer the f64 one than the
-# original does. A real defect in the masks moves a frame by whole nats.
+# Relative to the ENCODER output's max |value| (it compared log-probs until family 13 reused the
+# preparation under two heads that are not CTC's). On the chirp: Citrinet-1024 5.5e-7, TitaNet-large
+# 7.5e-8, frame-VAD MarbleNet exactly 0. When it compared log-probs, Citrinet measured 3.3e-5 absolute on
+# JFK against an f32-vs-f64 spread of NeMo's own forward of 1.5e-4. A real defect in the masks moves a
+# frame by whole units, not ulps.
 CONV_ASR_CHECK_TOLERANCE = 1e-5
 
 
@@ -466,8 +468,10 @@ def prepare_conv_asr_encoder_for_trace(model) -> None:
        padded frames are masked out of every convolution, so they change how many frames come out
        past the valid length and nothing inside it.
 
-    `CONV_ASR_CHECK_SAMPLES` of a chirp runs through the model before and after, and the log-probs of
-    the frames NeMo itself counts (`encoded_len`) must agree within `CONV_ASR_CHECK_TOLERANCE`.
+    `CONV_ASR_CHECK_SAMPLES` of a chirp runs through the front end and encoder before and after, and the
+    encoder output over the frames NeMo itself counts (`encoded_len`) must agree within
+    `CONV_ASR_CHECK_TOLERANCE`. The encoder rather than the whole model, because the heads differ
+    (CTC, a speaker pool, a frame classifier) and none of them is touched here.
     """
     from nemo.collections.asr.parts.submodules.jasper import MaskedConv1d, SqueezeExcite
 
@@ -483,8 +487,7 @@ def prepare_conv_asr_encoder_for_trace(model) -> None:
     seconds = CONV_ASR_CHECK_SAMPLES / sample_rate
     probe = torch.sin(2.0 * torch.pi * (200.0 + 1500.0 * t / seconds) * t).unsqueeze(0)
     probe_len = torch.tensor([CONV_ASR_CHECK_SAMPLES])
-    with torch.no_grad():
-        want, want_len, _ = model(input_signal=probe, input_signal_length=probe_len)
+    want, want_len = _encode_for_check(model, probe, probe_len)
 
     featurizer.pad_to = 0
     model.encoder.update_max_sequence_length = lambda seq_length, device: None
@@ -500,23 +503,33 @@ def prepare_conv_asr_encoder_for_trace(model) -> None:
                 )
             module.forward = types.MethodType(_squeeze_excite_forward, module)
 
-    with torch.no_grad():
-        got, got_len, _ = model(input_signal=probe, input_signal_length=probe_len)
+    got, got_len = _encode_for_check(model, probe, probe_len)
     n = int(want_len[0])
-    if int(got_len[0]) != n or got.shape[1] < n:
+    if int(got_len[0]) != n or got.shape[-1] < n:
         raise ValueError(
             f"prepare_conv_asr_encoder_for_trace: NeMo counts {n} encoder frames for "
             f"{CONV_ASR_CHECK_SAMPLES} samples; the prepared model counts {int(got_len[0])} and emits "
             f"{got.shape[1]}."
         )
-    scale = max(want[0, :n].abs().max().item(), 1.0)
-    deviation = (want[0, :n] - got[0, :n]).abs().max().item()
+    scale = max(want[0, :, :n].abs().max().item(), 1.0)
+    deviation = (want[0, :, :n] - got[0, :, :n]).abs().max().item()
     if deviation > CONV_ASR_CHECK_TOLERANCE * scale:
         raise ValueError(
-            f"prepare_conv_asr_encoder_for_trace: the prepared model's log-probs differ from NeMo's own "
-            f"by {deviation} (max |log-prob| = {scale}) over the {n} frames NeMo decodes. The "
+            f"prepare_conv_asr_encoder_for_trace: the prepared encoder's output differs from NeMo's own "
+            f"by {deviation} (max |value| = {scale}) over the {n} frames NeMo counts. The "
             f"preparation exists to be the same model, so this is a defect in it, not a tolerance."
         )
+
+
+def _encode_for_check(model, probe, probe_len):
+    """The front end and the encoder, which is everything `prepare_conv_asr_encoder_for_trace` changes.
+
+    Compared on the ENCODER's output rather than the model's: a CTC model's forward returns three values,
+    a speaker model's two and a frame classifier's one, while every one of them runs exactly this before
+    its head (family 13 reuses the preparation under two heads that are not CTC's)."""
+    with torch.no_grad():
+        mel, mel_len = model.preprocessor(input_signal=probe, length=probe_len)
+        return model.encoder(audio_signal=mel, length=mel_len)
 
 
 def _masked_conv1d_forward(self, x, lens):
@@ -616,8 +629,12 @@ def _read_nemo_model_config(path: Path) -> dict:
     `ASRModel.restore_from`, no untar-to-tempdir) -- cheap enough to call once per recognizer during
     detection."""
     with tarfile.open(path) as t:
-        f = t.extractfile("./model_config.yaml")
-        return yaml.safe_load(f.read())
+        # Archives differ in whether members carry a leading `./` (the ASR checkpoints do, TitaNet's
+        # does not), so the member is found by name rather than spelled.
+        name = next((n for n in t.getnames() if n.lstrip("./") == "model_config.yaml"), None)
+        if name is None:
+            raise KeyError(f"{path}: no model_config.yaml in the archive")
+        return yaml.safe_load(t.extractfile(name).read())
 
 
 def _is_nemo_archive(path: Path) -> bool:
