@@ -1376,6 +1376,107 @@ licence is its recording's, and so is the consent: clone only voices you have th
             "checkpoint's own learned position table."
         ),
     ),
+    # Family 13: small audio classifiers and embedders (loom.cpp ADR-062). One door per output KIND --
+    # `speech2class` for a distribution per clip or per frame, `speech2embeddings` for one vector per
+    # clip -- and three snippets for the first, because what a reader does with the rows differs: a VAD
+    # is a speech curve, a language id is read top-k, a segmentation model's classes are speaker SETS.
+    ModelCard(
+        slug="titanet-large",
+        checkpoint=Path("titanet-large/speakerverification_en_titanet_large.nemo"),
+        task_type="audio-embedding",
+        # The Hub has no audio-embedding tag; `feature-extraction` is the one it gives a model whose
+        # output is a vector rather than a label.
+        pipeline_tag="feature-extraction",
+        base_repo="nvidia/speakerverification_en_titanet_large", license_id="cc-by-4.0",
+        language=["en"],
+        title="TitaNet-Large (speaker embeddings)",
+        summary="NVIDIA NeMo's TitaNet-Large speaker-verification model, exported for loom.cpp. "
+                "Family 13: audio in, one 192-dimensional speaker embedding per clip out.",
+        limitations=(
+            "The vector comes back **unnormalised**, exactly as the model's own embedding layer "
+            "produces it. Comparing two -- cosine similarity is what TitaNet was trained for -- and "
+            "choosing the threshold that means \"same speaker\" are yours: a threshold is a property of "
+            "the application (its false-accept cost, its recording conditions), not of the model.\n\n"
+            "One embedding per call, over the whole clip. Diarizing a recording means embedding its "
+            "segments one by one and clustering them; that loop is the host's.\n\n"
+            "Trained on VoxCeleb, Fisher, Switchboard, LibriSpeech and SRE -- English-dominant, mostly "
+            "telephone and interview speech. Audio must be mono 16 kHz."
+        ),
+    ),
+    ModelCard(
+        slug="marblenet-vad-v2",
+        checkpoint=Path("frame-vad-marblenet-v2/frame_vad_multilingual_marblenet_v2.0.nemo"),
+        task_type="audio-classification", pipeline_tag="voice-activity-detection",
+        snippet="audio-classification-vad",
+        base_repo="nvidia/frame_vad_multilingual_marblenet_v2.0", license_id="other",
+        license_name="NVIDIA Open Model License Agreement",
+        license_url="https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license",
+        language=["en", "es", "fr", "de", "ru", "zh"],
+        title="Frame-VAD Multilingual MarbleNet v2.0",
+        summary="NVIDIA NeMo's 91.5K-parameter frame-level voice activity detector, exported for "
+                "loom.cpp. Family 13: audio in, a speech probability for every 20 ms frame out.",
+        limitations=(
+            "The answer is a **probability per frame, not a decision**. Upstream's own card says the "
+            "output may need smoothing and thresholding (0.5 is its example); both are left to you, "
+            "because every consumer of a VAD -- an ASR front end, a recorder, a diarizer -- wants "
+            "different onset and offset behaviour.\n\n"
+            "One row per 20 ms of input, starting at 0 s: `result.times` gives each row's start. "
+            "Audio must be mono 16 kHz.\n\n"
+            "Distributed under the **NVIDIA Open Model License Agreement**, which upstream names; read "
+            "it before shipping this in a product."
+        ),
+    ),
+    ModelCard(
+        slug="ecapa-voxlingua107", checkpoint=Path("ecapa-voxlingua107"),
+        task_type="audio-classification", snippet="audio-classification-language",
+        base_repo="speechbrain/lang-id-voxlingua107-ecapa", license_id="apache-2.0",
+        # Upstream's own list, minus "multilingual" (not an ISO-639 code, and HF rejects it). Its YAML
+        # also writes Norwegian as a bare `no`, which a YAML parser reads as `false`; restored here.
+        language=["ab", "af", "am", "ar", "as", "az", "ba", "be", "bg", "bi", "bo", "br", "bs", "ca",
+                  "ceb", "cs", "cy", "da", "de", "el", "en", "eo", "es", "et", "eu", "fa", "fi", "fo",
+                  "fr", "gl", "gn", "gu", "gv", "ha", "haw", "hi", "hr", "ht", "hu", "hy", "ia", "id",
+                  "is", "it", "he", "ja", "jv", "ka", "kk", "km", "kn", "ko", "la", "lm", "ln", "lo",
+                  "lt", "lv", "mg", "mi", "mk", "ml", "mn", "mr", "ms", "mt", "my", "ne", "nl", "nn",
+                  "no", "oc", "pa", "pl", "ps", "pt", "ro", "ru", "sa", "sco", "sd", "si", "sk", "sl",
+                  "sn", "so", "sq", "sr", "su", "sv", "sw", "ta", "te", "tg", "th", "tk", "tl", "tr",
+                  "tt", "uk", "ud", "uz", "vi", "war", "yi", "yo", "zh"],
+        title="ECAPA-TDNN VoxLingua107 (spoken language identification)",
+        summary="SpeechBrain's ECAPA-TDNN spoken-language identifier over VoxLingua107's 107 "
+                "languages, exported for loom.cpp. Family 13: audio in, one language distribution per "
+                "clip out.",
+        limitations=(
+            "**One whole clip per call.** The export takes no `length`, so a batch of padded clips "
+            "cannot be passed: the padding would be heard as part of the audio. Call it once per "
+            "clip.\n\n"
+            "Trained on VoxLingua107, which is speech scraped from YouTube: a few seconds of clean "
+            "speech is plenty, and closely related languages (the upstream card's examples are "
+            "Bosnian/Croatian/Serbian and the Scandinavian languages) are routinely confused -- read "
+            "the top few answers rather than only the first. Audio must be mono 16 kHz."
+        ),
+    ),
+    ModelCard(
+        slug="pyannote-segmentation-3.0", checkpoint=Path("pyannote-segmentation-3.0"),
+        task_type="audio-classification", pipeline_tag="voice-activity-detection",
+        snippet="audio-classification-segmentation",
+        base_repo="pyannote/segmentation-3.0", license_id="mit",
+        title="pyannote segmentation 3.0",
+        summary="pyannote.audio's speaker segmentation model (SincNet + BiLSTM, powerset output), "
+                "exported for loom.cpp. Family 13: audio in, for every ~17 ms frame a distribution "
+                "over which of up to three speakers are talking.",
+        limitations=(
+            "**Trained on 10-second windows.** The export accepts other lengths, but what the model "
+            "learned is 10 s of audio at a time, and a full recording is processed by sliding that "
+            "window over it -- a loop the host owns, as pyannote.audio's own pipeline does.\n\n"
+            "**Speaker labels are LOCAL to a window.** `speaker1` in one window and `speaker1` in the "
+            "next are not known to be the same person; this model segments, it does not identify. "
+            "Full diarization adds a speaker embedding per segment (see `titanet-large-loom`) and a "
+            "clustering step across windows, as the upstream card explains.\n\n"
+            "The seven classes are speaker SETS (pyannote's powerset encoding): no speech, one of three "
+            "speakers alone, or one of the three pairs. Audio must be mono 16 kHz.\n\n"
+            "Upstream gates its repo behind an accept-terms form although the licence is MIT; this "
+            "copy is gated the same way."
+        ),
+    ),
 ]
 
 CATALOG_BY_SLUG = {m.slug: m for m in CATALOG}
@@ -1581,6 +1682,89 @@ print(restored.strip())
 raw = model.text2class.infer("hello my name is wolfgang and i live in berlin do you know it",
                              strip_special=False)
 print(len(raw), "rows including <s> and </s>, against", len(result), "without")
+""",
+    # Family 13 (ADR-062). Every one of these runs the WHOLE clip in one call and returns the model's
+    # own distribution -- the rows, the label names and the time each frame row starts at are read off
+    # the file -- so what differs between the three classifier cards is only what a reader does with
+    # the rows. The release gate grades the last result each card binds.
+    "audio-classification-vad": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# Audio is a mono float list at 16 kHz. One call over the whole clip, one row per 20 ms frame back.
+result = model.speech2class.infer(audio)
+print(result.granularity, result.labels)
+# frame ['non_speech', 'speech']
+
+# A probability per frame, not a decision: the threshold and any smoothing are yours. With a plain
+# 0.5 threshold, the speech curve becomes segments:
+speech = result.probability("speech")
+segments, start = [], None
+for t, p in zip(result.times, speech):
+    if p >= 0.5 and start is None:
+        start = t
+    elif p < 0.5 and start is not None:
+        segments.append((round(start, 2), round(t, 2)))
+        start = None
+if start is not None:
+    segments.append((round(start, 2), round(len(audio) / 16000, 2)))
+print(segments)   # [(start_seconds, end_seconds), ...]
+""",
+    "audio-classification-language": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# Audio is a mono float list at 16 kHz, one whole clip per call. The answer is one row: a probability
+# for every language the model knows, labelled "<code>: <name>".
+result = model.speech2class.infer(audio)
+print(result.best[0])
+# en: English
+
+# Closely related languages share probability, so read the top few rather than only the first:
+for label, p in result.top(3):
+    print(f"{label:24s} {p:.3f}")
+""",
+    "audio-classification-segmentation": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# Audio is a mono float list at 16 kHz. The model was trained on 10-second windows; a longer
+# recording is processed by sliding one over it.
+window = audio[:10 * 16000]
+result = model.speech2class.infer(window)
+print(result.labels)
+# ['non_speech', 'speaker1', 'speaker2', 'speaker3', 'speaker1+speaker2', 'speaker1+speaker3', 'speaker2+speaker3']
+print(len(result), "frames,", round(result.frame_rate, 2), "per second")
+
+# Each frame's most likely speaker SET, collapsed into turns. The speaker numbers are local to this
+# window: telling who is who across windows takes an embedding model and a clustering step.
+turns = []
+for t, label in zip(result.times, result.best):
+    if not turns or turns[-1][1] != label:
+        turns.append((round(t, 2), label))
+for start, label in turns:
+    print(f"{start:6.2f}s  {label}")
+""",
+    "audio-embedding": """import math
+
+import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# Audio is a mono float list at 16 kHz. One call embeds one clip; the vector comes back unnormalised.
+embedding = model.speech2embeddings.infer(audio)
+print(len(embedding))
+# 192
+
+# "Same speaker?" is a comparison between two embeddings, and the threshold is yours. Two halves of
+# one recording score high; two different voices score near zero.
+def cosine(a, b):
+    return sum(x * y for x, y in zip(a, b)) / math.sqrt(sum(x * x for x in a) * sum(y * y for y in b))
+
+half = len(audio) // 2
+first = model.speech2embeddings.infer(audio[:half])
+second = model.speech2embeddings.infer(audio[half:])
+print(f"{cosine(first, second):.2f}")
 """,
     # A codec DECODER, which is the one card here whose input a reader cannot type. Codes come from
     # an encoder or from an AR codec-token LM, so the snippet demonstrates the GEOMETRY -- how many
