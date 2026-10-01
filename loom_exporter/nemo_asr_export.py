@@ -187,10 +187,16 @@ class EncoderOutput(Enum):
         frame longer: the mel front end counts `floor(n/160)` valid frames out of `floor(n/160) + 1`, and
         each stride-2 stage rounds the two counts apart again (Citrinet: 39 frames, 38 counted, for
         48777 samples). That frame is computed from masked context and NeMo never reads it; the CTC
-        driver reads every row, so it is cut here, in the graph, rather than trusted to decode blank."""
+        driver reads every row, so it is cut here, in the graph, rather than trusted to decode blank.
+
+        **The transducer encoder is cut the same way**, on its time axis (last, in NeMo's `(B, D, T)`)
+        before the transpose. Parakeet-TDT/RNNT emit one frame past `encoded_len` at 5 of 7 lengths
+        measured (39 for 38 at 48777 samples), and the decode loop steps through every row, so a TDT
+        step could emit on a frame NeMo never decodes. GigaAM's encoder counts the two the same way at
+        every length measured, and the cut is a no-op there."""
         if self is EncoderOutput.CTC_LOG_PROBS:
             return outputs[0][:, :outputs[1][0]]
-        return outputs[0].transpose(1, 2)
+        return outputs[0][:, :, :outputs[1][0]].transpose(1, 2)
 
     def validate(self, model, outputs):
         """Cross-checks this claim against what the real model just returned, raising ValueError naming
