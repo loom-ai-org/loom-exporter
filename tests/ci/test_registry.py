@@ -854,13 +854,14 @@ def test_the_tts_families_share_one_task():
     the fifth, Pocket-TTS, whose AR loop carries latents and has no ODE sampler at all. Nine since the
     sixth, VoxCPM2, whose loop carries latents too and integrates each patch in its own driver. Eleven
     since the eighth, Voxtral-TTS, whose loop carries CODE frames and integrates each frame's acoustic
-    half in one graph (CosyVoice3, the seventh, is the tenth)."""
+    half in one graph (CosyVoice3, the seventh, is the tenth). Twelve since family 9b's SpeechT5, whose
+    loop carries MEL frames and has no sampler at all."""
     from loom_exporter.registry import default_registry
 
     registry = default_registry()
     names = {rec.name for rec in registry._entries["text-to-speech"].recognizers}
     assert names == {"kokoro", "styletts2", "vits", "matcha", "supertonic", "f5-tts", "chatterbox",
-                     "pocket-tts", "voxcpm2", "cosyvoice3", "voxtral-tts"}
+                     "pocket-tts", "voxcpm2", "cosyvoice3", "voxtral-tts", "speecht5"}
     for model in names:
         assert registry.get("text-to-speech", model).name == model
 

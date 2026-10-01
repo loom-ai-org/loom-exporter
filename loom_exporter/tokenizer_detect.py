@@ -233,8 +233,9 @@ _BYTE_TOKENIZER_CLASSES = frozenset({"ByT5Tokenizer", "DiaTokenizer"})
 
 #: The names a checkpoint may ship its SentencePiece protobuf under. `tokenizer.model` is T5's and
 #: LLaMA's, `spiece.model` is ALBERT/XLNet's, and `sentencepiece.bpe.model` is the fairseq-derived
-#: family's -- one file, three conventions, and nothing inside distinguishes them.
-_SPM_PROTO_NAMES = ("tokenizer.model", "spiece.model", "sentencepiece.bpe.model")
+#: family's -- one file, three conventions, and nothing inside distinguishes them. `spm_char.model` is
+#: SpeechT5's (a character-level model; the name says so, the protobuf's `model_type` says it again).
+_SPM_PROTO_NAMES = ("tokenizer.model", "spiece.model", "sentencepiece.bpe.model", "spm_char.model")
 
 
 def detect_vocab_family(tokenizer_dir: str) -> str:
