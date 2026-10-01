@@ -312,6 +312,15 @@ CATALOG = [
                   "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk"],
         title="Canary 1B v2", summary="NVIDIA NeMo's Canary 1B v2 speech recognition and translation model (25 languages), exported for loom.cpp.",
         snippet="automatic-speech-recognition-canary",
+        limitations=(
+            "**Long audio needs loom 1.0.0-rc14 or later.** The model was trained on clips of up to "
+            "40 s. Past that, this file tells loom to do what NeMo's own `transcribe()` does: cut the "
+            "audio into overlapping 30-40 s windows, decode each, and stitch the transcripts where they "
+            "overlap. On 1.0.0-rc13 and earlier a long clip is decoded in one pass, which degrades fast "
+            "-- on 79 s of LibriSpeech it returned 116 of 181 words.\n\n"
+            "No timestamps: NeMo gets them from a second (CTC) model inside the `.nemo`, which is not "
+            "exported. `segments` is one span covering the whole clip."
+        ),
     ),
     ModelCard(
         slug="parakeet-tdt-0.6b", checkpoint=Path("parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo"),
@@ -1550,7 +1559,8 @@ for segment in result.segments:
 
 model = loom.Model.from_pretrained("{repo_id}")
 
-# Audio is a mono float list at 16 kHz, up to 40 s (longer clips are not chunked).
+# Audio is a mono float list at 16 kHz. Past 40 s, what the model was trained on, it is decoded in
+# overlapping windows and stitched, as NeMo does (see Known limitations for the version this needs).
 # `language` is what the audio is in; it is not detected, and defaults to English.
 result = model.speech2text.infer(audio)
 print(result.text)
