@@ -191,6 +191,7 @@ _FAMILY_MODULES = (
     "nemo_asr_export",
     "gigaam_export",
     "whisper_export",
+    "canary_export",
     "qwen3_asr_export",
     "granite_speech_export",
     "kokoro_export",

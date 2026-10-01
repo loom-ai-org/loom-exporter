@@ -236,6 +236,16 @@ CATALOG = [
         base_repo="nvidia/stt_en_conformer_ctc_small", license_id="cc-by-4.0", language=["en"],
         title="Conformer-CTC Small (en)", summary="NVIDIA NeMo's small Conformer-CTC English ASR model, exported for loom.cpp.",
     ),
+    # The only Citrinet on the Hub (the 256/512 variants are NGC-only). Same template and driver as
+    # Conformer-CTC; what differs is the encoder, 1-D Jasper blocks with squeeze-excite, which
+    # `nemo_asr_export.prepare_conv_asr_encoder_for_trace` makes traceable.
+    ModelCard(
+        slug="citrinet-1024", checkpoint=Path("stt-en-citrinet-1024-gamma-0.25/stt_en_citrinet_1024_gamma_0_25.nemo"),
+        export_task="automatic-speech-recognition", export_model="citrinet",
+        task_type="automatic-speech-recognition",
+        base_repo="nvidia/stt_en_citrinet_1024_gamma_0_25", license_id="cc-by-4.0", language=["en"],
+        title="Citrinet-1024 (en)", summary="NVIDIA NeMo's Citrinet-1024 English CTC ASR model, exported for loom.cpp.",
+    ),
     # Family 4 (P5): CNN + transformer + CTC. `export_model="hf-ctc-asr"` is the one generic
     # recognizer, so both leaves name it -- which is the family's whole claim about itself.
     #
@@ -289,6 +299,19 @@ CATALOG = [
         selects_language=False,
         title="Paraformer-large (Chinese/English)",
         summary="Alibaba's Paraformer-large non-autoregressive ASR model, exported for loom.cpp.",
+    ),
+    # FastConformer + transformer decoder; transcribes AND translates. Its own snippet because the
+    # multilingual one says "omit language= to detect it", and canary2 has no detection: the source
+    # defaults to English, and the language WRITTEN is its own argument (ADR-061), defaulting to English.
+    ModelCard(
+        slug="canary-1b-v2", checkpoint=Path("canary-1b-v2/canary-1b-v2.nemo"),
+        export_task="automatic-speech-recognition", export_model="canary",
+        task_type="automatic-speech-recognition", selects_language=True,
+        base_repo="nvidia/canary-1b-v2", license_id="cc-by-4.0",
+        language=["bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it", "lv",
+                  "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk"],
+        title="Canary 1B v2", summary="NVIDIA NeMo's Canary 1B v2 speech recognition and translation model (25 languages), exported for loom.cpp.",
+        snippet="automatic-speech-recognition-canary",
     ),
     ModelCard(
         slug="parakeet-tdt-0.6b", checkpoint=Path("parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo"),
@@ -1420,6 +1443,20 @@ result = model.speech2text.infer(audio, language="en", timestamps=True)
 print(result.text)
 for segment in result.segments:
     print(segment.start, segment.end, segment.text)
+""",
+    # Canary's door: no language detection, and a target language of its own (ADR-061).
+    "automatic-speech-recognition-canary": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# Audio is a mono float list at 16 kHz, up to 40 s (longer clips are not chunked).
+# `language` is what the audio is in; it is not detected, and defaults to English.
+result = model.speech2text.infer(audio)
+print(result.text)
+
+# `target_language` is what to WRITE, and it defaults to English: German audio with no target comes
+# back translated, and language="de", target_language="de" keeps it German.
+print(model.speech2text.infer(audio, language="en", target_language="fr").text)
 """,
     # Two TTS snippets, because "TTS" is not one answer. Which one a model gets is `takes_text` below,
     # a per-model fact read off the export rather than assumed from the task -- the single phoneme-ids

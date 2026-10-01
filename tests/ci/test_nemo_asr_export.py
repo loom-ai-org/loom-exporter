@@ -41,9 +41,10 @@ class _FakeASRModel(nn.Module):
     signature, returning a tuple of the family's own arity and shapes."""
 
     def __init__(self, arity=3, channels=1025, transposed=False, cfg=None, decoder=None,
-                 has_preprocessor=True, has_encoder=True):
+                 has_preprocessor=True, has_encoder=True, encoded_len=7):
         super().__init__()
         self.arity = arity
+        self.encoded_len = encoded_len
         self.channels = channels
         self.transposed = transposed  # emit (B, C, T) like NeMo's own encoder output
         self.cfg = _cfg() if cfg is None else cfg
@@ -57,8 +58,9 @@ class _FakeASRModel(nn.Module):
         n_frames = 7
         main = (torch.zeros(1, self.channels, n_frames) if self.transposed
                 else torch.zeros(1, n_frames, self.channels))
-        rest = tuple(torch.zeros(1) for _ in range(self.arity - 1))
-        return (main,) + rest
+        # NeMo's second value is the encoder length, which can be shorter than the tensor.
+        rest = (torch.tensor([self.encoded_len]),) + tuple(torch.zeros(1) for _ in range(self.arity - 2))
+        return (main,) + rest[:self.arity - 1]
 
 
 def _spec(output=EncoderOutput.CTC_LOG_PROBS, **kw):
@@ -75,6 +77,13 @@ def _run(model, output):
 def test_ctc_returns_log_probs_untransposed():
     out = _run(_FakeASRModel(arity=3, channels=1025), EncoderOutput.CTC_LOG_PROBS)
     assert tuple(out.shape) == (1, 7, 1025)
+
+
+def test_ctc_log_probs_stop_at_the_encoded_length():
+    """The tensor can run a frame past `encoded_len` (the mel front end and each stride-2 stage round
+    the valid count and the frame count apart); NeMo never decodes that frame, so neither may loom."""
+    out = _run(_FakeASRModel(arity=3, channels=1025, encoded_len=6), EncoderOutput.CTC_LOG_PROBS)
+    assert tuple(out.shape) == (1, 6, 1025)
 
 
 def test_encoder_output_is_transposed_to_bt_d():
