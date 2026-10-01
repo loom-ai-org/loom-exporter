@@ -31,6 +31,7 @@ from loom_exporter.causal_lm_export import (  # noqa: E402
     _is_qwen3,
 )
 from loom_exporter.nemo_asr_export import (  # noqa: E402
+    _is_citrinet,
     _is_conformer_ctc,
     _is_parakeet_rnnt,
     _is_parakeet_tdt,
@@ -93,6 +94,14 @@ def _make_nemo_archive(tmp_path: Path, name: str, config: dict) -> Path:
 
 
 CTC_CONFIG = {"target": "nemo.collections.asr.models.ctc_bpe_models.EncDecCTCModelBPE"}
+CANARY_CONFIG = {
+    "target": "nemo.collections.asr.models.aed_multitask_models.EncDecMultiTaskModel",
+    "prompt_format": "canary2",
+}
+CITRINET_CONFIG = {
+    "target": "nemo.collections.asr.models.ctc_bpe_models.EncDecCTCModelBPE",
+    "encoder": {"_target_": "nemo.collections.asr.modules.ConvASREncoder"},
+}
 TDT_CONFIG = {
     "target": "nemo.collections.asr.models.rnnt_bpe_models.EncDecRNNTBPEModel",
     "model_defaults": {"enc_hidden": 1024, "tdt_durations": [0, 1, 2, 3, 4], "num_tdt_durations": 5},
@@ -233,6 +242,30 @@ def test_is_conformer_ctc_matches_ctc_target(tmp_path):
     assert _is_conformer_ctc(path)
     assert not _is_parakeet_tdt(path)
     assert not _is_parakeet_rnnt(path)
+
+
+def test_citrinet_shares_conformer_ctcs_target_and_is_told_apart_by_its_encoder(tmp_path):
+    """Both restore through `EncDecCTCModelBPE`; Citrinet's encoder is a `ConvASREncoder` (1-D Jasper
+    blocks), and that is the discriminator. A config with no encoder target stays Conformer-CTC's."""
+    citrinet = _make_nemo_archive(tmp_path, "citrinet", CITRINET_CONFIG)
+    conformer = _make_nemo_archive(tmp_path, "conformer", {
+        **CTC_CONFIG, "encoder": {"_target_": "nemo.collections.asr.modules.ConformerEncoder"}})
+    assert _is_citrinet(citrinet) and not _is_conformer_ctc(citrinet)
+    assert _is_conformer_ctc(conformer) and not _is_citrinet(conformer)
+    assert not _is_citrinet(_make_nemo_archive(tmp_path, "ctc", CTC_CONFIG))
+
+
+def test_canary_is_claimed_by_its_prompt_format_and_by_nothing_else(tmp_path):
+    """`EncDecMultiTaskModel` with the `canary2` prompt. The first Canary spells its prompt `canary`, a
+    different token row the driver does not build, so it is not claimed rather than mis-prompted."""
+    from loom_exporter.canary_export import _is_canary
+
+    canary = _make_nemo_archive(tmp_path, "canary", CANARY_CONFIG)
+    canary_v1 = _make_nemo_archive(tmp_path, "canary_v1", {**CANARY_CONFIG, "prompt_format": "canary"})
+    assert _is_canary(canary) and not _is_canary(canary_v1)
+    for detect in (_is_conformer_ctc, _is_citrinet, _is_parakeet_tdt, _is_parakeet_rnnt):
+        assert not detect(canary)
+    assert not _is_canary(_make_nemo_archive(tmp_path, "ctc", CTC_CONFIG))
 
 
 def test_tdt_and_rnnt_share_a_target_but_are_told_apart_by_model_defaults(tmp_path):

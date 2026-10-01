@@ -302,5 +302,50 @@ class TestAxisZeroIsNotAssumedToBeBatch(unittest.TestCase):
         self.assertEqual(facts.gather_shape_value(gather), as_expr(1))
 
 
+class TestTruncDivision(unittest.TestCase):
+    """`torch.div(a, b, rounding_mode='trunc')`, which reaches MIL as `sign(x) * floor(x * sign(x))`.
+
+    NeMo's `MaskedConv1d.get_seq_len` derives every Citrinet stage's length this way. The walk knew
+    neither `sign` nor unary `floor`, so the encoder's length resolved to None and a slice ending at it
+    silently kept the whole axis: Citrinet's CTC output came out one frame past `encoded_len` at half of
+    all input lengths. These build the exact op pattern by hand and evaluate the derived expression on
+    both sides of zero, where trunc and floor disagree."""
+
+    class _StubExporter:
+        root_axis = "n_tokens"
+
+        def _infer_dynamic_dim_expr(self, var, torch_axis, _seen=None):
+            return N_TOKENS
+
+    def _resolve(self, offset, scale, other_sign=False):
+        """scalar_expr of trunc((offset + n) * scale) -- or, with `other_sign`, of the same pattern
+        with the outer `sign` taken of a different value, which is not a trunc and must not resolve."""
+        from coremltools.converters.mil.mil import Builder as mb, get_new_symbol
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, get_new_symbol()))])
+        def prog(x):
+            n = mb.gather(x=mb.shape(x=x), indices=np.array([1], dtype=np.int32), axis=0)
+            q = mb.mul(x=mb.cast(x=mb.add(x=n, y=np.int32(offset)), dtype="fp32"), y=np.float32(scale))
+            s = mb.sign(x=q)
+            outer = mb.sign(x=mb.add(x=q, y=np.float32(1.0))) if other_sign else s
+            t = mb.mul(x=mb.floor(x=mb.mul(x=q, y=s)), y=outer)
+            return mb.slice_by_index(x=t, begin=np.array([0], dtype=np.int32), end=np.array([1], dtype=np.int32))
+
+        out = prog.functions["main"].outputs[0]
+        return ValueFacts(exporter=self._StubExporter()).scalar_expr(out)
+
+    def test_trunc_is_exact_on_both_sides_of_zero(self):
+        for offset, scale in ((-1, 0.5), (-9, 0.5), (3, -0.25)):
+            expr = self._resolve(offset, scale)
+            self.assertIsNotNone(expr, (offset, scale))
+            for n in range(1, 20):
+                want = int((offset + n) * scale)   # Python's int() truncates toward zero
+                got = float(expr.subs(N_TOKENS, n))
+                self.assertEqual(got, want, f"trunc(({offset} + {n}) * {scale})")
+
+    def test_a_sign_of_something_else_is_not_a_trunc(self):
+        self.assertIsNone(self._resolve(-1, 0.5, other_sign=True))
+
+
 if __name__ == "__main__":
     unittest.main()
