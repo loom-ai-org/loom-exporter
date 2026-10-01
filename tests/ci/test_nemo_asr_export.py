@@ -86,6 +86,14 @@ def test_ctc_log_probs_stop_at_the_encoded_length():
     assert tuple(out.shape) == (1, 6, 1025)
 
 
+def test_the_transducer_encoder_stops_at_the_encoded_length():
+    """The same cut as the CTC head's, on the transducer encoder's time axis -- NeMo's LAST axis, before
+    the transpose. Parakeet emits one frame past `encoded_len` at most lengths."""
+    model = _FakeASRModel(arity=2, channels=1024, transposed=True, encoded_len=6)
+    out = _run(model, EncoderOutput.ENCODER_BT_D)
+    assert tuple(out.shape) == (1, 6, 1024)
+
+
 def test_encoder_output_is_transposed_to_bt_d():
     model = _FakeASRModel(arity=2, channels=1024, transposed=True)
     out = _run(model, EncoderOutput.ENCODER_BT_D)
