@@ -53,6 +53,35 @@ _ARITH_OPS = {
 }
 
 
+def _single_element(var) -> bool:
+    shape = getattr(var, "shape", None)
+    return shape is not None and all(isinstance(d, (int, np.integer)) and d == 1 for d in shape)
+
+
+def _trunc_operand(op):
+    """`x` when `op` is MIL's lowering of `trunc(x)`, `mul(floor(mul(x, sign(x))), sign(x))` with the
+    same `sign` var in both places, else None. Matched by identity on the vars, so a `sign` of something
+    else -- or two different signs -- is not mistaken for it."""
+    if op.op_type != "mul":
+        return None
+    pair = (op.inputs.get("x"), op.inputs.get("y"))
+    for sign_var, floor_var in (pair, pair[::-1]):
+        if not (isinstance(sign_var, Var) and isinstance(floor_var, Var)):
+            continue
+        if sign_var.op is None or sign_var.op.op_type != "sign":
+            continue
+        if floor_var.op is None or floor_var.op.op_type != "floor":
+            continue
+        inner = floor_var.op.inputs.get("x")
+        if not isinstance(inner, Var) or inner.op is None or inner.op.op_type != "mul":
+            continue
+        a, b = inner.op.inputs.get("x"), inner.op.inputs.get("y")
+        x = b if a is sign_var else a if b is sign_var else None
+        if x is not None and sign_var.op.inputs.get("x") is x:
+            return x
+    return None
+
+
 def static_value(var, default=None):
     """`var`'s compile-time-constant value exactly as MIL stores it (array, scalar, or str), else
     `default`. This one function replaces the
@@ -377,6 +406,25 @@ class ValueFacts:
             if beta is not None and math.isfinite(beta) and beta < limit:
                 inner = sympy.Min(inner, as_expr(beta))
             return (inner, guess)
+        if op.op_type == "floor":
+            inner, guess = self._scalar_entry(op.inputs.get("x"), _seen)
+            return (None, False) if inner is None else (sympy.floor(inner), guess)
+        if op.op_type == "slice_by_index" and _single_element(op.inputs.get("x")):
+            # `lens[0]` on a one-element length tensor: the element IS the tensor's value.
+            return self._scalar_entry(op.inputs.get("x"), _seen)
+        trunc_of = _trunc_operand(op)
+        if trunc_of is not None:
+            # `torch.div(a, b, rounding_mode='trunc')` -- how NeMo's `MaskedConv1d.get_seq_len` derives
+            # every Jasper/Citrinet stage's length -- reaches MIL as `sign(x) * floor(x * sign(x))`, and
+            # the engine's grammar has no `sign`. Written exactly in what it does have: trunc(x) =
+            # floor(Max(x, 0)) - floor(Max(-x, 0)), right on both sides of zero. Before this, the whole
+            # chain resolved to None and a slice ending at the encoder's length silently kept the full
+            # axis (Citrinet's `log_probs[:, :encoded_len]` came out one frame long at half of all
+            # lengths).
+            inner, guess = self._scalar_entry(trunc_of, _seen)
+            if inner is None:
+                return (None, False)
+            return (sympy.floor(sympy.Max(inner, 0)) - sympy.floor(sympy.Max(-inner, 0)), guess)
         if op.op_type in _ARITH_OPS:
             x_e, x_guess = self._scalar_entry(op.inputs.get("x"), _seen)
             y_e, y_guess = self._scalar_entry(op.inputs.get("y"), _seen)
