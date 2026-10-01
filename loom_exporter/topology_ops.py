@@ -1561,11 +1561,20 @@ def _op_loom_mean(self, op, ctx):
         cont_name = x_name + "_mean_cont"
         ctx.nodes.append({"op": "CONT", "inputs": [x_name], "outputs": [cont_name]})
         x_name = cont_name
-    ctx.nodes.append({
-        "op": "MEAN",
-        "inputs": [x_name],
-        "outputs": [self.safe_name(op.outputs[0].name)],
-    })
+    out_name = self.safe_name(op.outputs[0].name)
+    if bool(static_value(op.inputs.get("keep_dims"), False)):
+        ctx.nodes.append({"op": "MEAN", "inputs": [x_name], "outputs": [out_name]})
+        return
+    # `keep_dims=False`: ggml_mean always leaves the reduced ne[0] in place at size 1, and MIL's
+    # output has one rank fewer -- so every consumer that names an ne axis (a CONCAT's `dim`, a
+    # broadcast) would address the WRONG one. Found by ECAPA-TDNN's pool, `cat([x.mean(2), std], 1)`:
+    # the concat ran along the leftover ne[0] and INTERLEAVED the two vectors, which every comparison
+    # of the flattened mean missed (the bytes are the same) and the next matmul did not (rel 0.95).
+    # REDUCE_SUM drops its axis in the engine for the same reason; ggml_mean is not ours to change.
+    mean_name = out_name + "_mean_kept"
+    ctx.nodes.append({"op": "MEAN", "inputs": [x_name], "outputs": [mean_name]})
+    ctx.nodes.append({"op": "RESHAPE", "inputs": [mean_name], "outputs": [out_name],
+                      "attrs": {"shape": list(self.get_var_info(op.outputs[0])["shape"])}})
 
 
 @topology_rule('loom_rms_norm')
@@ -1772,6 +1781,37 @@ def _reduce_max_total(self, op):
             return None
         total = total * dim
     return total
+
+
+@topology_rule('max_pool')
+def _op_max_pool(self, op, ctx):
+    """A 1-D max-pool over the last (time) axis, as `POOL_1D` -- ggml_pool_1d pools `ne[0]`, which is
+    MIL's last axis, so no permute is needed.
+
+    pyannote's SincNet is the first export with one (three `MaxPool1d(3, 3)` between its convolutions).
+    Only what ggml_pool_1d computes is accepted: one spatial axis, no padding, floor rounding. A padded
+    max-pool pads with -inf in torch and with zeros in ggml's pool, and a ceil-mode one emits a frame
+    ggml would not -- both raise here rather than shipping a pool that differs at the edges.
+    """
+    x_var = op.inputs["x"]
+    kernel = static_ints(op.inputs.get("kernel_sizes"))
+    strides = static_ints(op.inputs.get("strides"))
+    pad_type = static_value(op.inputs.get("pad_type"), "valid")
+    pad = static_ints(op.inputs.get("pad")) or []
+    ceil_mode = bool(static_value(op.inputs.get("ceil_mode"), False))
+    if x_var.shape is None or len(x_var.shape) != 3 or kernel is None or len(kernel) != 1:
+        raise NotImplementedError(f"max_pool op '{op.name}': only a 1-D pool over [batch, channels, "
+                                  f"time] is lowered (got shape {x_var.shape}, kernel {kernel}).")
+    if ceil_mode or (pad_type not in ("valid", "custom")) or any(int(p) != 0 for p in pad):
+        raise NotImplementedError(f"max_pool op '{op.name}': padding ({pad_type}, {pad}) or ceil_mode "
+                                  f"is not lowered -- ggml's pool pads with zeros where torch pads -inf.")
+    stride = int(strides[0]) if strides else int(kernel[0])
+    ctx.nodes.append({
+        "op": "POOL_1D",
+        "inputs": [ctx.resolve(self.safe_name(x_var.name))],
+        "outputs": [self.safe_name(op.outputs[0].name)],
+        "attrs": {"op": "max", "k0": int(kernel[0]), "s0": stride, "p0": 0},
+    })
 
 
 @topology_rule('reduce_max', guard=lambda self, op: _reduce_max_total(self, op) is not None,
