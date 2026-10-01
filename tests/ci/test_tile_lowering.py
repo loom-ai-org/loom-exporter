@@ -116,7 +116,7 @@ class TestAGatherByAMatrixIndex(unittest.TestCase):
 
     def test_is_warned_about_at_export(self):
         # A warning, not a refusal: Dia's embedding has the same shape and runs, at T = 1 only.
-        with self.assertWarnsRegex(UserWarning, "Flatten the index"):
+        with self.assertWarnsRegex(UserWarning, "flatten the index in the wrapper"):
             _gather_nodes(PairIndexGather(flat=False))
 
     def test_the_flattened_spelling_lowers_quietly(self):
@@ -125,4 +125,4 @@ class TestAGatherByAMatrixIndex(unittest.TestCase):
             warnings.simplefilter("always")
             nodes = _gather_nodes(PairIndexGather(flat=True))
         self.assertIn("GET_ROWS", [n["op"] for n in nodes])
-        self.assertFalse([w for w in caught if "Flatten the index" in str(w.message)])
+        self.assertFalse([w for w in caught if "flatten the index" in str(w.message)])
