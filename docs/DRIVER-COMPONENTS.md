@@ -70,15 +70,15 @@ differs is entirely what the host does with the one output. The family names its
 
 | component | class | emits | links | unchecked | used by |
 |---|---|---|---|---|---|
-| `driver_inputs` | `DriverInputs` | statements | 0 | 5 | chatterbox, conformer-ctc, cosyvoice3, dac, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, moss-audio-tokenizer, pocket-tts, qwen3, qwen3-tts-tokenizer-12hz, snac, speecht5, voxcpm2, voxtral-tts |
-| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | conformer-ctc, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, qwen3 |
+| `driver_inputs` | `DriverInputs` | statements | 0 | 5 | chatterbox, citrinet, conformer-ctc, cosyvoice3, dac, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, moss-audio-tokenizer, pocket-tts, qwen3, qwen3-tts-tokenizer-12hz, snac, speecht5, voxcpm2, voxtral-tts |
+| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | citrinet, conformer-ctc, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, qwen3 |
 | `chunked_codec_call` | `ChunkedCodecCall` | statements | 2 | 6 | *nobody* (see below) |
 | `padded_codec_call` | `PaddedCodecCall` | statements | 2 | 6 | *nobody* (see below) |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
 | `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 16 | granite-speech, hf-causal-lm, lfm2-monolithic, qwen3, qwen3-asr, t5, whisper |
 | `waveform_valid_length` | `WaveformValidLength` | statements | 0 | 5 | granite-speech, qwen3-asr |
 | `prompt_segments` | `PromptSegments` | statements | 2 | 5 | granite-speech, qwen3-asr |
-| `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | conformer-ctc, funasr-sensevoice, hf-ctc-asr |
+| `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | citrinet, conformer-ctc, funasr-sensevoice, hf-ctc-asr |
 | `token_labels_epilogue` | `TokenLabelsEpilogue` | statements | 1 | 0 | funasr-paraformer, hf-token-classifier |
 | `cif_boundary` | `CifBoundary` | statements | 1 | 6 | funasr-paraformer |
 | `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 4 | hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
@@ -95,7 +95,7 @@ differs is entirely what the host does with the one output. The family names its
 
 Binds every name the topologies below are called with: read from the caller's `inputs` table, or computed host-side (`cache_position` via loom.range, `attention_mask` via loom.causal_mask).
 
-*Emits:* statements. *Used by:* chatterbox, conformer-ctc, cosyvoice3, dac, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, moss-audio-tokenizer, pocket-tts, qwen3, qwen3-tts-tokenizer-12hz, snac, speecht5, voxcpm2, voxtral-tts.
+*Emits:* statements. *Used by:* chatterbox, citrinet, conformer-ctc, cosyvoice3, dac, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, moss-audio-tokenizer, pocket-tts, qwen3, qwen3-tts-tokenizer-12hz, snac, speecht5, voxcpm2, voxtral-tts.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -103,7 +103,7 @@ Binds every name the topologies below are called with: read from the caller's `i
 
 The single `run_subgraph` call a flattened export's driver makes, capturing the output's shape alongside its data so the epilogue knows the vocab size -- or, for a KV-cached topology, retaining the output engine-side and binding nothing, so the logits never become a Lua table at all.
 
-*Emits:* statements. *Used by:* conformer-ctc, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, qwen3.
+*Emits:* statements. *Used by:* citrinet, conformer-ctc, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, qwen3.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
@@ -170,7 +170,7 @@ A prompt made of alternating text and non-text pieces -- family 3's audio embedd
 
 Greedy CTC decode: per-frame argmax over the retained logits, then collapse consecutive duplicates and drop the blank. `argmax_epilogue`'s ASR counterpart -- the same single forward pass, but a reduction over EVERY row returning a sequence, rather than over one row returning a token.
 
-*Emits:* statements. *Used by:* conformer-ctc, funasr-sensevoice, hf-ctc-asr.
+*Emits:* statements. *Used by:* citrinet, conformer-ctc, funasr-sensevoice, hf-ctc-asr.
 
 * `retained_module` — TopologyName
 

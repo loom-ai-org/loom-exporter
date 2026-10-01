@@ -236,6 +236,16 @@ CATALOG = [
         base_repo="nvidia/stt_en_conformer_ctc_small", license_id="cc-by-4.0", language=["en"],
         title="Conformer-CTC Small (en)", summary="NVIDIA NeMo's small Conformer-CTC English ASR model, exported for loom.cpp.",
     ),
+    # The only Citrinet on the Hub (the 256/512 variants are NGC-only). Same template and driver as
+    # Conformer-CTC; what differs is the encoder, 1-D Jasper blocks with squeeze-excite, which
+    # `nemo_asr_export.prepare_conv_asr_encoder_for_trace` makes traceable.
+    ModelCard(
+        slug="citrinet-1024", checkpoint=Path("stt-en-citrinet-1024-gamma-0.25/stt_en_citrinet_1024_gamma_0_25.nemo"),
+        export_task="automatic-speech-recognition", export_model="citrinet",
+        task_type="automatic-speech-recognition",
+        base_repo="nvidia/stt_en_citrinet_1024_gamma_0_25", license_id="cc-by-4.0", language=["en"],
+        title="Citrinet-1024 (en)", summary="NVIDIA NeMo's Citrinet-1024 English CTC ASR model, exported for loom.cpp.",
+    ),
     # Family 4 (P5): CNN + transformer + CTC. `export_model="hf-ctc-asr"` is the one generic
     # recognizer, so both leaves name it -- which is the family's whole claim about itself.
     #
