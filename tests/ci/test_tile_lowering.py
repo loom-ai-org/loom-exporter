@@ -14,6 +14,7 @@ one onto the other, and the padded key column was never masked (Retro-065).
 import unittest
 from pathlib import Path
 
+import numpy as np
 import torch
 import coremltools as ct
 
@@ -77,3 +78,51 @@ class TestRepeatWithAShapeReadRep(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PairIndexGather(torch.nn.Module):
+    """SpeechT5's relative-position lookup: a table indexed by an `[n, n]` matrix."""
+
+    def __init__(self, flat):
+        super().__init__()
+        self.table = torch.nn.Embedding(8, 4)
+        self.flat = flat
+
+    def forward(self, idx):
+        if not self.flat:
+            return self.table(idx)
+        n = idx.shape[1]
+        return self.table(idx.reshape(n * n)).view(n, n, 4)
+
+
+def _gather_nodes(module):
+    idx = torch.randint(0, 8, (5, 5), dtype=torch.int32)
+    n = ct.RangeDim(2, 100)
+    prog = ct.convert(torch.jit.trace(module.eval(), (idx,)),
+                      inputs=[ct.TensorType(name="idx", shape=(n, n), dtype=np.int32)],
+                      convert_to="milinternal")
+    out = Path("test_gather_lowering.gguf")
+    try:
+        exporter = LoomGGUFExporter(prog, output_path=str(out), architecture="gather_test")
+        exporter.export()
+    finally:
+        out.unlink(missing_ok=True)
+    return next(iter(exporter.topologies.values()))["nodes"]
+
+
+class TestAGatherByAMatrixIndex(unittest.TestCase):
+    """`ggml_get_rows` looks up one index ROW per batch of a 3-D table, so a 2-D index into a 2-D table
+    asserted inside the engine at the first call -- after export, write and load had all passed."""
+
+    def test_is_warned_about_at_export(self):
+        # A warning, not a refusal: Dia's embedding has the same shape and runs, at T = 1 only.
+        with self.assertWarnsRegex(UserWarning, "Flatten the index"):
+            _gather_nodes(PairIndexGather(flat=False))
+
+    def test_the_flattened_spelling_lowers_quietly(self):
+        import warnings
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            nodes = _gather_nodes(PairIndexGather(flat=True))
+        self.assertIn("GET_ROWS", [n["op"] for n in nodes])
+        self.assertFalse([w for w in caught if "Flatten the index" in str(w.message)])
