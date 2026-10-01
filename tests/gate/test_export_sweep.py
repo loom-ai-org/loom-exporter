@@ -67,6 +67,14 @@ def _transformers_version() -> tuple:
 MODELS = [
     ("conformer-ctc", "conformer-ctc-small/stt_en_conformer_ctc_small.nemo",
      ["--task", "automatic-speech-recognition", "--model", "conformer-ctc"]),
+    # The same CTC template through a 1-D Jasper encoder: the row that fails if
+    # `prepare_conv_asr_encoder_for_trace` stops making the masks trace to one graph.
+    ("citrinet", "stt-en-citrinet-1024-gamma-0.25/stt_en_citrinet_1024_gamma_0_25.nemo",
+     ["--task", "automatic-speech-recognition", "--model", "citrinet"]),
+    # FastConformer encoder + NeMo transformer decoder: family 1's encoder joined to family 2's
+    # cross_kv/decoder split, with the dynamic encoder length T5 has.
+    ("canary", "canary-1b-v2/canary-1b-v2.nemo",
+     ["--task", "automatic-speech-recognition", "--model", "canary"]),
     ("gigaam-rnnt", "gigaam-v3", ["--task", "automatic-speech-recognition", "--model", "gigaam-rnnt"]),
     ("kokoro", "kokoro_model", ["--task", "text-to-speech", "--model", "kokoro"]),
     ("matcha", "matcha_model/ckpt", ["--task", "text-to-speech", "--model", "matcha"]),
