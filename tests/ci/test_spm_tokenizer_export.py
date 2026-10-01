@@ -262,7 +262,12 @@ def test_no_protobuf_reproduces_the_protobuf_path(tmp_path):
                          for i in f.data]
                 for f in reader.fields.values() if f.name.startswith("tokenizer.")}
 
-    assert kvs(tmp_path / "with.gguf", proto.SerializeToString()) == kvs(tmp_path / "without.gguf", None)
+    # Identical but for ONE key, on purpose: the protobuf path's reference is SentencePiece, whose
+    # float-stored Viterbi breaks exact ties differently from the doubles `tokenizers` computes for a
+    # `tokenizer.json`, so only it asks the engine for SentencePiece's arithmetic (loom.cpp ADR-060).
+    with_proto = kvs(tmp_path / "with.gguf", proto.SerializeToString())
+    assert bytes(with_proto.pop("tokenizer.ggml.unigram_scoring")[0]) == b"sentencepiece"
+    assert with_proto == kvs(tmp_path / "without.gguf", None)
 
 
 def test_no_protobuf_and_no_layout_is_refused(tmp_path):
@@ -320,3 +325,21 @@ def test_a_char_model_with_a_multi_character_piece_is_refused():
     """With a two-character piece the lattice has a second path, and Unigram would take it."""
     with pytest.raises(NotImplementedError, match="multi-character"):
         write_sentencepiece_vocab(_RecordingWriter(), _char_proto(["▁", "a", "ab"]))
+
+
+# -- which arithmetic decides a tie (loom.cpp ADR-060) -------------------------------------------------
+
+def test_a_protobuf_vocabulary_asks_for_sentencepieces_arithmetic():
+    """SentencePiece is the reference for a vocabulary read off its `.model`, and its float-stored path
+    scores break exact ties differently from doubles; the engine needs to be told which it is."""
+    writer = _RecordingWriter()
+    writer.add_string = lambda k, v: writer.kv.__setitem__(k, v)
+    write_sentencepiece_vocab(writer, _proto_bytes())
+    assert writer.kv["tokenizer.ggml.unigram_scoring"] == "sentencepiece"
+
+
+def test_a_protobuf_bpe_vocabulary_does_not():
+    writer = _RecordingWriter()
+    writer.add_string = lambda k, v: writer.kv.__setitem__(k, v)
+    write_sentencepiece_vocab(writer, _proto_bytes(unigram=False))
+    assert "tokenizer.ggml.unigram_scoring" not in writer.kv
