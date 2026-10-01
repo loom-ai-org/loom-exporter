@@ -413,13 +413,13 @@ anything.""",
             "**It clones a voice, so it needs one.** Every call takes a reference clip at 24 kHz, the "
             "transcript of that clip, and the text to speak -- the model in-fills one spectrogram "
             "whose first frames are the reference, so there is no way to synthesise without a prompt.\n\n"
-            "**The door is `text2speech.infer(text, reference=, reference_text=)`, which needs a "
-            "loom-py-rt release after 1.0.0rc11.** It joins the transcript to the text and passes the "
+            "**The door is `text2speech.infer(text, reference=, reference_text=)`, which needs "
+            "loom-py-rt 1.0.0rc12 or later.** It joins the transcript to the text and passes the "
             "file's own inputs: `waveform` (the clip, mono, 24 kHz), `text_ids` (the transcript's ids, a "
             "space, then the text's) and `n_ref_text` (how many of those ids are the transcript -- the "
             "duration estimate is a ratio of the two lengths, and nothing in the ids marks the join). "
-            "On 1.0.0rc11 call `model.infer(waveform=, text_ids=, n_ref_text=)` with that join spelled "
-            "out; the audio is identical. Text alone is refused: this model has no voice of its own. "
+            "On 1.0.0rc11 and earlier call `model.infer(waveform=, text_ids=, n_ref_text=)` with that join "
+            "spelled out; the audio is identical. Text alone is refused: this model has no voice of its own. "
             "`loom_cli --wav ref.wav --ref-text \"...\" --prompt \"...\" --out out.wav` does the same "
             "from the shell. Optional knobs: `n_steps`, `cfg_scale`, `sway_coef`, `speed`, `duration` "
             "(total frames), `seed`.\n\n"
@@ -1621,8 +1621,8 @@ audio.save("out.wav")
 """,
     # F5-TTS: a voice-cloning TTS with no voice of its own, so every call takes a reference clip AND its
     # transcript, through `Text2Speech`'s `reference=` door (loom.cpp ADR-056), which joins them the way
-    # `loom_cli --ref-text` does. That door is newer than 1.0.0rc11, so this card must not be published
-    # before a loom-py-rt release carries it (loom.cpp's Host API item). The example clip is JFK's
+    # `loom_cli --ref-text` does. That door shipped in loom-py-rt 1.0.0rc12, so this card must not be
+    # published before that release is on PyPI (loom.cpp's Host API item). The example clip is JFK's
     # (public domain), the one the model-card gate stands in for the reader's recording, so the
     # transcript below is its own.
     "text-to-speech-voice-clone": """import loom
