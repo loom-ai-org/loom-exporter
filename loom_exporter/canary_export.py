@@ -200,6 +200,45 @@ def _check_fused_attention(topo: dict, n_layers: int) -> int:
     return 0
 
 
+def long_form_policy(sample_rate: int, subsampling_factor: int, window_stride: float) -> dict:
+    """How NeMo decodes audio past the 40 s Canary was trained on, as the numbers loom.cpp's
+    `transcribe` reads (`loom.asr.window_*`, `loom.asr.merge_*`; loom.cpp asr_long_form.h).
+
+    **Read off NeMo, not restated.** The window bounds and the overlap are the defaults of NeMo's own
+    `PromptedAudioToTextLhotseDataset._find_optimal_chunk_size(min_sec=30, max_sec=40, overlap_sec=1.0)`,
+    taken from its signature, so an export follows the NeMo it was made against. The search runs in
+    whole seconds (`range(min_sec, max_sec + 1)`).
+
+    The merge widths are `merge_parallel_chunks`'s: `delay` is the encoder frames in one second
+    (`int(1 / (subsampling_factor / 100))`, which assumes NeMo's 10 ms feature stride -- checked below),
+    the search covers `delay * max_steps_per_timestep` tokens (`max_steps_per_timestep=2`), and only
+    `int(delay * 0.6)` tokens of each new window take part ("approximately 60% of the tokens are non
+    blank"). Those two literals live inside the function body, where no signature can be read.
+
+    Without this, one decode runs over the whole file: on 79 s of LibriSpeech that returned 116 of 181
+    words (WER 0.43), and on 304 s it looped on "of the world" until the token budget ran out.
+    """
+    import inspect
+
+    from nemo.collections.asr.data.audio_to_text_lhotse_prompted import PromptedAudioToTextLhotseDataset
+
+    defaults = {name: p.default for name, p in
+                inspect.signature(PromptedAudioToTextLhotseDataset._find_optimal_chunk_size).parameters.items()
+                if p.default is not inspect.Parameter.empty}
+    if abs(window_stride - 0.01) > 1e-9:
+        raise ValueError(f"canary: NeMo's chunk merge assumes a 10 ms feature stride (it divides the "
+                         f"subsampling factor by 100); this checkpoint's is {window_stride} s.")
+    delay = int(1 / (subsampling_factor / 100))
+    return {
+        "window_max_samples": int(defaults["max_sec"] * sample_rate),
+        "window_min_samples": int(defaults["min_sec"] * sample_rate),
+        "window_search_step_samples": int(sample_rate),
+        "window_overlap_samples": int(defaults["overlap_sec"] * sample_rate),
+        "merge_search_tokens": int(delay * 2),
+        "merge_head_tokens": int(delay * 0.6),
+    }
+
+
 @dataclass(kw_only=True)
 class ASRCanaryExportConfig(BaseMultiPhaseModelExportConfig):
     """Canary as three traced phases -- `encoder`, `cross_kv`, `decoder` -- and a driver that runs the
@@ -364,6 +403,8 @@ class ASRCanaryExportConfig(BaseMultiPhaseModelExportConfig):
         self.d_model = int(model.cfg.model_defaults.lm_dec_hidden)
         self.max_positions = int(model.transf_decoder.embedding.position_embedding.pos_enc.shape[0])
         self.max_generation_delta = int(model.cfg.decoding.beam.max_generation_delta)
+        self.long_form = long_form_policy(self.sample_rate, int(model.encoder.subsampling_factor),
+                                          float(model.cfg.preprocessor.window_stride))
         self.cross_kv_names = cross_kv_input_names(self.n_layers)
 
         n_samples = int(TRACE_SECONDS * self.sample_rate)
@@ -448,6 +489,8 @@ class ASRCanaryExportConfig(BaseMultiPhaseModelExportConfig):
             # English <-> each of the other 24.
             contract["asr.target_language_names"] = names
             contract["asr.target_language_ids"] = [self.lang_to_id[n] for n in names]
+        for key, value in (getattr(self, "long_form", None) or {}).items():
+            contract[f"asr.{key}"] = value
         contract["text.frontend"] = "vocab"
         return contract
 
