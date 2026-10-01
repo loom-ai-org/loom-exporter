@@ -335,6 +335,12 @@ def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: Optiona
         raise ValueError(f"tokenizer_model={tokenizer_model!r} wraps a Unigram vocabulary, and this "
                          f"one is {tokenizer_model_tag!r}")
     writer.add_tokenizer_model(tokenizer_model or tokenizer_model_tag)
+    if m is not None and tokenizer_model_tag == "t5":
+        # A Unigram vocabulary read off a SentencePiece `.model`: its reference is SentencePiece, whose
+        # Viterbi stores path scores as float and compares pieces in double -- arithmetic that decides
+        # exact ties differently from `tokenizers`' doubles. The engine reproduces it on this key
+        # (loom.cpp ADR-060). A `tokenizer.json`-only vocabulary writes none and keeps doubles.
+        writer.add_string("tokenizer.ggml.unigram_scoring", "sentencepiece")
     writer.add_token_list(pieces)
     writer.add_token_scores(scores)
     writer.add_token_types(types)
