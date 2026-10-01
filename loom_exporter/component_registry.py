@@ -132,7 +132,7 @@ def _entries() -> Tuple[ComponentEntry, ...]:
         FlowMatchingSampler,
         LuaFragment, ModularChain,
         MonolithicCall, PrefillDecodeLoop, PromptSegments, RawLuaDriver, RecurrentCall,
-        SubgraphCallComponent, TokenLabelsEpilogue, WaveformValidLength,
+        BiRecurrentCall, SubgraphCallComponent, TokenLabelsEpilogue, WaveformValidLength,
     )
     from .lua_library import LuaLibrary
 
@@ -286,6 +286,11 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "recurrent_call", RecurrentCall, (STATEMENTS,),
             "One `loom.run_recurrent`: a whole sequence through one LSTM cell topology, with the "
             "timestep loop and the h/c carry on the C++ side. A stack is one per layer, chained.",
+        ),
+        ComponentEntry(
+            "bi_recurrent_call", BiRecurrentCall, (STATEMENTS,),
+            "One `loom.run_bi_recurrent_and_retain`: a bidirectional LSTM layer, both directions swept "
+            "in C++ and retained as one `[h_fwd | h_bwd]` row per timestep. A stack is one per layer.",
         ),
         ComponentEntry(
             "flow_matching_sampler", FlowMatchingSampler, (PRELUDE, STATEMENTS),

@@ -795,7 +795,9 @@ def _check_retained_reads(function: Function, topologies: dict) -> None:
             # of what produces. Its slot count is 1: the binding retains the sequence, not the cell's
             # two declared outputs.
             for expr in _own_exprs(stmt):
-                if (isinstance(expr, Call) and expr.fn == RECURRENT_RETAIN_FN and expr.args
+                # `run_bi_recurrent_and_retain` too: both directions land in its FIRST module's store
+                # (the forward cell's), interleaved -- which is the module a reader names.
+                if (isinstance(expr, Call) and expr.fn in RECURRENT_RETAIN_FNS and expr.args
                         and isinstance(expr.args[0], Lit)):
                     produced[str(expr.args[0].value)] = 1
                 # Only a CALL's own arguments here. A `SubgraphCall`'s inputs carry the same
@@ -846,6 +848,7 @@ def _check_retained_reads(function: Function, topologies: dict) -> None:
 
 # The binding whose retained sequence `_check_retained_reads` must know about, spelled once.
 RECURRENT_RETAIN_FN = "loom.run_recurrent_and_retain"
+RECURRENT_RETAIN_FNS = (RECURRENT_RETAIN_FN, "loom.run_bi_recurrent_and_retain")
 
 
 def _output_refs_in(expr):
