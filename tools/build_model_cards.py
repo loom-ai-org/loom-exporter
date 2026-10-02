@@ -352,6 +352,28 @@ CATALOG = [
         ),
     ),
     ModelCard(
+        slug="lfm2.5-audio-1.5b-asr", checkpoint=Path("lfm2.5-audio-1.5b"),
+        export_task="automatic-speech-recognition", export_model="lfm2.5-audio",
+        task_type="automatic-speech-recognition",
+        base_repo="LiquidAI/LFM2.5-Audio-1.5B", license_id="other",
+        license_name="LFM Open License v1.0",
+        license_url="https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B/blob/main/LICENSE",
+        language=["en"],
+        title="LFM2.5-Audio-1.5B (speech to text)",
+        summary="Liquid AI's LFM2.5-Audio-1.5B as a speech recognizer, exported for loom.cpp: a FastConformer "
+                "audio encoder feeding the LFM2.5-1.2B hybrid conv/attention language model.",
+        limitations=(
+            "**The speech-to-text door only.** LFM2.5-Audio also speaks (text to speech, and speech-to-speech "
+            "chat); those need its audio-generating half, which is not in this file. It transcribes with the "
+            "fixed system prompt the model card names for ASR, `Perform ASR.`, greedily, as liquid-audio's "
+            "`generate_sequential` does: the same text ids, step for step.\n\n"
+            "**Up to 280 seconds per call**, which is what its 4096-position cache holds alongside the "
+            "transcript; split longer recordings. No timestamps: `segments` is one span covering the "
+            "whole clip.\n\n"
+            "**English.** The audio is taken at 16 kHz."
+        ),
+    ),
+    ModelCard(
         slug="parakeet-tdt-0.6b", checkpoint=Path("parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo"),
         export_task="automatic-speech-recognition", export_model="parakeet-tdt",
         task_type="automatic-speech-recognition",

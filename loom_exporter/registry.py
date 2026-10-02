@@ -214,6 +214,7 @@ _FAMILY_MODULES = (
     "pocket_tts_export",
     "soprano_export",
     "kyutai_stt_export",
+    "lfm25_audio_export",
     "speecht5_export",
     "voxcpm2_export",
     "voxtral_tts_export",
