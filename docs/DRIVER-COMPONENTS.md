@@ -70,7 +70,7 @@ differs is entirely what the host does with the one output. The family names its
 
 | component | class | emits | links | unchecked | used by |
 |---|---|---|---|---|---|
-| `driver_inputs` | `DriverInputs` | statements | 0 | 5 | chatterbox, citrinet, conformer-ctc, cosyvoice3, dac, ecapa-tdnn-lid, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, kyutai-stt, lfm2-modular, lfm2-monolithic, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, moss-audio-tokenizer, pocket-tts, pyannote-segmentation, qwen3, qwen3-tts-tokenizer-12hz, silero-vad, snac, soprano, speecht5, titanet, voxcpm2, voxtral-tts |
+| `driver_inputs` | `DriverInputs` | statements | 0 | 5 | chatterbox, citrinet, conformer-ctc, cosyvoice3, dac, ecapa-tdnn-lid, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, kyutai-stt, lfm2-modular, lfm2-monolithic, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, moss-audio-tokenizer, pocket-tts, pyannote-segmentation, qwen3, qwen3-tts-tokenizer-12hz, silero-vad, snac, soprano, speecht5, titanet, voxcpm2, voxtral-tts, wakehubert |
 | `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | citrinet, conformer-ctc, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, qwen3 |
 | `chunked_codec_call` | `ChunkedCodecCall` | statements | 2 | 6 | *nobody* (see below) |
 | `padded_codec_call` | `PaddedCodecCall` | statements | 2 | 6 | *nobody* (see below) |
@@ -89,14 +89,14 @@ differs is entirely what the host does with the one output. The family names its
 | `recurrent_call` | `RecurrentCall` | statements | 1 | 8 | encodec, silero-vad |
 | `bi_recurrent_call` | `BiRecurrentCall` | statements | 2 | 6 | pyannote-segmentation |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 11 | chatterbox, cosyvoice3, f5-tts, matcha, supertonic |
-| `driver_return` | `DriverReturn` | statements | 0 | 1 | chatterbox, cosyvoice3, dac, dia, ecapa-tdnn-lid, encodec, f5-tts, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, matcha, moss-audio-tokenizer, moss-tts-local, pocket-tts, pyannote-segmentation, qwen3-tts, qwen3-tts-tokenizer-12hz, silero-vad, snac, soprano, speecht5, styletts2, supertonic, titanet, vits, voxcpm2, voxtral-tts |
+| `driver_return` | `DriverReturn` | statements | 0 | 1 | chatterbox, cosyvoice3, dac, dia, ecapa-tdnn-lid, encodec, f5-tts, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, matcha, moss-audio-tokenizer, moss-tts-local, pocket-tts, pyannote-segmentation, qwen3-tts, qwen3-tts-tokenizer-12hz, silero-vad, snac, soprano, speecht5, styletts2, supertonic, titanet, vits, voxcpm2, voxtral-tts, wakehubert |
 | `lua_library` | `LuaLibrary` | prelude | 1 | 0 | f5-tts, funasr-paraformer, kokoro, matcha, styletts2, vits |
 
 ### `driver_inputs` — `DriverInputs`
 
 Binds every name the topologies below are called with: read from the caller's `inputs` table, or computed host-side (`cache_position` via loom.range, `attention_mask` via loom.causal_mask).
 
-*Emits:* statements. *Used by:* chatterbox, citrinet, conformer-ctc, cosyvoice3, dac, ecapa-tdnn-lid, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, kyutai-stt, lfm2-modular, lfm2-monolithic, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, moss-audio-tokenizer, pocket-tts, pyannote-segmentation, qwen3, qwen3-tts-tokenizer-12hz, silero-vad, snac, soprano, speecht5, titanet, voxcpm2, voxtral-tts.
+*Emits:* statements. *Used by:* chatterbox, citrinet, conformer-ctc, cosyvoice3, dac, ecapa-tdnn-lid, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, kyutai-stt, lfm2-modular, lfm2-monolithic, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, moss-audio-tokenizer, pocket-tts, pyannote-segmentation, qwen3, qwen3-tts-tokenizer-12hz, silero-vad, snac, soprano, speecht5, titanet, voxcpm2, voxtral-tts, wakehubert.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -274,7 +274,7 @@ A `FlowMatchingSpec`'s generated Euler-CFM sampler function, plus the line that 
 
 What the entry function hands back to the host.
 
-*Emits:* statements. *Used by:* chatterbox, cosyvoice3, dac, dia, ecapa-tdnn-lid, encodec, f5-tts, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, matcha, moss-audio-tokenizer, moss-tts-local, pocket-tts, pyannote-segmentation, qwen3-tts, qwen3-tts-tokenizer-12hz, silero-vad, snac, soprano, speecht5, styletts2, supertonic, titanet, vits, voxcpm2, voxtral-tts.
+*Emits:* statements. *Used by:* chatterbox, cosyvoice3, dac, dia, ecapa-tdnn-lid, encodec, f5-tts, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, matcha, moss-audio-tokenizer, moss-tts-local, pocket-tts, pyannote-segmentation, qwen3-tts, qwen3-tts-tokenizer-12hz, silero-vad, snac, soprano, speecht5, styletts2, supertonic, titanet, vits, voxcpm2, voxtral-tts, wakehubert.
 
 * nothing — every field is `__unchecked__`, with its reason
 
