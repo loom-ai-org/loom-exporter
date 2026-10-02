@@ -675,6 +675,55 @@ dataset each recording comes from; every file also records its own (`loom.voice.
             "**English only.**",
     ),
     ModelCard(
+        slug="lfm2.5-audio-1.5b-tts", checkpoint=Path("lfm2.5-audio-1.5b"),
+        export_task="text-to-speech", export_model="lfm2.5-audio-tts", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="LiquidAI/LFM2.5-Audio-1.5B", license_id="other",
+        license_name="LFM Open License v1.0",
+        license_url="https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B/blob/main/LICENSE",
+        language=["en"],
+        # Declared by the export (`lfm25_audio_export.TTS_SAMPLE_RATE`): the detokenizer's 24 kHz.
+        sample_rate=24000,
+        title="LFM2.5-Audio-1.5B (text to speech)",
+        summary="Liquid AI's LFM2.5-Audio-1.5B as a speech synthesizer, exported for loom.cpp: the LFM2.5 "
+                "hybrid LM drawing Mimi-codebook frames through its depthformer, and its LFM2-based "
+                "detokenizer. Encodes text itself; four voices.",
+        usage_extra="""### Choosing a voice
+
+The model's voices are the four system prompts its README names. The file speaks as `us_male` when you
+name none; the other three ship in this repo as voice files under `voices/`, and a name is enough:
+
+```python
+print(model.voices)                          # the built-in one first, then the voice files
+
+audio = model.text2speech.infer("Hello there.", voice="uk_female")
+audio.save("uk_female.wav")
+```
+
+| voice | the system prompt it stands for |
+|---|---|
+| `us_male` (built in) | "Perform TTS. Use the US male voice." |
+| `us_female` | "Perform TTS. Use the US female voice." |
+| `uk_male` | "Perform TTS. Use the UK male voice." |
+| `uk_female` | "Perform TTS. Use the UK female voice." |""",
+        extra_files=[
+            "`voices/*.gguf` -- the README's other three voices as loom voice files (each is its system "
+            "prompt's ids), written by `loom_exporter.lfm25_audio_voices`. Only needed to pick a voice "
+            "other than `us_male`.",
+        ],
+        limitations=(
+            "**The text-to-speech door only.** LFM2.5-Audio also transcribes (a separate file, "
+            "`lfm2.5-audio-1.5b-asr`) and chats speech-to-speech (interleaved generation, not exported).\n\n"
+            "**Sampled by default**, as the README's TTS call samples: each frame's codes at temperature "
+            "0.8, top-k 64; the text before and after the speech is greedy. Two calls differ; pass `seed` "
+            "to reproduce one, or `temperature=0` for the greedy decode the export is verified with -- every "
+            "frame's codes as liquid-audio draws them, and the waveform within 4.1e-06.\n\n"
+            "**One generation per call, up to about 80 s of speech** (1024 steps); split long text into "
+            "sentences.\n\n"
+            "**English only.**"
+        ),
+    ),
+    ModelCard(
         slug="voxcpm2", checkpoint=Path("voxcpm2"),
         export_task="text-to-speech", export_model="voxcpm2", task_type="text-to-speech",
         takes_text=True,
