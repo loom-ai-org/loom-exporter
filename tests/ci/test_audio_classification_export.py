@@ -12,7 +12,9 @@ error:
 * `max_pool` had no lowering and no walk case (pyannote's SincNet);
 * `run_bi_recurrent_and_retain` was unknown to the retained-read check.
 
-The real checkpoints are the gate half: `tests/gate/` would need four downloads, and the oracle numbers
+Silero VAD's whole-clip rewrite is checked here against its own frame loop on random weights.
+
+The real checkpoints are the gate half: `tests/gate/` would need five downloads, and the oracle numbers
 are in loom.cpp's Epic-03.
 """
 import io
@@ -290,6 +292,78 @@ def test_a_bidirectional_layer_retains_into_its_forward_cell():
         check_subgraph_calls(Function("infer", ["inputs"], [pre, *stmts, head("lstm_l0_bwd")]), {})
 
 
+# -- Silero VAD: the whole-clip rewrite ------------------------------------------------------------------
+
+def _silero_weights(seed=0):
+    g = torch.Generator().manual_seed(seed)
+    shapes = {"stft": (258, 1, 256), "conv1.weight": (128, 129, 3), "conv1.bias": (128,),
+              "conv2.weight": (64, 128, 3), "conv2.bias": (64,), "conv3.weight": (64, 64, 3),
+              "conv3.bias": (64,), "conv4.weight": (128, 64, 3), "conv4.bias": (128,),
+              "lstm.weight_ih": (512, 128), "lstm.weight_hh": (512, 128), "lstm.bias_ih": (512,),
+              "lstm.bias_hh": (512,), "final.weight": (1, 128, 1), "final.bias": (1,)}
+    return {k: (torch.randn(*s, generator=g, dtype=torch.float64) * 0.1) for k, s in shapes.items()}
+
+
+def _silero_streamed(w, wav):
+    """`tinygrad_model.py`'s forward, one frame at a time with the previous frame's 64 samples in front
+    and the state carried -- the reference the rewrite must equal."""
+    cell = nn.LSTMCell(128, 128).double()
+    with torch.no_grad():
+        for t in ("weight_ih", "weight_hh", "bias_ih", "bias_hh"):
+            getattr(cell, t).copy_(w["lstm." + t])
+    x_all = F.pad(F.pad(wav, (0, (-wav.numel()) % 512)), (64, 0))
+    h = c = torch.zeros(1, 128, dtype=torch.float64)
+    out = []
+    for i in range(64, x_all.numel(), 512):
+        x = F.pad(x_all[i - 64:i + 512].view(1, 1, -1), (0, 64), mode="reflect")
+        x = F.conv1d(x, w["stft"], stride=128)
+        x = (x[:, :129] ** 2 + x[:, 129:] ** 2).sqrt()
+        for k, (s, p) in enumerate(((1, 1), (2, 1), (2, 1), (1, 1))):
+            x = F.relu(F.conv1d(x, w[f"conv{k + 1}.weight"], w[f"conv{k + 1}.bias"], stride=s, padding=p))
+        h, c = cell(x.squeeze(-1), (h, c))
+        out.append(torch.sigmoid(F.conv1d(F.relu(h).unsqueeze(-1), w["final.weight"], w["final.bias"])))
+    return torch.cat(out).flatten()
+
+
+@pytest.mark.parametrize("n", [1, 511, 512, 513, 512 * 6 + 77])
+def test_the_whole_clip_silero_is_the_streamed_one(n):
+    """The reflect pad folded into the STFT weights, the per-frame convolutions as dense pointwise maps
+    and the cell as one `nn.LSTM`: the same function as the frame loop, to f64 rounding, at lengths that
+    end mid-frame, on a boundary and one sample past it."""
+    w = _silero_weights()
+    model = A._SileroWholeClip(w, 256, 128)
+    wav = torch.randn(n, generator=torch.Generator().manual_seed(n), dtype=torch.float64)
+    with torch.no_grad():
+        got = model(wav.unsqueeze(0))[0]
+    want = _silero_streamed(w, wav)
+    assert got.shape == (A._silero_frames(n), 2) == (want.numel(), 2)
+    assert torch.allclose(got[:, 1], want, rtol=0, atol=1e-12)
+    assert torch.allclose(got.sum(-1), torch.ones(got.shape[0], dtype=torch.float64))
+
+
+def test_a_silero_stft_of_another_size_is_refused():
+    w = _silero_weights()
+    w["stft"] = torch.zeros(130, 1, 128, dtype=torch.float64)
+    with pytest.raises(ValueError, match="four-column"):
+        A._SileroWholeClip(w, 128, 64)
+
+
+def test_the_silero_driver_counts_whole_frames():
+    """`ceil(n / 512)` frames, as `(n - 1) // 512 + 1`, read by the sweep and the head alike."""
+    from loom_exporter.driver_components import RecurrentCall, SubgraphCallComponent
+
+    spec = A.SileroVadExportConfig(checkpoint="x", output_path="x.gguf")
+    components = spec.driver_components()
+    sweep = next(c for c in components if isinstance(c, RecurrentCall))
+    head = [c for c in components if isinstance(c, SubgraphCallComponent)][-1]
+    assert sweep.topology == "lstm_l0_fwd" and not sweep.reverse and sweep.retain
+    assert sweep.seq_len == head.length
+    assert sweep.seq_len.render() == "(math.floor((#waveform - 1) / 512) + 1)"
+    contract = A.audio_contract(A.AudioOutput.FRAME_CLASSES, 16000, A._frame_vad_labels(["0", "1"]),
+                                16000 / 512)
+    assert contract["output.frame_rate"] == 31.25 and contract["labels"] == ["non_speech", "speech"]
+
+
 # -- recognizers --------------------------------------------------------------------------------------
 
 def _nemo_archive(path, cfg, dot_slash):
@@ -337,6 +411,14 @@ def test_the_speechbrain_and_pyannote_recognizers(tmp_path):
     assert A._pyannote_checkpoint(pa) == pa / "pytorch_model.bin"
     assert not A._is_pyannote_segmentation(sb)
 
+    sv = tmp_path / "sv"
+    sv.mkdir()
+    assert not A._is_silero_vad(sv)
+    (sv / "silero_vad.jit").write_bytes(b"")
+    assert A._is_silero_vad(sv) and A._silero_checkpoint(sv) == sv / "silero_vad.jit"
+    assert A._is_silero_vad(sv / "silero_vad.jit")
+    assert not A._is_silero_vad(pa / "pytorch_model.bin")
+
 
 def test_both_tasks_are_registered():
     from loom_exporter.registry import default_registry
@@ -345,4 +427,5 @@ def test_both_tasks_are_registered():
     names = {(rec.task, rec.name) for entry in registry._entries.values() for rec in entry.recognizers}
     assert {("audio-embedding", "titanet"), ("audio-classification", "marblenet-vad"),
             ("audio-classification", "ecapa-tdnn-lid"),
-            ("audio-classification", "pyannote-segmentation")} <= names
+            ("audio-classification", "pyannote-segmentation"),
+            ("audio-classification", "silero-vad")} <= names
