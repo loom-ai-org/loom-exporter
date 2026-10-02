@@ -110,6 +110,11 @@ class ModelCard:
     # different codec, a `language=` argument and none of Dia's guidance -- so the shared snippet
     # would publish calls this file does not answer. Wins over everything `snippet_key` derives.
     snippet: Optional[str] = None
+    # A frame classifier's frame length in milliseconds, written into its snippet's comment. Recorded
+    # here because the snippet is shared: MarbleNet's 20 ms was once a literal in it, and the second VAD
+    # (Silero, 32 ms) would have published the first one's number. The file declares the rate itself
+    # (`output.frame_rate`), and `build_one` checks this against it.
+    frame_ms: Optional[int] = None
     # `--task`/`--model` for loom-export; empty means auto-detection resolves both.
     export_task: Optional[str] = None
     export_model: Optional[str] = None
@@ -356,6 +361,27 @@ CATALOG = [
                        "[[reference-qwen3-asr-hf-checkpoint]]",
         title="Qwen3-ASR-0.6B", summary="Alibaba's Qwen3-ASR 0.6B multilingual ASR model, exported for loom.cpp.",
     ),
+    *[ModelCard(
+        slug=f"moonshine-streaming-{size}", checkpoint=Path(f"moonshine-streaming-{size}"), venv="ovos",
+        task_type="automatic-speech-recognition",
+        base_repo=f"moonshine-ai/moonshine-streaming-{size}", license_id="mit", language=["en"],
+        title=f"Moonshine Streaming {size.capitalize()}",
+        summary=f"Useful Sensors' Moonshine Streaming {size} ({params}) English speech recognizer -- a "
+                f"sliding-window encoder over the raw waveform and an autoregressive decoder -- exported "
+                f"for loom.cpp.",
+        limitations=(
+            "**At most 81.9 s per call.** The decoder's position table has 4096 encoder rows (50 per "
+            "second); a longer clip is refused with an error rather than truncated. Split long audio "
+            "at its pauses -- a VAD such as `silero-vad-loom` finds them -- and transcribe each part.\n\n"
+            "Decoding is the model card's own: greedy, and capped at 6.5 tokens per second of audio "
+            "\"to avoid hallucination loops\". A clip shorter than about 0.3 s therefore returns no "
+            "text. Like other encoder-decoder recognizers it can still repeat or invent words on noisy "
+            "or very short audio.\n\n"
+            "The whole clip is one pass, every encoder layer attending through the sliding window the "
+            "model was trained with -- what the model card's usage computes. This export does not run "
+            "the encoder incrementally (live streaming); English only, mono 16 kHz."
+        ),
+    ) for size, params in (("tiny", "34M"), ("small", "123M"))],
     ModelCard(
         slug="granite-speech-4.0-1b", checkpoint=Path("granite-speech-4.0.1b"),
         task_type="automatic-speech-recognition",
@@ -1416,7 +1442,7 @@ licence is its recording's, and so is the consent: clone only voices you have th
         slug="marblenet-vad-v2",
         checkpoint=Path("frame-vad-marblenet-v2/frame_vad_multilingual_marblenet_v2.0.nemo"),
         task_type="audio-classification", pipeline_tag="voice-activity-detection",
-        snippet="audio-classification-vad",
+        snippet="audio-classification-vad", frame_ms=20,
         base_repo="nvidia/frame_vad_multilingual_marblenet_v2.0", license_id="other",
         license_name="NVIDIA Open Model License Agreement",
         license_url="https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license",
@@ -1484,6 +1510,35 @@ licence is its recording's, and so is the consent: clone only voices you have th
             "speakers alone, or one of the three pairs. Audio must be mono 16 kHz.\n\n"
             "Upstream gates its repo behind an accept-terms form although the licence is MIT; this "
             "copy is gated the same way."
+        ),
+    ),
+    ModelCard(
+        # The directory holds `silero_vad.jit` from the `silero-vad` 6.2.3 wheel; the JIT, not the
+        # wheel's tinygrad safetensors, is what is exported (audio_classification_export says why).
+        slug="silero-vad", checkpoint=Path("silero-vad"),
+        task_type="audio-classification", pipeline_tag="voice-activity-detection",
+        snippet="audio-classification-vad", frame_ms=32,
+        source_url="https://github.com/snakers4/silero-vad", source_name="Silero VAD v6.2.3 (16 kHz)",
+        license_id="mit",
+        language_note="Language-agnostic: upstream reports training on corpora covering over 6,000 "
+                      "languages.",
+        title="Silero VAD v6",
+        summary="Silero's voice activity detector (STFT + CNN + LSTM, ~300K parameters), exported for "
+                "loom.cpp. Family 13: audio in, a speech probability for every 32 ms frame out.",
+        limitations=(
+            "The answer is a **probability per frame, not a decision**. Silero's own "
+            "`get_speech_timestamps` thresholds it (0.5), pads each segment and drops short ones; "
+            "that post-processing is left to you, because every consumer of a VAD wants different "
+            "onset and offset behaviour.\n\n"
+            "One row per 512 samples (32 ms) of input, starting at 0 s: `result.times` gives each "
+            "row's start. The whole clip is one call -- the model's streaming state is carried across "
+            "every frame of it, exactly as upstream's frame loop carries it. Audio must be mono "
+            "16 kHz; upstream's 8 kHz model, in the same JIT, is not exported.\n\n"
+            "The weights are upstream's, RE-LAID OUT: the per-frame reflect pad is folded into the "
+            "STFT kernel and the four per-frame convolutions become dense pointwise maps, so the whole "
+            "clip is one pass. The arithmetic is the same -- checked against upstream's own JIT at "
+            "every export -- and the probabilities agree with it to its own float rounding (1.6e-5 "
+            "worst case on real speech, against an f64 reference it is itself 1.0e-5 from)."
         ),
     ),
 ]
@@ -1701,7 +1756,7 @@ print(len(raw), "rows including <s> and </s>, against", len(result), "without")
 
 model = loom.Model.from_pretrained("{repo_id}")
 
-# Audio is a mono float list at 16 kHz. One call over the whole clip, one row per 20 ms frame back.
+# Audio is a mono float list at 16 kHz. One call over the whole clip, one row per {frame_ms} ms frame back.
 result = model.speech2class.infer(audio)
 print(result.granularity, result.labels)
 # frame ['non_speech', 'speech']
@@ -1949,7 +2004,7 @@ audio.save("out.wav")
 #: and Python has braces. The first card to write `{n_codebooks}` inside an explanatory comment
 #: crashed the build with `KeyError: 'n_codebooks'`, and the first one to show a dict or a set literal
 #: would have done the same. Targeted replacement cannot: an unknown brace is just text.
-SNIPPET_PLACEHOLDERS = ("repo_id", "slug", "sample_rate")
+SNIPPET_PLACEHOLDERS = ("repo_id", "slug", "sample_rate", "frame_ms")
 
 
 def render_snippet(text: str, **values) -> str:
@@ -2012,6 +2067,9 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
             f"not something these checkpoints carry -- look it up in the model's documentation and "
             f"record it on the catalogue entry, with where you got it."
         )
+
+    if "{frame_ms}" in USAGE_SNIPPETS[snippet_key(card)] and not card.frame_ms:
+        raise ValueError(f"{card.slug}: no frame_ms, and its usage snippet states the frame length.")
 
     lang_lines = "".join(f"- {code}\n" for code in card.language)
     frontmatter = ["---", f"license: {card.license_id}"]
@@ -2108,7 +2166,7 @@ pip install -U "loom-py-rt[{install_extras}]"
 ```
 {phonemizer_note}
 ```python
-{render_snippet(USAGE_SNIPPETS[snippet_key(card)], repo_id=repo_id(card), slug=card.slug, sample_rate=card.sample_rate)}```
+{render_snippet(USAGE_SNIPPETS[snippet_key(card)], repo_id=repo_id(card), slug=card.slug, sample_rate=card.sample_rate, frame_ms=card.frame_ms)}```
 {usage_extra_section}
 ### The layer underneath
 
@@ -2152,8 +2210,24 @@ def build_one(card: ModelCard, models_root: Path, output_dir: Path, readme_only:
         print(f"  [export] {card.slug}  ({checkpoint} -> {gguf_path})")
         do_export(card, checkpoint, gguf_path)
 
+    if card.frame_ms:
+        check_frame_ms(card, gguf_path)
     (model_dir / "README.md").write_text(render_readme(card, gguf_name))
     print(f"  [ok] {card.slug}: {model_dir}")
+
+
+def check_frame_ms(card: ModelCard, gguf_path: Path) -> None:
+    """The card's `frame_ms` against the frame rate the file itself declares -- the one number in a
+    frame classifier's card that is hand-recorded and also on disk."""
+    from gguf import GGUFReader
+
+    field = GGUFReader(str(gguf_path)).fields.get("loom.output.frame_rate")
+    if field is None:
+        raise ValueError(f"{card.slug}: frame_ms is set but {gguf_path.name} declares no frame rate.")
+    declared = 1000.0 / float(field.parts[field.data[0]][0])
+    if abs(declared - card.frame_ms) > 0.5:
+        raise ValueError(f"{card.slug}: the card says {card.frame_ms} ms frames and the file declares "
+                         f"{declared:.2f} ms.")
 
 
 def running_venv() -> str:

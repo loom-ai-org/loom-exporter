@@ -809,6 +809,315 @@ class _PyannoteHead(nn.Module):
         return out
 
 
+# -- Silero VAD: a streaming CNN + LSTMCell, run over the whole clip -----------------------------------
+#
+# Silero's 16 kHz model reads one 512-sample frame at a time, prefixed with the previous frame's last 64
+# samples, and carries an `LSTMCell` state between calls. Per frame: the 576 samples reflect-padded by 64
+# on the right, a 256-point STFT as a stride-128 convolution (four columns), its magnitude, four 3-tap
+# convolutions over those four columns (the two strided ones take them to one), the cell, a 1x1
+# convolution and a sigmoid. Upstream's own `sequence_vad.py` runs exactly this over a whole clip and
+# calls it bit-exact, which is the export's shape too: a graph over every frame, the cell swept in C++,
+# a graph after it -- pyannote's, with one direction.
+#
+# **The weights are the JIT's.** The wheel also carries `silero_vad_16k.safetensors` beside a tinygrad
+# definition, and every tensor in it but the STFT basis differs from the JIT's (conv4's weight by 18.2);
+# the JIT is what `load_silero_vad()` returns and the default ONNX carries the same numbers, so the
+# safetensors is a different snapshot, not a second spelling.
+
+#: Samples per frame and of carried context -- the 16 kHz model's streaming contract (upstream's
+#: `RATE_CONFIG`). The JIT does not expose them as attributes; `_check_silero_rewrite` runs the JIT
+#: itself over a probe, which is what would catch a model framed otherwise.
+_SILERO_FRAME = 512
+_SILERO_CONTEXT = 64
+_SILERO_RATE = 16000
+
+
+@dataclass(kw_only=True)
+class SileroVadExportConfig(BaseMultiPhaseModelExportConfig):
+    """Silero VAD's `silero_vad.jit` (its 16 kHz model): per-frame speech probability."""
+
+    checkpoint: str
+    architecture: Optional[str] = "silero-vad"
+    driver_script_path: Path = Path(__file__).resolve().parent
+    output: AudioOutput = AudioOutput.FRAME_CLASSES
+    # The trace length and the RangeDim ceiling. The model is a streaming one with no window of its own,
+    # so the ceiling is a declaration, not a limit in the model.
+    trace_seconds: float = 2.0
+    max_seconds: float = 3600.0
+
+    sample_rate: Optional[int] = field(default=None, init=False, repr=False)
+    labels: List[str] = field(default_factory=list, init=False, repr=False)
+    frame_rate: Optional[float] = field(default=None, init=False, repr=False)
+    frame_offset: float = field(default=0.0, init=False, repr=False)
+    _model: Optional[object] = field(default=None, init=False, repr=False)
+
+    __unchecked__ = {
+        "checkpoint": Unchecked("path to `silero_vad.jit`; the loader checks every weight's shape and "
+                                "runs the JIT itself against the rewrite before anything is traced"),
+        "architecture": Unchecked("the name the engine reads back"),
+        "output": Unchecked("fixed: this model's head is one speech probability per frame"),
+        "trace_seconds": Unchecked("the concrete length torch.jit.trace runs at; the dynamic range is "
+                                   "declared separately"),
+        "max_seconds": Unchecked("the ct.RangeDim upper bound -- see the field's comment"),
+        "sample_rate": Unchecked("the 16 kHz model's; the 8 kHz one in the same JIT is not exported"),
+        "labels": Unchecked("the binary VAD pair, as marblenet-vad names it"),
+        "frame_rate": Unchecked("DERIVED: sample_rate / the 512-sample frame"),
+        "frame_offset": Unchecked("0: frame i is samples [512 i, 512 (i + 1)), its 64 samples of "
+                                  "context reaching back into the frame before"),
+        "_model": Unchecked("the rewritten model, cached so phases() can build wrappers around it"),
+    }
+
+    def load_model(self):
+        print(f"Loading Silero VAD from {self.checkpoint}...")
+        jit = torch.jit.load(self.checkpoint, map_location="cpu").eval()
+        model = _SileroWholeClip(_silero_16k_weights(jit), int(jit._model.stft.filter_length),
+                                 int(jit._model.stft.hop_length)).eval()
+        _check_silero_rewrite(jit, model)
+        self.sample_rate = _SILERO_RATE
+        self.labels = _frame_vad_labels(["0", "1"])
+        self.frame_rate = _SILERO_RATE / _SILERO_FRAME
+        self._model = model
+        return model
+
+    def export_architecture(self) -> str:
+        return self.architecture
+
+    def phases(self):
+        import coremltools as ct
+        import numpy as np
+
+        model = self._model if self._model is not None else self.load_model()
+        n_samples = int(self.trace_seconds * _SILERO_RATE)
+        frames = _silero_frames(n_samples)
+        max_samples = int(self.max_seconds * _SILERO_RATE)
+        width = model.lstm.hidden_size
+        return [
+            ExportPhase(
+                name="frontend", wrapper=_SileroFrontEnd(model), dummy_inputs=(torch.randn(1, n_samples),),
+                root_axis="n_samples",
+                mil_inputs=[ct.TensorType(name="waveform", dtype=np.float32,
+                                          shape=(1, ct.RangeDim(1, max_samples)))],
+            ),
+            RecurrentPhase(name="lstm", module=model.lstm, number_layers=True),
+            ExportPhase(
+                name="head", wrapper=_SileroHead(model, self), root_axis="n_enc_frames",
+                dummy_inputs=(torch.randn(1, frames, width),),
+                mil_inputs=[ct.TensorType(name="lstm_out", dtype=np.float32, shape=(
+                    1, ct.RangeDim(1, _silero_frames(max_samples)), width))],
+            ),
+        ]
+
+    def driver_components(self):
+        """The front end, one `run_recurrent` sweep, the head -- EnCodec's chain with the classifier's
+        ends. No hand-written Lua.
+
+        The frame count is `ceil(n / 512)`, the reference's own (it zero-pads the clip to whole
+        frames), spelled `(n - 1) // 512 + 1` because the driver IR has floor division only.
+        """
+        from .driver_components import (
+            CALLER, DriverInputs, DriverReturn, RecurrentCall, SubgraphCallComponent,
+        )
+        from .driver_ir import BinOp, Len, Lit, OutputRef, Var
+
+        hidden = int(self._model.lstm.hidden_size) if self._model is not None else 1
+        n_samples = Len(Var("waveform"))
+        n_frames = BinOp("+", BinOp("floordiv", BinOp("-", n_samples, Lit(1)), Lit(_SILERO_FRAME)),
+                         Lit(1))
+        return [
+            DriverInputs(bindings=(("waveform", CALLER),), n_tokens=n_samples),
+            SubgraphCallComponent(
+                topology="frontend", outputs=(), retain=True, length=n_samples,
+                inputs={"waveform": Var("waveform")},
+                note=("Every frame's STFT magnitude and four convolutions at once, emitted time-major "
+                      "and RETAINED: its only reader is the LSTM sweep."),
+            ),
+            RecurrentCall(
+                topology="lstm_l0_fwd", out_var="lstm_gen", sequence=OutputRef("frontend"),
+                seq_len=n_frames, input_dim=hidden, hidden_dim=hidden, retain=True,
+                note=("The LSTMCell the streaming model calls once per frame, swept over every frame "
+                      "in C++ from a zero state -- what the reference's first call starts from."),
+            ),
+            SubgraphCallComponent(
+                topology="head", outputs=("probs",), length=n_frames,
+                inputs={"lstm_out": OutputRef("lstm_l0_fwd")},
+                note="ReLU, the 1x1 convolution and the sigmoid, as [non_speech, speech] per frame.",
+            ),
+            DriverReturn(values=("probs",)),
+        ]
+
+    def contract(self) -> dict:
+        return audio_contract(self.output, self.sample_rate, self.labels, self.frame_rate,
+                              self.frame_offset)
+
+    def backend_kwargs(self) -> dict:
+        return dict(hparams=self.hparams())
+
+
+def _silero_frames(n_samples: int) -> int:
+    return (n_samples - 1) // _SILERO_FRAME + 1
+
+
+#: The 16 kHz model's weights inside the JIT, under the names `_SileroWholeClip` reads them by.
+_SILERO_JIT_NAMES = {
+    "stft": "_model.stft.forward_basis_buffer",
+    **{f"conv{i + 1}.{t}": f"_model.encoder.{i}.reparam_conv.{t}"
+       for i in range(4) for t in ("weight", "bias")},
+    **{f"lstm.{t}": f"_model.decoder.rnn.{t}" for t in ("weight_ih", "weight_hh", "bias_ih", "bias_hh")},
+    "final.weight": "_model.decoder.decoder.2.weight",
+    "final.bias": "_model.decoder.decoder.2.bias",
+}
+
+
+def _silero_16k_weights(jit) -> dict:
+    state = jit.state_dict()
+    missing = sorted(v for v in _SILERO_JIT_NAMES.values() if v not in state)
+    if missing:
+        raise ValueError(f"silero-vad: the JIT has no {missing}; only the v5/v6 `VADRNNJIT` layout "
+                         f"is reproduced.")
+    return {k: state[v].detach().clone() for k, v in _SILERO_JIT_NAMES.items()}
+
+
+class _SileroWholeClip(nn.Module):
+    """The streaming model's arithmetic over every frame of a clip at once.
+
+    **Frame i is one window of a strided convolution.** With the clip padded by the 64 context samples
+    on the left and up to a whole frame on the right, frame i's 576 samples are the padded clip's
+    `[512 i, 512 i + 576)` -- a kernel of 576 at stride 512 -- and the per-frame reflect pad reads only
+    samples inside that window, so it folds into the STFT weights: a tap that reads reflected sample `m`
+    reads sample `2 * 575 - m` instead. The four STFT columns are four groups of the convolution's
+    output channels, real and imaginary parts in separate convolutions.
+
+    **conv1..conv4 are pointwise.** They run over a frame's four columns, not over time, with their zero
+    padding at the FRAME's edges; flattened `(column, channel)` per frame, each is one dense matrix --
+    a 1x1 convolution over time -- carrying exactly the original taps and zeros where a tap fell in the
+    padding.
+
+    Checked against the streamed JIT at load (`_check_silero_rewrite`); at f64 it differs from a
+    streamed f64 port by 2.7e-15.
+    """
+
+    def __init__(self, weights: dict, n_fft: int, hop: int):
+        super().__init__()
+        basis = weights["stft"]
+        window = _SILERO_FRAME + _SILERO_CONTEXT
+        n_columns = (window + _SILERO_CONTEXT - n_fft) // hop + 1
+        if tuple(basis.shape) != (n_fft + 2, 1, n_fft) or n_columns != 4:
+            raise ValueError(f"silero-vad: an STFT basis of {tuple(basis.shape)} at hop {hop} is not the "
+                             f"256-point, four-column one this rewrite folds.")
+        re, im = _fold_reflected_stft(basis, n_columns, hop, window)
+        self.register_buffer("stft_re", re)
+        self.register_buffer("stft_im", im)
+        columns = n_columns
+        for i, (stride, pad) in enumerate(((1, 1), (2, 1), (2, 1), (1, 1))):
+            matrix, bias, columns = _conv_over_columns(weights[f"conv{i + 1}.weight"],
+                                                       weights[f"conv{i + 1}.bias"], columns, stride, pad)
+            self.register_buffer(f"conv{i}_w", matrix)
+            self.register_buffer(f"conv{i}_b", bias)
+        if columns != 1:
+            raise ValueError(f"silero-vad: the encoder leaves {columns} columns per frame; the cell "
+                             f"reads one.")
+        hidden = weights["lstm.weight_hh"].shape[1]
+        self.lstm = nn.LSTM(weights["lstm.weight_ih"].shape[1], hidden, batch_first=True,
+                            dtype=weights["lstm.weight_ih"].dtype)
+        with torch.no_grad():
+            for name in ("weight_ih", "weight_hh", "bias_ih", "bias_hh"):
+                getattr(self.lstm, f"{name}_l0").copy_(weights[f"lstm.{name}"])
+        self.register_buffer("final_w", weights["final.weight"][:, :, 0].clone())
+        self.register_buffer("final_b", weights["final.bias"].clone())
+
+    def frontend(self, waveform):
+        """`[1, n]` -> `[1, n_frames, 128]`, time-major for the sweep."""
+        x = F.pad(waveform, (_SILERO_CONTEXT, _SILERO_FRAME - 1)).unsqueeze(1)
+        re = F.conv1d(x, self.stft_re, stride=_SILERO_FRAME)
+        im = F.conv1d(x, self.stft_im, stride=_SILERO_FRAME)
+        x = torch.sqrt(re * re + im * im)
+        for i in range(4):
+            x = F.relu(F.conv1d(x, getattr(self, f"conv{i}_w"), getattr(self, f"conv{i}_b")))
+        return x.transpose(1, 2)
+
+    def head(self, lstm_out):
+        """`[1, n_frames, 128]` -> `[1, n_frames, 2]`: `[1 - p, p]`, the pair marblenet-vad's softmax
+        emits, so a host reads either file the same way."""
+        p = torch.sigmoid(F.linear(F.relu(lstm_out), self.final_w, self.final_b))
+        return torch.cat([1.0 - p, p], dim=-1)
+
+    def forward(self, waveform):
+        return self.head(self.lstm(self.frontend(waveform))[0])
+
+
+def _fold_reflected_stft(basis, n_columns: int, hop: int, window: int):
+    """The STFT basis `[2F, 1, n_fft]` over a `window`-sample frame reflect-padded on the right, as two
+    `[n_columns * F, 1, window]` kernels over the UNPADDED frame (real, imaginary). Column-major in the
+    output channels: channel `k * F + f` is column k's bin f."""
+    taps = basis[:, 0, :]
+    n_fft = taps.shape[1]
+    folded = torch.zeros(n_columns, taps.shape[0], window, dtype=taps.dtype)
+    for k in range(n_columns):
+        for t in range(n_fft):
+            m = hop * k + t
+            # `ReflectionPad1d`: the edge sample is not repeated.
+            folded[k, :, m if m < window else 2 * (window - 1) - m] += taps[:, t]
+    bins = taps.shape[0] // 2
+    return (folded[:, :bins].reshape(n_columns * bins, 1, window).contiguous(),
+            folded[:, bins:].reshape(n_columns * bins, 1, window).contiguous())
+
+
+def _conv_over_columns(weight, bias, n_in: int, stride: int, pad: int):
+    """A `Conv1d(k, stride, pad)` over an axis of `n_in` positions, as the `[n_out * OC, n_in * IC, 1]`
+    kernel of a 1x1 convolution over `(position, channel)`-flattened channels."""
+    out_ch, in_ch, k = weight.shape
+    n_out = (n_in + 2 * pad - k) // stride + 1
+    matrix = torch.zeros(n_out * out_ch, n_in * in_ch, dtype=weight.dtype)
+    for q in range(n_out):
+        for d in range(k):
+            p = q * stride - pad + d
+            if 0 <= p < n_in:
+                matrix[q * out_ch:(q + 1) * out_ch, p * in_ch:(p + 1) * in_ch] = weight[:, :, d]
+    return matrix.unsqueeze(-1), bias.repeat(n_out), n_out
+
+
+def _check_silero_rewrite(jit, model) -> None:
+    """The JIT itself, streamed frame by frame the way its own `audio_forward` does, against the
+    rewrite over the whole probe. Lengths that end mid-frame and on a boundary, so the zero padding of
+    the last frame is covered too. The tolerance is the reference's own float floor: f32 against f64
+    differs by up to 1.0e-5 on real speech."""
+    generator = torch.Generator().manual_seed(0)
+    for n in (_SILERO_FRAME * 7, _SILERO_FRAME * 9 + 100):
+        probe = torch.randn(n, generator=generator) * 0.1
+        padded = F.pad(probe, (0, (-n) % _SILERO_FRAME))
+        jit.reset_states()
+        with torch.no_grad():
+            want = torch.cat([jit(padded[i:i + _SILERO_FRAME].unsqueeze(0), _SILERO_RATE)
+                              for i in range(0, padded.numel(), _SILERO_FRAME)], dim=1)[0]
+            got = model(probe.unsqueeze(0))[0, :, 1]
+        if got.shape != want.shape or (got - want).abs().max().item() > 1e-4:
+            raise ValueError(f"silero-vad: the whole-clip rewrite differs from the streamed JIT on a "
+                             f"{n}-sample probe ({tuple(got.shape)} vs {tuple(want.shape)} frames). It "
+                             f"exists to be the same model, so the JIT is not the layout it folds.")
+    jit.reset_states()
+
+
+class _SileroFrontEnd(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, waveform):
+        return self.model.frontend(waveform)
+
+
+class _SileroHead(nn.Module):
+    def __init__(self, model, spec):
+        super().__init__()
+        self.model = model
+        self._spec = [spec]  # a list, so trace does not walk the config as a submodule
+
+    def forward(self, lstm_out):
+        out = self.model.head(lstm_out)
+        _check_output(self._spec[0], out)
+        return out
+
+
 # -- recognizers -----------------------------------------------------------------------------------
 
 
@@ -858,6 +1167,21 @@ def _pyannote_checkpoint(path: Path) -> Optional[Path]:
 
 def _is_pyannote_segmentation(path: Path) -> bool:
     return _pyannote_checkpoint(path) is not None
+
+
+def _silero_checkpoint(path: Path) -> Optional[Path]:
+    """`silero_vad.jit`, or a directory holding it. By name: the file is a TorchScript archive like any
+    other, and detection must not load it -- the loader checks what is inside."""
+    candidate = path / "silero_vad.jit" if path.is_dir() else path
+    return candidate if candidate.name == "silero_vad.jit" and candidate.is_file() else None
+
+
+def _is_silero_vad(path: Path) -> bool:
+    return _silero_checkpoint(path) is not None
+
+
+def _build_silero_vad(path: Path, output_path: str):
+    return SileroVadExportConfig(checkpoint=str(_silero_checkpoint(path)), output_path=output_path)
 
 
 def _build_pyannote_segmentation(path: Path, output_path: str):
@@ -913,5 +1237,12 @@ def register(registry) -> None:
         recognizers=[
             ModelRecognizer(name="pyannote-segmentation", detect=_is_pyannote_segmentation,
                             build_config=_build_pyannote_segmentation),
+        ],
+    ))
+    registry.register(TaskRegistryEntry(
+        task="audio-classification",
+        config_class=SileroVadExportConfig,
+        recognizers=[
+            ModelRecognizer(name="silero-vad", detect=_is_silero_vad, build_config=_build_silero_vad),
         ],
     ))

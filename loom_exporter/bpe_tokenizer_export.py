@@ -130,6 +130,41 @@ def _tokenizer_json_text(tok_dir: Path) -> str:
         return written.read_text()
 
 
+# The `tokenizer.ggml.pre` names loom.cpp reads as `BpeShape::kSpmByteFallback`: a SentencePiece model
+# converted to `tokenizer.json` (literal UTF-8 pieces, U+2581 for a space, `<0xNN>` byte fallback).
+SPM_BYTE_FALLBACK_PRES = frozenset({"granite-embed-multi-311m", "granite-embed-multi-97m",
+                                    "spm-byte-fallback"})
+_SPM_SPACE = "\u2581"
+
+
+def _spm_dummy_prefix(tokenizer_json: dict) -> bool:
+    """Whether a SentencePiece-converted `tokenizer.json` prepends U+2581 to the text -- the dummy
+    prefix, which loom.cpp reads as `tokenizer.ggml.add_space_prefix` on this shape and nowhere else.
+
+    The engine implements exactly the pair the converter writes: `Prepend("\u2581")` in the normalizer
+    and `Strip(" ", 1, 0)` after `Fuse` in the decoder. A prefix without that strip would decode with a
+    leading space the reference does not produce, so the two are required together."""
+    def walk(node, key):
+        if isinstance(node, dict):
+            yield node
+            for child in node.get(key) or []:
+                yield from walk(child, key)
+
+    prepends = [n for n in walk(tokenizer_json.get("normalizer"), "normalizers")
+                if n.get("type") == "Prepend"]
+    if not prepends:
+        return False
+    if [n.get("prepend") for n in prepends] != [_SPM_SPACE]:
+        raise NotImplementedError(f"tokenizer.json prepends {[n.get('prepend') for n in prepends]}; "
+                                  f"only a single U+2581 dummy prefix is implemented.")
+    strips = [n for n in walk(tokenizer_json.get("decoder"), "decoders") if n.get("type") == "Strip"]
+    if [(n.get("content"), n.get("start"), n.get("stop")) for n in strips] != [(" ", 1, 0)]:
+        raise NotImplementedError("tokenizer.json prepends a U+2581 dummy prefix but its decoder does not "
+                                  "strip exactly one leading space back off, which is the pair loom.cpp "
+                                  "implements.")
+    return True
+
+
 def write_bpe_vocab(writer: GGUFWriter, tokenizer_dir: str, pre_type: str = "qwen2",
                     eos_token_ids: list[int] | None = None, tokenizer_model: str = "gpt2") -> None:
     """`tokenizer_model` names the scheme for a front end that WRAPS this byte-level BPE and so has a
@@ -204,3 +239,6 @@ def write_bpe_vocab(writer: GGUFWriter, tokenizer_dir: str, pre_type: str = "qwe
         writer.add_eos_token_id(eos_ids[0])
         writer.add_array("tokenizer.ggml.eos_token_ids", eos_ids)
     writer.add_add_bos_token(bool(config.get("add_bos_token", False)))
+    # Written only when true, so Gemma 3's file -- the same shape, no prefix -- is byte-identical.
+    if pre_type in SPM_BYTE_FALLBACK_PRES and _spm_dummy_prefix(tokenizer_json):
+        writer.add_add_space_prefix(True)
