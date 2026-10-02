@@ -241,8 +241,8 @@ class Lfm25AudioAsrExportConfig(BaseMultiPhaseModelExportConfig):
         return contract
 
     def backend_kwargs(self) -> dict:
-        return dict(flat_namespace=False, root_axis=self.root_axis, tokenizer_dir=self.model_dir,
-                    eos_token_id=int(self._facts.get("eot", 7)))
+        return dict(flat_namespace=False, root_axis=self.root_axis, hparams=self.hparams(),
+                    tokenizer_dir=self.model_dir, eos_token_id=int(self._facts.get("eot", 7)))
 
 
 def _is_lfm25_audio(path: Path) -> bool:
@@ -633,7 +633,8 @@ class Lfm25AudioTtsExportConfig(BaseMultiPhaseModelExportConfig):
         return contract
 
     def backend_kwargs(self) -> dict:
-        return dict(flat_namespace=False, root_axis=self.root_axis, tokenizer_dir=self.model_dir)
+        return dict(flat_namespace=False, root_axis=self.root_axis, hparams=self.hparams(),
+                    tokenizer_dir=self.model_dir)
 
 
 def _build_lfm25_audio_tts(path: Path, output_path: str) -> LoomExportConfig:
