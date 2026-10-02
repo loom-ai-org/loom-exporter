@@ -306,8 +306,13 @@ def _hf_model_type(path: Path) -> Optional[str]:
 
 def _is_qwen3(path: Path) -> bool:
     """Real structural check (BACKLOG.md P3.2): an HF-style directory whose own `config.json` declares
-    `model_type == "qwen3"`."""
-    return _hf_model_type(path) == "qwen3"
+    `model_type == "qwen3"`.
+
+    **Not when the directory also carries a `decoder.pth`.** That is Soprano TTS
+    (`soprano_export`): a qwen3 LM whose vocabulary is audio ids and whose output is the vocoder's
+    input, not text. Exported as a causal LM it would load and generate ids that spell nothing, and
+    left to both recognizers an untasked export would refuse as ambiguous."""
+    return _hf_model_type(path) == "qwen3" and not (path / "decoder.pth").is_file()
 
 
 def _build_qwen3(path: Path, output_path: str) -> LoomExportConfig:

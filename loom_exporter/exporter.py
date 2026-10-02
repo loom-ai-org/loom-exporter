@@ -3060,6 +3060,12 @@ class LoomGGUFExporter:
             # detected as plain "sentencepiece_proto", which tokenizes but does not prepare or chunk.
             from .pocket_tts_tokenizer_export import write_pocket_tts_vocab
             write_pocket_tts_vocab(w, tokenizer_dir)
+        elif family == "soprano":
+            # Family 9's eighth leaf: a character BPE wrapped in tortoise-tts's English normaliser and
+            # sentence split, its rules shipped as the reference's own pattern strings. Named by the
+            # family: the `tokenizer.json` alone would be detected as a plain HF BPE.
+            from .soprano_tokenizer_export import write_soprano_vocab
+            write_soprano_vocab(w, tokenizer_dir)
         elif family == "voxcpm2":
             # Family 9's sixth leaf: a rank-merged character BPE with byte fallback, under the
             # reference's split of multi-character Chinese pieces. Named by the family: the

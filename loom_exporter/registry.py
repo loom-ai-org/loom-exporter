@@ -212,6 +212,7 @@ _FAMILY_MODULES = (
     "f5_tts_export",
     "chatterbox_export",
     "pocket_tts_export",
+    "soprano_export",
     "speecht5_export",
     "voxcpm2_export",
     "voxtral_tts_export",
