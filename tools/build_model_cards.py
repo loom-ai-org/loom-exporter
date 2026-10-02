@@ -361,6 +361,27 @@ CATALOG = [
                        "[[reference-qwen3-asr-hf-checkpoint]]",
         title="Qwen3-ASR-0.6B", summary="Alibaba's Qwen3-ASR 0.6B multilingual ASR model, exported for loom.cpp.",
     ),
+    *[ModelCard(
+        slug=f"moonshine-streaming-{size}", checkpoint=Path(f"moonshine-streaming-{size}"), venv="ovos",
+        task_type="automatic-speech-recognition",
+        base_repo=f"moonshine-ai/moonshine-streaming-{size}", license_id="mit", language=["en"],
+        title=f"Moonshine Streaming {size.capitalize()}",
+        summary=f"Useful Sensors' Moonshine Streaming {size} ({params}) English speech recognizer -- a "
+                f"sliding-window encoder over the raw waveform and an autoregressive decoder -- exported "
+                f"for loom.cpp.",
+        limitations=(
+            "**At most 81.9 s per call.** The decoder's position table has 4096 encoder rows (50 per "
+            "second); a longer clip is refused with an error rather than truncated. Split long audio "
+            "at its pauses -- a VAD such as `silero-vad-loom` finds them -- and transcribe each part.\n\n"
+            "Decoding is the model card's own: greedy, and capped at 6.5 tokens per second of audio "
+            "\"to avoid hallucination loops\". A clip shorter than about 0.3 s therefore returns no "
+            "text. Like other encoder-decoder recognizers it can still repeat or invent words on noisy "
+            "or very short audio.\n\n"
+            "The whole clip is one pass, every encoder layer attending through the sliding window the "
+            "model was trained with -- what the model card's usage computes. This export does not run "
+            "the encoder incrementally (live streaming); English only, mono 16 kHz."
+        ),
+    ) for size, params in (("tiny", "34M"), ("small", "123M"))],
     ModelCard(
         slug="granite-speech-4.0-1b", checkpoint=Path("granite-speech-4.0.1b"),
         task_type="automatic-speech-recognition",

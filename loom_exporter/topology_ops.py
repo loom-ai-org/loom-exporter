@@ -2102,7 +2102,8 @@ def _op_range_1d(self, op, ctx):
     end_resolved = self.facts.range_scalar(end_obj)
     step_resolved = self.facts.range_scalar(step_obj)
 
-    range_node = {"op": "RANGE_1D", "outputs": [self.safe_name(op.outputs[0].name)]}
+    output_name = self.safe_name(op.outputs[0].name)
+    range_node = {"op": "RANGE_1D", "outputs": [output_name]}
     if start_resolved is not None and end_resolved is not None and step_resolved is not None:
         range_node["inputs"] = []
         range_node["attrs"] = {
@@ -2117,6 +2118,41 @@ def _op_range_1d(self, op, ctx):
                 range_inputs.append(resolve(self.safe_name(v.name)))
         range_node["inputs"] = range_inputs
     nodes.append(range_node)
+    # The engine's RANGE_1D always builds F32 (op_range_1d), while MIL types an integer range int32 --
+    # so no `cast` exists in the program, and a range used as a GATHER's indices reached GET_ROWS as
+    # F32, which ggml refuses (Moonshine Streaming's encoder-position table, `pos_emb(arange(n))`, the
+    # first range ever to index a gather). The gather gets an I32 copy of its own (`_gather_by_range`);
+    # every other reader -- `arange(T) < length` masks -- keeps the F32 range it was written against,
+    # so those topologies are byte-identical.
+    if _indexes_a_gather(op.outputs[0]):
+        nodes.append({"op": "CAST", "inputs": [output_name], "outputs": [output_name + _RANGE_I32],
+                      "attrs": {"dtype": "i32"}})
+
+
+_RANGE_I32 = "_i32"
+
+
+def _indexes_a_gather(var) -> bool:
+    """Whether `_gather_by_range` claims a gather reading `var` -- the same predicate, so the I32 copy is
+    emitted exactly when something reads it."""
+    return any(child.op_type == "gather" and child.inputs.get("indices") is var
+               and _range_indexed_gather(None, child) for child in var.child_ops)
+
+
+def _range_indexed_gather(exporter, op) -> bool:
+    """An embedding-style gather -- axis 0, one index vector -- whose indices a `range_1d` produces."""
+    indices = op.inputs.get("indices")
+    return (indices is not None and indices.op is not None and indices.op.op_type == "range_1d"
+            and int(static_value(op.inputs.get("axis"), 0)) == 0)
+
+
+@topology_rule('gather', guard=_range_indexed_gather, when="indices are a range_1d (axis 0)")
+def _gather_by_range(self, op, ctx):
+    nodes, resolve = ctx.nodes, ctx.resolve
+    x_name = self.safe_name((op.inputs.get("x") or op.inputs.get("params")).name)
+    indices_name = self.safe_name(op.inputs["indices"].name)
+    nodes.append({"op": "GET_ROWS", "inputs": [resolve(x_name), resolve(indices_name) + _RANGE_I32],
+                  "outputs": [self.safe_name(op.outputs[0].name)]})
 
 
 @topology_rule('conv')
