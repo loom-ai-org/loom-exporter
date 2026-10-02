@@ -598,6 +598,37 @@ dataset each recording comes from; every file also records its own (`loom.voice.
             "**English only.** Kyutai's other languages are separate checkpoints and are not this file.",
     ),
     ModelCard(
+        slug="soprano-1.1-80m", checkpoint=Path("soprano-1.1-80m"),
+        export_task="text-to-speech", export_model="soprano", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="ekwek/Soprano-1.1-80M", license_id="apache-2.0",
+        source_url="https://github.com/ekwek1/soprano", source_name="Soprano 1.1 (80M)",
+        language=["en"],
+        # Declared by the export (`soprano_export.SAMPLE_RATE`), restated here like Pocket-TTS's.
+        sample_rate=32000,
+        title="Soprano 1.1 (80M)",
+        summary="Soprano-1.1-80M, exported for loom.cpp: an 80M-parameter Qwen3 language model whose "
+                "hidden states drive a Vocos decoder, 32 kHz. Encodes text itself; one voice.",
+        limitations=
+            "**One voice.** Soprano has no speaker conditioning; every call speaks in the voice it was "
+            "trained on.\n\n"
+            "**Practically deterministic, as the reference is.** The reference samples at temperature "
+            "0.001 (its `temperature=0` is replaced by 0.001), top-k 50, top-p 0.95 and repetition "
+            "penalty 1.2, which picks the most likely token unless two are within a hair of each other -- "
+            "and then either may come out, so two calls can differ in a word's delivery now and then. "
+            "These are the file's defaults too; pass `seed` to reproduce a call, or `temperature=0` for "
+            "the deterministic decode the export is verified with: the reference's tokens exactly, and "
+            "its waveform within 4.7e-05 over a 13.6-second, two-sentence text.\n\n"
+            "**The text is normalised the reference's way, and long text is split into sentences.** "
+            "Numbers, dates, times, money, abbreviations and symbols are spelled out by Soprano's own "
+            "English normaliser (shipped in the file and identical to the reference on 20,000 test "
+            "texts), and its quirks come with it: `2026` is read as a year (\"twenty twenty-six\"), and "
+            "a pound sign becomes \"P S\". Each sentence (short ones are merged into a neighbour) is "
+            "generated separately and the audio joined; one generation stops at 512 tokens, about 32 "
+            "seconds.\n\n"
+            "**English only.**",
+    ),
+    ModelCard(
         slug="voxcpm2", checkpoint=Path("voxcpm2"),
         export_task="text-to-speech", export_model="voxcpm2", task_type="text-to-speech",
         takes_text=True,
