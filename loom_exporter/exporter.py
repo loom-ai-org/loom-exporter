@@ -272,6 +272,12 @@ class LoomGGUFExporter:
         self.flat_namespace = bool(kwargs.get("flat_namespace"))
         self.output_path = kwargs.get("output_path") or os.environ.get("LOOM_OUTPUT_PATH", "model.gguf")
         self.quantize = kwargs.get("quantize") or os.environ.get("LOOM_QUANTIZE", None)
+        # Weights a family keeps at F32 whatever `quantize` asks for, by their written name. For a
+        # tensor that is eligible by op and by shape but whose precision the model cannot spare: a DFT
+        # basis feeding a log (WakeHuBERT), where F16's 11-bit mantissa in a near-empty bin moves the
+        # log by more than the quantized layers after it do. Every name must exist (`pack_weights`
+        # raises otherwise), so a renamed tensor cannot silently fall out of its exemption.
+        self.keep_float = frozenset(kwargs.get("keep_float") or ())
         # This topology's ONE true dynamic quantity's real name (EXPORT-ROADMAP.md R1, axes.py) --
         # "n_tokens" unless the caller says otherwise. The engine's own dynamic-shape support is
         # genuinely single-axis (see get_var_info's own docstring): every symbolic dim ordinarily
@@ -2910,6 +2916,8 @@ class LoomGGUFExporter:
                     continue
                 if usage[name] != {(op, 0)}:
                     continue
+                if name in self.keep_float:
+                    continue
                 spatial = tuple(int(d) for d in array.shape[1:])   # (IC, K) or (IC, KH, KW)
                 fastest = int(np.prod(spatial))
                 if fastest % block_size:
@@ -3166,6 +3174,11 @@ class LoomGGUFExporter:
         pending = [name for name in self.weights if name not in self.packing.raw_dtypes]
         if not pending:
             return self.packing
+        if self.quantize and self.keep_float:
+            missing = sorted(self.keep_float - set(self.weights))
+            if missing:
+                raise ValueError(f"keep_float names {missing}, which this export does not write; its "
+                                 f"weights are named e.g. {sorted(self.weights)[:6]}.")
 
         packing = WeightPacking()
         # Resolved before the loop rather than beside it, because the FOLD rewrites topology nodes and
@@ -3211,7 +3224,8 @@ class LoomGGUFExporter:
             # 1D tensors have negligible size benefit and real accuracy cost). Tensors whose last
             # (fastest-varying) dimension isn't block-aligned are left F32 rather than erroring, same
             # graceful behavior as the standalone quantize_gguf_q8_0.py POC.
-            eligible_by_op = qtype is not None and name in quantizable and array.dtype == np.float32
+            eligible_by_op = (qtype is not None and name in quantizable and array.dtype == np.float32
+                              and name not in self.keep_float)
             aligned = array.ndim >= 2 and array.shape[-1] % block_size == 0
             if eligible_by_op and not aligned:
                 packing.n_declined_shape += 1
@@ -3458,6 +3472,8 @@ class LoomGGUFExporter:
             if packing.n_folded:
                 suffix += (f", {packing.n_folded} conv kernel(s) folded to [IC*K, OC] to align their "
                            f"blocks")
+            if self.keep_float:
+                suffix += f", kept F32 by the family: {', '.join(sorted(self.keep_float))}"
             # A quantization that covered nothing is the failure mode this reporting exists for: the
             # export succeeds, the file is byte-for-byte the size it was, and nothing said so. What
             # remains ineligible after `PACKED_WEIGHT_FIRST_OPS` gained the convolutions is a weight
