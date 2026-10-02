@@ -1,0 +1,14 @@
+-- Moonshine Streaming (moonshine_export.py): a sliding-window encoder over the raw waveform, run once,
+-- then a KV-cached cross-attention decode loop.
+--
+-- Three traced topologies: `encoder` takes a whole number of 5 ms frames and emits the decoder-width
+-- encoder states (the position table and projection included); `cross_kv` projects them into every
+-- decoder layer's cross-attention K/V, once; `decoder` is one cached step.
+--
+-- inputs: waveform (flat f32 array at `loom.sample_rate`), and two optional ones -- audio_samples (how
+-- many of those samples are the caller's real audio, before any padding; omitted means all of them)
+-- and max_new_tokens. Returns the generated ids, `</s>` included when it was reached.
+--
+-- The default budget is the model card's: `max_length = floor(audio_samples * 6.5 / 16000)` tokens,
+-- the start token included, "to avoid hallucination loops". The card computes it in float32, which
+-- rounds up by one at exactly one length this file accepts (1284923 samples); this is the exact floor.
