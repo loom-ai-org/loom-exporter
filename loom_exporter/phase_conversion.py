@@ -104,6 +104,7 @@ def convert_phase(phase, quantize: Optional[str] = None) -> PhaseResult:
         # Per-phase, not per-export: an encoder-decoder model caches its decoder's attention and must
         # not cache its encoder's. See ExportPhase.fuse_attention.
         fuse_attention=phase.fuse_attention, kv_cache_size=phase.kv_cache_size,
+        fuse_conv=getattr(phase, "fuse_conv", False),
         # Reaches a PHASE exporter as of P5.0's second change, where it used to reach only the output
         # one. Quantization is what makes packing early worth doing at all -- an F32 pack is a dtype
         # cast and frees nothing.

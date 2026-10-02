@@ -2760,13 +2760,19 @@ class LoomGGUFExporter:
                 "it never sizes and make_kv_cache would reject it. Pass the capacity in tokens (the "
                 "causal-LM family passes its own `max_seq_len`)."
             )
-        return {
+        geometry = {
             "n_layer": n_blocks,
             "n_head_kv": n_head_kv,
             "n_embd_head_k": head_dim_k,
             "n_embd_head_v": head_dim_v,
             "kv_cache_size": int(kv_cache_size),
         }
+        # A RING cache (loom.cpp ADR-066): `kv_cache_size` cells reused modulo, which is a sliding
+        # window of exactly that many keys when every layer attends to the last `kv_cache_size`
+        # positions. Only written when set, so every other file is byte-identical.
+        if self.kwargs.get("kv_cache_ring"):
+            geometry["kv_cache_ring"] = True
+        return geometry
 
     def _conv_state_geometry(self) -> dict:
         """The three facts `loom::make_conv_state_cache` needs, read off the fused SHORT_CONV nodes
@@ -3060,6 +3066,12 @@ class LoomGGUFExporter:
             # detected as plain "sentencepiece_proto", which tokenizes but does not prepare or chunk.
             from .pocket_tts_tokenizer_export import write_pocket_tts_vocab
             write_pocket_tts_vocab(w, tokenizer_dir)
+        elif family == "soprano":
+            # Family 9's eighth leaf: a character BPE wrapped in tortoise-tts's English normaliser and
+            # sentence split, its rules shipped as the reference's own pattern strings. Named by the
+            # family: the `tokenizer.json` alone would be detected as a plain HF BPE.
+            from .soprano_tokenizer_export import write_soprano_vocab
+            write_soprano_vocab(w, tokenizer_dir)
         elif family == "voxcpm2":
             # Family 9's sixth leaf: a rank-merged character BPE with byte fallback, under the
             # reference's split of multi-character Chinese pieces. Named by the family: the
@@ -3087,8 +3099,12 @@ class LoomGGUFExporter:
             # importable as a top-level package the same way loom_exporter is -- not "tools.convert_nemo".
             from .spm_tokenizer_export import read_hf_id_layout, write_sentencepiece_vocab
             from .tokenizer_detect import _SPM_PROTO_NAMES
-            proto_path = next(Path(tokenizer_dir) / name for name in _SPM_PROTO_NAMES
-                              if (Path(tokenizer_dir) / name).exists())
+            # A family whose protobuf has its own name (Kyutai's moshi releases name it in
+            # `config.json`) says so; every other directory holds one of the standard names.
+            named = self.kwargs.get("tokenizer_proto_name")
+            proto_path = Path(tokenizer_dir) / named if named else next(
+                Path(tokenizer_dir) / name for name in _SPM_PROTO_NAMES
+                if (Path(tokenizer_dir) / name).exists())
             # The protobuf says what the pieces ARE; a `tokenizer.json` beside it, where one exists,
             # says what their IDS are, and for the fairseq-derived family those disagree -- see
             # spm_tokenizer_export's module docstring. A directory without one reads None here and
@@ -3331,7 +3347,10 @@ class LoomGGUFExporter:
         # allocates from the file alone rather than from a per-model C++ struct. Absent entirely for
         # every unfused export, which is every model but the causal LMs.
         for key, value in self._kv_cache_geometry().items():
-            w.add_uint32(f"loom.{key}", int(value))
+            if isinstance(value, bool):
+                w.add_bool(f"loom.{key}", value)
+            else:
+                w.add_uint32(f"loom.{key}", int(value))
 
         # The conv-state geometry, on exactly the same terms, when this export produced SHORT_CONV
         # nodes (BACKLOG.md P4.0.10). Absent for every model without stateful convolutions, which today
