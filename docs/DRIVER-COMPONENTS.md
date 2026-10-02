@@ -70,7 +70,7 @@ differs is entirely what the host does with the one output. The family names its
 
 | component | class | emits | links | unchecked | used by |
 |---|---|---|---|---|---|
-| `driver_inputs` | `DriverInputs` | statements | 0 | 5 | chatterbox, citrinet, conformer-ctc, cosyvoice3, dac, ecapa-tdnn-lid, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, marblenet-vad, moss-audio-tokenizer, pocket-tts, pyannote-segmentation, qwen3, qwen3-tts-tokenizer-12hz, snac, speecht5, titanet, voxcpm2, voxtral-tts |
+| `driver_inputs` | `DriverInputs` | statements | 0 | 5 | chatterbox, citrinet, conformer-ctc, cosyvoice3, dac, ecapa-tdnn-lid, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, marblenet-vad, moss-audio-tokenizer, pocket-tts, pyannote-segmentation, qwen3, qwen3-tts-tokenizer-12hz, silero-vad, snac, speecht5, titanet, voxcpm2, voxtral-tts |
 | `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | citrinet, conformer-ctc, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, qwen3 |
 | `chunked_codec_call` | `ChunkedCodecCall` | statements | 2 | 6 | *nobody* (see below) |
 | `padded_codec_call` | `PaddedCodecCall` | statements | 2 | 6 | *nobody* (see below) |
@@ -85,18 +85,18 @@ differs is entirely what the host does with the one output. The family names its
 | `export_constants` | `ExportConstants` | statements | 0 | 1 | canary, chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, matcha, moss-tts-local, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, speecht5, styletts2, supertonic, t5, vits, voxcpm2, voxtral-tts, whisper |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
 | `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 4 | canary, chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, matcha, moss-tts-local, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, speecht5, styletts2, supertonic, t5, vits, voxcpm2, voxtral-tts, whisper |
-| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | canary, chatterbox, cosyvoice3, dia, encodec, f5-tts, funasr-paraformer, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, pyannote-segmentation, qwen3-asr, styletts2, supertonic, t5, vits, whisper |
-| `recurrent_call` | `RecurrentCall` | statements | 1 | 8 | encodec |
+| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | canary, chatterbox, cosyvoice3, dia, encodec, f5-tts, funasr-paraformer, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, pyannote-segmentation, qwen3-asr, silero-vad, styletts2, supertonic, t5, vits, whisper |
+| `recurrent_call` | `RecurrentCall` | statements | 1 | 8 | encodec, silero-vad |
 | `bi_recurrent_call` | `BiRecurrentCall` | statements | 2 | 6 | pyannote-segmentation |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 11 | chatterbox, cosyvoice3, f5-tts, matcha, supertonic |
-| `driver_return` | `DriverReturn` | statements | 0 | 1 | chatterbox, cosyvoice3, dac, dia, ecapa-tdnn-lid, encodec, f5-tts, kokoro, marblenet-vad, matcha, moss-audio-tokenizer, moss-tts-local, pocket-tts, pyannote-segmentation, qwen3-tts, qwen3-tts-tokenizer-12hz, snac, speecht5, styletts2, supertonic, titanet, vits, voxcpm2, voxtral-tts |
+| `driver_return` | `DriverReturn` | statements | 0 | 1 | chatterbox, cosyvoice3, dac, dia, ecapa-tdnn-lid, encodec, f5-tts, kokoro, marblenet-vad, matcha, moss-audio-tokenizer, moss-tts-local, pocket-tts, pyannote-segmentation, qwen3-tts, qwen3-tts-tokenizer-12hz, silero-vad, snac, speecht5, styletts2, supertonic, titanet, vits, voxcpm2, voxtral-tts |
 | `lua_library` | `LuaLibrary` | prelude | 1 | 0 | f5-tts, funasr-paraformer, kokoro, matcha, styletts2, vits |
 
 ### `driver_inputs` — `DriverInputs`
 
 Binds every name the topologies below are called with: read from the caller's `inputs` table, or computed host-side (`cache_position` via loom.range, `attention_mask` via loom.causal_mask).
 
-*Emits:* statements. *Used by:* chatterbox, citrinet, conformer-ctc, cosyvoice3, dac, ecapa-tdnn-lid, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, marblenet-vad, moss-audio-tokenizer, pocket-tts, pyannote-segmentation, qwen3, qwen3-tts-tokenizer-12hz, snac, speecht5, titanet, voxcpm2, voxtral-tts.
+*Emits:* statements. *Used by:* chatterbox, citrinet, conformer-ctc, cosyvoice3, dac, ecapa-tdnn-lid, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-modular, lfm2-monolithic, marblenet-vad, moss-audio-tokenizer, pocket-tts, pyannote-segmentation, qwen3, qwen3-tts-tokenizer-12hz, silero-vad, snac, speecht5, titanet, voxcpm2, voxtral-tts.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -240,7 +240,7 @@ One hand-written block of a peeled driver, kept as its own `.lua` file, declarin
 
 One `loom.run_subgraph` as IR rather than text, so `check_subgraph_calls` covers its output arity too -- what a peel buys structurally.
 
-*Emits:* statements. *Used by:* canary, chatterbox, cosyvoice3, dia, encodec, f5-tts, funasr-paraformer, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, pyannote-segmentation, qwen3-asr, styletts2, supertonic, t5, vits, whisper.
+*Emits:* statements. *Used by:* canary, chatterbox, cosyvoice3, dia, encodec, f5-tts, funasr-paraformer, gigaam-rnnt, granite-speech, kokoro, matcha, parakeet-rnnt, parakeet-tdt, pyannote-segmentation, qwen3-asr, silero-vad, styletts2, supertonic, t5, vits, whisper.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
@@ -249,7 +249,7 @@ One `loom.run_subgraph` as IR rather than text, so `check_subgraph_calls` covers
 
 One `loom.run_recurrent`: a whole sequence through one LSTM cell topology, with the timestep loop and the h/c carry on the C++ side. A stack is one per layer, chained.
 
-*Emits:* statements. *Used by:* encodec.
+*Emits:* statements. *Used by:* encodec, silero-vad.
 
 * `topology` — TopologyName
 
@@ -274,7 +274,7 @@ A `FlowMatchingSpec`'s generated Euler-CFM sampler function, plus the line that 
 
 What the entry function hands back to the host.
 
-*Emits:* statements. *Used by:* chatterbox, cosyvoice3, dac, dia, ecapa-tdnn-lid, encodec, f5-tts, kokoro, marblenet-vad, matcha, moss-audio-tokenizer, moss-tts-local, pocket-tts, pyannote-segmentation, qwen3-tts, qwen3-tts-tokenizer-12hz, snac, speecht5, styletts2, supertonic, titanet, vits, voxcpm2, voxtral-tts.
+*Emits:* statements. *Used by:* chatterbox, cosyvoice3, dac, dia, ecapa-tdnn-lid, encodec, f5-tts, kokoro, marblenet-vad, matcha, moss-audio-tokenizer, moss-tts-local, pocket-tts, pyannote-segmentation, qwen3-tts, qwen3-tts-tokenizer-12hz, silero-vad, snac, speecht5, styletts2, supertonic, titanet, vits, voxcpm2, voxtral-tts.
 
 * nothing — every field is `__unchecked__`, with its reason
 
