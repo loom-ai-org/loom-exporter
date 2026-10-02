@@ -328,6 +328,30 @@ CATALOG = [
         ),
     ),
     ModelCard(
+        slug="kyutai-stt-1b-en-fr", checkpoint=Path("kyutai-stt-1b-en-fr"),
+        export_task="automatic-speech-recognition", export_model="kyutai-stt",
+        task_type="automatic-speech-recognition", snippet="automatic-speech-recognition-24khz",
+        base_repo="kyutai/stt-1b-en_fr", license_id="cc-by-4.0", language=["en", "fr"],
+        title="Kyutai STT 1B (English, French)",
+        summary="Kyutai's streaming speech-to-text model (1B, English and French), exported for loom.cpp: "
+                "the Mimi codec's encoder and a 16-layer language model reading 12.5 codec frames a second.",
+        limitations=(
+            "**Takes 24 kHz audio**, the Mimi codec's rate, which the file declares "
+            "(`model.contract[\"sample_rate\"]`). Resample to it before calling: loom does not.\n\n"
+            "**Run as Kyutai's own `moshi` runs it, not as the transformers port does.** The "
+            "`kyutai/stt-1b-en_fr-trfs` conversion re-encodes the first audio frame and windows the language "
+            "model at 375 positions where this checkpoint was trained with 750, so its transcripts can differ "
+            "from these. This file reproduces `moshi`'s `run_inference`: the same codes on every frame, and "
+            "the same text ids, step for step.\n\n"
+            "**Any length, in fixed memory.** The language model attends to the last 750 frames (60 s) "
+            "through a ring cache, and the codec encodes in chunks, so a long recording costs time, not "
+            "memory. Needs loom 1.0.0-rc14 or later (the ring cache).\n\n"
+            "**The transcript arrives 0.5 s behind the audio** by design (the model's text delay), which is "
+            "why 1.5 s of silence is appended before decoding; a word spoken in the final half second is "
+            "still transcribed. No timestamps: `segments` is one span covering the whole clip."
+        ),
+    ),
+    ModelCard(
         slug="parakeet-tdt-0.6b", checkpoint=Path("parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo"),
         export_task="automatic-speech-recognition", export_model="parakeet-tdt",
         task_type="automatic-speech-recognition",
@@ -1654,6 +1678,19 @@ print(result.text)
 # `target_language` is what to WRITE, and it defaults to English: German audio with no target comes
 # back translated, and language="de", target_language="de" keeps it German.
 print(model.speech2text.infer(audio, language="en", target_language="fr").text)
+""",
+    # Kyutai STT's door: the same call, at the Mimi codec's 24 kHz. loom does not resample, so a card
+    # whose model takes another rate than the 16 kHz every other ASR card assumes has to say so in code.
+    "automatic-speech-recognition-24khz": """import loom
+from scipy.signal import resample_poly   # any resampler will do
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# Audio is a mono float list at 24 kHz -- this model's rate, not the 16 kHz most ASR models take
+# (`model.contract["sample_rate"]` says so). From a 16 kHz recording, resample it first:
+audio_24k = resample_poly(audio, 3, 2).tolist()
+result = model.speech2text.infer(audio_24k)
+print(result.text)
 """,
     # Two TTS snippets, because "TTS" is not one answer. Which one a model gets is `takes_text` below,
     # a per-model fact read off the export rather than assumed from the task -- the single phoneme-ids
