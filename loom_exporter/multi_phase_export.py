@@ -57,6 +57,10 @@ class ExportPhase:
     # backend once per export everywhere else (`causal_lm_export.backend_kwargs`), which cannot express
     # that. Defaults False, so no existing phase changes.
     fuse_attention: bool = False
+    # Fuse this phase's causal depthwise convolutions into stateful `SHORT_CONV` nodes, the conv half of
+    # a hybrid LM (LFM2's), per phase for the reason `fuse_attention` is: an audio encoder in the same
+    # GGUF has depthwise convolutions too, and they must not acquire state. Defaults False.
+    fuse_conv: bool = False
     # The cache capacity in tokens, required when `fuse_attention` is set and meaningless otherwise --
     # `LoomGGUFExporter._kv_cache_geometry` raises naming it if a fused export does not supply one.
     kv_cache_size: Optional[int] = None
@@ -139,6 +143,10 @@ class ExportPhase:
             "as it was, and the presence of a fused node is read back off the emitted graph where it "
             "matters (`_kv_cache_geometry`, `_topology_uses_kv_cache`), which is the same "
             "request-versus-result split KV-CACHE.md decision 5 draws on the engine side."
+        ),
+        "fuse_conv": Unchecked(
+            "a request, read back off the emitted graph like `fuse_attention`: `fuse_loom_short_conv` "
+            "leaves anything it does not recognise as it was, and `_conv_state_geometry` counts what fused"
         ),
         "kv_cache_size": Unchecked(
             "the capacity to declare, in tokens. Bounded by nothing the checkpoint states -- exporting "
