@@ -328,6 +328,52 @@ CATALOG = [
         ),
     ),
     ModelCard(
+        slug="kyutai-stt-1b-en-fr", checkpoint=Path("kyutai-stt-1b-en-fr"),
+        export_task="automatic-speech-recognition", export_model="kyutai-stt",
+        task_type="automatic-speech-recognition", snippet="automatic-speech-recognition-24khz",
+        base_repo="kyutai/stt-1b-en_fr", license_id="cc-by-4.0", language=["en", "fr"],
+        title="Kyutai STT 1B (English, French)",
+        summary="Kyutai's streaming speech-to-text model (1B, English and French), exported for loom.cpp: "
+                "the Mimi codec's encoder and a 16-layer language model reading 12.5 codec frames a second.",
+        limitations=(
+            "**Takes 24 kHz audio**, the Mimi codec's rate, which the file declares "
+            "(`model.contract[\"sample_rate\"]`). Resample to it before calling: loom does not.\n\n"
+            "**Run as Kyutai's own `moshi` runs it, not as the transformers port does.** The "
+            "`kyutai/stt-1b-en_fr-trfs` conversion re-encodes the first audio frame and windows the language "
+            "model at 375 positions where this checkpoint was trained with 750, so its transcripts can differ "
+            "from these. This file reproduces `moshi`'s `run_inference`: the same codes on every frame, and "
+            "the same text ids, step for step.\n\n"
+            "**Any length, in fixed memory.** The language model attends to the last 750 frames (60 s) "
+            "through a ring cache, and the codec encodes in chunks, so a long recording costs time, not "
+            "memory. Needs loom 1.0.0-rc14 or later (the ring cache).\n\n"
+            "**The transcript arrives 0.5 s behind the audio** by design (the model's text delay), which is "
+            "why 1.5 s of silence is appended before decoding; a word spoken in the final half second is "
+            "still transcribed. No timestamps: `segments` is one span covering the whole clip."
+        ),
+    ),
+    ModelCard(
+        slug="lfm2.5-audio-1.5b-asr", checkpoint=Path("lfm2.5-audio-1.5b"),
+        export_task="automatic-speech-recognition", export_model="lfm2.5-audio",
+        task_type="automatic-speech-recognition",
+        base_repo="LiquidAI/LFM2.5-Audio-1.5B", license_id="other",
+        license_name="LFM Open License v1.0",
+        license_url="https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B/blob/main/LICENSE",
+        language=["en"],
+        title="LFM2.5-Audio-1.5B (speech to text)",
+        summary="Liquid AI's LFM2.5-Audio-1.5B as a speech recognizer, exported for loom.cpp: a FastConformer "
+                "audio encoder feeding the LFM2.5-1.2B hybrid conv/attention language model.",
+        limitations=(
+            "**The speech-to-text door only.** LFM2.5-Audio also speaks (text to speech, and speech-to-speech "
+            "chat); those need its audio-generating half, which is not in this file. It transcribes with the "
+            "fixed system prompt the model card names for ASR, `Perform ASR.`, greedily, as liquid-audio's "
+            "`generate_sequential` does: the same text ids, step for step.\n\n"
+            "**Up to 280 seconds per call**, which is what its 4096-position cache holds alongside the "
+            "transcript; split longer recordings. No timestamps: `segments` is one span covering the "
+            "whole clip.\n\n"
+            "**English.** The audio is taken at 16 kHz."
+        ),
+    ),
+    ModelCard(
         slug="parakeet-tdt-0.6b", checkpoint=Path("parakeet_tdt_model/parakeet-tdt-0.6b-v3.nemo"),
         export_task="automatic-speech-recognition", export_model="parakeet-tdt",
         task_type="automatic-speech-recognition",
@@ -596,6 +642,86 @@ dataset each recording comes from; every file also records its own (`loom.voice.
             "tokens, each generated separately from the same voice and joined. A single sentence "
             "longer than that is cut at its commas.\n\n"
             "**English only.** Kyutai's other languages are separate checkpoints and are not this file.",
+    ),
+    ModelCard(
+        slug="soprano-1.1-80m", checkpoint=Path("soprano-1.1-80m"),
+        export_task="text-to-speech", export_model="soprano", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="ekwek/Soprano-1.1-80M", license_id="apache-2.0",
+        source_url="https://github.com/ekwek1/soprano", source_name="Soprano 1.1 (80M)",
+        language=["en"],
+        # Declared by the export (`soprano_export.SAMPLE_RATE`), restated here like Pocket-TTS's.
+        sample_rate=32000,
+        title="Soprano 1.1 (80M)",
+        summary="Soprano-1.1-80M, exported for loom.cpp: an 80M-parameter Qwen3 language model whose "
+                "hidden states drive a Vocos decoder, 32 kHz. Encodes text itself; one voice.",
+        limitations=
+            "**One voice.** Soprano has no speaker conditioning; every call speaks in the voice it was "
+            "trained on.\n\n"
+            "**Practically deterministic, as the reference is.** The reference samples at temperature "
+            "0.001 (its `temperature=0` is replaced by 0.001), top-k 50, top-p 0.95 and repetition "
+            "penalty 1.2, which picks the most likely token unless two are within a hair of each other -- "
+            "and then either may come out, so two calls can differ in a word's delivery now and then. "
+            "These are the file's defaults too; pass `seed` to reproduce a call, or `temperature=0` for "
+            "the deterministic decode the export is verified with: the reference's tokens exactly, and "
+            "its waveform within 4.7e-05 over a 13.6-second, two-sentence text.\n\n"
+            "**The text is normalised the reference's way, and long text is split into sentences.** "
+            "Numbers, dates, times, money, abbreviations and symbols are spelled out by Soprano's own "
+            "English normaliser (shipped in the file and identical to the reference on 20,000 test "
+            "texts), and its quirks come with it: `2026` is read as a year (\"twenty twenty-six\"), and "
+            "a pound sign becomes \"P S\". Each sentence (short ones are merged into a neighbour) is "
+            "generated separately and the audio joined; one generation stops at 512 tokens, about 32 "
+            "seconds.\n\n"
+            "**English only.**",
+    ),
+    ModelCard(
+        slug="lfm2.5-audio-1.5b-tts", checkpoint=Path("lfm2.5-audio-1.5b"),
+        export_task="text-to-speech", export_model="lfm2.5-audio-tts", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="LiquidAI/LFM2.5-Audio-1.5B", license_id="other",
+        license_name="LFM Open License v1.0",
+        license_url="https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B/blob/main/LICENSE",
+        language=["en"],
+        # Declared by the export (`lfm25_audio_export.TTS_SAMPLE_RATE`): the detokenizer's 24 kHz.
+        sample_rate=24000,
+        title="LFM2.5-Audio-1.5B (text to speech)",
+        summary="Liquid AI's LFM2.5-Audio-1.5B as a speech synthesizer, exported for loom.cpp: the LFM2.5 "
+                "hybrid LM drawing Mimi-codebook frames through its depthformer, and its LFM2-based "
+                "detokenizer. Encodes text itself; four voices.",
+        usage_extra="""### Choosing a voice
+
+The model's voices are the four system prompts its README names. The file speaks as `us_male` when you
+name none; the other three ship in this repo as voice files under `voices/`, and a name is enough:
+
+```python
+print(model.voices)                          # the built-in one first, then the voice files
+
+audio = model.text2speech.infer("Hello there.", voice="uk_female")
+audio.save("uk_female.wav")
+```
+
+| voice | the system prompt it stands for |
+|---|---|
+| `us_male` (built in) | "Perform TTS. Use the US male voice." |
+| `us_female` | "Perform TTS. Use the US female voice." |
+| `uk_male` | "Perform TTS. Use the UK male voice." |
+| `uk_female` | "Perform TTS. Use the UK female voice." |""",
+        extra_files=[
+            "`voices/*.gguf` -- the README's other three voices as loom voice files (each is its system "
+            "prompt's ids), written by `loom_exporter.lfm25_audio_voices`. Only needed to pick a voice "
+            "other than `us_male`.",
+        ],
+        limitations=(
+            "**The text-to-speech door only.** LFM2.5-Audio also transcribes (a separate file, "
+            "`lfm2.5-audio-1.5b-asr`) and chats speech-to-speech (interleaved generation, not exported).\n\n"
+            "**Sampled by default**, as the README's TTS call samples: each frame's codes at temperature "
+            "0.8, top-k 64; the text before and after the speech is greedy. Two calls differ; pass `seed` "
+            "to reproduce one, or `temperature=0` for the greedy decode the export is verified with -- every "
+            "frame's codes as liquid-audio draws them, and the waveform within 4.1e-06.\n\n"
+            "**One generation per call, up to about 80 s of speech** (1024 steps); split long text into "
+            "sentences.\n\n"
+            "**English only.**"
+        ),
     ),
     ModelCard(
         slug="voxcpm2", checkpoint=Path("voxcpm2"),
@@ -1623,6 +1749,19 @@ print(result.text)
 # `target_language` is what to WRITE, and it defaults to English: German audio with no target comes
 # back translated, and language="de", target_language="de" keeps it German.
 print(model.speech2text.infer(audio, language="en", target_language="fr").text)
+""",
+    # Kyutai STT's door: the same call, at the Mimi codec's 24 kHz. loom does not resample, so a card
+    # whose model takes another rate than the 16 kHz every other ASR card assumes has to say so in code.
+    "automatic-speech-recognition-24khz": """import loom
+from scipy.signal import resample_poly   # any resampler will do
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# Audio is a mono float list at 24 kHz -- this model's rate, not the 16 kHz most ASR models take
+# (`model.contract["sample_rate"]` says so). From a 16 kHz recording, resample it first:
+audio_24k = resample_poly(audio, 3, 2).tolist()
+result = model.speech2text.infer(audio_24k)
+print(result.text)
 """,
     # Two TTS snippets, because "TTS" is not one answer. Which one a model gets is `takes_text` below,
     # a per-model fact read off the export rather than assumed from the task -- the single phoneme-ids
