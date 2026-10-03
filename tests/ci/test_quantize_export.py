@@ -167,6 +167,49 @@ class TestOnlyFirstOperandsAreEligible(unittest.TestCase):
         self.assertEqual(set(types.values()), {"F32"})
 
 
+class TestAFamilyCanKeepAWeightAtF32(unittest.TestCase):
+    """`keep_float`: a weight eligible by op AND by shape that a family keeps at F32 anyway. WakeHuBERT's
+    DFT basis is the case -- a CONV_1D kernel, so eligible, and at F16 (block size 1, so aligned) its
+    rounding moved the worst frame's cosine to 0.976, more than Q8_0 on every other layer did."""
+
+    def _export(self, quantize, keep_float):
+        from gguf import GGUFReader
+
+        from loom_exporter.exporter import LoomGGUFExporter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "q.gguf")
+            exporter = LoomGGUFExporter(None, output_path=out, architecture="test", quantize=quantize,
+                                        keep_float=keep_float)
+            exporter.topologies = {"t": {"nodes": [
+                {"op": "CONV_1D", "inputs": ["basis", "act"]},
+                {"op": "MUL_MAT", "inputs": ["proj", "act"]},
+            ]}}
+            exporter.weights = {"basis": np.full((8, 1, 64), 1.0, dtype=np.float32),
+                                "proj": np.full((4, 256), 2.0, dtype=np.float32),
+                                "act": np.full((4, 256), 3.0, dtype=np.float32)}
+            exporter.write_gguf("-- driver")
+            return {t.name: (t.tensor_type.name, [int(d) for d in t.shape])
+                    for t in GGUFReader(out).tensors}
+
+    def test_the_named_weight_stays_f32_and_the_rest_are_quantized(self):
+        for quantize in ("F16", "Q8_0"):
+            types = self._export(quantize, ("basis",))
+            self.assertEqual(types["basis"][0], "F32", quantize)
+            self.assertEqual(types["proj"][0], quantize)
+
+    def test_a_kept_conv_kernel_is_not_folded(self):
+        """The fold exists to align blocks for quantization; a kernel that will not be quantized keeps
+        its declared 3-D shape, which the direct-conv lowering reads its geometry from."""
+        self.assertEqual(self._export("Q8_0", ("basis",))["basis"], ("F32", [64, 1, 8]))
+        self.assertEqual(self._export("Q8_0", ())["basis"], ("Q8_0", [64, 8]))
+
+    def test_a_name_the_export_does_not_write_is_refused(self):
+        """A renamed tensor would otherwise fall out of its exemption silently."""
+        with self.assertRaisesRegex(ValueError, "keep_float names \\['bassis'\\]"):
+            self._export("Q8_0", ("bassis",))
+
+
 class TestConvKernelsAreFoldedSoTheirBlocksAlign(unittest.TestCase):
     """The SHAPE half (P4.13), which is what makes the op half above actually pay.
 

@@ -108,3 +108,26 @@ def test_every_card_publishes_a_tag_huggingface_recognizes(cards):
         f"`pipeline_tag=` from HF's list; do NOT change `task_type`, which drives the usage snippet "
         f"and render_readme's per-family checks."
     )
+
+
+def test_a_multi_file_card_names_its_file_and_starts_from_f32(cards):
+    """A repo with several GGUFs needs `from_pretrained(repo, filename)` -- loom-py refuses to choose --
+    so its snippet must name `{gguf}`; and the file the snippet loads is the unquantized one, which is
+    the one whose numbers are the model's own."""
+    for card in cards.CATALOG:
+        if not card.variants:
+            continue
+        assert "{gguf}" in cards.USAGE_SNIPPETS[cards.snippet_key(card)], card.slug
+        types = [qtype for qtype, _ in card.variants]
+        assert types[0] == "F32", f"{card.slug}: the snippet's file should be the F32 one, not {types[0]}"
+        assert len(set(types)) == len(types), f"{card.slug}: a precision is listed twice"
+        names = [name for name, _ in cards.gguf_names(card)]
+        assert names[0] == f"{card.slug}-f32.gguf" and len(set(names)) == len(names)
+        readme = cards.render_readme(card, names[0])
+        assert all(f"`{name}`" in readme for name in names), f"{card.slug}: a file is not in Files"
+
+
+def test_a_single_file_card_is_unchanged_by_variants(cards):
+    """Every card published before multi-file repos keeps its `<slug>.gguf` and its one Files line."""
+    card = next(c for c in cards.CATALOG if not c.variants)
+    assert cards.gguf_names(card) == [(f"{card.slug}.gguf", None)]

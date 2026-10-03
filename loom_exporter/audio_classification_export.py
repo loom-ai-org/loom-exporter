@@ -47,13 +47,15 @@ from .spec_protocol import Axis, Unchecked
 class AudioOutput(Enum):
     """What one forward pass hands back, as the contract names it: `(output.kind, output.granularity)`.
 
-    A closed set rather than two free strings, so a leaf cannot declare a pair no host reads -- an
-    `embeddings` output per FRAME is a real thing (a frame-level encoder) and is not one of these until
-    a leaf needs it and a door answers it.
+    A closed set rather than two free strings, so a leaf cannot declare a pair no file means.
+    `FRAME_EMBEDDINGS` is declared before any door answers it: `loom::audio::embed` refuses a `frame`
+    file with an error naming the granularity, and `infer` returns its rows, `[n_frames, D]` row-major.
     """
 
     # One fixed-width vector per clip: TitaNet, ECAPA speaker models.
     EMBEDDING = ("embeddings", "clip")
+    # One fixed-width vector per encoder frame: a frame-level feature extractor (WakeHuBERT).
+    FRAME_EMBEDDINGS = ("embeddings", "frame")
     # One probability row per encoder frame: VAD, segmentation.
     FRAME_CLASSES = ("class", "frame")
     # One probability row for the whole clip: language id.
@@ -69,7 +71,7 @@ class AudioOutput(Enum):
 
     @property
     def task(self) -> str:
-        return "audio-embedding" if self is AudioOutput.EMBEDDING else "audio-classification"
+        return "audio-embedding" if self.kind == "embeddings" else "audio-classification"
 
 
 @dataclass(kw_only=True)
@@ -156,7 +158,7 @@ def audio_contract(output: AudioOutput, sample_rate: Optional[int], labels: List
     }
     if sample_rate is not None:
         contract["sample_rate"] = int(sample_rate)
-    if output is AudioOutput.FRAME_CLASSES and frame_rate is not None:
+    if output.granularity == "frame" and frame_rate is not None:
         contract["output.frame_rate"] = float(frame_rate)
         if frame_offset:
             contract["output.frame_offset"] = float(frame_offset)
@@ -174,6 +176,11 @@ def _check_output(spec: AudioClassificationExportConfig, out: torch.Tensor) -> N
         if out.dim() != 2 or out.shape[0] != 1:
             raise ValueError(f"{spec.architecture}: an embedding is one [1, D] row per clip; the "
                              f"traced forward returned {tuple(out.shape)}.")
+        return
+    if spec.output is AudioOutput.FRAME_EMBEDDINGS:
+        if out.dim() != 3 or out.shape[0] != 1:
+            raise ValueError(f"{spec.architecture}: frame embeddings are [1, n_frames, D]; the traced "
+                             f"forward returned {tuple(out.shape)}.")
         return
     want_rank = 3 if spec.output is AudioOutput.FRAME_CLASSES else 2
     if out.dim() != want_rank or out.shape[0] != 1:
@@ -1118,6 +1125,113 @@ class _SileroHead(nn.Module):
         return out
 
 
+# -- WakeHuBERT: a causal log-mel + dilated depthwise-separable conv feature extractor ----------------
+#
+# `TigreGotico/wakehubert-tiny`: a 0.64M-parameter student distilled from HuBERT-base, which turns 16 kHz
+# audio into one 128-dimensional feature vector per 320 samples (50 per second) for a wake-word
+# classifier trained on top of it. The checkpoint is `model.safetensors` beside upstream's own
+# `student.py` (plain torch) and a `config.json` that names the class and its arguments; the model is
+# built by `student.py`'s own loader, so the weights and the network are upstream's, unmodified. Every
+# layer is a convolution, a batch norm or a ReLU, and the DFT is already a fixed convolution: one graph
+# over the whole clip, nothing rewritten.
+
+_WAKEHUBERT_FAMILY = "WakeHuBERT"
+
+
+@dataclass(kw_only=True)
+class WakeHubertExportConfig(AudioClassificationExportConfig):
+    """A WakeHuBERT checkpoint directory: `config.json`, `model.safetensors` and `student.py`."""
+
+    output: AudioOutput = AudioOutput.FRAME_EMBEDDINGS
+    architecture: Optional[str] = "wakehubert"
+    # The trace length and the RangeDim ceiling. The model is a streaming one with a 2.5 s receptive
+    # field and no window of its own, so the ceiling is a declaration, not a limit in the model.
+    trace_seconds: float = 1.0
+    max_seconds: float = 3600.0
+
+    _hop: int = field(default=0, init=False, repr=False)
+
+    __unchecked__ = {
+        **AudioClassificationExportConfig.__unchecked__,
+        "trace_seconds": Unchecked("the concrete length torch.jit.trace runs at; the dynamic range is "
+                                   "declared separately"),
+        "max_seconds": Unchecked("the ct.RangeDim upper bound -- see the field's comment"),
+        "_hop": Unchecked("READ off the network (mel hop x stem stride) at load and checked against "
+                          "config.json's `hop_samples` and against the traced frame count"),
+    }
+
+    def load_model(self):
+        import importlib.util
+        import json
+
+        directory = Path(self.checkpoint)
+        config = json.loads((directory / "config.json").read_text())
+        torch_cfg = config["pytorch"]
+        print(f"Loading WakeHuBERT from {directory} (upstream's {torch_cfg['module']})...")
+        # Upstream's own definition and loader, imported from the checkpoint directory: the network is
+        # theirs, so there is no second spelling of it here to drift.
+        spec = importlib.util.spec_from_file_location("_loom_wakehubert_student",
+                                                      directory / torch_cfg["module"])
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        model = getattr(module, torch_cfg["loader"])(str(directory / torch_cfg["weights"]),
+                                                     str(directory / "config.json"))
+        model.eval()
+
+        self.sample_rate = int(config["input"]["sample_rate"])
+        if self.sample_rate != module.SR:
+            raise ValueError(f"wakehubert: config.json says {self.sample_rate} Hz and student.py's "
+                             f"front end is built for {module.SR} Hz.")
+        hop = int(model.mel.hop) * int(model.stem.conv.stride[0])
+        if hop != int(config["output"]["hop_samples"]):
+            raise ValueError(f"wakehubert: the network strides {hop} samples per frame and config.json "
+                             f"says {config['output']['hop_samples']}.")
+        self._hop = hop
+        self.frame_rate = self.sample_rate / hop
+        return model
+
+    def encoder_wrapper(self, model):
+        return _WakeHubertFeatures(model, self).eval()
+
+    def backend_kwargs(self) -> dict:
+        """The front end stays F32 at every `--quantize`, as upstream's own int8 file keeps it in float.
+        The DFT basis is eligible (a convolution kernel), and at F16 its rounding in the near-empty high
+        bins of a loud frame is amplified by the log: measured on jfk.wav, an F16 basis took the worst
+        frame's cosine to the f64 reference from 0.9999 to 0.976, more than Q8_0 on every other layer.
+        The mel matrix is a second matmul operand (never quantized) and is named for the intent."""
+        return dict(super().backend_kwargs(), keep_float=("model_mel_basis", "model_mel_mel"))
+
+    def build_trace(self, model):
+        """The waveform alone: the network takes no length, and a clip handed over whole is all audio."""
+        import coremltools as ct
+        import numpy as np
+
+        n_samples = int(self.trace_seconds * self.sample_rate)
+        seq_dim = ct.RangeDim(self._hop, int(self.max_seconds * self.sample_rate))
+        mil_inputs = [ct.TensorType(name="waveform", shape=(1, seq_dim), dtype=np.float32)]
+        return self.encoder_wrapper(model), (torch.randn(1, n_samples),), mil_inputs
+
+
+class _WakeHubertFeatures(nn.Module):
+    """`WakeHuBERTTiny.forward`: `[1, n]` -> `[1, n // hop, 128]`, frame t computed from the samples
+    before `hop * (t + 1)`. The frame count is checked here, during the trace, against the one the
+    contract's frame rate promises."""
+
+    def __init__(self, model, spec):
+        super().__init__()
+        self.model = model
+        self._spec = [spec]  # a list, so trace does not walk the config as a submodule
+
+    def forward(self, waveform):
+        out = self.model(waveform)
+        spec = self._spec[0]
+        _check_output(spec, out)
+        if int(out.shape[1]) != int(waveform.shape[1]) // spec._hop:
+            raise ValueError(f"wakehubert: {int(waveform.shape[1])} samples gave {int(out.shape[1])} "
+                             f"frames, not one per {spec._hop}.")
+        return out
+
+
 # -- recognizers -----------------------------------------------------------------------------------
 
 
@@ -1180,6 +1294,35 @@ def _is_silero_vad(path: Path) -> bool:
     return _silero_checkpoint(path) is not None
 
 
+def _wakehubert_checkpoint(path: Path) -> Optional[Path]:
+    """The directory holding `config.json` whose `family` is WakeHuBERT, and the module and weights it
+    names -- or None. Read as JSON: detection must not import `student.py`."""
+    import json
+
+    directory = path if path.is_dir() else path.parent
+    config = directory / "config.json"
+    if not config.is_file():
+        return None
+    try:
+        data = json.loads(config.read_text())
+    except (ValueError, OSError):
+        return None
+    if not isinstance(data, dict) or data.get("family") != _WAKEHUBERT_FAMILY:
+        return None
+    torch_cfg = data.get("pytorch") or {}
+    if not all((directory / str(torch_cfg.get(k, ""))).is_file() for k in ("module", "weights")):
+        return None
+    return directory
+
+
+def _is_wakehubert(path: Path) -> bool:
+    return _wakehubert_checkpoint(path) is not None
+
+
+def _build_wakehubert(path: Path, output_path: str):
+    return WakeHubertExportConfig(checkpoint=str(_wakehubert_checkpoint(path)), output_path=output_path)
+
+
 def _build_silero_vad(path: Path, output_path: str):
     return SileroVadExportConfig(checkpoint=str(_silero_checkpoint(path)), output_path=output_path)
 
@@ -1218,6 +1361,7 @@ def register(registry) -> None:
         config_class=AudioClassificationExportConfig,
         recognizers=[
             ModelRecognizer(name="titanet", detect=_is_titanet, build_config=_build_titanet),
+            ModelRecognizer(name="wakehubert", detect=_is_wakehubert, build_config=_build_wakehubert),
         ],
     ))
     registry.register(TaskRegistryEntry(
