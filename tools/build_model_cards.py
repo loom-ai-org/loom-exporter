@@ -25,7 +25,7 @@ import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 # REPO_ROOT computed locally, not imported from loom_exporter.paths -- this script is invoked directly
 # (`python tools/build_model_cards.py`), which puts `tools/` on sys.path[0], not the repo root, so
@@ -166,6 +166,13 @@ class ModelCard:
     # Extra bullets for the "Files" section, for a repo that ships more than the GGUF. Each string is
     # one bullet, markdown, without the leading "- ".
     extra_files: List[str] = field(default_factory=list)
+    # Several precisions of one model in ONE repo, as `(quantize type, Files-list note)` pairs: each is
+    # exported to `<slug>-<type>.gguf` (`--quantize <type>`; "F32" is the unquantized export) and the
+    # first is the one the usage snippet loads. Empty for the usual one-GGUF repo, `<slug>.gguf`. A
+    # repo with several files needs `from_pretrained(repo, filename)` -- loom-py refuses to choose --
+    # so a snippet that serves such a card names `{gguf}`. The notes are MEASURED numbers and carry
+    # their source in the catalogue entry's comment.
+    variants: List[Tuple[str, str]] = field(default_factory=list)
 
 
 # The 19 models the exporter can produce today (BACKLOG.md's implementation-sequence table, P4/P5).
@@ -1667,6 +1674,58 @@ licence is its recording's, and so is the consent: clone only voices you have th
             "worst case on real speech, against an f64 reference it is itself 1.0e-5 from)."
         ),
     ),
+    ModelCard(
+        # The checkpoint directory is the Hub repo's `config.json`, `model.safetensors` and
+        # `student.py` (upstream's own torch definition, which the loader imports). Four precisions in
+        # one repo, at the user's request (2026-10-03). Each note's cosine is per 20 ms frame against
+        # upstream's student.py run at f64, on samples/jfk.wav (550 frames), measured 2026-10-03; the
+        # same order held on noise, a 1-frame clip, an odd length and a 60 s clip. The F32 figure is
+        # f32 summation order: an f32 DFT accumulated in 8 SIMD lanes lands at the same 3.4e-5.
+        slug="wakehubert-tiny", checkpoint=Path("wakehubert-tiny"),
+        task_type="audio-embedding", pipeline_tag="feature-extraction",
+        snippet="audio-frame-embedding", frame_ms=20,
+        base_repo="TigreGotico/wakehubert-tiny", license_id="apache-2.0",
+        # Upstream's list minus "multilingual", which is not an ISO-639 code.
+        language=["en", "de", "nl", "fr", "es", "it", "pt", "pl"],
+        title="WakeHuBERT tiny (streaming speech features for wake words)",
+        summary="TigreGotico's 0.64M-parameter causal feature extractor, distilled from HuBERT-base for "
+                "wake-word detection, exported for loom.cpp in four precisions. Family 13: audio in, "
+                "one 128-dimensional feature vector per 20 ms frame out.",
+        variants=[
+            ("F32", "full precision, 3.3 MB. Matches upstream's PyTorch model to float rounding: "
+                    "largest difference 3.4e-5 on features up to 11.5, cosine 1.000000 on every frame."),
+            # Speeds: scripts/bench_wakehubert.py in loom.cpp, Ryzen 3 3250U, 2026-10-03 (Epic-03).
+            ("F16", "2.0 MB. Mean cosine 1.000000 to the PyTorch model, worst frame 0.999998. A size "
+                    "choice, not a speed one: on an x86 CPU it runs about 1.4x SLOWER than F32 (the "
+                    "quantized files run at F32's speed)."),
+            ("Q8_0", "1.4 MB. Mean cosine 0.99992, worst frame 0.99978 -- closer than upstream's own "
+                     "`wakehubert_int8.onnx` (mean 0.9975)."),
+            # Q4_1, not Q4_0 (the user's call, 2026-10-03): Q4_0 measured mean 0.981 / worst 0.94 on
+            # the same clip, for 0.1 MB less.
+            ("Q4_1", "1.2 MB. Mean cosine 0.987, worst frame 0.972: a measurably different feature "
+                     "space. A detector trained on the F32 features needs re-validating on these, or "
+                     "training on them."),
+        ],
+        limitations=(
+            "**Use `model.infer`, not `speech2embeddings`.** This file's embeddings are per FRAME, and "
+            "loom's `speech2embeddings` door returns one vector per clip, so it refuses this model with "
+            "an error naming the granularity (it is still listed in `model.capabilities`). `infer` "
+            "returns the frames, row-major.\n\n"
+            "**One call is one whole clip, offline.** The model is strictly causal -- frame *t* depends "
+            "only on audio before sample 320 x (t + 1), within a 2.5 s receptive field -- and it was "
+            "trained to describe each HuBERT frame 100 ms late, so a detector built on it reacts about "
+            "that long after the word ends. To stream it, call it on a sliding buffer that keeps 40,000 "
+            "samples (2.5 s) of context and take the newest frames: those then equal the offline ones. "
+            "A clip shorter than 320 samples gives no frames. Audio must be mono 16 kHz.\n\n"
+            "**Every precision keeps the front end in F32.** The log-mel's DFT basis is the one weight "
+            "this model cannot spare precision in: at F16 its rounding in the near-empty high bins of a "
+            "loud frame is amplified by the log, which took the worst frame to cosine 0.976 before the "
+            "basis was exempted. Upstream's own int8 file keeps its front end in float too.\n\n"
+            "Upstream evaluates it on one English wake word and one benchmark, and notes that agreement "
+            "with the teacher predicts detection quality poorly: judge it, and any of the quantized "
+            "files, by a detector trained on its features."
+        ),
+    ),
 ]
 
 CATALOG_BY_SLUG = {m.slug: m for m in CATALOG}
@@ -1949,6 +2008,27 @@ for t, label in zip(result.times, result.best):
 for start, label in turns:
     print(f"{start:6.2f}s  {label}")
 """,
+    # A frame-level feature extractor: one vector per frame, which no door answers yet (loom.cpp
+    # ADR-062 declares the granularity), so the card calls `infer` and cuts the flat answer into rows
+    # itself. Plain lists, because `loom-py-rt` has no numpy dependency and the card installs nothing
+    # else. `{gguf}` because the repo carries several precisions and `from_pretrained` will not choose.
+    "audio-frame-embedding": """import loom
+
+# This repo holds four precisions of one model; name the file you want (see "Files" below).
+model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
+
+# Audio is a mono float list at 16 kHz. `infer` returns every frame's features in one flat list, and
+# the file declares its own frame rate: one frame per 320 samples.
+flat = model.infer(waveform=audio)
+hop = round(model.contract["sample_rate"] / model.contract["frame_rate"])
+dim = len(flat) // (len(audio) // hop)
+features = [flat[i:i + dim] for i in range(0, len(flat), dim)]
+print(len(features), dim)
+# one row per {frame_ms} ms of audio, 128 features each: 550 128 for an 11 s clip
+
+# Each row describes the speech about 100 ms before its frame ends; a wake-word classifier is trained
+# on a window of these rows, and its decision rule is yours.
+""",
     "audio-embedding": """import math
 
 import loom
@@ -2143,7 +2223,7 @@ audio.save("out.wav")
 #: and Python has braces. The first card to write `{n_codebooks}` inside an explanatory comment
 #: crashed the build with `KeyError: 'n_codebooks'`, and the first one to show a dict or a set literal
 #: would have done the same. Targeted replacement cannot: an unknown brace is just text.
-SNIPPET_PLACEHOLDERS = ("repo_id", "slug", "sample_rate", "frame_ms")
+SNIPPET_PLACEHOLDERS = ("repo_id", "slug", "sample_rate", "frame_ms", "gguf")
 
 
 def render_snippet(text: str, **values) -> str:
@@ -2207,6 +2287,9 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
             f"record it on the catalogue entry, with where you got it."
         )
 
+    if card.variants and "{gguf}" not in USAGE_SNIPPETS[snippet_key(card)]:
+        raise ValueError(f"{card.slug}: the repo carries {len(card.variants)} GGUFs and its snippet "
+                         f"does not name one; `from_pretrained` refuses to choose.")
     if "{frame_ms}" in USAGE_SNIPPETS[snippet_key(card)] and not card.frame_ms:
         raise ValueError(f"{card.slug}: no frame_ms, and its usage snippet states the frame length.")
 
@@ -2271,6 +2354,31 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
     install_extras = "hub,phonemes" if needs_phonemes else "hub"
     phonemizer_note = PHONEMIZER_NOTE if needs_phonemes else ""
     extra_files_section = "".join(f"- {bullet}\n" for bullet in card.extra_files)
+    weights_line = ("Weights are unmodified; this repo packages the same parameters into\n"
+                    "loom.cpp's GGUF format.")
+    if card.variants:
+        weights_line = ("The F32 file carries the same parameters unmodified, in loom.cpp's GGUF "
+                        "format;\nthe others are quantized from them (see Files).")
+    # A card whose snippet calls `infer` directly is already ON the layer the paragraph below would
+    # point down to, so it says that instead of calling `infer` a door.
+    if "model.infer(" in USAGE_SNIPPETS[snippet_key(card)]:
+        layer_line = (
+            "The call above is `model.infer(...)`, which passes your arguments straight to the driver "
+            "this GGUF\nembeds; no high-level door answers this model's output yet.")
+    else:
+        layer_line = (
+            "The call above is the high-level door: one per task, named for the modality pair it maps "
+            "between, with\nthe windowing, sampling and assembly this model needs already applied. "
+            "Under it, `model.infer(...)`\npasses your arguments straight to the driver this GGUF "
+            "embeds -- which is where you go for a knob the\ndoor does not name.")
+    if card.variants:
+        gguf_files_section = (
+            "One model in several precisions; every file carries the same graph and driver. The "
+            "quantized ones pack the convolution and projection weights (`loom-export --quantize "
+            "<type>`), so their numbers differ from the original model's by the amount noted.\n\n"
+            + "".join(f"- `{variant_gguf_name(card, qtype)}` -- {note}\n" for qtype, note in card.variants))
+    else:
+        gguf_files_section = f"- `{gguf_name}` -- the model, exported with loom-exporter.\n"
     # Named in the Files list rather than left to be discovered from the byte count: a quantized
     # export is not the same artifact as the F32 one, and a reader comparing this against their own
     # export needs to know which they are looking at.
@@ -2285,8 +2393,7 @@ that carries its own graph topologies, tokenizer (if any) and driver script, pro
 
 ## Original model
 
-Exported from {source_line}. Weights are unmodified; this repo packages the same parameters into
-loom.cpp's GGUF format.
+Exported from {source_line}. {weights_line}
 
 ## License
 
@@ -2305,14 +2412,11 @@ pip install -U "loom-py-rt[{install_extras}]"
 ```
 {phonemizer_note}
 ```python
-{render_snippet(USAGE_SNIPPETS[snippet_key(card)], repo_id=repo_id(card), slug=card.slug, sample_rate=card.sample_rate, frame_ms=card.frame_ms)}```
+{render_snippet(USAGE_SNIPPETS[snippet_key(card)], repo_id=repo_id(card), slug=card.slug, sample_rate=card.sample_rate, frame_ms=card.frame_ms, gguf=gguf_name)}```
 {usage_extra_section}
 ### The layer underneath
 
-The call above is the high-level door: one per task, named for the modality pair it maps between, with
-the windowing, sampling and assembly this model needs already applied. Under it, `model.infer(...)`
-passes your arguments straight to the driver this GGUF embeds -- which is where you go for a knob the
-door does not name.
+{layer_line}
 
 `model.driver_source` prints that driver, including a header comment documenting every argument it
 accepts for this model, and is the authority on it. See [loom-py]({LOOM_PY_URL}) for the API and
@@ -2320,37 +2424,54 @@ accepts for this model, and is the authority on it. See [loom-py]({LOOM_PY_URL})
 {limitations_section}
 ## Files
 
-- `{gguf_name}` -- the model, exported with loom-exporter.
-{extra_files_section}"""
+{gguf_files_section}{extra_files_section}"""
     return "\n".join(frontmatter) + body
 
 
-def do_export(card: ModelCard, checkpoint: Path, out_gguf: Path) -> None:
+def variant_gguf_name(card: ModelCard, qtype: str) -> str:
+    return f"{card.slug}-{qtype.lower()}.gguf"
+
+
+def gguf_names(card: ModelCard) -> List[Tuple[str, Optional[str]]]:
+    """Every GGUF this card's repo carries, as `(file name, --quantize type or None)`; the first is
+    the one the snippet loads."""
+    if not card.variants:
+        return [(f"{card.slug}.gguf", None)]
+    return [(variant_gguf_name(card, qtype), None if qtype == "F32" else qtype)
+            for qtype, _ in card.variants]
+
+
+def do_export(card: ModelCard, checkpoint: Path, out_gguf: Path, quantize: Optional[str] = None) -> None:
     from loom_exporter.main_export import main_export
 
     out_gguf.parent.mkdir(parents=True, exist_ok=True)
-    main_export(str(checkpoint), str(out_gguf), task=card.export_task, model=card.export_model)
+    main_export(str(checkpoint), str(out_gguf), task=card.export_task, model=card.export_model,
+                quantize=quantize)
 
 
 def build_one(card: ModelCard, models_root: Path, output_dir: Path, readme_only: bool) -> None:
     model_dir = output_dir / card.slug
-    gguf_name = f"{card.slug}.gguf"
-    gguf_path = model_dir / gguf_name
+    files = gguf_names(card)
+    gguf_name = files[0][0]
 
     if readme_only:
-        if not gguf_path.exists():
-            print(f"  [skip] {card.slug}: --readme-only but {gguf_path} does not exist")
+        missing = [name for name, _ in files if not (model_dir / name).exists()]
+        if missing:
+            print(f"  [skip] {card.slug}: --readme-only but {', '.join(missing)} not in {model_dir}")
             return
     else:
         checkpoint = resolve_checkpoint(card, models_root)
         if not checkpoint.exists():
             print(f"  [skip] {card.slug}: checkpoint not found at {checkpoint}")
             return
-        print(f"  [export] {card.slug}  ({checkpoint} -> {gguf_path})")
-        do_export(card, checkpoint, gguf_path)
+        for name, quantize in files:
+            print(f"  [export] {card.slug}  ({checkpoint} -> {model_dir / name}"
+                  f"{', ' + quantize if quantize else ''})")
+            do_export(card, checkpoint, model_dir / name, quantize)
 
     if card.frame_ms:
-        check_frame_ms(card, gguf_path)
+        for name, _ in files:
+            check_frame_ms(card, model_dir / name)
     (model_dir / "README.md").write_text(render_readme(card, gguf_name))
     print(f"  [ok] {card.slug}: {model_dir}")
 

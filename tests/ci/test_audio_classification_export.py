@@ -53,6 +53,14 @@ def test_a_frame_output_declares_its_rate_and_only_a_nonzero_offset():
     assert isinstance(seg["output.frame_rate"], float)
 
 
+def test_frame_embeddings_declare_their_rate_under_the_embedding_task():
+    """WakeHuBERT's output: an `embeddings` kind at `frame` granularity, which no door answers yet --
+    so the rate is what lets a host calling `infer` put a time on each row."""
+    feats = A.audio_contract(A.AudioOutput.FRAME_EMBEDDINGS, 16000, [], 50.0)
+    assert feats == {"task": "audio-embedding", "input.kind": "audio", "output.kind": "embeddings",
+                     "output.granularity": "frame", "sample_rate": 16000, "output.frame_rate": 50.0}
+
+
 def test_a_frame_rate_on_a_clip_output_is_not_declared():
     clip = A.audio_contract(A.AudioOutput.CLIP_CLASSES, 16000, ["x"], 50.0, 0.5)
     assert "output.frame_rate" not in clip and "output.frame_offset" not in clip
@@ -420,6 +428,111 @@ def test_the_speechbrain_and_pyannote_recognizers(tmp_path):
     assert not A._is_silero_vad(pa / "pytorch_model.bin")
 
 
+# A WakeHuBERT-shaped checkpoint directory: `config.json` naming the module, loader and weights, and a
+# `student.py` with upstream's attribute names (`mel.hop`, `stem.conv.stride`, `mel.basis`) at toy
+# widths -- 32 channels, so a Q8_0 block fits the 1x1 projection's rows.
+_TOY_STUDENT = """
+import json, math
+from pathlib import Path
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+SR = 16000
+
+
+class CausalLogMel(nn.Module):
+    def __init__(self, n_mels=8, n_fft=64, hop=32):
+        super().__init__()
+        k, f = torch.arange(n_fft), torch.arange(n_fft // 2 + 1)
+        ang = 2 * math.pi * f[:, None] * k[None, :] / n_fft
+        self.register_buffer("basis", torch.cat([torch.cos(ang), -torch.sin(ang)]).unsqueeze(1))
+        self.register_buffer("mel", torch.rand(n_mels, n_fft // 2 + 1))
+        self.pad, self.hop, self.n_freq = n_fft - hop, hop, n_fft // 2 + 1
+
+    def forward(self, wav):
+        spec = F.conv1d(F.pad(wav.unsqueeze(1), (self.pad, 0)), self.basis, stride=self.hop)
+        power = spec[:, :self.n_freq].pow(2) + spec[:, self.n_freq:].pow(2)
+        return torch.log(torch.matmul(self.mel, power) + 1e-6)
+
+
+class CausalConv1d(nn.Module):
+    def __init__(self, i, o, k, s):
+        super().__init__()
+        self.pad = k - s
+        self.conv = nn.Conv1d(i, o, k, s, bias=False)
+
+    def forward(self, x):
+        return self.conv(F.pad(x, (self.pad, 0)))
+
+
+class Toy(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mel = CausalLogMel()
+        self.stem = CausalConv1d(8, 32, 4, 2)
+        self.stem_bn = nn.BatchNorm1d(32)
+        self.out = nn.Conv1d(32, 16, 1)
+
+    def forward(self, wav):
+        return self.out(F.relu(self.stem_bn(self.stem(self.mel(wav))))).transpose(1, 2)
+
+
+def load_toy(path, config=None):
+    torch.manual_seed(0)
+    model = Toy()
+    model.load_state_dict(torch.load(path))
+    return model.eval()
+"""
+
+
+def _toy_wakehubert(tmp_path):
+    d = tmp_path / "wakehubert"
+    d.mkdir()
+    (d / "student.py").write_text(_TOY_STUDENT)
+    namespace = {}
+    exec(compile(_TOY_STUDENT, "toy_student", "exec"), namespace)
+    torch.manual_seed(0)
+    torch.save(namespace["Toy"]().state_dict(), d / "weights.pt")
+    (d / "config.json").write_text(json.dumps({
+        "family": "WakeHuBERT", "input": {"sample_rate": 16000}, "output": {"hop_samples": 64},
+        "pytorch": {"module": "student.py", "loader": "load_toy", "weights": "weights.pt"}}))
+    return d
+
+
+def test_the_wakehubert_recognizer_reads_the_config_family(tmp_path):
+    d = _toy_wakehubert(tmp_path)
+    assert A._is_wakehubert(d) and A._is_wakehubert(d / "config.json")
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "config.json").write_text(json.dumps({"family": "Something"}))
+    assert not A._is_wakehubert(tmp_path / "other")
+    (d / "weights.pt").unlink()
+    assert not A._is_wakehubert(d), "a config whose weights are missing is not a checkpoint"
+
+
+def test_a_wakehubert_export_declares_frames_and_keeps_its_front_end_float(tmp_path):
+    """The toy through the real compiler at F16 -- the precision that would otherwise pack the DFT
+    basis (block size 1 aligns everything). The basis stays F32, the projection is packed, and the
+    contract states one frame per hop."""
+    from gguf import GGUFReader
+
+    from loom_exporter.main_export import main_export
+
+    out = tmp_path / "toy.gguf"
+    main_export(str(_toy_wakehubert(tmp_path)), str(out), quantize="F16")
+    reader = GGUFReader(str(out))
+    types = {t.name: t.tensor_type.name for t in reader.tensors}
+    assert types["model_mel_basis"] == "F32" and types["model_out_weight"] == "F16"
+
+    def kv(key):
+        field = reader.fields[key]
+        value = field.parts[field.data[0]]
+        return bytes(value).decode() if field.types[0].name == "STRING" else value.tolist()[0]
+
+    assert kv("loom.output.kind") == "embeddings" and kv("loom.output.granularity") == "frame"
+    assert kv("loom.output.frame_rate") == 16000 / 64
+
+
 def test_both_tasks_are_registered():
     from loom_exporter.registry import default_registry
 
@@ -428,4 +541,4 @@ def test_both_tasks_are_registered():
     assert {("audio-embedding", "titanet"), ("audio-classification", "marblenet-vad"),
             ("audio-classification", "ecapa-tdnn-lid"),
             ("audio-classification", "pyannote-segmentation"),
-            ("audio-classification", "silero-vad")} <= names
+            ("audio-classification", "silero-vad"), ("audio-embedding", "wakehubert")} <= names
