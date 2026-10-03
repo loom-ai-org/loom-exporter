@@ -1696,7 +1696,7 @@ licence is its recording's, and so is the consent: clone only voices you have th
                     "largest difference 3.4e-5 on features up to 11.5, cosine 1.000000 on every frame."),
             # Speeds: scripts/bench_wakehubert.py in loom.cpp, Ryzen 3 3250U, 2026-10-03 (Epic-03).
             ("F16", "2.0 MB. Mean cosine 1.000000 to the PyTorch model, worst frame 0.999998. A size "
-                    "choice, not a speed one: on an x86 CPU it runs 1.4-1.7x SLOWER than F32 (the "
+                    "choice, not a speed one: on an x86 CPU it runs about 1.4x SLOWER than F32 (the "
                     "quantized files run at F32's speed)."),
             ("Q8_0", "1.4 MB. Mean cosine 0.99992, worst frame 0.99978 -- closer than upstream's own "
                      "`wakehubert_int8.onnx` (mean 0.9975)."),
