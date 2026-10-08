@@ -14,6 +14,10 @@ ways. loom.cpp ADR-062 decides the names once for the family:
   key means, so no published file moves), `frame` or `clip`;
 * `loom.output.frame_rate` is the frames per second of a `frame` output, so a host can put a time on
   each row without knowing the encoder's stride;
+* `loom.output.embedding_dim` is the width of one `embeddings` row -- the role `loom.labels` plays for
+  classes. Without it a flat frame answer cannot be cut into rows: the frame count is not the host's
+  to derive (an encoder may pad or offset), and guessing it from the size is what the contract exists
+  to remove;
 * `loom.labels` names the classes, exactly as family 12 already declares them.
 
 **What the driver returns is the model's own distribution, not a decision.** A token classifier's
@@ -48,8 +52,8 @@ class AudioOutput(Enum):
     """What one forward pass hands back, as the contract names it: `(output.kind, output.granularity)`.
 
     A closed set rather than two free strings, so a leaf cannot declare a pair no file means.
-    `FRAME_EMBEDDINGS` is declared before any door answers it: `loom::audio::embed` refuses a `frame`
-    file with an error naming the granularity, and `infer` returns its rows, `[n_frames, D]` row-major.
+    `loom::audio::embed` answers both `embeddings` granularities, cutting the flat `[n_rows, D]`
+    row-major answer by the declared `output.embedding_dim`.
     """
 
     # One fixed-width vector per clip: TitaNet, ECAPA speaker models.
@@ -95,6 +99,7 @@ class AudioClassificationExportConfig(LoomExportConfig):
     labels: List[str] = field(default_factory=list, init=False, repr=False)
     frame_rate: Optional[float] = field(default=None, init=False, repr=False)
     frame_offset: float = field(default=0.0, init=False, repr=False)
+    embedding_dim: Optional[int] = field(default=None, init=False, repr=False)
 
     __links__ = {"root_axis": Axis()}
     __unchecked__ = {
@@ -116,6 +121,8 @@ class AudioClassificationExportConfig(LoomExportConfig):
                                 "forward actually produced"),
         "frame_offset": Unchecked("DERIVED with frame_rate; 0 for every leaf whose frame i starts at "
                                   "i / frame_rate"),
+        "embedding_dim": Unchecked("READ off the traced output's last axis by `_check_output`, during "
+                                   "the trace -- the one moment the real tensor exists"),
     }
 
     def build_trace(self, model):
@@ -123,7 +130,7 @@ class AudioClassificationExportConfig(LoomExportConfig):
 
     def contract(self) -> dict:
         return audio_contract(self.output, self.sample_rate, self.labels, self.frame_rate,
-                              self.frame_offset)
+                              self.frame_offset, self.embedding_dim)
 
     def synthesized_builder_key(self) -> str:
         """Nothing to reduce: the tensor IS the answer -- the codec decoder's builder, under the name
@@ -138,7 +145,8 @@ class AudioClassificationExportConfig(LoomExportConfig):
 
 
 def audio_contract(output: AudioOutput, sample_rate: Optional[int], labels: List[str],
-                   frame_rate: Optional[float], frame_offset: float = 0.0) -> dict:
+                   frame_rate: Optional[float], frame_offset: float = 0.0,
+                   embedding_dim: Optional[int] = None) -> dict:
     """The task, the modality pair, and the facts a host needs to read the output (loom.cpp ADR-062).
 
     `output.granularity` is written for every leaf, including the `clip` ones a host could infer from a
@@ -149,7 +157,16 @@ def audio_contract(output: AudioOutput, sample_rate: Optional[int], labels: List
     `[offset + i / rate, offset + (i + 1) / rate)` seconds: a strided encoder that pads its input
     (MarbleNet) starts at 0, and one that does not (pyannote's SincNet, whose first frame needs 991
     samples of context) starts later.
+
+    `output.embedding_dim` is written for every `embeddings` output whose width is known, clip ones
+    included, and is REQUIRED for a `frame` one: a clip answer is one row of whatever came back, so a
+    clip file without it stays readable (TitaNet's and ECAPA's published files), while a frame answer
+    without it cannot be cut at all.
     """
+    if output is AudioOutput.FRAME_EMBEDDINGS and not embedding_dim:
+        raise ValueError("frame embeddings need their width (`output.embedding_dim`) declared: without "
+                         "it no host can cut the flat answer into one row per frame. It is read off "
+                         "the traced output, so the contract was asked for before the trace ran.")
     contract = {
         "task": output.task,
         "input.kind": "audio",
@@ -162,6 +179,8 @@ def audio_contract(output: AudioOutput, sample_rate: Optional[int], labels: List
         contract["output.frame_rate"] = float(frame_rate)
         if frame_offset:
             contract["output.frame_offset"] = float(frame_offset)
+    if output.kind == "embeddings" and embedding_dim:
+        contract["output.embedding_dim"] = int(embedding_dim)
     if labels:
         contract["labels"] = list(labels)
     return contract
@@ -171,16 +190,21 @@ def _check_output(spec: AudioClassificationExportConfig, out: torch.Tensor) -> N
     """The traced output against what the config says it is -- run inside the wrapper's forward, during
     the trace, because that is the one moment the real tensor exists (`EncoderOutput.validate`'s
     argument). A head that is not the shape the contract will declare is a file whose labels or frame
-    rate lie, and nothing downstream could tell."""
+    rate lie, and nothing downstream could tell.
+
+    For an embedding it is also where the width is READ: the last axis of the real output is the
+    `output.embedding_dim` the contract declares, so the declaration cannot disagree with the graph."""
     if spec.output is AudioOutput.EMBEDDING:
         if out.dim() != 2 or out.shape[0] != 1:
             raise ValueError(f"{spec.architecture}: an embedding is one [1, D] row per clip; the "
                              f"traced forward returned {tuple(out.shape)}.")
+        spec.embedding_dim = int(out.shape[-1])
         return
     if spec.output is AudioOutput.FRAME_EMBEDDINGS:
         if out.dim() != 3 or out.shape[0] != 1:
             raise ValueError(f"{spec.architecture}: frame embeddings are [1, n_frames, D]; the traced "
                              f"forward returned {tuple(out.shape)}.")
+        spec.embedding_dim = int(out.shape[-1])
         return
     want_rank = 3 if spec.output is AudioOutput.FRAME_CLASSES else 2
     if out.dim() != want_rank or out.shape[0] != 1:
