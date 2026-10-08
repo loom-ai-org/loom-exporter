@@ -1707,10 +1707,11 @@ licence is its recording's, and so is the consent: clone only voices you have th
                      "training on them."),
         ],
         limitations=(
-            "**Use `model.infer`, not `speech2embeddings`.** This file's embeddings are per FRAME, and "
-            "loom's `speech2embeddings` door returns one vector per clip, so it refuses this model with "
-            "an error naming the granularity (it is still listed in `model.capabilities`). `infer` "
-            "returns the frames, row-major.\n\n"
+            "**Needs loom 1.0.0-rc15 or later.** This file's embeddings are per FRAME: "
+            "`model.speech2embeddings.infer(audio)` returns a `FrameEmbeddings` (`rows`, `times`, "
+            "`dim`, `frame_rate`), cut by the width the file declares. rc14 and earlier refuse the "
+            "file at that door with an error naming the granularity; there, `model.infer(waveform=audio)` "
+            "returns the same frames as one flat row-major list, 128 values per frame.\n\n"
             "**One call is one whole clip, offline.** The model is strictly causal -- frame *t* depends "
             "only on audio before sample 320 x (t + 1), within a 2.5 s receptive field -- and it was "
             "trained to describe each HuBERT frame 100 ms late, so a detector built on it reacts about "
@@ -2008,23 +2009,23 @@ for t, label in zip(result.times, result.best):
 for start, label in turns:
     print(f"{start:6.2f}s  {label}")
 """,
-    # A frame-level feature extractor: one vector per frame, which no door answers yet (loom.cpp
-    # ADR-062 declares the granularity), so the card calls `infer` and cuts the flat answer into rows
-    # itself. Plain lists, because `loom-py-rt` has no numpy dependency and the card installs nothing
-    # else. `{gguf}` because the repo carries several precisions and `from_pretrained` will not choose.
+    # A frame-level feature extractor: one vector per frame. The door (loom-py-rt 1.0.0rc15) cuts the
+    # flat answer into rows by the file's declared `loom.output.embedding_dim` and puts a time on each
+    # from its frame rate (loom.cpp ADR-062), so the card does no arithmetic of its own. Plain lists,
+    # because `loom-py-rt` has no numpy dependency and the card installs nothing else. `{gguf}` because
+    # the repo carries several precisions and `from_pretrained` will not choose.
     "audio-frame-embedding": """import loom
 
 # This repo holds four precisions of one model; name the file you want (see "Files" below).
 model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
 
-# Audio is a mono float list at 16 kHz. `infer` returns every frame's features in one flat list, and
-# the file declares its own frame rate: one frame per 320 samples.
-flat = model.infer(waveform=audio)
-hop = round(model.contract["sample_rate"] / model.contract["frame_rate"])
-dim = len(flat) // (len(audio) // hop)
-features = [flat[i:i + dim] for i in range(0, len(flat), dim)]
-print(len(features), dim)
+# Audio is a mono float list at 16 kHz. The answer is one row of features per frame, and each row
+# knows when its frame starts.
+features = model.speech2embeddings.infer(audio)
+print(len(features), features.dim)
 # one row per {frame_ms} ms of audio, 128 features each: 550 128 for an 11 s clip
+for start, row in zip(features.times[:3], features.rows[:3]):
+    print(f"{start:.2f}s", [round(x, 3) for x in row[:4]])
 
 # Each row describes the speech about 100 ms before its frame ends; a wake-word classifier is trained
 # on a window of these rows, and its decision rule is yours.
