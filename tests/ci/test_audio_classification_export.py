@@ -20,6 +20,7 @@ are in loom.cpp's Epic-03.
 import io
 import json
 import tarfile
+import types
 
 import numpy as np
 import pytest
@@ -39,9 +40,10 @@ def test_the_contract_names_the_granularity_for_every_leaf():
     clip = A.audio_contract(A.AudioOutput.CLIP_CLASSES, 16000, ["en", "th"], None)
     assert clip == {"task": "audio-classification", "input.kind": "audio", "output.kind": "class",
                     "output.granularity": "clip", "sample_rate": 16000, "labels": ["en", "th"]}
-    emb = A.audio_contract(A.AudioOutput.EMBEDDING, 16000, [], None)
+    emb = A.audio_contract(A.AudioOutput.EMBEDDING, 16000, [], None, embedding_dim=192)
     assert emb["task"] == "audio-embedding" and emb["output.kind"] == "embeddings"
     assert emb["output.granularity"] == "clip" and "labels" not in emb
+    assert emb["output.embedding_dim"] == 192
 
 
 def test_a_frame_output_declares_its_rate_and_only_a_nonzero_offset():
@@ -53,12 +55,39 @@ def test_a_frame_output_declares_its_rate_and_only_a_nonzero_offset():
     assert isinstance(seg["output.frame_rate"], float)
 
 
-def test_frame_embeddings_declare_their_rate_under_the_embedding_task():
-    """WakeHuBERT's output: an `embeddings` kind at `frame` granularity, which no door answers yet --
-    so the rate is what lets a host calling `infer` put a time on each row."""
-    feats = A.audio_contract(A.AudioOutput.FRAME_EMBEDDINGS, 16000, [], 50.0)
+def test_frame_embeddings_declare_their_rate_and_width_under_the_embedding_task():
+    """WakeHuBERT's output: an `embeddings` kind at `frame` granularity. The rate puts a time on each
+    row and the width is what the door cuts the flat answer by."""
+    feats = A.audio_contract(A.AudioOutput.FRAME_EMBEDDINGS, 16000, [], 50.0, embedding_dim=128)
     assert feats == {"task": "audio-embedding", "input.kind": "audio", "output.kind": "embeddings",
-                     "output.granularity": "frame", "sample_rate": 16000, "output.frame_rate": 50.0}
+                     "output.granularity": "frame", "sample_rate": 16000, "output.frame_rate": 50.0,
+                     "output.embedding_dim": 128}
+    # An int, not a float: the GGUF writer picks the KV type off the Python type, and the engine reads
+    # an integer key.
+    assert isinstance(feats["output.embedding_dim"], int)
+
+
+def test_frame_embeddings_without_a_width_are_refused():
+    """A frame file without its width is one no host can cut into rows -- refused at export, not
+    discovered at the first call."""
+    with pytest.raises(ValueError, match="embedding_dim"):
+        A.audio_contract(A.AudioOutput.FRAME_EMBEDDINGS, 16000, [], 50.0)
+
+
+def test_a_clip_embedding_without_a_width_stays_valid():
+    """TitaNet's and ECAPA's published files predate the key; a clip answer is one row of whatever came
+    back, so the key is written when known and not demanded."""
+    emb = A.audio_contract(A.AudioOutput.EMBEDDING, 16000, [], None)
+    assert "output.embedding_dim" not in emb
+
+
+def test_the_width_is_read_off_the_traced_output():
+    """`_check_output` records the last axis of the real tensor, so the declaration and the graph
+    cannot disagree."""
+    for output, shape in ((A.AudioOutput.EMBEDDING, (1, 192)), (A.AudioOutput.FRAME_EMBEDDINGS, (1, 7, 128))):
+        spec = types.SimpleNamespace(output=output, architecture="toy", labels=[], embedding_dim=None)
+        A._check_output(spec, torch.zeros(shape))
+        assert spec.embedding_dim == shape[-1]
 
 
 def test_a_frame_rate_on_a_clip_output_is_not_declared():
@@ -531,6 +560,9 @@ def test_a_wakehubert_export_declares_frames_and_keeps_its_front_end_float(tmp_p
 
     assert kv("loom.output.kind") == "embeddings" and kv("loom.output.granularity") == "frame"
     assert kv("loom.output.frame_rate") == 16000 / 64
+    # The toy's head is 16 wide: read off the traced output, and an INTEGER key the engine cuts by.
+    assert kv("loom.output.embedding_dim") == 16
+    assert reader.fields["loom.output.embedding_dim"].types[0].name in ("INT32", "UINT32")
 
 
 def test_both_tasks_are_registered():
