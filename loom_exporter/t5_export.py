@@ -246,7 +246,7 @@ def _check_fused_attention(topo: dict, n_layers: int) -> int:
     total = [node for node in topo["nodes"] if node["op"] == "ATTENTION"]
     if len(cached) != n_layers or len(total) != n_layers:
         raise ValueError(
-            f"t5 decoder: fused {len(total)} ATTENTION node(s) ({len(cached)} cached) for a stack with "
+            f"decoder: fused {len(total)} ATTENTION node(s) ({len(cached)} cached) for a stack with "
             f"{n_layers} self-attention blocks. Cross-attention must NOT fuse -- it has no mask once "
             f"MIL folds its zero bias away, and a cached cross-attention block would take a KV cache "
             f"slot the self-attention blocks address."

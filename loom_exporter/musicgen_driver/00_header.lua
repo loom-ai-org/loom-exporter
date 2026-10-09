@@ -1,0 +1,18 @@
+-- MusicGen: a T5 text encoder run once, then a KV-cached cross-attention decode loop that emits one
+-- EnCodec token per codebook per step.
+--
+-- Three traced topologies (musicgen_export.py): `encoder` is T5 plus `enc_to_dec_proj`; `cross_kv`
+-- projects its output into every decoder layer's cross-attention K/V, once per prompt; `decoder` is
+-- one cached step at n_tokens = 1. Under classifier-free guidance `cross_kv_uncond` and
+-- `decoder_uncond` are second STREAMS of the last two, each with its own retained output and, for the
+-- decoder, its own KV cache (Dia's arrangement; see ExportPhase.extra_streams).
+--
+-- inputs: tokens (ids from this model's own T5 SentencePiece vocabulary, `</s>` appended), and five
+-- optional knobs -- max_new_tokens, temperature, top_k, guidance_scale and seed. `max_new_tokens` is a
+-- count of AUDIO FRAMES (50 per second for the 32 kHz codec), as for every codec LM here; it costs
+-- N_CODEBOOKS - 1 more decoder steps than that, to finish the delayed codebooks. The decoding knobs default to the checkpoint's own generation config -- for MusicGen,
+-- sampling with top_k 50 under guidance 3.0 -- so `temperature = 0` is the greedy decode a reference
+-- comparison uses, and `guidance_scale = 1` turns guidance off and halves the work.
+--
+-- Returns a FLAT, frame-major array of codec tokens: N_CODEBOOKS per frame, delay undone, for the
+-- EnCodec GGUF (`encodec-32khz`) to decode. It is not audio; see ADR-020.
