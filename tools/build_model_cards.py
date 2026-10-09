@@ -1329,6 +1329,37 @@ against the prompt at 12.5 per second.""",
         ),
     ),
     ModelCard(
+        slug="musicgen-small", checkpoint=Path("musicgen-small"),
+        task_type="text-to-codes", pipeline_tag="text-to-audio",
+        snippet="text-to-codes-musicgen",
+        base_repo="facebook/musicgen-small", license_id="cc-by-nc-4.0", language=["en"],
+        title="MusicGen Small",
+        summary="Meta's MusicGen Small text-to-music model, exported for loom.cpp. Family 14: a text "
+                "description in, EnCodec tokens out -- pair it with `encodec-32khz-loom` for audio.",
+        limitations=(
+            "**This model does not produce audio.** It emits four streams of EnCodec tokens, and "
+            "[`encodec-32khz-loom`](https://huggingface.co/loom-ai-org/encodec-32khz-loom) -- the codec "
+            "it was trained with -- turns them into 32 kHz mono audio. The usage snippet above is the "
+            "whole of the joining.\n\n"
+            "**The prompt describes the music; it is not lyrics.** Genre, instruments, tempo and mood "
+            "in English, through the T5 vocabulary this file carries. MusicGen Small makes no vocals.\n\n"
+            "**It samples, at the settings `transformers` uses for this checkpoint**: `top_k 50` and "
+            "classifier-free guidance at `3.0`. (Meta's own `audiocraft` library samples with `top_k "
+            "250`; this file follows the checkpoint's Hugging Face generation config.) Two runs give two "
+            "takes; `seed=` pins one, and `temperature=0` decodes greedily, which reproduces "
+            "`transformers`' `generate(do_sample=False)` code for code.\n\n"
+            "`max_new_tokens` counts **audio frames** at 50 per second, so 250 is five seconds. The "
+            "default is 1496 frames, about 30 s, which is the checkpoint's own generation length and "
+            "its training clip length. The decoder's 2048 positions cap one call at 2045 frames (40.9 s).\n\n"
+            "Guidance costs a second decoder pass at every step, so it roughly doubles the work. "
+            "`guidance_scale=1.0` turns it off: faster, and the music follows the prompt less closely. "
+            "On a 4-thread laptop-class CPU, two seconds of music took about 27 s with guidance and "
+            "14 s without; a GPU or more cores helps.\n\n"
+            "Mono and text-conditioned only. The melody-conditioned and stereo MusicGen checkpoints are "
+            "different models and are not covered by this file. 2.1 GB, F32."
+        ),
+    ),
+    ModelCard(
         slug="moss-tts-local-transformer-v1.5", checkpoint=Path("moss-tts-local-transformer-v1.5"),
         task_type="text-to-codes", pipeline_tag="text-to-speech",
         snippet="text-to-codes-moss",
@@ -2152,6 +2183,30 @@ print(model.hparam("codec.n_codebooks"), "==", codec.hparam("codec.n_codebooks")
 # take reproducible; pass temperature=0 for greedy, which reproduces `transformers` exactly.
 print(model.hparam("sampling.temperature", "f32"),
       model.hparam("sampling.repetition_penalty", "f32"))
+""",
+    # MusicGen: Dia's two-file shape with EnCodec as the codec. The prompt is a DESCRIPTION of the
+    # music, and the frame rate (50 per second) is what a reader needs to choose a length.
+    "text-to-codes-musicgen": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# The prompt DESCRIBES the music -- genre, instruments, mood. What comes back is EnCodec TOKENS, not
+# audio: frame-major, 4 codebooks wide, 50 frames per second, so max_new_tokens=250 is five seconds.
+codes = model.text2codes.infer("80s pop track with bassy drums and synth", max_new_tokens=250, seed=1)
+print(len(codes), "frames x", len(codes[0]), "codebooks")
+
+# The second half of the pair, in a repo of its own: the codec this model was trained with.
+codec = loom.Model.from_pretrained("loom-ai-org/encodec-32khz-loom")
+audio = codec.codes2speech.infer(codes)
+print(len(audio), "samples at", audio.sample_rate, "Hz =", round(audio.duration, 2), "s")
+audio.save("out.wav")
+
+# Nothing goes between those two calls. Both files declare the width of a frame:
+print(model.hparam("codec.n_codebooks"), "==", codec.hparam("codec.n_codebooks"))
+
+# This model SAMPLES by default, with classifier-free guidance; `seed=` pins a take, and
+# temperature=0 decodes greedily (transformers' generate(do_sample=False), code for code).
+print(model.hparam("sampling.top_k"), model.hparam("sampling.guidance_scale", "f32"))
 """,
     # MOSS-TTS: Dia's two-file shape with a different codec, a `language=` and no guidance. The codec
     # is 32 codebooks wide and this model emits 12; the codec declares an absent id and
