@@ -1,0 +1,10 @@
+-- sanoTTS nano (sanotts_export.py, TTSSanoNanoExportConfig): the duration net, then the acoustic net to
+-- mel-100 and a noise-fed ConvNeXt/iSTFT decoder as one graph, then a DC blocker here.
+--
+-- inputs: tokens (phoneme ids over the 62-symbol misaki-normalised table, `[1, p1, ..., pn, 2]` -- the
+-- text door's own vocabulary builds exactly that), and optionally length_scale (default 1.0) and seed.
+-- Returns the waveform at `loom.sample_rate` (24 kHz), 256 samples per frame.
+--
+-- The decoder is fed four channels of Gaussian noise per frame, drawn from ATen's own CPU stream
+-- (`aten_randn`), so a seed renders as upstream's runtimes render it. `seed` 0 -- what a host passes when
+-- the caller named none -- means upstream's default seed, so the default rendering is upstream's.

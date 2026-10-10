@@ -49,6 +49,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .decomposition import Decomposition, MultiPhase
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
@@ -203,7 +204,8 @@ class _SynthWrapper(nn.Module):
         self.output = latent.output
         self.decoder = decoder
 
-    def forward(self, tokens, token_features, frame_index, frame_features):
+    def mel(self, tokens, token_features, frame_index, frame_features):
+        """The acoustic student alone: `[1, out_channels, T]` -- piperlite's latent, nano's mel-100."""
         x = self.token_input_proj(torch.cat([self.embedding(tokens).transpose(1, 2), token_features], dim=1))
         for block in self.token_blocks:
             x = block(x)
@@ -211,7 +213,10 @@ class _SynthWrapper(nn.Module):
         x = self.frame_input_proj(torch.cat([frames.transpose(0, 1).unsqueeze(0), frame_features], dim=1))
         for block in self.frame_blocks:
             x = block(x)
-        return self.decoder(self.output(x)).reshape(1, -1)
+        return self.output(x)
+
+    def forward(self, tokens, token_features, frame_index, frame_features):
+        return self.decoder(self.mel(tokens, token_features, frame_index, frame_features)).reshape(1, -1)
 
 
 def _bcp47(code: str) -> str:
@@ -365,6 +370,360 @@ class TTSSanoTTSExportConfig(BaseMultiPhaseModelExportConfig):
         ]
 
 
+
+# ---------------------------------------------------------------------------------------------------------
+# The NANO line (heart, heart-nano): the same duration and acoustic students, emitting mel-100, and a
+# Vocos-shaped decoder -- ConvNeXt1D, a magnitude/phase head, iSTFT -- fed four channels of noise.
+#
+# **The decoder's torch module was never published** (upstream's `train_tiny_vocos_student.py` is in no
+# commit of the repository), so `_TinyVocos` below is this export's own, written to the definition
+# upstream DOES publish: the pip package's numpy runtime (`pypkg/sanotts/nano.py`), which upstream gates
+# against its PyTorch reference. The user's call (2026-10-10), the Silero precedent: published weights
+# plus a plain-Python definition. The front end's modules are upstream's own torch classes, as for
+# piperlite.
+#
+# **The weights are a C runtime's blobs**: `front_*.bin` / `model_*.bin` addressed by the generated
+# `nano_q8_meta.h` -- per layer an `_W8` region of rows padded to 16 bytes, an `_SCALE` and a `_BIAS`, or
+# one `_F32` region. heart ships float32 rows (`NANO_WEIGHT_FORMAT 1`, unit scales); heart-nano ships
+# int8 with a per-row scale, which is DEQUANTISED here, as the pip package does: its C runtime also
+# quantises activations, which a float graph does not reproduce, and upstream gates both against the same
+# float reference rather than against each other.
+# ---------------------------------------------------------------------------------------------------------
+
+NANO_LAYER_NORM_EPS = 1e-6   # upstream's `make_norm`, NOT torch's 1e-5 (nano.py: "cost 0.06 of correlation")
+NANO_MAG_MAX = 1e2           # the head's exp(magnitude) is clipped here
+# The DC blocker after the iSTFT: H(z) = (1 - z^-1) / (1 - R z^-1), which upstream applies as a 4096-tap
+# truncation of its impulse response. The driver runs the recursion itself; the truncated tail is below
+# R^4096 = 1.6e-5 of the signal.
+NANO_DC_BLOCK_R = 0.9973
+# Upstream's default seed (`engine.DEFAULT_NANO_SEED`); ATen keeps its low 32 bits.
+NANO_DEFAULT_SEED = 2236265385529901705 & 0xFFFFFFFF
+
+
+def _parse_nano_header(path: Path) -> dict:
+    import re
+
+    out = {}
+    pattern = re.compile(r"^#define\s+([A-Z0-9_]+)\s+(-?\d+)\s*$")
+    for line in path.read_text(encoding="utf-8").splitlines():
+        m = pattern.match(line.strip())
+        if m:
+            out[m.group(1)] = int(m.group(2))
+    if "NANO_FRONT_BYTES" not in out:
+        raise ValueError(f"sanoTTS: {path} is not a nano offsets header")
+    return out
+
+
+class _NanoBlobs:
+    """One nano package's two blobs and its header: a region by name, as float32."""
+
+    def __init__(self, package_dir: Path):
+        self.meta_json = json.loads((package_dir / "meta.json").read_text())
+        self.h = _parse_nano_header(package_dir / "nano_q8_meta.h")
+        self.front = (package_dir / self.meta_json["front"]).read_bytes()
+        self.dec = (package_dir / self.meta_json["dec"]).read_bytes()
+        for blob, key in ((self.front, "NANO_FRONT_BYTES"), (self.dec, "NANO_DEC_BYTES")):
+            if len(blob) != self.h[key]:
+                raise ValueError(f"sanoTTS: a nano blob is {len(blob)} bytes, the header says {self.h[key]}.")
+        if self.h.get("NANO_NORM_TYPE", 0) != 0 or self.h.get("NANO_ACT_TYPE", 0) != 0:
+            raise ValueError("sanoTTS: a DyT/ReLU nano decoder (NANO_NORM_TYPE/NANO_ACT_TYPE != 0); only "
+                             "LayerNorm + GELU, the shipped voices' operators, is reproduced.")
+
+    def rows(self, blob: str, prefix: str, name: str, out_ch: int, in_flat: int) -> tuple:
+        """`(weight [out_ch, in_flat], bias [out_ch])` of one row-major layer, dequantised."""
+        h, data = self.h, (self.front if blob == "front" else self.dec)
+        n16 = h[f"NANO_{name}_N16"]
+        w_off, s_off, b_off = (h[f"{prefix}_{name}_{k}"] for k in ("W8", "SCALE", "BIAS"))
+        if h.get("NANO_WEIGHT_FORMAT", 0) == 1:
+            rows = np.frombuffer(data, np.float32, out_ch * n16, w_off).reshape(out_ch, n16)
+            weight = rows[:, :in_flat].astype(np.float32)
+        else:
+            q = np.frombuffer(data, np.int8, out_ch * n16, w_off).reshape(out_ch, n16)
+            scale = np.frombuffer(data, np.float32, out_ch, s_off)
+            weight = q[:, :in_flat].astype(np.float32) * scale[:, None]
+        bias = np.frombuffer(data, np.float32, out_ch, b_off).astype(np.float32)
+        return torch.from_numpy(np.ascontiguousarray(weight)), torch.from_numpy(bias.copy())
+
+    def f32(self, blob: str, prefix: str, name: str, count: int) -> torch.Tensor:
+        data = self.front if blob == "front" else self.dec
+        return torch.from_numpy(np.frombuffer(data, np.float32, count, self.h[f"{prefix}_{name}_F32"]).copy())
+
+
+def _load_conv(conv: nn.Conv1d, weight: torch.Tensor, bias: torch.Tensor) -> None:
+    """Rows are torch's `[C_out, C_in, K]` flattened, kernel fastest -- the device kernel's layout."""
+    conv.weight.data.copy_(weight.reshape(conv.weight.shape))
+    conv.bias.data.copy_(bias)
+
+
+def _load_front(blobs: _NanoBlobs, duration, latent) -> None:
+    h = blobs.h
+    V = h["NANO_VOCAB"]
+    DH, DK = h["NANO_DUR_HIDDEN"], h["NANO_DUR_KERNEL"]
+    duration.embedding.weight.data.copy_(blobs.f32("front", "NOFF", "DUR_EMB", V * DH).reshape(V, DH))
+    _load_conv(duration.input_proj, *blobs.rows("front", "NOFF", "DUR_PROJ", DH, DH + 3))
+    for b, block in enumerate(duration.blocks):
+        _load_conv(block.net[0], *blobs.rows("front", "NOFF", f"DUR_B{b}_C0", DH, DH * DK))
+        _load_conv(block.net[2], *blobs.rows("front", "NOFF", f"DUR_B{b}_C1", DH, DH * DK))
+        block.scale.data.copy_(blobs.f32("front", "NOFF", f"DUR_B{b}_SCALE", 1)[0])
+    _load_conv(duration.output, *blobs.rows("front", "NOFF", "DUR_OUT", 1, DH))
+
+    AH, AK = h["NANO_AC_HIDDEN"], h["NANO_AC_KERNEL"]
+    latent.embedding.weight.data.copy_(blobs.f32("front", "NOFF", "AC_EMB", V * AH).reshape(V, AH))
+    _load_conv(latent.token_input_proj, *blobs.rows("front", "NOFF", "AC_TPROJ", AH, AH + 2))
+    for b, block in enumerate(latent.token_blocks):
+        _load_conv(block.net[0], *blobs.rows("front", "NOFF", f"AC_TB{b}_C0", AH, AH * AK))
+        _load_conv(block.net[2], *blobs.rows("front", "NOFF", f"AC_TB{b}_C1", AH, AH * AK))
+        block.scale.data.copy_(blobs.f32("front", "NOFF", f"AC_TB{b}_SCALE", 1)[0])
+    _load_conv(latent.frame_input_proj, *blobs.rows("front", "NOFF", "AC_FPROJ", AH, AH + 3))
+    for b, block in enumerate(latent.frame_blocks):
+        _load_conv(block.net[0], *blobs.rows("front", "NOFF", f"AC_FB{b}_C0", AH, AH * AK))
+        _load_conv(block.net[2], *blobs.rows("front", "NOFF", f"AC_FB{b}_C1", AH, AH * AK))
+        block.scale.data.copy_(blobs.f32("front", "NOFF", f"AC_FB{b}_SCALE", 1)[0])
+    _load_conv(latent.output, *blobs.rows("front", "NOFF", "AC_OUT", h["NANO_MELS"], AH))
+
+
+class _TinyVocos(nn.Module):
+    """The nano decoder: `(mel [1, 100, T], noise [1, 4, T]) -> waveform [1, 256 T]`, as `nano.py`'s
+    `decoder_forward` and `istft` compute it."""
+
+    def __init__(self, blobs: _NanoBlobs):
+        super().__init__()
+        from .istft import ISTFT
+
+        h = blobs.h
+        dim, ek, dk, hid = h["NANO_DIM"], h["NANO_EMBED_KERNEL"], h["NANO_DW_KERNEL"], h["NANO_PW_HIDDEN"]
+        mels, noise_ch, bins = h["NANO_MELS"], h["NANO_NOISE_CH"], h["NANO_BINS"]
+        if h["NANO_HEAD_OUT"] != 2 * bins or bins != h["NANO_N_FFT"] // 2 + 1:
+            raise ValueError("sanoTTS: the nano head is not [magnitude; phase] over n_fft/2 + 1 bins.")
+        self.bins = bins
+
+        def norm(prefix):
+            ln = nn.LayerNorm(dim, eps=NANO_LAYER_NORM_EPS)
+            ln.weight.data.copy_(blobs.f32("dec", "DOFF", f"{prefix}_W", dim))
+            ln.bias.data.copy_(blobs.f32("dec", "DOFF", f"{prefix}_B", dim))
+            return ln
+
+        def linear(name, out_f, in_f):
+            lin = nn.Linear(in_f, out_f)
+            w, b = blobs.rows("dec", "DOFF", name, out_f, in_f)
+            lin.weight.data.copy_(w)
+            lin.bias.data.copy_(b)
+            return lin
+
+        self.embed = nn.Conv1d(mels, dim, ek, padding=ek // 2)
+        _load_conv(self.embed, *blobs.rows("dec", "DOFF", "EMBED", dim, mels * ek))
+        self.noise = nn.Conv1d(noise_ch, dim, ek, padding=ek // 2)
+        _load_conv(self.noise, *blobs.rows("dec", "DOFF", "NOISE", dim, noise_ch * ek))
+        self.norm = norm("NORM")
+        self.dw, self.block_norm, self.pw0, self.pw1 = (nn.ModuleList() for _ in range(4))
+        gammas = []
+        for b in range(h["NANO_BLOCKS"]):
+            dw = nn.Conv1d(dim, dim, dk, padding=dk // 2, groups=dim)
+            dw.weight.data.copy_(blobs.f32("dec", "DOFF", f"B{b}_DW_W", dim * dk).reshape(dim, 1, dk))
+            dw.bias.data.copy_(blobs.f32("dec", "DOFF", f"B{b}_DW_B", dim))
+            self.dw.append(dw)
+            self.block_norm.append(norm(f"B{b}_NORM"))
+            self.pw0.append(linear(f"B{b}_PW0", hid, dim))
+            self.pw1.append(linear(f"B{b}_PW1", dim, hid))
+            gammas.append(blobs.f32("dec", "DOFF", f"B{b}_GAMMA", dim))
+        self.register_buffer("gamma", torch.stack(gammas))
+        self.final_norm = norm("FNORM")
+        self.head = linear("HEAD", 2 * bins, dim)
+        # Bin 0 and Nyquist are zeroed: upstream's magnitude/phase parametrisation collapses there.
+        edges = torch.ones(1, bins, 1)
+        edges[0, 0, 0] = edges[0, -1, 0] = 0.0
+        self.register_buffer("edges", edges)
+        self.istft = ISTFT(n_fft=h["NANO_N_FFT"], hop_length=h["NANO_HOP"], win_length=h["NANO_N_FFT"],
+                           center=True)
+
+    def forward(self, mel, noise):
+        x = self.embed(mel) + self.noise(noise)                       # [1, dim, T]
+        x = self.norm(x.transpose(1, 2))                              # [1, T, dim]
+        for b in range(len(self.dw)):
+            h = self.dw[b](x.transpose(1, 2)).transpose(1, 2)
+            h = self.pw1[b](F.gelu(self.pw0[b](self.block_norm[b](h))))
+            x = x + h * self.gamma[b]
+        out = self.head(self.final_norm(x)).transpose(1, 2)           # [1, 2 bins, T]
+        mag = torch.clamp(torch.exp(out[:, : self.bins]), max=NANO_MAG_MAX) * self.edges
+        phase = out[:, self.bins:]
+        return self.istft(mag * torch.cos(phase), mag * torch.sin(phase))
+
+
+class _NanoSynthWrapper(nn.Module):
+    """`(tokens, token_features, frame_index, frame_features, noise [1, 4, T]) -> waveform [1, 256 T]`:
+    the acoustic student to mel-100, the expansion a gather as in `_SynthWrapper`, then `_TinyVocos`."""
+
+    def __init__(self, latent, decoder):
+        super().__init__()
+        self.acoustic = _SynthWrapper(latent, decoder=None)
+        self.decoder = decoder
+
+    def forward(self, tokens, token_features, frame_index, frame_features, noise):
+        return self.decoder(self.acoustic.mel(tokens, token_features, frame_index, frame_features), noise)
+
+
+def build_nano_models(package_dir: Path, repo: Optional[str] = None) -> tuple:
+    """`(blobs, duration, latent, decoder)`: upstream's front-end modules and `_TinyVocos`, loaded."""
+    duration_mod, latent_mod, _ = load_sanotts_modules(repo)
+    blobs = _NanoBlobs(package_dir)
+    h = blobs.h
+    duration = duration_mod.DurationStudent(
+        vocab_size=h["NANO_VOCAB"], hidden=h["NANO_DUR_HIDDEN"], depth=h["NANO_DUR_DEPTH"],
+        kernel_size=h["NANO_DUR_KERNEL"], max_tokens=h["NANO_DUR_MAX_TOKENS"])
+    latent = latent_mod.ContextualLatentStudent(
+        vocab_size=h["NANO_VOCAB"], hidden=h["NANO_AC_HIDDEN"], depth=h["NANO_AC_DEPTH"],
+        token_depth=h["NANO_AC_TOKEN_DEPTH"], kernel_size=h["NANO_AC_KERNEL"], out_channels=h["NANO_MELS"])
+    _load_front(blobs, duration, latent)
+    decoder = _TinyVocos(blobs)
+    for module in (duration, latent, decoder):
+        module.eval()
+    return blobs, duration, latent, decoder
+
+
+def nano_vocabulary(blobs: _NanoBlobs, repo: Optional[str] = None) -> dict:
+    """The package's symbol table: its own when `meta.json` carries one, else upstream's frozen default
+    -- `nano_frontend.vocabulary_for`, read from the clone rather than copied here."""
+    clone = Path(repo or SANOTTS_REPO)
+    pypkg = str(clone / "pypkg")
+    if pypkg not in sys.path:
+        sys.path.insert(0, pypkg)
+    from sanotts.nano_frontend import vocabulary_for
+
+    vocab = vocabulary_for(blobs.meta_json)
+    if len(vocab) != blobs.h["NANO_VOCAB"]:
+        raise ValueError(f"sanoTTS: the vocabulary has {len(vocab)} symbols, the header {blobs.h['NANO_VOCAB']}.")
+    return vocab
+
+
+@dataclass(kw_only=True)
+class TTSSanoNanoExportConfig(TTSSanoTTSExportConfig):
+    """One sanoTTS nano voice package (heart, heartnano) -> one GGUF."""
+
+    architecture: str = "sanotts-nano"
+    driver_script_path: Path = Path(__file__).resolve().parent / "sanotts_nano_driver"
+
+    blobs: Optional[object] = field(default=None, init=False, repr=False)
+
+    __unchecked__ = dict(TTSSanoTTSExportConfig.__unchecked__, blobs=Unchecked("READ off the package"))
+
+    def phases(self) -> List[ExportPhase]:
+        import coremltools as ct
+
+        blobs, duration, latent, decoder = build_nano_models(Path(self.package_dir))
+        self.blobs = blobs
+        h = blobs.h
+        n, t = int(self.trace_tokens), int(self.trace_frames)
+        token_axis = ct.RangeDim(1, self.max_tokens)
+        frame_axis = ct.RangeDim(1, self.max_frames)
+        g = torch.Generator().manual_seed(0)
+        return [
+            ExportPhase(
+                name="duration", wrapper=_DurationWrapper(duration).eval(),
+                dummy_inputs=(torch.randint(0, h["NANO_VOCAB"], (1, n), generator=g),
+                              torch.rand(1, 3, n, generator=g)),
+                mil_inputs=[ct.TensorType(name="tokens", shape=(1, token_axis), dtype=np.int32),
+                            ct.TensorType(name="features", shape=(1, 3, token_axis), dtype=np.float32)],
+                root_axis="n_tokens",
+            ),
+            ExportPhase(
+                name="synth", wrapper=_NanoSynthWrapper(latent, decoder).eval(),
+                dummy_inputs=(torch.randint(0, h["NANO_VOCAB"], (1, n), generator=g),
+                              torch.rand(1, 2, n, generator=g),
+                              torch.sort(torch.randint(0, n, (t,), generator=g)).values,
+                              torch.rand(1, 3, t, generator=g),
+                              torch.randn(1, h["NANO_NOISE_CH"], t, generator=g)),
+                mil_inputs=[ct.TensorType(name="tokens", shape=(1, token_axis), dtype=np.int32),
+                            ct.TensorType(name="token_features", shape=(1, 2, token_axis), dtype=np.float32),
+                            ct.TensorType(name="frame_index", shape=(frame_axis,), dtype=np.int32),
+                            ct.TensorType(name="frame_features", shape=(1, 3, frame_axis), dtype=np.float32),
+                            ct.TensorType(name="noise", shape=(1, h["NANO_NOISE_CH"], frame_axis),
+                                          dtype=np.float32)],
+                root_axis="n_enc_frames",
+                declared_axes={"tokens": {1: "n_tokens"}, "token_features": {2: "n_tokens"}},
+            ),
+        ]
+
+    def hparams(self) -> dict:
+        if not self.blobs:
+            return {}
+        return {"sample_rate": int(self.blobs.meta_json["sample_rate"])}
+
+    def contract(self) -> dict:
+        contract = BaseMultiPhaseModelExportConfig.contract(self)
+        contract["text.frontend"] = "phonemes"
+        contract["text.phoneme_alphabet"] = "ipa"
+        contract["text.languages"] = ["en-US"]
+        return contract
+
+    def phoneme_table(self) -> dict:
+        """The 62-symbol misaki-normalised table, framed `[BOS, p1, ..., pn, EOS]` with no blank -- what
+        upstream's `phonemes_to_token_ids` builds."""
+        vocab = nano_vocabulary(self.blobs or _NanoBlobs(Path(self.package_dir)))
+        for symbol, want in (("<pad>", 0), ("<bos>", 1), ("<eos>", 2)):
+            if vocab.get(symbol) != want:
+                raise ValueError(f"sanoTTS: {symbol} is {vocab.get(symbol)} in the nano vocabulary, not {want}.")
+        symbols = sorted(vocab, key=vocab.get)
+        return {"symbols": symbols, "ids": [vocab[s] for s in symbols],
+                "bos": 1, "eos": 2, "blank": -1, "interleave_blank": False}
+
+    def driver_components(self) -> List:
+        from .driver_components import (
+            DriverReturn, ExportConstants, LuaFragment, SubgraphCallComponent,
+        )
+        from .driver_ir import Lit, Var
+        from .lua_library import LuaLibrary
+
+        h = self.blobs.h if self.blobs else {}
+        fragment = self.driver_script_path
+        piperlite = TTSSanoTTSExportConfig.driver_script_path
+        return [
+            LuaFragment(fragment / "00_header.lua", top_level=True),
+            LuaLibrary(uses=("round_half_to_even", "to_f32", "aten_randn")),
+            ExportConstants(values={
+                "DUR_VOCAB": int(h.get("NANO_VOCAB", 0)),
+                "AC_VOCAB": int(h.get("NANO_VOCAB", 0)),
+                "FALLBACK_ID": FALLBACK_ID,
+                "MAX_TOKENS": int(h.get("NANO_DUR_MAX_TOKENS", 0)),
+                "MAX_DURATION": int(h.get("NANO_DUR_MAX_DURATION", 0)),
+                "LENGTH_SCALE": 1.0,
+                "NOISE_CH": int(h.get("NANO_NOISE_CH", 0)),
+                "DEFAULT_SEED": NANO_DEFAULT_SEED,
+                "DC_BLOCK_R": NANO_DC_BLOCK_R,
+            }),
+            LuaFragment(fragment / "01_limit.lua", reads=("MAX_TOKENS", "DUR_VOCAB")),
+            # The token features and the expansion are piperlite's, statement for statement.
+            LuaFragment(piperlite / "01_tokens.lua",
+                        reads=("DUR_VOCAB", "AC_VOCAB", "FALLBACK_ID", "MAX_TOKENS"),
+                        defines=("_n", "_dur_tokens", "_dur_features", "_ac_tokens", "linspace01")),
+            SubgraphCallComponent(
+                topology="duration", outputs=("_log_duration",),
+                inputs={"tokens": Var("_dur_tokens"), "features": Var("_dur_features")},
+                axes={"n_tokens": Var("_n"), "n_past": Lit(0)},
+                note="Duration net: per-token log-duration."),
+            LuaFragment(piperlite / "02_expand.lua",
+                        reads=("_n", "_log_duration", "LENGTH_SCALE", "MAX_DURATION", "linspace01"),
+                        defines=("_n_frames", "_token_features", "_frame_index", "_frame_features")),
+            LuaFragment(fragment / "03_noise.lua", reads=("_n_frames", "NOISE_CH", "DEFAULT_SEED"),
+                        defines=("_noise",)),
+            SubgraphCallComponent(
+                topology="synth", outputs=("_wave",),
+                inputs={"tokens": Var("_ac_tokens"), "token_features": Var("_token_features"),
+                        "frame_index": Var("_frame_index"), "frame_features": Var("_frame_features"),
+                        "noise": Var("_noise")},
+                axes={"n_tokens": Var("_n"), "n_enc_frames": Var("_n_frames"), "n_past": Lit(0)},
+                note="Acoustic net to mel-100, then the ConvNeXt decoder and the iSTFT."),
+            LuaFragment(fragment / "04_dc_block.lua", reads=("_wave", "DC_BLOCK_R"), defines=("waveform",)),
+            DriverReturn(values=("waveform",)),
+        ]
+
+
+def _is_sanotts_nano(path: Path) -> bool:
+    return path.is_dir() and (path / "nano_q8_meta.h").is_file() and (path / "meta.json").is_file()
+
+
+def _build_sanotts_nano(path: Path, output_path: str) -> TTSSanoNanoExportConfig:
+    return TTSSanoNanoExportConfig(package_dir=str(path), output_path=output_path)
+
 def _is_sanotts(path: Path) -> bool:
     manifest = path / "manifest.json"
     if not path.is_dir() or not manifest.is_file():
@@ -386,4 +745,10 @@ def register(registry) -> None:
         task="text-to-speech",
         config_class=TTSSanoTTSExportConfig,
         recognizers=[ModelRecognizer(name="sanotts", detect=_is_sanotts, build_config=_build_sanotts)],
+    ))
+    registry.register(TaskRegistryEntry(
+        task="text-to-speech",
+        config_class=TTSSanoNanoExportConfig,
+        recognizers=[ModelRecognizer(name="sanotts-nano", detect=_is_sanotts_nano,
+                                     build_config=_build_sanotts_nano)],
     ))

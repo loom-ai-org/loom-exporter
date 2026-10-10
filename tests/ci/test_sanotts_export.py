@@ -177,3 +177,71 @@ def test_it_is_registered_for_tts():
     registry = default_registry()
     names = {(rec.task, rec.name) for entry in registry._entries.values() for rec in entry.recognizers}
     assert ("text-to-speech", "sanotts") in names
+
+
+# -- the nano line: the C runtime's blobs ---------------------------------------------------------------
+
+def _nano_package(tmp_path, weight_format):
+    """One 2x3 layer, rows padded to 16, plus one f32 region -- the header/blob discipline upstream's
+    `export_e12_nano_q8.py` writes."""
+    q = np.array([[1, -2, 3], [127, 0, -127]], dtype=np.int8)
+    scale = np.array([0.5, 0.25], dtype=np.float32)
+    bias = np.array([1.0, -1.0], dtype=np.float32)
+    if weight_format == 1:
+        rows = np.zeros((2, 16), np.float32)
+        rows[:, :3] = q * scale[:, None]
+        w_bytes, scale = rows.tobytes(), np.ones(2, np.float32)
+    else:
+        rows = np.zeros((2, 16), np.int8)
+        rows[:, :3] = q
+        w_bytes = rows.tobytes()
+    f32 = np.array([3.5, -4.25], dtype=np.float32)
+    dec = w_bytes + scale.tobytes() + bias.tobytes() + f32.tobytes()
+    w_off, s_off = 0, len(w_bytes)
+    header = {"NANO_FRONT_BYTES": 0, "NANO_DEC_BYTES": len(dec), "NANO_L_N16": 16,
+              "DOFF_L_W8": w_off, "DOFF_L_SCALE": s_off, "DOFF_L_BIAS": s_off + 8,
+              "DOFF_G_F32": s_off + 16}
+    if weight_format == 1:
+        header["NANO_WEIGHT_FORMAT"] = 1
+    (tmp_path / "nano_q8_meta.h").write_text(
+        "/* generated */\n" + "".join(f"#define {k} {v}\n" for k, v in header.items()))
+    (tmp_path / "front.bin").write_bytes(b"")
+    (tmp_path / "dec.bin").write_bytes(dec)
+    (tmp_path / "meta.json").write_text(json.dumps({"front": "front.bin", "dec": "dec.bin"}))
+    return tmp_path, q.astype(np.float32) * np.array([[0.5], [0.25]], np.float32), bias, f32
+
+
+@pytest.mark.parametrize("weight_format", [0, 1])
+def test_a_nano_layer_is_dequantised_and_its_padding_dropped(tmp_path, weight_format):
+    pkg, want_w, want_b, want_f32 = _nano_package(tmp_path, weight_format)
+    blobs = S._NanoBlobs(pkg)
+    w, b = blobs.rows("dec", "DOFF", "L", 2, 3)
+    assert w.shape == (2, 3)
+    assert torch.equal(w, torch.from_numpy(want_w)) and torch.equal(b, torch.from_numpy(want_b))
+    assert torch.equal(blobs.f32("dec", "DOFF", "G", 2), torch.from_numpy(want_f32))
+
+
+def test_a_nano_blob_of_the_wrong_size_is_refused(tmp_path):
+    pkg, *_ = _nano_package(tmp_path, 0)
+    (pkg / "dec.bin").write_bytes((pkg / "dec.bin").read_bytes()[:-4])
+    with pytest.raises(ValueError, match="the header says"):
+        S._NanoBlobs(pkg)
+
+
+def test_a_dyt_decoder_is_refused(tmp_path):
+    pkg, *_ = _nano_package(tmp_path, 0)
+    with open(pkg / "nano_q8_meta.h", "a") as f:
+        f.write("#define NANO_NORM_TYPE 1\n")
+    with pytest.raises(ValueError, match="DyT"):
+        S._NanoBlobs(pkg)
+
+
+def test_the_nano_recognizer_wants_the_header(tmp_path):
+    pkg, *_ = _nano_package(tmp_path, 0)
+    assert S._is_sanotts_nano(pkg) and not S._is_sanotts(pkg)
+    (pkg / "nano_q8_meta.h").unlink()
+    assert not S._is_sanotts_nano(pkg)
+
+
+def test_the_default_seed_is_upstreams_low_32_bits():
+    assert S.NANO_DEFAULT_SEED == 2236265385529901705 % 2 ** 32
