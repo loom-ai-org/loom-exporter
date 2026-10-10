@@ -1194,6 +1194,18 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         # per-architecture -- another Piper voice may differ, so this belongs to this catalogue entry.
         sample_rate=22050,
         title="Piper VITS en-GB (miro)", summary="OpenVoiceOS's Piper-compatible VITS en-GB \"miro\" voice, exported for loom.cpp. Takes phoneme ids, not text.",
+        # Measured 2026-10-10: Whisper-small WER on the 30 shortest LibriSpeech-dummy sentences (235
+        # words), both framings, three front ends (loom.cpp Retro-081). The espeak-convention fold
+        # (ADR-071) made the door WORSE here (25.5% -> 30.2%), so this export declares no phoneme style.
+        limitations=(
+            "**The best input is espeak-ng's phonemes** (voice `en-gb-x-rp`), the G2P this voice was "
+            "trained on. Whisper-small's word error rate on 30 LibriSpeech sentences was 13.2% with "
+            "them and 25.5% through the built-in G2P with the ipa-dict lexicon. espeak-ng is GPL-3.0, "
+            "which is why it is not bundled.\n\n"
+            "**loom 1.0.0-rc17 or later** frames the ids the way Piper's training did, with a blank right "
+            "after the start token. Older versions run this file with the earlier framing, a little "
+            "less accurately (14.9% and 29.4% on the same test)."
+        ),
     ),
     ModelCard(
         slug="styletts2-ljspeech",

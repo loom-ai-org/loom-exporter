@@ -457,9 +457,14 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
         refused rather than silently truncated: taking `[0]` of it would produce a plausible id sequence
         that is not what the voice was trained on.
 
-        `phonemes_to_ids` in `tools/convert_piper_vits/reference_forward_vits.py` is the authority on the
-        assembly, and it is the reason `interleave_blank` exists: piper puts a blank between every
-        phoneme and none right after BOS.
+        The assembly is the one Piper TRAINED with, which is not the one its old `python_run` runtime
+        uses (loom.cpp Retro-081). piper-phonemize, which `piper_train.preprocess` calls, builds
+        `[BOS, blank, p1, blank, ..., pn, blank, EOS]` -- a blank between every phoneme AND one right
+        after BOS. `phonemes_to_ids` in `tools/convert_piper_vits/reference_forward_vits.py` copied the
+        runtime and omits that one blank; every voice published before 2026-10-10 was fed one id short.
+        VITS is robust enough that this was never heard, but it is measurable: Whisper-small WER on 30
+        LibriSpeech sentences through miro fell from 14.9% to 13.2% with espeak-ng's phonemes and from
+        29.4% to 25.5% through the text door (ipa-dict), 2026-10-10.
         """
         import json
 
@@ -488,12 +493,13 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
         return {
             "symbols": symbols,
             "ids": [id_map[sym][0] for sym in symbols],
-            # Piper's own constants (`reference_forward_vits.phonemes_to_ids`): 1 opens, 2 closes, 0 is
-            # the blank interleaved between phonemes.
+            # Piper's own constants: 1 opens, 2 closes, 0 is the blank interleaved between phonemes and
+            # put once more right after the opening 1 (`blank_after_bos`, see above).
             "bos": 1,
             "eos": 2,
             "blank": 0,
             "interleave_blank": True,
+            "blank_after_bos": True,
         }
 
     def driver_input_aliases(self) -> dict:
