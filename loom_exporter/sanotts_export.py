@@ -296,9 +296,12 @@ class TTSSanoTTSExportConfig(BaseMultiPhaseModelExportConfig):
         ]
 
     def hparams(self) -> dict:
+        """The rate, and the phoneme conventions the voice was trained in (`tts.phoneme_style`, which the
+        text door folds a G2P's IPA to -- loom.cpp ADR-071): piperlite's teachers were Piper voices,
+        trained on espeak's IPA."""
         if not self.manifest:
             return {}
-        return {"sample_rate": int(self.manifest["sample_rate"])}
+        return {"sample_rate": int(self.manifest["sample_rate"]), "tts.phoneme_style": "espeak"}
 
     def contract(self) -> dict:
         contract = super().contract()
@@ -644,9 +647,11 @@ class TTSSanoNanoExportConfig(TTSSanoTTSExportConfig):
         ]
 
     def hparams(self) -> dict:
+        """The rate, and `tts.phoneme_style`: the nano voices were distilled on misaki's normalised IPA
+        (Kokoro's alphabet)."""
         if not self.blobs:
             return {}
-        return {"sample_rate": int(self.blobs.meta_json["sample_rate"])}
+        return {"sample_rate": int(self.blobs.meta_json["sample_rate"]), "tts.phoneme_style": "misaki"}
 
     def contract(self) -> dict:
         contract = BaseMultiPhaseModelExportConfig.contract(self)
