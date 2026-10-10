@@ -173,6 +173,14 @@ class ModelCard:
     # so a snippet that serves such a card names `{gguf}`. The notes are MEASURED numbers and carry
     # their source in the catalogue entry's comment.
     variants: List[Tuple[str, str]] = field(default_factory=list)
+    # Several MODELS in one repo, as `(checkpoint subdirectory, GGUF file name, Files-list note)`: each
+    # is exported from `checkpoint / subdirectory` to its own file, and the first is the one the usage
+    # snippet loads. For a family whose upstream ships one package per voice (sanoTTS: 28 voices, each
+    # its own weights) -- not precisions of one model, which is `variants`. The two never combine.
+    packages: List[Tuple[str, str, str]] = field(default_factory=list)
+    # Files copied into the repo beside the GGUFs, as `(path in the repo, source)`; a relative source is
+    # under `--models-root`. For data a card's usage needs from the same repo (a lexicon, its licence).
+    copied_files: List[Tuple[str, str]] = field(default_factory=list)
 
 
 # The 19 models the exporter can produce today (BACKLOG.md's implementation-sequence table, P4/P5).
@@ -499,6 +507,86 @@ CATALOG = [
             "or very short audio.\n\n"
             "**Small, not fast, on the smallest boards.** On a Raspberry Pi Zero W (one ARMv6 core, "
             "no SIMD) 11 s of speech takes about 75 s at either precision. English only, mono 16 kHz."
+        ),
+    ),
+    ModelCard(
+        # ampixa/sanoTTS at HF c532a5d, exported through a pinned clone of upstream's GPL-3.0 training
+        # scripts (loom.cpp ADR-070). Measured 2026-10-10: every voice against upstream's own path
+        # (`~/.claude/tmp/sano/work/sweep_all.py`); amy 7.2e-6, heart-nano 3.5e-6, heart 1.1e-5;
+        # Whisper word-perfect on amy/heart/heart-nano; Pi Zero W timings on the P4.31 engine.
+        slug="sanotts", checkpoint=Path("sanotts"),
+        export_task="text-to-speech", task_type="text-to-speech", snippet="text-to-speech-voices",
+        base_repo="ampixa/sanoTTS", license_id="gpl-3.0",
+        language=["en", "ar", "cs", "de", "es", "fr", "id", "it", "pt", "ro", "ru", "tr", "vi", "zh"],
+        sample_rate=24000,
+        title="sanoTTS (28 tiny voices)",
+        summary="Ampixa's sanoTTS: tiny distilled TTS voices, 0.29M to 2.27M parameters, in 14 languages, "
+                "exported for loom.cpp. Two lines: piperlite (distilled from Piper voices, 22.05 kHz) and "
+                "nano (distilled from Kokoro's af_heart through a Vocos-style decoder, 24 kHz).",
+        packages=[
+            ("heartnano", "sanotts-heartnano.gguf", "heart-nano: the nano line's smallest voice (Kokoro af_heart's student, int8 upstream, dequantised here). The default above: on a Raspberry Pi Zero W it synthesises at 1.1x real time in 34 MB."),
+            ("heart", "sanotts-heart.gguf", "heart: the nano line at 2.27M (Kokoro af_heart's student). 2.5x real time on a Pi Zero W, 42 MB."),
+            ("amy-en-1p46m", "sanotts-amy-en-1p46m.gguf", "amy (Piper en_US-amy-medium's student), 1.46M: upstream's best-scored English voice (SCOREQ 4.13). 8.4x real time on a Pi Zero W."),
+            ("amy-en-1p1m", "sanotts-amy-en-1p1m.gguf", "amy, 1.08M."),
+            ("amy-en-1p8m", "sanotts-amy-en-1p8m.gguf", "amy, 1.83M."),
+            ("hfc-en-1p8m", "sanotts-hfc-en-1p8m.gguf", "hfc (Piper en_US-hfc_female-medium), 1.83M."),
+            ("kristin-en-1p4m", "sanotts-kristin-en-1p4m.gguf", "kristin (Piper en_US-kristin-medium), 1.40M, with upstream's waveform post-filter."),
+            ("ar-kareem-1p57m", "sanotts-ar-kareem-1p57m.gguf", "Arabic, kareem (Piper ar_JO-kareem-medium), 1.57M."),
+            ("cs-jirka-0p51m", "sanotts-cs-jirka-0p51m.gguf", "Czech, jirka, 0.51M."),
+            ("cs-jirka-1p57m", "sanotts-cs-jirka-1p57m.gguf", "Czech, jirka, 1.57M."),
+            ("de-thorsten-0p51m", "sanotts-de-thorsten-0p51m.gguf", "German, thorsten, 0.51M: 2.3x real time on a Pi Zero W, 54 MB."),
+            ("de-thorsten-1p57m", "sanotts-de-thorsten-1p57m.gguf", "German, thorsten, 1.57M."),
+            ("es-davefx-0p51m", "sanotts-es-davefx-0p51m.gguf", "Spanish, davefx, 0.51M."),
+            ("es-davefx-1p56m", "sanotts-es-davefx-1p56m.gguf", "Spanish, davefx, 1.56M."),
+            ("fr-siwis-1p57m", "sanotts-fr-siwis-1p57m.gguf", "French, siwis, 1.57M."),
+            ("id-newstts-1p46m", "sanotts-id-newstts-1p46m.gguf", "Indonesian, news_tts, 1.56M."),
+            ("it-serena-0p51m", "sanotts-it-serena-0p51m.gguf", "Italian, serena, 0.51M."),
+            ("it-serena-1p57m", "sanotts-it-serena-1p57m.gguf", "Italian, serena, 1.57M."),
+            ("pt-cadu-0p51m", "sanotts-pt-cadu-0p51m.gguf", "Portuguese (Brazil), cadu, 0.51M."),
+            ("pt-cadu-1p57m", "sanotts-pt-cadu-1p57m.gguf", "Portuguese (Brazil), cadu, 1.57M."),
+            ("ro-mihai-0p51m", "sanotts-ro-mihai-0p51m.gguf", "Romanian, mihai, 0.51M."),
+            ("ro-mihai-1p57m", "sanotts-ro-mihai-1p57m.gguf", "Romanian, mihai, 1.57M."),
+            ("ru-irina-0p51m", "sanotts-ru-irina-0p51m.gguf", "Russian, irina, 0.51M."),
+            ("ru-irina-1p57m", "sanotts-ru-irina-1p57m.gguf", "Russian, irina, 1.57M."),
+            ("tr-dfki-0p51m", "sanotts-tr-dfki-0p51m.gguf", "Turkish, dfki, 0.51M."),
+            ("tr-dfki-1p56m", "sanotts-tr-dfki-1p56m.gguf", "Turkish, dfki, 1.56M."),
+            ("vi-vais1000-1p46m", "sanotts-vi-vais1000-1p46m.gguf", "Vietnamese, vais1000, 1.57M."),
+            ("zh-xiaoya-1p55m", "sanotts-zh-xiaoya-1p55m.gguf", "Chinese, xiao_ya, 1.55M."),
+        ],
+        # misaki's us_gold.json over us_silver.json (revision e820629, as upstream's pypkg vendors them),
+        # each entry's DEFAULT pronunciation, as `word<TAB>ipa`: 183,561 entries. Chosen over ipa-dict by
+        # measurement (30 LibriSpeech sentences, Whisper, through the door): heart-nano 11.9% folded vs
+        # 15.7% for ipa-dict folded; amy 12.3% vs 11.1% -- one lexicon serves both lines.
+        copied_files=[("lexicons/en_US-misaki.tsv", "sanotts-lexicons/en_US-misaki.tsv"),
+                      ("lexicons/LICENSE.misaki", "sanotts-lexicons/LICENSE.misaki")],
+        extra_files=[
+            "`lexicons/en_US-misaki.tsv` -- [hexgrad/misaki](https://github.com/hexgrad/misaki)'s US English "
+            "pronunciation dictionaries (`us_gold.json` over `us_silver.json`, each word's default "
+            "reading), Apache-2.0 (`lexicons/LICENSE.misaki`), as `word<TAB>ipa` -- the shape "
+            "`loom.phonemizers.set_lexicon` reads.",
+        ],
+        limitations=(
+            "**GPL-3.0**, like upstream's weights and code: these files carry upstream's parameters. "
+            "loom.cpp, loom-exporter and loom-py contain no GPL code; the export imports upstream's "
+            "training scripts from a pinned clone rather than vendoring them.\n\n"
+            "**Small, but not real time on the smallest boards.** On a Raspberry Pi Zero W (one ARMv6 "
+            "core at 1 GHz, no SIMD), synthesis takes 1.1 times the audio's duration with heart-nano "
+            "(34 MB of memory), 2.3 times with the 0.51M piperlite voices, 2.5 times with heart and 8.4 "
+            "times with amy-1.46M. On a 2-core x86 laptop CPU, amy-1.46M takes a fourteenth of it.\n\n"
+            "**The text door is measured in English only.** Through `text2speech.infer(text)` with the "
+            "bundled lexicon, heart-nano scored 11.9% word error rate on 30 LibriSpeech sentences "
+            "(Whisper) against 8.1% with upstream's own front end, and amy-1.46M 12.3% against 8.5%. "
+            "Without the lexicon, English is far worse. The other languages "
+            "use orthography2ipa's rules with only the language-independent convention fixes; for full "
+            "quality there, pass `phonemes=` from an espeak-style G2P. **Chinese has no text door**: "
+            "orthography2ipa's output for it lands almost entirely outside the zh voice's phoneme table "
+            "(a 13-character sentence encoded to 3 ids), so pass that voice espeak-style pinyin "
+            "phonemes yourself.\n\n"
+            "**heart and heart-nano take at most 207 phoneme symbols per call** (upstream's own limit); "
+            "split longer text at its sentences. Their decoder is noise-fed: `seed` changes the voice "
+            "slightly, and the default reproduces upstream's default rendering. Upstream's optional "
+            "\"sibilant injection\" (applied by its dashboard and Arduino runtime, not by its pip "
+            "package) is not reproduced."
         ),
     ),
     ModelCard(
@@ -1898,6 +1986,26 @@ model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
 result = model.speech2text.infer(audio)
 print(result.text)
 """,
+    # A repo of several VOICES (sanoTTS), each its own model, with the English lexicon the text door
+    # uses shipped beside them. Each voice declares the IPA conventions it was trained in, and the door
+    # folds the G2P's output to them (loom.cpp ADR-071) -- which is what makes the built-in path usable on
+    # a voice this small.
+    "text-to-speech-voices": """import loom
+
+# This repo holds many voices, each its own model; name the file you want (see "Files" below).
+model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
+
+# The built-in text door: orthography2ipa, plus a pronunciation lexicon for English that ships in this
+# repo (hexgrad/misaki's, Apache-2.0). The voice declares the IPA conventions it was trained in and the
+# door rewrites the G2P's output to them before encoding.
+loom.phonemizers.set_lexicon("hf://{repo_id}/lexicons/en_US-misaki.tsv", language="en-US")
+audio = model.text2speech.infer("hello world")
+audio.save("hello.wav")
+
+# Full quality: phonemes from your own G2P, in the voice's own conventions (espeak's for the piperlite
+# voices, misaki's for heart and heart-nano), are encoded as given.
+# audio = model.text2speech.infer(phonemes="...")
+""",
     "automatic-speech-recognition-multilingual": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
@@ -2441,8 +2549,12 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
             f"record it on the catalogue entry, with where you got it."
         )
 
-    if card.variants and "{gguf}" not in USAGE_SNIPPETS[snippet_key(card)]:
-        raise ValueError(f"{card.slug}: the repo carries {len(card.variants)} GGUFs and its snippet "
+    if card.variants and card.packages:
+        raise ValueError(f"{card.slug}: `variants` (precisions of one model) and `packages` (several "
+                         f"models) do not combine.")
+    n_files = len(card.variants or card.packages)
+    if n_files and "{gguf}" not in USAGE_SNIPPETS[snippet_key(card)]:
+        raise ValueError(f"{card.slug}: the repo carries {n_files} GGUFs and its snippet "
                          f"does not name one; `from_pretrained` refuses to choose.")
     if "{frame_ms}" in USAGE_SNIPPETS[snippet_key(card)] and not card.frame_ms:
         raise ValueError(f"{card.slug}: no frame_ms, and its usage snippet states the frame length.")
@@ -2510,6 +2622,9 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
     extra_files_section = "".join(f"- {bullet}\n" for bullet in card.extra_files)
     weights_line = ("Weights are unmodified; this repo packages the same parameters into\n"
                     "loom.cpp's GGUF format.")
+    if card.packages:
+        weights_line = ("Each file is one upstream voice, its parameters in loom.cpp's GGUF format "
+                        "(see Files).")
     if card.variants:
         weights_line = ("The F32 file carries the same parameters unmodified, in loom.cpp's GGUF "
                         "format;\nthe others are quantized from them (see Files).")
@@ -2531,6 +2646,11 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
             "quantized ones pack the convolution and projection weights (`loom-export --quantize "
             "<type>`), so their numbers differ from the original model's by the amount noted.\n\n"
             + "".join(f"- `{variant_gguf_name(card, qtype)}` -- {note}\n" for qtype, note in card.variants))
+    elif card.packages:
+        gguf_files_section = (
+            "Several voices; each file is its own model, exported from its own upstream package, with "
+            "its own graph and driver.\n\n"
+            + "".join(f"- `{name}` -- {note}\n" for _, name, note in card.packages))
     else:
         gguf_files_section = f"- `{gguf_name}` -- the model, exported with loom-exporter.\n"
     # Named in the Files list rather than left to be discovered from the byte count: a quantized
@@ -2589,6 +2709,8 @@ def variant_gguf_name(card: ModelCard, qtype: str) -> str:
 def gguf_names(card: ModelCard) -> List[Tuple[str, Optional[str]]]:
     """Every GGUF this card's repo carries, as `(file name, --quantize type or None)`; the first is
     the one the snippet loads."""
+    if card.packages:
+        return [(name, None) for _, name, _ in card.packages]
     if not card.variants:
         return [(f"{card.slug}.gguf", None)]
     return [(variant_gguf_name(card, qtype), None if qtype == "F32" else qtype)
@@ -2618,10 +2740,16 @@ def build_one(card: ModelCard, models_root: Path, output_dir: Path, readme_only:
         if not checkpoint.exists():
             print(f"  [skip] {card.slug}: checkpoint not found at {checkpoint}")
             return
-        for name, quantize in files:
-            print(f"  [export] {card.slug}  ({checkpoint} -> {model_dir / name}"
+        sources = ([checkpoint / sub for sub, _, _ in card.packages] if card.packages
+                   else [checkpoint] * len(files))
+        for (name, quantize), source in zip(files, sources):
+            print(f"  [export] {card.slug}  ({source} -> {model_dir / name}"
                   f"{', ' + quantize if quantize else ''})")
-            do_export(card, checkpoint, model_dir / name, quantize)
+            do_export(card, source, model_dir / name, quantize)
+        for dest, source in card.copied_files:
+            src = Path(source) if Path(source).is_absolute() else models_root / source
+            (model_dir / dest).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, model_dir / dest)
 
     if card.frame_ms:
         for name, _ in files:
