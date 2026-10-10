@@ -195,6 +195,7 @@ _FAMILY_MODULES = (
     "canary_export",
     "moonshine_export",
     "moonshine_v1_export",
+    "sanotts_export",
     "qwen3_asr_export",
     "granite_speech_export",
     "kokoro_export",

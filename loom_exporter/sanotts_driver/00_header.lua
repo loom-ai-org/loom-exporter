@@ -1,0 +1,11 @@
+-- sanoTTS piperlite (sanotts_export.py): a duration net, then the acoustic net and the decoder as one
+-- graph, with the frame expansion's counts and positions computed here in between.
+--
+-- inputs: tokens (phoneme ids, framed as the voice's front end frames them -- `[1, 0, p1, 0, ..., pn,
+-- 0, 2]`, piper-phonemize's build; the text door's own phoneme vocabulary produces exactly that), and
+-- optionally length_scale (the duration multiplier, larger is slower; default the voice's own).
+-- Returns the waveform at `loom.sample_rate`, 256 samples per acoustic frame.
+--
+-- Every per-token and per-frame feature below is computed as upstream's torch code computes it, in
+-- float32 (`to_f32`), because two of them decide integers: a duration is `round` of a float32 product,
+-- and a frame count is the sum of those.
