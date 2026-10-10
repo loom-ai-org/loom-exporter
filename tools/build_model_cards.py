@@ -414,6 +414,38 @@ CATALOG = [
                        "[[reference-qwen3-asr-hf-checkpoint]]",
         title="Qwen3-ASR-0.6B", summary="Alibaba's Qwen3-ASR 0.6B multilingual ASR model, exported for loom.cpp.",
     ),
+    ModelCard(
+        slug="nemotron-3.5-asr-streaming-0.6b", checkpoint=Path("nemotron-3.5-asr-streaming-0.6b"),
+        venv="ovos", task_type="automatic-speech-recognition", selects_language=True,
+        snippet="automatic-speech-recognition-nemotron",
+        base_repo="nvidia/nemotron-3.5-asr-streaming-0.6b", license_id="other",
+        license_name="OpenMDW License 1.1", license_url="https://openmdw.ai/license/1-1/",
+        language=["en", "es", "de", "fr", "it", "ar", "ja", "ko", "pt", "ru", "hi", "zh", "vi", "he",
+                  "nl", "cs", "da", "pl", "no", "sv", "th", "tr", "bg", "el", "et", "fi", "hr", "hu",
+                  "lt", "lv", "ro", "sk", "uk", "mt", "sl"],
+        title="Nemotron 3.5 ASR Streaming 0.6B",
+        summary="NVIDIA's Nemotron 3.5 ASR (0.6B): a cache-aware FastConformer encoder with an RNN-T "
+                "decoder and language-ID prompting, 40 language-locale combinations in one checkpoint, "
+                "exported for loom.cpp.",
+        limitations=(
+            "**The whole clip in one pass, not live streaming.** The checkpoint is trained to stream in "
+            "chunks with a cached encoder; this file runs it the way `transformers`' offline "
+            "`generate()` does: every frame at once, attending through the same chunked window "
+            "(320 ms chunks, 4.5 s of left context). The transcripts are `transformers`' own, token for "
+            "token. Incremental streaming is not exported.\n\n"
+            "**Cost grows with the clip.** Attention is computed over the whole clip, so on a 4-thread "
+            "laptop-class CPU 11 s of speech took 4.8 s and 120 s took 82 s, peaking at 4.0 GB of "
+            "memory, and memory grows faster than the clip does. There is no length cap (`transformers` "
+            "stops at 400 s, its position table; this file computes positions instead), so split long "
+            "audio at its pauses -- `silero-vad-loom` finds them.\n\n"
+            "**Without `language`, the model identifies it** (`auto`, the checkpoint's own default). "
+            "Naming it helps on short or ambiguous clips, but a WRONG name is worse than none: told "
+            "that English speech is German, it returns an empty transcript. The model also writes a "
+            "language tag such as `<en-US>` after each sentence; loom drops the tags from `text`, as "
+            "`transformers`' `skip_special_tokens` does, which leaves a double space where each one was.\n\n"
+            "No timestamps: `segments` is one span covering the whole clip. Mono 16 kHz."
+        ),
+    ),
     *[ModelCard(
         slug=f"moonshine-streaming-{size}", checkpoint=Path(f"moonshine-streaming-{size}"), venv="ovos",
         task_type="automatic-speech-recognition",
@@ -1846,6 +1878,20 @@ print(result.text)
 # `target_language` is what to WRITE, and it defaults to English: German audio with no target comes
 # back translated, and language="de", target_language="de" keeps it German.
 print(model.speech2text.infer(audio, language="en", target_language="fr").text)
+""",
+    # Nemotron 3.5 ASR's door: it identifies the language itself, and takes the checkpoint's own locale
+    # names when told.
+    "automatic-speech-recognition-nemotron": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+
+# Audio is a mono float list at 16 kHz. With no `language` the model identifies it itself.
+result = model.speech2text.infer(audio)
+print(result.text)
+
+# Or name it, in the checkpoint's own locale names: "en-US", "de-DE", "zh-CN", ... (all 121 are in
+# `model.contract["asr_languages"]`, "auto" included). A wrong name returns an empty transcript.
+print(model.speech2text.infer(audio, language="de-DE").text)
 """,
     # Kyutai STT's door: the same call, at the Mimi codec's 24 kHz. loom does not resample, so a card
     # whose model takes another rate than the 16 kHz every other ASR card assumes has to say so in code.

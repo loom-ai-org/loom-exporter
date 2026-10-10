@@ -372,8 +372,12 @@ class transpose_pad_to_last_axis(AbstractGraphPass):
     have to be re-checked on every version bump. Accepting whichever layout arrives and normalising it
     is the version-independent shape of the fix.
 
-    Only ONE axis may carry a non-zero pad, which is what `topology_ops.py` already required: a
-    two-axis pad has no single transpose that makes it a last-axis one, and no model has asked.
+    **A constant pad on SEVERAL axes becomes a chain of one-axis pads**, each moved to the last axis
+    the same way. Zero-padding one axis and then another is exactly zero-padding both at once (the
+    corner cells are zero either way), so the split is not an approximation. First needed by Nemotron
+    ASR's causal subsampling `Conv2d`, which pads frequency and then time in two `F.pad` calls that
+    coremltools merges into one pad op on two axes. Any other mode on several axes is still refused:
+    whether a reflect or replicate pad separates is a question nobody has needed answered.
     """
 
     def apply(self, prog):
@@ -408,25 +412,33 @@ class transpose_pad_to_last_axis(AbstractGraphPass):
                        if pad_vals[2 * i] or pad_vals[2 * i + 1]]
         if not padded_axes or padded_axes == [rank - 1]:
             return False
-        if len(padded_axes) > 1:
-            raise NotImplementedError(
-                f"pad op '{op.name}' has non-zero padding on {len(padded_axes)} axes {padded_axes} of "
-                f"a rank-{rank} tensor. One transpose cannot make both the last axis, and the engine "
-                f"pads only ne[0]; no model has needed this."
-            )
-        axis = padded_axes[0]
-        perm = list(range(rank))
-        perm[axis], perm[rank - 1] = perm[rank - 1], perm[axis]
-        # The pair that was on `axis` moves to the last position, and everything else is zeroed: after
-        # the transpose there is nothing left to pad but the axis that was swapped in.
-        moved = pad_vals[2 * (axis - (rank - n_padded))], pad_vals[2 * (axis - (rank - n_padded)) + 1]
-        new_pad = [0, 0, int(moved[0]), int(moved[1])]
         mode = static_value(op.inputs.get("mode"), "constant")
+        if len(padded_axes) > 1 and mode != "constant":
+            raise NotImplementedError(
+                f"pad op '{op.name}' has mode={mode!r} padding on {len(padded_axes)} axes "
+                f"{padded_axes} of a rank-{rank} tensor. A constant pad splits into one-axis pads "
+                f"exactly; whether this mode does has not been established, and the engine pads only "
+                f"ne[0]."
+            )
         out_name = op.outputs[0].name
+        new_out = x
         with _scope_ctx_like(op):
-            swapped = mb.transpose(x=x, perm=perm, before_op=op)
-            padded = mb.pad(x=swapped, pad=new_pad, mode=mode, before_op=op)
-            new_out = mb.transpose(x=padded, perm=perm, name=out_name, before_op=op)
+            for i, axis in enumerate(padded_axes):
+                pair = pad_vals[2 * (axis - (rank - n_padded))], pad_vals[2 * (axis - (rank - n_padded)) + 1]
+                last = i == len(padded_axes) - 1
+                if axis == rank - 1:
+                    new_out = mb.pad(x=new_out, pad=[int(pair[0]), int(pair[1])], mode=mode,
+                                     before_op=op, **({"name": out_name} if last else {}))
+                    continue
+                perm = list(range(rank))
+                perm[axis], perm[rank - 1] = perm[rank - 1], perm[axis]
+                # The pair that was on `axis` moves to the last position, and everything else is
+                # zeroed: after the transpose there is nothing left to pad but the axis swapped in.
+                swapped = mb.transpose(x=new_out, perm=perm, before_op=op)
+                padded = mb.pad(x=swapped, pad=[0, 0, int(pair[0]), int(pair[1])], mode=mode,
+                                before_op=op)
+                new_out = mb.transpose(x=padded, perm=perm, before_op=op,
+                                       **({"name": out_name} if last else {}))
         if not block.try_replace_uses_of_var_after_op(anchor_op=op, old_var=op.outputs[0],
                                                       new_var=new_out):
             return False
