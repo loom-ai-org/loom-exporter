@@ -188,6 +188,10 @@ _FUNCTIONS = (
     # exactly on float32 midpoints, so `round_half_to_even` is what decides them.
     LuaFunction("to_f32", requires=("round_half_to_even",)),
     LuaFunction("cif_fire", requires=("to_f32",)),
+    # -- seeded noise --------------------------------------------------------------------------------
+    # ATen's own CPU stream, for a noise-fed decoder whose reference renders a seed one way (sanoTTS's
+    # nano voices). `to_f32` because ATen's Box-Muller is float32 throughout.
+    LuaFunction("aten_randn", requires=("to_f32",)),
     # -- vocoder-side host precomputation ----------------------------------------------------------
     LuaFunction("compute_wsum"),
     # -- StyleTTS2's ADPM2 sampler, whole rather than shared ---------------------------------------

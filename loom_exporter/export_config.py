@@ -194,7 +194,8 @@ class LoomExportConfig:
     def phoneme_table(self) -> dict:
         """The phoneme vocabulary this model consumes, or `{}` for a model that takes no phonemes.
 
-        `{"symbols": [...], "ids": [...], "bos": int, "eos": int, "blank": int, "interleave_blank": bool}`.
+        `{"symbols": [...], "ids": [...], "bos": int, "eos": int, "blank": int, "interleave_blank": bool}`,
+        plus an optional `"blank_after_bos": True` for piper-phonemize's `[BOS, blank, p1, blank, ...]`.
 
         THE TABLE IS DATA THAT WAS ALREADY IN THE CHECKPOINT AND SIMPLY NOT EXPORTED. Piper's
         `phoneme_id_map` is 159 entries of symbol -> id; Kokoro, StyleTTS2 and Matcha each carry their
