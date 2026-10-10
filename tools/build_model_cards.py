@@ -1355,6 +1355,12 @@ against the prompt at 12.5 per second.""",
             "`guidance_scale=1.0` turns it off: faster, and the music follows the prompt less closely. "
             "On a 4-thread laptop-class CPU, two seconds of music took about 27 s with guidance and "
             "14 s without; a GPU or more cores helps.\n\n"
+            "**Expect lo-fi sound; that comes from the model, not from this export.** MusicGen "
+            "generates music as a 2.2 kbps EnCodec stream: four 2048-entry codebooks at 50 frames a "
+            "second. That is enough for style, rhythm and instrumentation, and it sounds about like "
+            "an old radio. This file's codes match `transformers` exactly, and the codec matches it "
+            "to 3e-5, so a sharper result would have to come from a larger MusicGen checkpoint, not "
+            "a different runtime.\n\n"
             "Mono and text-conditioned only. The melody-conditioned and stereo MusicGen checkpoints are "
             "different models and are not covered by this file. 2.1 GB, F32."
         ),
