@@ -293,15 +293,12 @@ class BaseTransducerExportConfig(BaseMultiPhaseModelExportConfig):
                 f"{n_token_classes + n_durations}. The duration set and the joint disagree."
             )
 
-        sample_rate = self.validate_encoder(model)
-        wrapper, dummy_inputs, mil_inputs = build_trace(self, model, sample_rate)
-        n_embd = int(model.cfg.encoder.d_model)
+        encoder_phase, n_embd = self.encoder_phase(model)
 
         import coremltools as ct
 
         return [
-            ExportPhase(name="encoder", wrapper=wrapper, dummy_inputs=dummy_inputs,
-                        mil_inputs=mil_inputs, root_axis=self.root_axis),
+            encoder_phase,
             ExportPhase(
                 name="embed", wrapper=_EmbedWrapper(parts.embed).eval(),
                 dummy_inputs=(torch.tensor([0], dtype=torch.int64),),
@@ -319,6 +316,29 @@ class BaseTransducerExportConfig(BaseMultiPhaseModelExportConfig):
                 ],
             ),
         ]
+
+    def encoder_phase(self, model) -> Tuple[ExportPhase, int]:
+        """The `encoder` phase, and the width of the frames it emits (what the joint's `encoder_frame`
+        is). The NeMo-shaped trace by default -- `(waveform, length)` through `encoder_wrapper`, the
+        width off `model.cfg` -- which both `.nemo` transducers and GigaAM take. A leaf whose encoder is
+        not that shape (Nemotron: a language prompt, no `cfg`) overrides this and `encoder_inputs`."""
+        sample_rate = self.validate_encoder(model)
+        wrapper, dummy_inputs, mil_inputs = build_trace(self, model, sample_rate)
+        return (ExportPhase(name="encoder", wrapper=wrapper, dummy_inputs=dummy_inputs,
+                            mil_inputs=mil_inputs, root_axis=self.root_axis),
+                int(model.cfg.encoder.d_model))
+
+    def encoder_inputs(self) -> dict:
+        """What the driver binds to the encoder's inputs, as driver-IR expressions. Paired with
+        `encoder_phase`: these names are that trace's MIL input names."""
+        from .driver_ir import FieldAccess, Var
+
+        return {"waveform": Var("_waveform"), "length": FieldAccess("inputs", "length")}
+
+    def encoder_prelude(self) -> List:
+        """Driver components that run before the encoder call, after `_waveform` is bound -- where a
+        leaf computes an extra encoder input. None for the NeMo-shaped leaves."""
+        return []
 
     def validate_encoder(self, model) -> int:
         """The encoder-side structural checks and the checkpoint's own sample rate, shared verbatim with
@@ -360,7 +380,7 @@ class BaseTransducerExportConfig(BaseMultiPhaseModelExportConfig):
         from .driver_components import (
             ComputedCall, ExportConstants, LuaFragment, SubgraphCallComponent,
         )
-        from .driver_ir import FieldAccess, Len, Var
+        from .driver_ir import Len
 
         fragment = self.driver_script_path
         return [
@@ -376,6 +396,7 @@ class BaseTransducerExportConfig(BaseMultiPhaseModelExportConfig):
             # `_waveform` first: the encoder's own root axis is its length, so it has to be a local
             # before the call that reads `#_waveform`.
             LuaFragment(fragment / "01_inputs.lua", defines=("_waveform",)),
+            *self.encoder_prelude(),
             SubgraphCallComponent(
                 # RETAINED, and it binds nothing: the decode loop consumes one encoder frame per call
                 # and names it (`{from = 'encoder', row = t, rows = 1}`), so the [n_embd, n_frames]
@@ -383,8 +404,7 @@ class BaseTransducerExportConfig(BaseMultiPhaseModelExportConfig):
                 # a time -- the largest avoidable crossing in the zoo, and linear in the audio length.
                 # `loom.output_shape` gives the loop its frame count without the data.
                 topology="encoder", outputs=(), retain=True,
-                inputs={"waveform": Var("_waveform"),
-                        "length": FieldAccess("inputs", "length")},
+                inputs=self.encoder_inputs(),
                 length=Len("_waveform"),
             ),
             LuaFragment(
