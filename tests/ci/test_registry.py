@@ -894,14 +894,15 @@ def test_the_tts_families_share_one_task():
     half in one graph (CosyVoice3, the seventh, is the tenth). Twelve since family 9b's SpeechT5, whose
     loop carries MEL frames and has no sampler at all. Thirteen since Soprano, whose loop carries the
     LM's hidden rows to a vocoder. Fourteen since LFM2.5-Audio's speaking door, a second task over the
-    same directory as its speech-to-text one."""
+    same directory as its speech-to-text one. Sixteen since sanoTTS's two lines, piperlite and nano, whose
+    packages are told apart by their files (a manifest, or a C runtime's offset header)."""
     from loom_exporter.registry import default_registry
 
     registry = default_registry()
     names = {rec.name for rec in registry._entries["text-to-speech"].recognizers}
     assert names == {"kokoro", "styletts2", "vits", "matcha", "supertonic", "f5-tts", "chatterbox",
                      "pocket-tts", "voxcpm2", "cosyvoice3", "voxtral-tts", "speecht5", "soprano",
-                     "lfm2.5-audio-tts"}
+                     "lfm2.5-audio-tts", "sanotts", "sanotts-nano"}
     for model in names:
         assert registry.get("text-to-speech", model).name == model
 

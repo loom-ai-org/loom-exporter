@@ -65,6 +65,11 @@ SANOTTS_COMMIT = "50a9c82235b4faf8d4191b225e3c79f2d9734574"
 FALLBACK_ID = 59
 # The decoder's three transposed convolutions, 8 x 8 x 4: waveform samples per acoustic frame.
 HOP = 256
+# Each line's rate, as an ARCHITECTURE fact the contract can state without opening a package: piperlite's
+# teachers are Piper "medium" voices (22.05 kHz) and nano's is Kokoro (24 kHz). An export refuses a
+# package that says otherwise rather than declare a rate it does not have.
+PIPERLITE_SAMPLE_RATE = 22050
+NANO_SAMPLE_RATE = 24000
 # The decoder-config keys `DecoderStudent` takes, as upstream's `export_piperlite_golden.py` lists them.
 _DECODER_KEYS = (
     "in_channels", "channels", "res_layers", "variant", "rank_ratio", "activation", "stage_affine",
@@ -265,6 +270,9 @@ class TTSSanoTTSExportConfig(BaseMultiPhaseModelExportConfig):
         self.manifest = manifest
         if int(manifest["hop_length"]) != HOP:
             raise ValueError(f"sanoTTS: hop_length {manifest['hop_length']}; the decoder upsamples by {HOP}.")
+        if int(manifest["sample_rate"]) != PIPERLITE_SAMPLE_RATE:
+            raise ValueError(f"sanoTTS: a {manifest['sample_rate']} Hz piperlite package; this export "
+                             f"declares {PIPERLITE_SAMPLE_RATE} for the line.")
         dc = manifest["components"]["duration"]["config"]
         ac = manifest["components"]["acoustic"]["config"]
         n, t = int(self.trace_tokens), int(self.trace_frames)
@@ -299,12 +307,11 @@ class TTSSanoTTSExportConfig(BaseMultiPhaseModelExportConfig):
         """The rate, and the phoneme conventions the voice was trained in (`tts.phoneme_style`, which the
         text door folds a G2P's IPA to -- loom.cpp ADR-071): piperlite's teachers were Piper voices,
         trained on espeak's IPA."""
-        if not self.manifest:
-            return {}
-        return {"sample_rate": int(self.manifest["sample_rate"]), "tts.phoneme_style": "espeak"}
+        return {"sample_rate": PIPERLITE_SAMPLE_RATE, "tts.phoneme_style": "espeak"}
 
     def contract(self) -> dict:
         contract = super().contract()
+        contract["sample_rate"] = PIPERLITE_SAMPLE_RATE
         contract["text.frontend"] = "phonemes"
         contract["text.phoneme_alphabet"] = "ipa"
         if self.manifest and self.manifest.get("language"):
@@ -615,6 +622,9 @@ class TTSSanoNanoExportConfig(TTSSanoTTSExportConfig):
         blobs, duration, latent, decoder = build_nano_models(Path(self.package_dir))
         self.blobs = blobs
         h = blobs.h
+        if int(blobs.meta_json["sample_rate"]) != NANO_SAMPLE_RATE or h["NANO_HOP"] != HOP:
+            raise ValueError(f"sanoTTS: a {blobs.meta_json['sample_rate']} Hz / hop {h['NANO_HOP']} nano "
+                             f"package; this export declares {NANO_SAMPLE_RATE} Hz at hop {HOP}.")
         n, t = int(self.trace_tokens), int(self.trace_frames)
         token_axis = ct.RangeDim(1, self.max_tokens)
         frame_axis = ct.RangeDim(1, self.max_frames)
@@ -649,12 +659,11 @@ class TTSSanoNanoExportConfig(TTSSanoTTSExportConfig):
     def hparams(self) -> dict:
         """The rate, and `tts.phoneme_style`: the nano voices were distilled on misaki's normalised IPA
         (Kokoro's alphabet)."""
-        if not self.blobs:
-            return {}
-        return {"sample_rate": int(self.blobs.meta_json["sample_rate"]), "tts.phoneme_style": "misaki"}
+        return {"sample_rate": NANO_SAMPLE_RATE, "tts.phoneme_style": "misaki"}
 
     def contract(self) -> dict:
         contract = BaseMultiPhaseModelExportConfig.contract(self)
+        contract["sample_rate"] = NANO_SAMPLE_RATE
         contract["text.frontend"] = "phonemes"
         contract["text.phoneme_alphabet"] = "ipa"
         contract["text.languages"] = ["en-US"]
