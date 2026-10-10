@@ -77,8 +77,18 @@ def read_sampling_defaults(model_dir) -> dict:
     also what an absent file gets, which keeps every existing baseline where it is: a checkpoint that
     never asked to be sampled is not sampled.
 
-    `top_k = 0` and `top_p = 1.0` mean "no truncation", matching `transformers`' own defaults for a
-    checkpoint that declares `do_sample` without either.
+    `top_k = 0` and `top_p = 1.0` mean "no truncation" to the engine. **A knob the file leaves out
+    gets the value `generate()` uses**, `_GENERATE_DEFAULTS`, and for `top_k` that is 50, not 0.
+    This function used to map a missing `top_k` to 0, which shipped an untruncated sampler the
+    reference never runs. MusicGen, `llama-3.2-1b`, `csm-1b` and `parler-tts` all set `do_sample`
+    without naming `top_k`.
+
+    The defaults are applied here rather than read off a resolved `GenerationConfig`, because the
+    resolved object depends on which transformers version is installed. 4.x stores the defaults on
+    the object; 5.x stores `None` and fills them in inside `generate()`. MusicGen's first export
+    read `GenerationConfig.top_k` and would have shipped 0 under the 5.x venv. An explicit `null`
+    is refused, because the two versions disagree on it: 4.x reads it as "no truncation", while
+    5.x reads it as "unset" and applies the default.
     """
     path = Path(model_dir) / "generation_config.json"
     cfg = {}
@@ -89,11 +99,27 @@ def read_sampling_defaults(model_dir) -> dict:
             cfg = {}
     if not cfg.get("do_sample"):
         return {"temperature": 0.0, "top_k": 0, "top_p": 1.0}
+    nulls = [k for k in _GENERATE_DEFAULTS if k in cfg and cfg[k] is None]
+    if nulls:
+        raise ValueError(
+            f"{path} sets do_sample with {nulls} = null. transformers 4.x reads that as 'no "
+            f"truncation' and 5.x as 'unset, use {[_GENERATE_DEFAULTS[k] for k in nulls]}', so the "
+            f"reference's own behaviour depends on its version. Decide which one the export follows "
+            f"and pass it explicitly."
+        )
+    resolved = {k: cfg.get(k, default) for k, default in _GENERATE_DEFAULTS.items()}
     return {
-        "temperature": float(cfg.get("temperature", 1.0)),
-        "top_k": int(cfg.get("top_k", 0) or 0),
-        "top_p": float(cfg.get("top_p", 1.0)),
+        "temperature": float(resolved["temperature"]),
+        "top_k": int(resolved["top_k"]),
+        "top_p": float(resolved["top_p"]),
     }
+
+
+# What `generate()` samples with when `generation_config.json` leaves a knob out. These are the
+# same three values on transformers 4.x (`GenerationConfig.__init__`) and 5.x
+# (`GenerationConfig._get_default_generation_params`); `test_sampling_defaults_match_transformers`
+# checks them against the installed version.
+_GENERATE_DEFAULTS = {"temperature": 1.0, "top_k": 50, "top_p": 1.0}
 
 
 def _tokenizer_json_text(tok_dir: Path) -> str:
