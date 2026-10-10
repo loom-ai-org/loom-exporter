@@ -346,3 +346,33 @@ class TestMatchaPhonemeAssembly(unittest.TestCase):
         expected = [0] * (len(body) * 2 + 1)
         expected[1::2] = body
         self.assertEqual(out, expected)
+
+
+class TestVitsPhonemeAssembly(unittest.TestCase):
+    """Piper's framing, which is the one its TRAINING built (loom.cpp Retro-081).
+
+    piper-phonemize's `phonemes_to_ids` -- what `piper_train.preprocess` calls -- is
+    `[BOS, PAD, p1, PAD, ..., pn, PAD, EOS]`. The old `python_run` runtime omits the PAD right after BOS,
+    and the first VITS export copied it, so every published voice was fed one id short until rc17. VITS
+    hears through it; Whisper still measured it (WER 14.9% -> 13.2% on miro with espeak-ng's phonemes).
+    """
+
+    def _table(self, id_map):
+        import json
+        import tempfile
+
+        from loom_exporter.vits_export import TTSVitsExportConfig
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ckpt = Path(tmp) / "voice.ckpt"
+            ckpt.write_bytes(b"")
+            (Path(tmp) / "voice.onnx.json").write_text(json.dumps({"phoneme_id_map": id_map}))
+            config = TTSVitsExportConfig(architecture="loom-vits-mil", output_path="/tmp/does-not-matter.gguf",
+                                         checkpoint_path=str(ckpt))
+            return config.phoneme_table()
+
+    def test_the_framing_is_piper_phonemizes(self):
+        table = self._table({"_": [0], "^": [1], "$": [2], "a": [14], "b": [15]})
+        self.assertEqual((table["bos"], table["eos"], table["blank"]), (1, 2, 0))
+        self.assertTrue(table["interleave_blank"])
+        self.assertTrue(table["blank_after_bos"])
