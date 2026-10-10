@@ -28,7 +28,10 @@ from loom_exporter.registry import default_registry
 # The families whose GGUF consumes PHONEME ids, and which therefore need a G2P step outside the engine.
 # Named rather than detected: "does this checkpoint take phonemes" is a fact about the model, and a rule
 # that inferred it from the same declaration it is checking would be circular.
-PHONEME_INPUT = {"kokoro", "matcha", "styletts2", "vits"}
+#
+# sanoTTS's two lines take phonemes too: Piper's espeak IPA (piperlite) and misaki's (nano), each declaring
+# its conventions as `tts.phoneme_style` (loom.cpp ADR-071).
+PHONEME_INPUT = {"kokoro", "matcha", "styletts2", "vits", "sanotts", "sanotts-nano"}
 # ...and the ones that do not. Supertonic encodes graphemes itself and its GGUF carries the codepoint
 # table, so `"vocab"` is the true answer for it and the wrong one for the four above. Here so the rule
 # cannot be satisfied by declaring `"phonemes"` everywhere, which would refuse them a real door.

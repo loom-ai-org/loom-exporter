@@ -75,22 +75,22 @@ differs is entirely what the host does with the one output. The family names its
 | `chunked_codec_call` | `ChunkedCodecCall` | statements | 2 | 6 | *nobody* (see below) |
 | `padded_codec_call` | `PaddedCodecCall` | statements | 2 | 6 | *nobody* (see below) |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
-| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 16 | canary, granite-speech, hf-causal-lm, lfm2-monolithic, moonshine-streaming, qwen3, qwen3-asr, t5, whisper |
+| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 16 | canary, granite-speech, hf-causal-lm, lfm2-monolithic, moonshine, moonshine-streaming, qwen3, qwen3-asr, t5, whisper |
 | `waveform_valid_length` | `WaveformValidLength` | statements | 0 | 5 | granite-speech, qwen3-asr |
 | `prompt_segments` | `PromptSegments` | statements | 2 | 5 | granite-speech, qwen3-asr |
 | `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | citrinet, conformer-ctc, funasr-sensevoice, hf-ctc-asr |
 | `token_labels_epilogue` | `TokenLabelsEpilogue` | statements | 1 | 0 | funasr-paraformer, hf-token-classifier |
 | `cif_boundary` | `CifBoundary` | statements | 1 | 6 | funasr-paraformer |
 | `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 4 | hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
-| `export_constants` | `ExportConstants` | statements | 0 | 1 | canary, chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, matcha, moonshine-streaming, moss-tts-local, musicgen, nemotron-asr, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, soprano, speecht5, styletts2, supertonic, t5, vits, voxcpm2, voxtral-tts, whisper |
+| `export_constants` | `ExportConstants` | statements | 0 | 1 | canary, chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, matcha, moonshine, moonshine-streaming, moss-tts-local, musicgen, nemotron-asr, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, sanotts, sanotts-nano, soprano, speecht5, styletts2, supertonic, t5, vits, voxcpm2, voxtral-tts, whisper |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
-| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 4 | canary, chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, matcha, moonshine-streaming, moss-tts-local, musicgen, nemotron-asr, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, soprano, speecht5, styletts2, supertonic, t5, vits, voxcpm2, voxtral-tts, whisper |
-| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | canary, chatterbox, cosyvoice3, dia, encodec, f5-tts, funasr-paraformer, gigaam-rnnt, granite-speech, kokoro, matcha, moonshine-streaming, musicgen, nemotron-asr, parakeet-rnnt, parakeet-tdt, pyannote-segmentation, qwen3-asr, silero-vad, styletts2, supertonic, t5, vits, whisper |
+| `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 4 | canary, chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, matcha, moonshine, moonshine-streaming, moss-tts-local, musicgen, nemotron-asr, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, sanotts, sanotts-nano, soprano, speecht5, styletts2, supertonic, t5, vits, voxcpm2, voxtral-tts, whisper |
+| `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | canary, chatterbox, cosyvoice3, dia, encodec, f5-tts, funasr-paraformer, gigaam-rnnt, granite-speech, kokoro, matcha, moonshine, moonshine-streaming, musicgen, nemotron-asr, parakeet-rnnt, parakeet-tdt, pyannote-segmentation, qwen3-asr, sanotts, sanotts-nano, silero-vad, styletts2, supertonic, t5, vits, whisper |
 | `recurrent_call` | `RecurrentCall` | statements | 1 | 8 | encodec, silero-vad |
 | `bi_recurrent_call` | `BiRecurrentCall` | statements | 2 | 6 | pyannote-segmentation |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 11 | chatterbox, cosyvoice3, f5-tts, matcha, supertonic |
-| `driver_return` | `DriverReturn` | statements | 0 | 1 | chatterbox, cosyvoice3, dac, dia, ecapa-tdnn-lid, encodec, f5-tts, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, matcha, moss-audio-tokenizer, moss-tts-local, musicgen, pocket-tts, pyannote-segmentation, qwen3-tts, qwen3-tts-tokenizer-12hz, silero-vad, snac, soprano, speecht5, styletts2, supertonic, titanet, vits, voxcpm2, voxtral-tts, wakehubert |
-| `lua_library` | `LuaLibrary` | prelude | 1 | 0 | f5-tts, funasr-paraformer, kokoro, matcha, styletts2, vits |
+| `driver_return` | `DriverReturn` | statements | 0 | 1 | chatterbox, cosyvoice3, dac, dia, ecapa-tdnn-lid, encodec, f5-tts, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, matcha, moss-audio-tokenizer, moss-tts-local, musicgen, pocket-tts, pyannote-segmentation, qwen3-tts, qwen3-tts-tokenizer-12hz, sanotts, sanotts-nano, silero-vad, snac, soprano, speecht5, styletts2, supertonic, titanet, vits, voxcpm2, voxtral-tts, wakehubert |
+| `lua_library` | `LuaLibrary` | prelude | 1 | 0 | f5-tts, funasr-paraformer, kokoro, matcha, sanotts, sanotts-nano, styletts2, vits |
 
 ### `driver_inputs` — `DriverInputs`
 
@@ -143,7 +143,7 @@ Threads one tensor through an independently-traced submodule chain: prefix -> [a
 
 The `infer_with_past` generation loop: prefill, then decode one token at a time against the KV cache until max_new_tokens or eos_token. One loop rather than a prefill plus a decode loop, because a cached ATTENTION node makes the prefill its first iteration. **The `used by` column over-states this one for the causal LMs**, and it is the only entry where that is true: it is a field of every flattened causal-LM builder, but the exporter sets it only for a topology whose cross-step state is ENTIRELY the KV cache. LFM2-monolithic's ten ShortConv layers are not, so it carries the field and exports `infer` alone. Whisper is not in that caveat: its family declares this component outright, with `bound` supplying the encoder's output to every step, which is what makes the same loop a cross-attention decode loop (BACKLOG.md P4.1).
 
-*Emits:* statements. *Used by:* canary, granite-speech, hf-causal-lm, lfm2-monolithic, moonshine-streaming, qwen3, qwen3-asr, t5, whisper.
+*Emits:* statements. *Used by:* canary, granite-speech, hf-causal-lm, lfm2-monolithic, moonshine, moonshine-streaming, qwen3, qwen3-asr, t5, whisper.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
@@ -203,7 +203,7 @@ Returns the next token rather than the raw logits: argmax over the active row, r
 
 Values only the checkpoint knows (a blank id, a duration set, a hidden width), bound as ordinary locals so every read of them is checked by driver_ir.validate -- rather than interpolated into hand-written Lua through a marker, where a misspelled read is a silent nil (BACKLOG.md P4.0.18).
 
-*Emits:* statements. *Used by:* canary, chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, matcha, moonshine-streaming, moss-tts-local, musicgen, nemotron-asr, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, soprano, speecht5, styletts2, supertonic, t5, vits, voxcpm2, voxtral-tts, whisper.
+*Emits:* statements. *Used by:* canary, chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, matcha, moonshine, moonshine-streaming, moss-tts-local, musicgen, nemotron-asr, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, sanotts, sanotts-nano, soprano, speecht5, styletts2, supertonic, t5, vits, voxcpm2, voxtral-tts, whisper.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -225,7 +225,7 @@ A hand-written `.lua` adopted whole -- prelude, one verbatim body block, postlud
 
 One hand-written block of a peeled driver, kept as its own `.lua` file, declaring what it reads and defines (and, since D.2, which topologies its computed call sites drive).
 
-*Emits:* prelude, statements. *Used by:* canary, chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, matcha, moonshine-streaming, moss-tts-local, musicgen, nemotron-asr, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, soprano, speecht5, styletts2, supertonic, t5, vits, voxcpm2, voxtral-tts, whisper.
+*Emits:* prelude, statements. *Used by:* canary, chatterbox, cosyvoice3, dia, f5-tts, gigaam-rnnt, granite-speech, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, matcha, moonshine, moonshine-streaming, moss-tts-local, musicgen, nemotron-asr, parakeet-rnnt, parakeet-tdt, pocket-tts, qwen3-asr, qwen3-tts, sanotts, sanotts-nano, soprano, speecht5, styletts2, supertonic, t5, vits, voxcpm2, voxtral-tts, whisper.
 
 * `drives` — ConfigDerived(needs=[])
   <br>*says:* {label} has computed call site(s) {detail} that no `drives` declaration covers, so the topologies they run are checked by nothing.
@@ -240,7 +240,7 @@ One hand-written block of a peeled driver, kept as its own `.lua` file, declarin
 
 One `loom.run_subgraph` as IR rather than text, so `check_subgraph_calls` covers its output arity too -- what a peel buys structurally.
 
-*Emits:* statements. *Used by:* canary, chatterbox, cosyvoice3, dia, encodec, f5-tts, funasr-paraformer, gigaam-rnnt, granite-speech, kokoro, matcha, moonshine-streaming, musicgen, nemotron-asr, parakeet-rnnt, parakeet-tdt, pyannote-segmentation, qwen3-asr, silero-vad, styletts2, supertonic, t5, vits, whisper.
+*Emits:* statements. *Used by:* canary, chatterbox, cosyvoice3, dia, encodec, f5-tts, funasr-paraformer, gigaam-rnnt, granite-speech, kokoro, matcha, moonshine, moonshine-streaming, musicgen, nemotron-asr, parakeet-rnnt, parakeet-tdt, pyannote-segmentation, qwen3-asr, sanotts, sanotts-nano, silero-vad, styletts2, supertonic, t5, vits, whisper.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
@@ -274,7 +274,7 @@ A `FlowMatchingSpec`'s generated Euler-CFM sampler function, plus the line that 
 
 What the entry function hands back to the host.
 
-*Emits:* statements. *Used by:* chatterbox, cosyvoice3, dac, dia, ecapa-tdnn-lid, encodec, f5-tts, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, matcha, moss-audio-tokenizer, moss-tts-local, musicgen, pocket-tts, pyannote-segmentation, qwen3-tts, qwen3-tts-tokenizer-12hz, silero-vad, snac, soprano, speecht5, styletts2, supertonic, titanet, vits, voxcpm2, voxtral-tts, wakehubert.
+*Emits:* statements. *Used by:* chatterbox, cosyvoice3, dac, dia, ecapa-tdnn-lid, encodec, f5-tts, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, matcha, moss-audio-tokenizer, moss-tts-local, musicgen, pocket-tts, pyannote-segmentation, qwen3-tts, qwen3-tts-tokenizer-12hz, sanotts, sanotts-nano, silero-vad, snac, soprano, speecht5, styletts2, supertonic, titanet, vits, voxcpm2, voxtral-tts, wakehubert.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -282,7 +282,7 @@ What the entry function hands back to the host.
 
 Emits the `loom_lua` functions a driver declares, and only those -- the transitive closure of `uses`, in definition order.
 
-*Emits:* prelude. *Used by:* f5-tts, funasr-paraformer, kokoro, matcha, styletts2, vits.
+*Emits:* prelude. *Used by:* f5-tts, funasr-paraformer, kokoro, matcha, sanotts, sanotts-nano, styletts2, vits.
 
 * `uses` — ConfigDerived(needs=[])
   <br>*says:* {label} declares loom_lua function(s) {detail}, which do not exist.
@@ -313,8 +313,9 @@ namespace their caller passes, and that column is the shape a caller's `HelperCa
 | `run_bi_lstm` | — | `<ns>_fwd`, `<ns>_bwd` ← `layer_input`, `h_prev`, `c_prev` | kokoro, styletts2 |
 | `run_resblk_stack` | — | `<ns>_block0`, `<ns>_block1`, `<ns>_block2` ← `x`, `style` | kokoro, styletts2 |
 | `run_proj1x1` | — | `<ns>` ← `x` | kokoro, styletts2 |
-| `to_f32` | `round_half_to_even` | — | *`cif_fire`* only |
+| `to_f32` | `round_half_to_even` | — | *`aten_randn`, `cif_fire`* only |
 | `cif_fire` | `to_f32` | — | **nothing** ⚠ |
+| `aten_randn` | `to_f32` | — | **nothing** ⚠ |
 | `compute_wsum` | — | — | kokoro, styletts2 |
 | `karras_schedule` | — | — | styletts2 |
 | `adpm2_step` | — | — | *`adpm2_sample`* only |

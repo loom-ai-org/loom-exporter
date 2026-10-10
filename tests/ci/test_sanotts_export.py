@@ -250,9 +250,7 @@ def test_the_default_seed_is_upstreams_low_32_bits():
 def test_each_line_declares_the_phoneme_style_it_was_trained_in(tmp_path):
     """piperlite's teachers were Piper voices (espeak IPA); nano was distilled on misaki's. The text
     door folds a G2P's output to it (loom.cpp ADR-071)."""
-    piperlite = S.TTSSanoTTSExportConfig(package_dir=str(tmp_path))
-    piperlite.manifest = {"sample_rate": 22050}
+    piperlite = S.TTSSanoTTSExportConfig(package_dir=str(tmp_path / "missing"))
     assert piperlite.hparams() == {"sample_rate": 22050, "tts.phoneme_style": "espeak"}
-    nano = S.TTSSanoNanoExportConfig(package_dir=str(tmp_path))
-    nano.blobs = type("B", (), {"meta_json": {"sample_rate": 24000}})()
+    nano = S.TTSSanoNanoExportConfig(package_dir=str(tmp_path / "missing"))
     assert nano.hparams() == {"sample_rate": 24000, "tts.phoneme_style": "misaki"}
