@@ -266,15 +266,38 @@ CATALOG = [
         base_repo="nvidia/stt_en_citrinet_1024_gamma_0_25", license_id="cc-by-4.0", language=["en"],
         title="Citrinet-1024 (en)", summary="NVIDIA NeMo's Citrinet-1024 English CTC ASR model, exported for loom.cpp.",
     ),
-    # The same leaf at a tenth of the size (10M parameters), for the boards Citrinet-1024 is too slow on.
-    # Trained on LibriSpeech only, and NeMo's oldest tokenizer: WordPiece (`tokenizer.type: wpe`).
+    # The same leaf at a tenth of the size (10M parameters), for the boards Citrinet-1024 is too slow
+    # on (the user, 2026-10-10: Moonshine tiny is ~7x slower than real time on a Pi Zero). Trained on
+    # LibriSpeech only, with NeMo's oldest tokenizer: WordPiece (`tokenizer.type: wpe`).
+    # Measured 2026-10-10 on hf-internal-testing/librispeech_asr_dummy (73 utterances): F32 CTC ids
+    # identical to NeMo's own forward on 73/73 (log-probs max |d| 7.9e-5 on jfk), Q8_0 70/73; WER
+    # (upper-cased, punctuation dropped) 9.39% for both, decoded by the checkpoint's vocab.txt. F16 is
+    # not shipped: 4.5x slower than F32 on the Pi Zero. Pi Zero W (ARMv6, 1 core, rc16 wheel): jfk
+    # 11.0 s took 64.0 s at F32 (peak RSS 96 MB) and 37.5 s at Q8_0 (71 MB); 29.4 s of LibriSpeech took
+    # 172.8 s and 97.7 s.
     ModelCard(
         slug="citrinet-256-ls", checkpoint=Path("stt-en-citrinet-256-ls/stt_en_citrinet_256_ls.nemo"),
         export_task="automatic-speech-recognition", export_model="citrinet",
-        task_type="automatic-speech-recognition",
+        task_type="automatic-speech-recognition", snippet="automatic-speech-recognition-variants",
         base_repo="nvidia/stt_en_citrinet_256_ls", license_id="cc-by-4.0", language=["en"],
         title="Citrinet-256 LibriSpeech (en)",
-        summary="NVIDIA NeMo's Citrinet-256 English CTC ASR model (LibriSpeech), exported for loom.cpp.",
+        summary="NVIDIA NeMo's Citrinet-256 (10M) English CTC speech recognizer, trained on LibriSpeech, "
+                "exported for loom.cpp in two precisions.",
+        variants=[
+            ("F32", "full precision, 40 MB. Token for token NeMo's own CTC output on all 73 test clips."),
+            ("Q8_0", "13 MB. The same word error rate as F32 on the same clips (9.39%); 70 of 73 "
+                     "transcripts are token-identical. About 1.7 times faster than F32 on a Raspberry "
+                     "Pi Zero (jfk.wav's 11 s in 37 s rather than 64 s, 71 MB peak rather than 96 MB)."),
+        ],
+        limitations=(
+            "**Needs loom 1.0.0-rc17 or later.** Its vocabulary is WordPiece (NeMo's `wpe` tokenizer), "
+            "which `transcribe` decodes from rc17 on; an older engine refuses the file with an "
+            "unsupported-tokenizer error. `model.infer(...)` returns the token ids on any version.\n\n"
+            "Trained on LibriSpeech only: read English audiobooks. Expect more errors on conversational, "
+            "accented or noisy speech than a model trained on more data, such as `citrinet-1024-loom`. "
+            "The transcript is lowercase with no punctuation, and an apostrophe stands apart from its "
+            "word (`frederick ' s`), as the model's tokenizer splits it."
+        ),
     ),
     # Family 4 (P5): CNN + transformer + CTC. `export_model="hf-ctc-asr"` is the one generic
     # recognizer, so both leaves name it -- which is the family's whole claim about itself.
