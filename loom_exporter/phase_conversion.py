@@ -120,6 +120,23 @@ def convert_phase(phase, quantize: Optional[str] = None) -> PhaseResult:
         before = len(topo["nodes"])
         phase.topology_rewrite(topo)
         print(f"  {phase.name}: topology rewrite removed {before - len(topo['nodes'])} node(s)")
+    # **A phase that sizes a KV cache and fused no cached ATTENTION is a broken file, always.**
+    # `fuse_attention` stays a request (`ExportPhase`'s own reasoning), but `kv_cache_size` is a
+    # promise that a decode loop will run this graph one step at a time against a cache, and with no
+    # cached block every step attends to itself alone: plausible output, no error. Retro-041 met this
+    # on T5 and left a per-family count (`t5_export._check_fused_attention`) as the prevention; MusicGen
+    # was written without one and shipped the identical silent failure into its first export
+    # (Retro-078). A convention each family must remember did not hold, so it is checked here for all.
+    if phase.kv_cache_size is not None and not any(
+            node["op"] == "ATTENTION" and node.get("attrs", {}).get("kv_cache", True)
+            for node in topo["nodes"]):
+        raise ValueError(
+            f"phase '{phase.name}' declares a {phase.kv_cache_size}-position KV cache but fused no "
+            f"cached ATTENTION node: `fuse_loom_attention` matched none of its attention blocks, so "
+            f"every cached decode step would attend to itself alone. Find which part of its pattern "
+            f"the traced block breaks (scaling on the scores rather than Q, a mask computed from the "
+            f"input rather than passed through, a merged transpose -- Retro-041, Retro-078)."
+        )
     print(f"  {phase.name}: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights{_rss_note()}")
 
     topologies = {phase.name: topo}
