@@ -58,12 +58,12 @@ package root.
 """
 import base64
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
 from gguf import GGUFWriter
-from sentencepiece import sentencepiece_model_pb2 as spm_pb2
 
 # SentencePiece's own `ModelProto.SentencePiece.Type`, which llama.cpp's `llama_token_type` matches
 # numerically (see the module docstring). Named here because the pieces this file SYNTHESIZES have no
@@ -72,6 +72,9 @@ _TYPE_NORMAL = 1
 _TYPE_UNKNOWN = 2
 _TYPE_CONTROL = 3
 _TYPE_USER_DEFINED = 4
+_TYPE_BYTE = 6
+# How SentencePiece spells a byte-fallback piece: `<0x` + two upper-case hex digits + `>`.
+_BYTE_PIECE = re.compile(r"<0x[0-9A-F]{2}>")
 
 
 def _every_piece_is_one_character(m) -> bool:
@@ -111,6 +114,9 @@ class HfIdLayout:
     precompiled_charsmap: Optional[bytes] = None
     add_dummy_prefix: bool = True
     remove_extra_whitespaces: bool = True
+    # "unigram", or "bpe" for a SentencePiece BPE model converted to `tokenizer.json` (see
+    # `read_hf_id_layout(..., allow_bpe=True)`), whose byte pieces are typed BYTE by their spelling.
+    model_type: str = "unigram"
 
 
 def _template_framing(tokenizer_json: dict) -> tuple[Optional[str], Optional[str]]:
@@ -173,11 +179,20 @@ def _read_hf_normalizer(tokenizer_json: dict) -> tuple[Optional[bytes], bool, bo
     return charsmap, add_dummy_prefix, True
 
 
-def read_hf_id_layout(tokenizer_dir) -> Optional[HfIdLayout]:
+def read_hf_id_layout(tokenizer_dir, *, allow_bpe: bool = False) -> Optional[HfIdLayout]:
     """A Unigram `tokenizer.json`'s own id order, or None when there is nothing to read.
 
     None for a directory with no `tokenizer.json` and for one whose tokenizer is not Unigram -- in both
     cases the protobuf is the only authority there is, which is exactly the pre-existing behaviour.
+
+    `allow_bpe` also reads a SentencePiece **BPE** model converted to `tokenizer.json` (Nemotron ASR's:
+    `Metaspace` pre-tokenizer, `<0xNN>` byte pieces, no `.model` shipped). Opt-in, so a checkpoint that
+    ships a protobuf beside a BPE `tokenizer.json` keeps reading the protobuf alone. Two things the
+    Unigram path gets from the file are supplied instead, each from where SentencePiece itself puts it:
+    a BPE piece's score is its merge priority, which SentencePiece's BPE trainer writes as `-id` (ids
+    ARE merge order, and `transformers`' converter keeps the proto's id order); and a piece spelled
+    `<0xNN>` is a BYTE piece, which is how SentencePiece spells every one. A BPE vocabulary that is not
+    SentencePiece-shaped (a byte-level GPT-2 BPE) is refused: it is not this writer's family.
     """
     tok_dir = Path(tokenizer_dir)
     tokenizer_json_path = tok_dir / "tokenizer.json"
@@ -185,12 +200,28 @@ def read_hf_id_layout(tokenizer_dir) -> Optional[HfIdLayout]:
         return None
     tokenizer_json = json.loads(tokenizer_json_path.read_text(encoding="utf-8"))
     model = tokenizer_json.get("model") or {}
-    if model.get("type") != "Unigram":
+    if model.get("type") == "BPE" and allow_bpe:
+        if (tokenizer_json.get("pre_tokenizer") or {}).get("type") != "Metaspace":
+            raise NotImplementedError(
+                f"{tokenizer_json_path}: a BPE tokenizer.json read as SentencePiece needs a Metaspace "
+                f"pre-tokenizer; this one has {(tokenizer_json.get('pre_tokenizer') or {}).get('type')!r}, "
+                f"so it is not a converted SentencePiece model")
+        vocab = model.get("vocab") or {}
+        by_id = {int(i): str(piece) for piece, i in vocab.items()}
+        for t in tokenizer_json.get("added_tokens") or []:
+            by_id.setdefault(int(t["id"]), str(t["content"]))
+        if sorted(by_id) != list(range(len(by_id))):
+            raise ValueError(f"{tokenizer_json_path}: BPE ids are not dense 0..{len(by_id) - 1}")
+        pieces = [by_id[i] for i in range(len(by_id))]
+        scores = [-float(i) for i in range(len(pieces))]
+        model_type = "bpe"
+    elif model.get("type") != "Unigram":
         return None
-
-    entries = model.get("vocab") or []
-    pieces = [str(entry[0]) for entry in entries]
-    scores = [float(entry[1]) for entry in entries]
+    else:
+        entries = model.get("vocab") or []
+        pieces = [str(entry[0]) for entry in entries]
+        scores = [float(entry[1]) for entry in entries]
+        model_type = "unigram"
     by_piece = {piece: idx for idx, piece in enumerate(pieces)}
 
     config_path = tok_dir / "tokenizer_config.json"
@@ -211,6 +242,7 @@ def read_hf_id_layout(tokenizer_dir) -> Optional[HfIdLayout]:
         precompiled_charsmap=norm_charsmap,
         add_dummy_prefix=dummy_prefix,
         remove_extra_whitespaces=strip_ws,
+        model_type=model_type,
         unk_id=by_piece.get(specials.get("unk_token")),
         # The post-processor decides the framing; the special-token map only supplies the piece text
         # when there is no post-processor to name it, which is the ALBERT/XLNet shape the explicit
@@ -259,6 +291,10 @@ def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: Optiona
     """
     m = None
     if tokenizer_model_bytes is not None:
+        # Imported here, not at module level: only a protobuf needs it, and the `tokenizer.json` path
+        # runs in the ovos venv, which has no `sentencepiece` (Nemotron ASR exports there).
+        from sentencepiece import sentencepiece_model_pb2 as spm_pb2
+
         m = spm_pb2.ModelProto()
         m.ParseFromString(tokenizer_model_bytes)
     elif hf_ids is None:
@@ -287,7 +323,9 @@ def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: Optiona
             # No protobuf: `added_tokens[].special` is the only type statement there is. UNKNOWN is
             # named separately because it is a role rather than a flag, and `loom::Vocab` looks it up
             # by type rather than by id.
-            types = [_TYPE_CONTROL if i in hf_ids.special_ids else _TYPE_NORMAL
+            types = [_TYPE_CONTROL if i in hf_ids.special_ids else
+                     _TYPE_BYTE if hf_ids.model_type == "bpe" and _BYTE_PIECE.fullmatch(pieces[i]) else
+                     _TYPE_NORMAL
                      for i in range(len(pieces))]
             if hf_ids.unk_id is not None and 0 <= hf_ids.unk_id < len(types):
                 types[hf_ids.unk_id] = _TYPE_UNKNOWN
@@ -329,7 +367,11 @@ def write_sentencepiece_vocab(writer: GGUFWriter, tokenizer_model_bytes: Optiona
         # faithful for Unigram and a BPE checkpoint arriving here would be silently mis-typed.
         if hf_ids is None:
             raise ValueError("no protobuf and no HfIdLayout")
-        tokenizer_model_tag = "t5"
+        # A SentencePiece BPE read off `tokenizer.json` (`read_hf_id_layout(..., allow_bpe=True)`) is
+        # llama.cpp's "llama", exactly as its protobuf would have been. Its byte fallback is NOT written:
+        # `loom::Vocab` refuses the flag on a BPE vocabulary (its BPE encode cannot fall back), and the
+        # BYTE-typed pieces are still there for the day it can.
+        tokenizer_model_tag = "llama" if hf_ids.model_type == "bpe" else "t5"
 
     if tokenizer_model is not None and tokenizer_model_tag != "t5":
         raise ValueError(f"tokenizer_model={tokenizer_model!r} wraps a Unigram vocabulary, and this "

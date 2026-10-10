@@ -167,6 +167,64 @@ class TestCanonicalizeReplicatePad(unittest.TestCase):
         self.assertIn("fastest-varying", str(cm.exception))
 
 
+def _run_pads_and_transposes(prog, x):
+    """Evaluates a program made only of `transpose`/`pad` ops (constants aside) with numpy, so a
+    rewrite of one can be checked for arithmetic and not just for shape."""
+    values = {"x": x}
+    for op in prog.functions["main"].operations:
+        if op.op_type == "const":
+            continue
+        src = values[op.x.name]
+        if op.op_type == "transpose":
+            values[op.outputs[0].name] = np.transpose(src, op.perm.val)
+        elif op.op_type == "pad":
+            pairs = [int(v) for v in op.pad.val]
+            width = [(0, 0)] * (src.ndim - len(pairs) // 2) + [
+                (pairs[2 * i], pairs[2 * i + 1]) for i in range(len(pairs) // 2)]
+            values[op.outputs[0].name] = np.pad(src, width)
+        else:
+            raise AssertionError(f"unexpected op {op.op_type}")
+    return values[prog.functions["main"].outputs[0].name]
+
+
+class TestTransposePadToLastAxis(unittest.TestCase):
+    def test_a_two_axis_constant_pad_becomes_one_axis_pads_with_the_same_result(self):
+        # Nemotron ASR's causal subsampling Conv2d: frequency then time, merged by coremltools into
+        # one pad on axes 2 and 3 of a rank-4 tensor.
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 2, 5, 3), dtype=types.fp32)])
+        def prog(x):
+            return mb.pad(x=x, pad=[0, 0, 0, 0, 2, 1, 2, 1], mode="constant")
+
+        x = np.random.default_rng(0).standard_normal((1, 2, 5, 3)).astype(np.float32)
+        want = np.pad(x, [(0, 0), (0, 0), (2, 1), (2, 1)])
+        PASS_REGISTRY["loom::transpose_pad_to_last_axis"](prog)
+
+        for op in prog.functions["main"].operations:
+            if op.op_type == "pad":
+                pairs = [int(v) for v in op.pad.val]
+                self.assertTrue(all(v == 0 for v in pairs[:-2]), pairs)   # only the last axis padded
+        self.assertEqual(_ops(prog).count("pad"), 2)
+        np.testing.assert_array_equal(_run_pads_and_transposes(prog, x), want)
+        self.assertEqual(tuple(prog.functions["main"].outputs[0].shape), want.shape)
+
+    def test_a_one_axis_pad_is_still_one_transpose_pair(self):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 5, 3), dtype=types.fp32)])
+        def prog(x):
+            return mb.pad(x=x, pad=[0, 0, 2, 1, 0, 0], mode="constant")
+
+        PASS_REGISTRY["loom::transpose_pad_to_last_axis"](prog)
+        self.assertEqual(_ops(prog), ["transpose", "pad", "transpose"])
+
+    def test_a_two_axis_reflect_pad_is_still_refused(self):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 2, 5, 6), dtype=types.fp32)])
+        def prog(x):
+            return mb.pad(x=x, pad=[0, 0, 0, 0, 1, 1, 1, 1], mode="reflect")
+
+        with self.assertRaises(NotImplementedError) as cm:
+            PASS_REGISTRY["loom::transpose_pad_to_last_axis"](prog)
+        self.assertIn("reflect", str(cm.exception))
+
+
 class TestCanonicalizeConvTransposeDw(unittest.TestCase):
     def test_rewrites_a_depthwise_conv_transpose(self):
         length = get_new_symbol()
