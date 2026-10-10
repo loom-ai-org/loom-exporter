@@ -255,6 +255,40 @@ def test_citrinet_shares_conformer_ctcs_target_and_is_told_apart_by_its_encoder(
     assert not _is_citrinet(_make_nemo_archive(tmp_path, "ctc", CTC_CONFIG))
 
 
+def test_a_wpe_nemo_archive_yields_its_wordpiece_table_and_a_bpe_one_its_proto(tmp_path):
+    """Citrinet-256-ls is `tokenizer.type: wpe`: its archive holds a BERT `vocab.txt` and no proto. A
+    SentencePiece archive holds a `<hash>_vocab.txt` TOO (the proto's listing), so the proto must win
+    there and the WordPiece branch must be taken only on `wpe`."""
+    from loom_exporter.nemo_asr_export import extract_nemo_tokenizer_dir
+    from loom_exporter.tokenizer_detect import detect_vocab_family
+
+    def archive(name, config, members):
+        path = _make_nemo_archive(tmp_path, name, config)
+        with tarfile.open(path, "a") as t:
+            for arcname, data in members.items():
+                src = tmp_path / f"{name}_{arcname.strip('./')}"
+                src.write_bytes(data)
+                t.add(src, arcname=arcname)
+        return str(path)
+
+    vocab = b"[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\n'\na\nb\n##a\n"
+    wpe = Path(extract_nemo_tokenizer_dir(archive(
+        "wpe", {**CITRINET_CONFIG, "tokenizer": {"type": "wpe"}}, {"./vocab.txt": vocab})))
+    assert (wpe / "vocab.txt").read_bytes() == vocab and not (wpe / "tokenizer.model").exists()
+    assert detect_vocab_family(str(wpe)) == "wordpiece"
+    assert json.loads((wpe / "special_tokens_map.json").read_text())["unk_token"] == "[UNK]"
+    assert json.loads((wpe / "tokenizer_config.json").read_text()) == {"do_lower_case": False}
+
+    bpe = Path(extract_nemo_tokenizer_dir(archive(
+        "bpe", {**CITRINET_CONFIG, "tokenizer": {"type": "bpe"}},
+        {"./abc_tokenizer.model": b"proto", "./abc_vocab.txt": vocab})))
+    assert (bpe / "tokenizer.model").read_bytes() == b"proto" and not (bpe / "vocab.txt").exists()
+
+    # A bpe archive with no proto has no tokenizer this can read: None, never its `vocab.txt`.
+    assert extract_nemo_tokenizer_dir(archive(
+        "noproto", {**CITRINET_CONFIG, "tokenizer": {"type": "bpe"}}, {"./abc_vocab.txt": vocab})) is None
+
+
 def test_canary_is_claimed_by_its_prompt_format_and_by_nothing_else(tmp_path):
     """`EncDecMultiTaskModel` with the `canary2` prompt. The first Canary spells its prompt `canary`, a
     different token row the driver does not build, so it is not claimed rather than mis-prompted."""

@@ -266,6 +266,16 @@ CATALOG = [
         base_repo="nvidia/stt_en_citrinet_1024_gamma_0_25", license_id="cc-by-4.0", language=["en"],
         title="Citrinet-1024 (en)", summary="NVIDIA NeMo's Citrinet-1024 English CTC ASR model, exported for loom.cpp.",
     ),
+    # The same leaf at a tenth of the size (10M parameters), for the boards Citrinet-1024 is too slow on.
+    # Trained on LibriSpeech only, and NeMo's oldest tokenizer: WordPiece (`tokenizer.type: wpe`).
+    ModelCard(
+        slug="citrinet-256-ls", checkpoint=Path("stt-en-citrinet-256-ls/stt_en_citrinet_256_ls.nemo"),
+        export_task="automatic-speech-recognition", export_model="citrinet",
+        task_type="automatic-speech-recognition",
+        base_repo="nvidia/stt_en_citrinet_256_ls", license_id="cc-by-4.0", language=["en"],
+        title="Citrinet-256 LibriSpeech (en)",
+        summary="NVIDIA NeMo's Citrinet-256 English CTC ASR model (LibriSpeech), exported for loom.cpp.",
+    ),
     # Family 4 (P5): CNN + transformer + CTC. `export_model="hf-ctc-asr"` is the one generic
     # recognizer, so both leaves name it -- which is the family's whole claim about itself.
     #

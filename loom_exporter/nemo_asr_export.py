@@ -59,6 +59,7 @@ The module keeps its name because NeMo is still the only loader with a config *o
 encoder half earns a module of its own; two did not make the case, and splitting on the first
 opportunity would have moved code before anything had shown where the seam is.
 """
+import json
 import os
 import sys
 import tarfile
@@ -368,12 +369,14 @@ class ASRNemoEncoderExportConfig(LoomExportConfig):
     def backend_kwargs(self) -> dict:
         kwargs = dict(flat_namespace=True, root_axis=self.root_axis,
                       driver_builder=self.synthesized_builder_key(), hparams=self.hparams())
-        # The checkpoint's own SentencePiece vocab, so the artifact is detokenizable on its own -- the
-        # one capability the bespoke converters had that the MIL export did not.
+        # The checkpoint's own vocab, so the artifact is detokenizable on its own -- the one capability
+        # the bespoke converters had that the MIL export did not. SentencePiece for every NeMo
+        # checkpoint but the oldest: Citrinet-256-ls is `tokenizer.type: wpe`, a BERT WordPiece table.
         tokenizer_dir = extract_nemo_tokenizer_dir(self.checkpoint)
         if tokenizer_dir is not None:
             kwargs["tokenizer_dir"] = tokenizer_dir
-            kwargs["tokenizer_family"] = "sentencepiece_proto"
+            kwargs["tokenizer_family"] = ("sentencepiece_proto" if (Path(tokenizer_dir) / "tokenizer.model").is_file()
+                                          else "wordpiece")
         # A CTC head's blank is its LAST class -- NeMo's own convention, and the same index
         # `loom_cli`'s C++ path passes to `ctc_greedy_decode` (`num_classes - 1`).
         #
@@ -597,6 +600,13 @@ def extract_nemo_tokenizer_dir(checkpoint: str) -> Optional[str]:
     """Unpacks the `.nemo` archive's SentencePiece model into a temp dir and returns it, or `None` for a
     checkpoint that carries no tokenizer.
 
+    **Or its WordPiece `vocab.txt`**, for a checkpoint whose `tokenizer.type` is `wpe` (Citrinet-256-ls,
+    2021). NeMo builds that tokenizer as `AutoTokenizer("bert-base-cased", vocab_file=...)`, so the
+    directory also gets the two files `write_wordpiece_vocab` reads the rest from: BERT's five specials
+    (which NeMo's `ids_to_text` drops) and `do_lower_case: false` (bert-base-cased's). A directory with
+    `tokenizer.model` is SentencePiece and one with only `vocab.txt` is WordPiece -- the caller tells
+    them apart by that file.
+
     **Why a directory for one file.** `LoomGGUFExporter._write_tokenizer` already has a
     `sentencepiece_proto` family that reads `tokenizer.model` out of a `tokenizer_dir` and calls the same
     `write_sentencepiece_vocab` the bespoke NeMo converters called. NeMo just keeps that file inside the
@@ -616,11 +626,25 @@ def extract_nemo_tokenizer_dir(checkpoint: str) -> Optional[str]:
     with tarfile.open(checkpoint) as archive:
         names = [n for n in archive.getnames() if n.endswith("_tokenizer.model") or
                  n.endswith("/tokenizer.model")]
-        if not names:
+        if names:
+            out = Path(tempfile.mkdtemp(prefix="loom_nemo_tokenizer_"))
+            (out / "tokenizer.model").write_bytes(archive.extractfile(names[0]).read())
+            return str(out)
+        # Only now a WordPiece table: a SentencePiece archive carries a `vocab.txt` too (the proto's
+        # human-readable listing), which must never be mistaken for the tokenizer.
+        cfg = _read_nemo_model_config(Path(checkpoint))
+        if (cfg.get("tokenizer") or {}).get("type") != "wpe":
             return None
+        names = [n for n in archive.getnames() if n.lstrip("./") == "vocab.txt" or n.endswith("_vocab.txt")]
+        if len(names) != 1:
+            raise FileNotFoundError(f"{checkpoint}: tokenizer.type is wpe but the archive holds "
+                                    f"{len(names)} vocab.txt members: {names}")
         out = Path(tempfile.mkdtemp(prefix="loom_nemo_tokenizer_"))
-        member = archive.extractfile(names[0])
-        (out / "tokenizer.model").write_bytes(member.read())
+        (out / "vocab.txt").write_bytes(archive.extractfile(names[0]).read())
+    (out / "special_tokens_map.json").write_text(json.dumps(
+        {"unk_token": "[UNK]", "sep_token": "[SEP]", "pad_token": "[PAD]", "cls_token": "[CLS]",
+         "mask_token": "[MASK]"}))
+    (out / "tokenizer_config.json").write_text(json.dumps({"do_lower_case": False}))
     return str(out)
 
 
