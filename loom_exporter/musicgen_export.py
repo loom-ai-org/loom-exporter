@@ -40,6 +40,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from .bpe_tokenizer_export import read_sampling_defaults
 from .decomposition import Decomposition, MultiPhase
 from .dia_export import _CrossKvSlot, causal_mask, cross_kv_input_names
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
@@ -186,23 +187,6 @@ class _MusicgenDecoderWrapper(nn.Module):
         return torch.cat([head(last) for head in self.lm_heads], dim=1)
 
 
-def read_generation_defaults(model) -> dict:
-    """The checkpoint's decoding defaults, read through `GenerationConfig` rather than the JSON.
-
-    `bpe_tokenizer_export.read_sampling_defaults` reads the file and maps a missing `top_k` to 0 (no
-    truncation). `transformers` defaults it to **50**, and MusicGen's `generation_config.json` sets
-    `do_sample` without naming `top_k`, so the file-level reading would ship an untruncated sampler the
-    reference never runs. The resolved object is the authority on what `generate()` does.
-    """
-    gen = model.generation_config
-    greedy = not gen.do_sample
-    return {
-        "temperature": 0.0 if greedy else float(gen.temperature if gen.temperature is not None else 1.0),
-        "top_k": 0 if greedy else int(gen.top_k or 0),
-        "top_p": 1.0 if greedy else float(gen.top_p if gen.top_p is not None else 1.0),
-    }
-
-
 @dataclass
 class TextToCodesMusicgenExportConfig(BaseMultiPhaseModelExportConfig):
     """MusicGen as `encoder` (T5 + projection), `cross_kv` (per-layer K/V, once) and `decoder` (one
@@ -274,9 +258,9 @@ class TextToCodesMusicgenExportConfig(BaseMultiPhaseModelExportConfig):
         "guidance_scale": Unchecked("READ off the resolved GenerationConfig, verbatim: MusicGen's "
                                     "processor is the standard uncond-centred form loom.sample_row "
                                     "implements, so no conversion"),
-        "sampling_defaults": Unchecked("READ off the resolved GenerationConfig by "
-                                       "`read_generation_defaults` -- see its docstring for why not "
-                                       "the JSON"),
+        "sampling_defaults": Unchecked("READ off generation_config.json by "
+                                       "`bpe_tokenizer_export.read_sampling_defaults`, which fills "
+                                       "a missing knob with what generate() uses (top_k 50)"),
     }
 
     def prepare_environment(self) -> None:
@@ -344,7 +328,7 @@ class TextToCodesMusicgenExportConfig(BaseMultiPhaseModelExportConfig):
         self.eos_token_id = int(txt_cfg.eos_token_id)
         self.max_length = int(model.generation_config.max_length)
         self.guidance_scale = float(model.generation_config.guidance_scale or 1.0)
-        self.sampling_defaults = read_generation_defaults(model)
+        self.sampling_defaults = read_sampling_defaults(self.model_dir)
         self.encoder_bias = tuple(relative_attention_bias_table(model.text_encoder.encoder))
         if len(self.encoder_bias) != self.num_buckets * self.n_text_head:
             raise ValueError(
