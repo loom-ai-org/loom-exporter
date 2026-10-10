@@ -494,6 +494,7 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
             "eos": 2,
             "blank": 0,
             "interleave_blank": True,
+            "blank_after_bos": True,
         }
 
     def driver_input_aliases(self) -> dict:
