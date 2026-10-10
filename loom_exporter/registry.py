@@ -190,6 +190,7 @@ _FAMILY_MODULES = (
     "causal_lm_export",
     "nemo_asr_export",
     "gigaam_export",
+    "nemotron_asr_export",
     "whisper_export",
     "canary_export",
     "moonshine_export",

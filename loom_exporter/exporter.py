@@ -3136,7 +3136,7 @@ class LoomGGUFExporter:
             # that has both; `tokenizer_detect` refuses the case where neither source records the
             # normalization.
             from .spm_tokenizer_export import read_hf_id_layout, write_sentencepiece_vocab
-            write_sentencepiece_vocab(w, None, hf_ids=read_hf_id_layout(tokenizer_dir))
+            write_sentencepiece_vocab(w, None, hf_ids=read_hf_id_layout(tokenizer_dir, allow_bpe=True))
         elif family == "byte":
             from .byt5_tokenizer_export import write_byte_vocab
             write_byte_vocab(w, tokenizer_dir)
