@@ -468,6 +468,40 @@ CATALOG = [
         ),
     ) for size, params in (("tiny", "34M"), ("small", "123M"))],
     ModelCard(
+        # Measured 2026-10-10 on hf-internal-testing/librispeech_asr_dummy (73 utterances) plus jfk.wav:
+        # F32 ids identical to transformers' greedy `generate` at the card's budget on 74/74; F16 73/74,
+        # Q8_0 67/74; WER (upper-cased, punctuation dropped) 9.83% for F32/F16/Q8_0 alike and 15.74%
+        # for Q4_1, which is therefore not shipped. Pi Zero W (ARMv6, 1 core): jfk 11.0 s took 75.7 s
+        # at Q8_0 (peak RSS 103 MB) and 74.7 s at F32 (174 MB).
+        slug="moonshine-tiny", checkpoint=Path("moonshine-tiny"),
+        task_type="automatic-speech-recognition", snippet="automatic-speech-recognition-variants",
+        base_repo="moonshine-ai/moonshine-tiny", license_id="mit", language=["en"],
+        title="Moonshine Tiny",
+        summary="Useful Sensors' original Moonshine tiny (27M) English speech recognizer -- a convolution "
+                "stem and encoder over the raw waveform and an autoregressive decoder -- exported for "
+                "loom.cpp in two precisions.",
+        variants=[
+            ("F32", "full precision, 110 MB. Token for token `transformers`' own transcript on all 74 "
+                    "test clips."),
+            ("Q8_0", "31 MB. The same word error rate as F32 on the same clips (9.83%); 67 of 74 "
+                     "transcripts are token-identical, the others differ in a word or its punctuation. "
+                     "The smaller file and the smaller memory footprint (103 MB peak on a Pi Zero "
+                     "versus 174 MB)."),
+        ],
+        limitations=(
+            "**At most 29.8 s per call.** The decoder holds 194 tokens, and the model card's budget of "
+            "6.5 tokens per second of audio reaches that at 29.8 s; a longer clip is refused with an "
+            "error rather than transcribed short. Split long audio at its pauses -- a VAD such as "
+            "`silero-vad-loom` finds them -- and transcribe each part.\n\n"
+            "Decoding is the model card's own: greedy, and capped at 6.5 tokens per second of audio "
+            "\"to avoid hallucination loops\". A clip shorter than about 0.3 s therefore returns no "
+            "text. Like other encoder-decoder recognizers it can still repeat or invent words on noisy "
+            "or very short audio.\n\n"
+            "**Small, not fast, on the smallest boards.** On a Raspberry Pi Zero W (one ARMv6 core, "
+            "no SIMD) 11 s of speech takes about 75 s at either precision. English only, mono 16 kHz."
+        ),
+    ),
+    ModelCard(
         slug="granite-speech-4.0-1b", checkpoint=Path("granite-speech-4.0.1b"),
         task_type="automatic-speech-recognition",
         base_repo="ibm-granite/granite-4.0-1b-speech", license_id="apache-2.0",
@@ -1851,6 +1885,18 @@ print(result.text)
 # `result.timestamped` is False. Check that before treating a start/end as a boundary the model chose.
 for segment in result.segments:
     print(segment.start, segment.end, segment.text)
+""",
+    # The same door from a repo of several precisions, which has to name its file.
+    "automatic-speech-recognition-variants": """import loom
+
+# This repo holds more than one precision of the model; name the file you want (see "Files" below).
+model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
+
+# Audio is a mono float list at 16 kHz. This model decodes in the one language it was trained for and
+# takes no `language=` argument -- passing one warns and is ignored, because nothing in its decode
+# could act on it.
+result = model.speech2text.infer(audio)
+print(result.text)
 """,
     "automatic-speech-recognition-multilingual": """import loom
 

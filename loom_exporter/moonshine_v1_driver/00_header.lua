@@ -1,0 +1,13 @@
+-- Moonshine v1 (moonshine_v1_export.py): a convolution stem and a full-attention encoder over the raw
+-- waveform, run once, then a KV-cached cross-attention decode loop.
+--
+-- Three traced topologies: `encoder` takes the waveform at any length of at least MIN_SAMPLES and emits
+-- the encoder states; `cross_kv` projects them into every decoder layer's cross-attention K/V, once;
+-- `decoder` is one cached step.
+--
+-- inputs: waveform (flat f32 array at `loom.sample_rate`), and two optional ones -- length (a
+-- one-element table: how many of those samples are the caller's real audio; omitted means all of them)
+-- and max_new_tokens. Returns the generated ids, `</s>` included when it was reached.
+--
+-- The default budget is the model card's: `max_length = floor(samples * 6.5 / 16000)` tokens, the
+-- start token included, "to avoid hallucination loops".
