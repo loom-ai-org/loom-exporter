@@ -2438,6 +2438,7 @@ class LoomGGUFExporter:
         topo_inputs = [inp for inp in topo_inputs if inp["name"] in referenced]
 
         pruned_nodes, output_symbols = self._materialize_view_outputs(pruned_nodes, output_symbols)
+        pruned_nodes = self._pack_gathered_views(pruned_nodes)
 
         self._retype_fused_mask_input(topo_inputs, pruned_nodes, func_name)
         # After the retyping, never before: that check asserts the fused mask's only consumers are
@@ -2644,6 +2645,34 @@ class LoomGGUFExporter:
             out_nodes.append({"op": "CONT", "inputs": [symbol], "outputs": [cont_name]})
             new_symbols.append(cont_name)
         return out_nodes, new_symbols
+
+    def _pack_gathered_views(self, nodes: list) -> list:
+        """Inserts a `CONT` between a view op and a `GET_ROWS` that gathers rows out of it.
+
+        ggml's `get_rows` copies each row as `ne0` CONTIGUOUS elements from the row's start and never
+        reads the table's element stride, so a gather out of a transposed view returns the right number
+        of values from the wrong places -- silently. Every gather before sanoTTS read a weight table,
+        which is always packed; sanoTTS's frame expansion gathers token states out of a conv stack's
+        `[channels, tokens]` output, which the trace hands over as a PERMUTE of it, and its audio came
+        out at correlation 0.002 with nothing raised. Same class of fix as
+        `_materialize_view_outputs`, one consumer over -- and done here rather than only in the engine so
+        a file is right on every engine that can load it.
+        """
+        by_output = {}
+        for node in nodes:
+            for name in node.get("outputs", []):
+                by_output[name] = node
+        out_nodes = []
+        for node in nodes:
+            if node["op"] == "GET_ROWS":
+                table = node["inputs"][0]
+                producer = by_output.get(table)
+                if producer is not None and producer["op"] in self._VIEW_PRODUCING_OPS:
+                    cont_name = f"{table}_rows"
+                    out_nodes.append({"op": "CONT", "inputs": [table], "outputs": [cont_name]})
+                    node = dict(node, inputs=[cont_name] + list(node["inputs"][1:]))
+            out_nodes.append(node)
+        return out_nodes
 
     def _prune_dead_nodes(self, nodes: list, output_symbols) -> list:
         """
@@ -3341,6 +3370,10 @@ class LoomGGUFExporter:
             w.add_int32("tokenizer.ggml.phoneme.eos_id", int(table["eos"]))
             w.add_int32("tokenizer.ggml.phoneme.blank_id", int(table["blank"]))
             w.add_bool("tokenizer.ggml.phoneme.interleave_blank", bool(table["interleave_blank"]))
+            # piper-phonemize's build puts a blank right after BOS as well; a model trained through it
+            # declares so. Written only when true, so every file before this key is byte-identical.
+            if table.get("blank_after_bos"):
+                w.add_bool("tokenizer.ggml.phoneme.blank_after_bos", True)
 
         tokenizer_dir = self.kwargs.get("tokenizer_dir") or os.environ.get("LOOM_TOKENIZER_DIR")
         if tokenizer_dir:
