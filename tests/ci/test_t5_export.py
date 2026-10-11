@@ -4,10 +4,12 @@
 engine has no primitive for and the whole export turns on where it is computed. Three properties, each
 of which the export satisfies silently when it is wrong:
 
-1. **The bias is bucketed, and the Lua that buckets it must match `transformers`.** A driver that
-   bucketed differently would still index inside the table and still produce a plausible sentence, so
-   the check is against HF's own `_relative_position_bucket` over the whole (query, key) grid rather
-   than against a recorded array.
+1. **The bias is bucketed, and every bucketing must match `transformers`.** The encoder's is in the
+   GRAPH since 2026-10-11 -- a clamp and a gather into a per-distance table the export bucketed with
+   HF's own function -- and the decoder's is still the driver's Lua. A bucketing that differed would
+   still index inside the table and still produce a plausible sentence, so both are checked against
+   HF's own `_relative_position_bucket` over the whole (query, key) grid, and the encoder wrapper
+   against HF's own encoder past the saturation distance.
 2. **Cross-attention must not fuse.** Its zero bias is folded away by a coremltools pass, not by
    anything here; if a release stops folding it, every cross block acquires a KV cache addressing the
    self-attention blocks' slots and the model decodes plausible tokens out of a mixed cache.
@@ -28,11 +30,13 @@ import pytest
 from loom_exporter.registry import default_registry
 from loom_exporter.t5_export import (
     Text2TextT5ExportConfig,
+    _T5EncoderWrapper,
     _build_t5,
     _check_fused_attention,
     _is_t5,
     cross_kv_input_names,
     relative_attention_bias_table,
+    relative_bias_by_distance,
 )
 from loom_exporter.tasks import task_spec
 
@@ -151,6 +155,44 @@ def test_the_transcribed_bucketing_is_the_fragment_that_ships():
                  "local max_exact = math.floor(n / 2)",
                  "if large > n - 1 then large = n - 1 end"):
         assert line in lua, line
+
+
+@pytest.mark.parametrize("bidirectional", [True, False])
+def test_the_distance_table_matches_transformers_over_the_whole_grid(bidirectional):
+    """The encoder's in-graph bias reads `table_by_distance[clamp(key - query) + max_distance]`; that
+    must be HF's `table[bucket(key - query)]` for EVERY pair a 512-long sequence has -- including the
+    pairs past `max_distance`, which is what the clamp claims to change nothing about, and the
+    distances 16/32/64 where an f32 `log` sits exactly on a bucket edge."""
+    torch = pytest.importorskip("torch")
+    from transformers.models.t5.modeling_t5 import T5Attention
+
+    model = _tiny_t5_model(num_heads=3, relative_attention_num_buckets=32,
+                           relative_attention_max_distance=128)
+    stack = model.encoder
+    table = stack.block[0].layer[0].SelfAttention.relative_attention_bias.weight.detach()
+    by_distance = relative_bias_by_distance(stack, 32, 128, bidirectional)
+    assert tuple(by_distance.shape) == (2 * 128 + 1, 3)
+    n = 512
+    rel = torch.arange(n)[None, :] - torch.arange(n)[:, None]
+    want = table[T5Attention._relative_position_bucket(
+        rel, bidirectional=bidirectional, num_buckets=32, max_distance=128)]
+    got = by_distance[rel.clamp(-128, 128) + 128]
+    assert torch.equal(got, want)
+
+
+def test_the_encoder_wrapper_matches_transformers_past_the_saturation_distance():
+    """The wrapper against HF's own `T5Stack` -- the only check that sees the ORIENTATION of
+    `key - query`: a bidirectional table is not symmetric, so `query - key` reads the other half of it
+    and is wrong everywhere off the diagonal. 40 positions against a `max_distance` of 16, so the clamp
+    is exercised too."""
+    torch = pytest.importorskip("torch")
+    model = _tiny_t5_model()
+    wrapper = _T5EncoderWrapper(model, int(model.config.relative_attention_max_distance)).eval()
+    ids = torch.randint(0, model.config.vocab_size, (1, 40))
+    with torch.no_grad():
+        want = model.encoder(input_ids=ids).last_hidden_state
+        got = wrapper(ids, torch.arange(40)[None, :])
+    assert torch.allclose(got, want, atol=1e-6), float((got - want).abs().max())
 
 
 def test_the_bias_table_is_flattened_bucket_major(tmp_path):
@@ -299,10 +341,15 @@ def test_the_masks_head_axis_survives_the_n_kv_retyping(tmp_path):
     exported = _export(_tiny_t5(tmp_path), tmp_path / "tiny.gguf")
     shapes = {i["name"]: i["shape"] for i in exported["decoder"]["inputs"]}
     assert shapes["position_bias"] == ["n_kv", "n_tokens", "2"], shapes["position_bias"]
-    # The encoder's is NOT retyped: that phase is unfused, so its mask is an ordinary input over the
-    # root axis and there is no cache for `n_kv` to mean anything about.
+    # The encoder has no bias input at all since 2026-10-11: it computes the bias from its own token
+    # positions, which is `n_src` integers rather than an `n_head x n_src x n_src` table from the driver.
     enc = {i["name"]: i["shape"] for i in exported["encoder"]["inputs"]}
-    assert enc["position_bias"] == ["n_tokens", "n_tokens", "2", "1"], enc["position_bias"]
+    assert "position_bias" not in enc, sorted(enc)
+    assert enc["positions"] == ["n_tokens", "1"], enc["positions"]
+    assert "enc_rel_bias" in str(sorted(exported["tensors"]))
+    # ...and the driver hands it a range, not the Lua bucketing, which is now the decoder's alone.
+    assert "positions = loom.range(0, #inputs.tokens)" in exported["driver"], exported["driver"]
+    assert "ENC_REL_BIAS" not in exported["driver"]
 
 
 def test_the_decoder_carries_two_independent_dynamic_axes(tmp_path):
