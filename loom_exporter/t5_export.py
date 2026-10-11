@@ -27,12 +27,18 @@ So this family hands that whole tensor in as the traced graph's mask input and l
 it, which makes the bias a host-side reduction of a 32x6 table rather than anything the engine or the
 graph has to learn:
 
-* the two bias tables (encoder, decoder) are read off the checkpoint and become `ExportConstants` --
-  192 floats each, the same order as Whisper's prompt table, and a number only the checkpoint knows is
-  what that component is for;
+* **the ENCODER's bias is computed in the graph since 2026-10-11** (ADR-074): the export buckets every
+  distance in `[-max_distance, max_distance]` with HF's own `_relative_position_bucket` into a
+  per-distance weight (`relative_bias_by_distance`), and the encoder clamps `key - query` and gathers.
+  The driver-built table it replaces was `n_head * n_src^2` doubles, ~5% of a long call;
+* the DECODER's table is read off the checkpoint and becomes an `ExportConstant` -- 192 floats, the
+  same order as Whisper's prompt table, and a number only the checkpoint knows is what that component
+  is for;
 * `t5_position_bias` in `t5_driver/00_header.lua` is `_relative_position_bucket` in Lua, and folds the
   causal mask into the same array for the decoder -- so the decoder's mask input is a mask in the
-  engine's sense and `_retype_fused_mask_input` retypes it to `n_kv` with nothing new to check;
+  engine's sense and `_retype_fused_mask_input` retypes it to `n_kv` with nothing new to check. It stays
+  there because that row is tiny (one per step) and IS the padded KV mask; MusicGen's T5 text encoder
+  still uses it too;
 * every stack is run by walking `T5Stack.block` directly rather than by calling the stack, which is
   what lets `position_bias` be PASSED rather than computed. Calling the stack would trace
   `compute_bias`'s `torch.arange(query_length)` at the dummy length and bake it (`query_length` is a
@@ -82,8 +88,56 @@ class _CrossKvSlot(nn.Module):
         return self._holder[self._key]
 
 
+def relative_bias_by_distance(stack, num_buckets: int, max_distance: int,
+                              bidirectional: bool) -> torch.Tensor:
+    """`[2 * max_distance + 1, n_head]`: the bias for every relative distance `key - query` in
+    `[-max_distance, max_distance]`, row `rel + max_distance`.
+
+    **Why a table of distances rather than the bucketing itself.** `_relative_position_bucket` is a
+    `log`, a division and a truncation, and the truncation sits EXACTLY on an integer at distances 16,
+    32 and 64 (`log(rel/8) / log(16) * 8` is 2, 4 and 6 in real arithmetic). Whether f32 lands just
+    under or on it depends on the `log` implementation, so the engine's `log` could pick a different
+    bucket from torch's there. Bucketing here, with HF's own function, makes the graph a clamp and a
+    gather that match it by construction.
+
+    **Why `max_distance` is enough.** The large-distance bucket is
+    `max_exact + log(rel / max_exact) / log(max_distance / max_exact) * (n - max_exact)`, which reaches
+    `n` at `rel = max_distance` and is clamped to `n - 1` from there on -- every distance at or beyond
+    it shares one bucket, so clamping the distance to `max_distance` changes no index. Checked below over
+    eight times that range rather than trusted, because a checkpoint whose config made that false would
+    still export and read the wrong bias for every long pair.
+    """
+    from transformers.models.t5.modeling_t5 import T5Attention
+
+    table = stack.block[0].layer[0].SelfAttention.relative_attention_bias.weight.detach()
+    rel = torch.arange(-max_distance, max_distance + 1)
+    buckets = T5Attention._relative_position_bucket(
+        rel, bidirectional=bidirectional, num_buckets=num_buckets, max_distance=max_distance)
+    far = torch.arange(-8 * max_distance, 8 * max_distance + 1)
+    exact = T5Attention._relative_position_bucket(
+        far, bidirectional=bidirectional, num_buckets=num_buckets, max_distance=max_distance)
+    clamped = buckets[far.clamp(-max_distance, max_distance) + max_distance]
+    if not torch.equal(exact, clamped):
+        bad = int(far[(exact != clamped).nonzero()[0, 0]])
+        raise ValueError(
+            f"T5 relative buckets do not saturate at max_distance={max_distance}: distance {bad} "
+            f"buckets to {int(exact[bad + 8 * max_distance])}, its clamp to "
+            f"{int(clamped[bad + 8 * max_distance])}. A distance table clamped there would read the "
+            f"wrong bias for that pair.")
+    return table[buckets].clone()
+
+
 class _T5EncoderWrapper(nn.Module):
-    """`(input_ids, position_bias) -> encoder hidden states`.
+    """`(input_ids, positions) -> encoder hidden states`.
+
+    **The relative bias is computed in the graph** (it was a host-built `position_bias` input until
+    2026-10-11). `positions` is the source's own token positions, `0..n_src-1` -- an input rather than a
+    `torch.arange` because tracing an arange bakes the dummy length, which is the same reason
+    `cache_position` is an input in every causal LM here. From it the graph forms `key - query` for
+    every pair, clamps it to the table's range and gathers the per-head bias:
+    `relative_bias_by_distance` has already done the bucketing. What crosses from the driver is `n_src`
+    integers, where the Lua builder handed over `n_head * n_src^2` doubles -- 1.35 M of them, 23 ms of a
+    913 ms flan-t5-small call, for a 410-token source.
 
     **The block loop is the point, not a convenience.** `T5Stack.forward` computes the relative bias
     itself the first time a layer needs one, from `torch.arange(query_length)` where `query_length` is
@@ -99,12 +153,29 @@ class _T5EncoderWrapper(nn.Module):
     wrappers, which is why the stacks are `enc`/`dec` and not both `stack`.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, max_distance: int):
         super().__init__()
         self.shared = model.shared
         self.enc = model.encoder
+        cfg = model.config
+        # An Embedding, so it is exported as a weight and read with the gather the token embedding
+        # already uses. `enc_rel_bias`, not anything under `enc.`: it is not a module of the stack, and a
+        # name the decoder wrapper could also produce would collide in `merge_phase_weights`.
+        self.enc_rel_bias = nn.Embedding.from_pretrained(
+            relative_bias_by_distance(model.encoder, int(cfg.relative_attention_num_buckets),
+                                      max_distance, bidirectional=True), freeze=True)
+        self.max_distance = max_distance
 
-    def forward(self, input_ids, position_bias):
+    def forward(self, input_ids, positions):
+        pos = positions[0].to(torch.float32)
+        ones = pos * 0.0 + 1.0
+        # `key - query` for every pair, HF's own orientation (row = query, column = key), as ONE matmul
+        # with an inner dimension of 2: `pos[None, :] - pos[:, None]` broadcasts BOTH operands, which
+        # the engine's elementwise ops refuse (Retro-070, `moonshine_export.window_mask`). One product
+        # per term and integers below 2^24, so it is exact.
+        rel = torch.matmul(torch.stack([-pos, ones], dim=1), torch.stack([ones, pos], dim=0))
+        rel = torch.clamp(rel, -float(self.max_distance), float(self.max_distance)) + self.max_distance
+        position_bias = self.enc_rel_bias(rel.to(torch.long)).permute(2, 0, 1).unsqueeze(0)
         hidden = self.shared(input_ids)
         for block in self.enc.block:
             hidden = block(hidden, attention_mask=None, position_bias=position_bias)[0]
@@ -432,13 +503,14 @@ class Text2TextT5ExportConfig(BaseMultiPhaseModelExportConfig):
         return [
             ExportPhase(
                 name="encoder",
-                wrapper=_T5EncoderWrapper(model).eval(),
+                wrapper=_T5EncoderWrapper(model, self.max_distance).eval(),
+                # Real positions, not zeros: a zero trace makes every distance 0 and every gather row
+                # the same, which hides a transposed `rel` from any check that compares outputs.
                 dummy_inputs=(torch.zeros((1, trace_src), dtype=torch.long),
-                              torch.zeros(1, self.n_head, trace_src, trace_src)),
+                              torch.arange(trace_src, dtype=torch.long)[None, :]),
                 mil_inputs=[
                     ct.TensorType(name="input_ids", shape=(1, src_axis), dtype=np.int32),
-                    ct.TensorType(name="position_bias",
-                                  shape=(1, self.n_head, src_axis, src_axis), dtype=np.float32),
+                    ct.TensorType(name="positions", shape=(1, src_axis), dtype=np.int32),
                 ],
                 root_axis="n_tokens",
                 # Not fused, and that is the same per-phase decision Whisper's encoder makes: this is a
@@ -538,7 +610,6 @@ class Text2TextT5ExportConfig(BaseMultiPhaseModelExportConfig):
                 # The two 32x6 tables, flattened `bucket * n_head + head`. A driver reads no GGUF
                 # metadata, and these are the only model VALUES it needs -- 192 floats each, which is
                 # the same order as Whisper's prompt table and three orders below any real weight.
-                "ENC_REL_BIAS": list(self.encoder_bias),
                 "DEC_REL_BIAS": list(self.decoder_bias),
             }),
             SubgraphCallComponent(
@@ -549,11 +620,10 @@ class Text2TextT5ExportConfig(BaseMultiPhaseModelExportConfig):
                 retain=True,
                 inputs={
                     "input_ids": FieldAccess("inputs", "tokens"),
-                    # Bidirectional (1) and no past: an encoder attends over the whole source, so
-                    # there is no causal half to fold in and the array is the bias alone.
-                    "position_bias": Call("t5_position_bias",
-                                          [Var("ENC_REL_BIAS")] + bias_shape
-                                          + [src_len, Lit(0), Lit(1)]),
+                    # `0..n_src-1`. The bias itself is computed in the graph from these
+                    # (`_T5EncoderWrapper`), so this is `n_src` integers rather than the
+                    # `n_head * n_src^2` table the driver used to build.
+                    "positions": Call("loom.range", [Lit(0), src_len]),
                 },
                 axes={"n_tokens": src_len, "n_past": Lit(0)},
                 note="Encoder: one bidirectional pass over the caller's source tokens.",
