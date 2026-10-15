@@ -29,6 +29,7 @@ from .shape_expr import (
 )
 from .symbols import DYNAMIC_SYMBOL_RE
 from .topology_ops import TopologyContext, lookup_topology_rule
+from .topology_cse import eliminate_common_subexpressions
 from .value_facts import ValueFacts, is_const_producer, static_array, static_scalar, static_value
 
 def _binding_kind(name: str, noise_inputs=(), defaulted_inputs=()) -> str:
@@ -3428,8 +3429,15 @@ class LoomGGUFExporter:
             else:
                 w.add_float32(f"loom.{key}", float(value))
 
-        # Embed each static submodule topology JSON string
+        # Embed each static submodule topology JSON string, its repeated pure subgraphs merged first
+        # (`topology_cse`: Citrinet-256-ls rebuilds one time mask 239 times). LOOM_EXPORT_NO_CSE=1 writes
+        # them as traced, for an A/B.
+        cse = os.environ.get("LOOM_EXPORT_NO_CSE", "") in ("", "0")
         for submodule_name, topo in self.topologies.items():
+            if cse:
+                topo, n_merged = eliminate_common_subexpressions(topo)
+                if n_merged:
+                    print(f"  topology {submodule_name}: {n_merged} repeated nodes merged")
             w.add_string(f"model.graph_topology.{submodule_name}", json.dumps(topo, cls=NumpyEncoder))
 
         # Content-address weight payloads (BACKLOG.md P0.2): a split export can legitimately declare the
