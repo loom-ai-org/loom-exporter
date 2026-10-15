@@ -6,6 +6,7 @@ exporter now fully covers (the new "pad"/"conv_transpose" handling in exporter.p
 has no handler for at all -- flow through the same standard pipeline instead of needing a bespoke
 hand-derived path (the way Kokoro's own STFT/ISTFT does today, outside this compiler entirely).
 """
+import os
 import unittest
 
 import numpy as np
@@ -40,28 +41,101 @@ class RoundTripModule(torch.nn.Module):
         return self.istft(spec.real, spec.imag)
 
 
-class TestStftExport(unittest.TestCase):
-    def test_stft_istft_round_trip_exports_without_bespoke_ops(self):
-        m = RoundTripModule().eval()
-        x = torch.randn(1, 16000)
+class _NoFft:
+    """LOOM_EXPORT_NO_FFT for the duration: both the trace (ISTFT) and the conversion (STFT) read it."""
 
+    def __init__(self, on: bool):
+        self.on = on
+
+    def __enter__(self):
+        self.old = os.environ.get("LOOM_EXPORT_NO_FFT")
+        os.environ["LOOM_EXPORT_NO_FFT"] = "1" if self.on else "0"
+
+    def __exit__(self, *exc):
+        if self.old is None:
+            os.environ.pop("LOOM_EXPORT_NO_FFT")
+        else:
+            os.environ["LOOM_EXPORT_NO_FFT"] = self.old
+
+
+def _export_round_trip(no_fft: bool, module=None, n=16000):
+    m = (module or RoundTripModule()).eval()
+    x = torch.randn(1, n)
+    with _NoFft(no_fft):
         traced = torch.jit.trace(m, (x,))
-        prog = ct.convert(traced, inputs=[ct.TensorType(name="x", shape=x.shape)], convert_to="milinternal")
-
+        prog = ct.convert(traced, inputs=[ct.TensorType(name="x", shape=x.shape)], convert_to="milinternal",
+                          compute_precision=ct.precision.FLOAT32)
         exporter = LoomGGUFExporter(prog, output_path="test_stft_output.gguf", architecture="stft_test")
         try:
             path = exporter.export()
-            self.assertTrue(Path(path).exists())
-
-            topo = next(iter(exporter.topologies.values()))
-            ops_used = {node["op"] for node in topo["nodes"]}
-            # Every op the STFT->ISTFT decomposition needs must be a real Loom primitive -- if any of
-            # these were still missing, .export() itself would have raised NotImplementedError above.
-            self.assertIn("PAD_1D_REFLECT", ops_used)  # STFT's center-framing reflect-pad
-            self.assertIn("CONV_1D", ops_used)  # STFT's DFT-as-convolution
-            self.assertIn("CONV_TRANSPOSE_1D", ops_used)  # ISTFT's synthesis + wsum normalization
+            assert Path(path).exists()
         finally:
             Path("test_stft_output.gguf").unlink(missing_ok=True)
+    return exporter, next(iter(exporter.topologies.values()))
+
+
+class TestStftExport(unittest.TestCase):
+    def test_stft_istft_round_trip_exports_without_bespoke_ops(self):
+        _, topo = _export_round_trip(no_fft=True)
+        ops_used = {node["op"] for node in topo["nodes"]}
+        # Every op the STFT->ISTFT decomposition needs must be a real Loom primitive -- if any of
+        # these were still missing, .export() itself would have raised NotImplementedError above.
+        self.assertIn("PAD_1D_REFLECT", ops_used)  # STFT's center-framing reflect-pad
+        self.assertIn("CONV_1D", ops_used)  # STFT's DFT-as-convolution
+        self.assertIn("CONV_TRANSPOSE_1D", ops_used)  # ISTFT's synthesis + wsum normalization
+        self.assertNotIn("ISTFT", ops_used)
+        self.assertNotIn("STFT", ops_used)
+
+    def test_stft_lowers_to_one_stft_node(self):
+        """ADR-080: `torch.stft` is one engine STFT node with two outputs and no convolution, its
+        window a periodic Hann of win_length centred in n_fft zeros, as torch.stft pads it."""
+        class Spec(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("window", torch.hann_window(400))
+
+            def forward(self, x):
+                s = torch.stft(x, n_fft=512, hop_length=160, win_length=400, window=self.window,
+                               return_complex=True, center=True)
+                return s.real * s.real + s.imag * s.imag
+
+        exporter, topo = _export_round_trip(no_fft=False, module=Spec())
+        nodes = [n for n in topo["nodes"] if n["op"] == "STFT"]
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(len(nodes[0]["outputs"]), 2)
+        self.assertNotIn("CONV_1D", {n["op"] for n in topo["nodes"]})
+        self.assertEqual(nodes[0]["attrs"], {"n_fft": 512, "hop": 160})
+        window = np.asarray(exporter.weights[nodes[0]["inputs"][1]], dtype=np.float64).reshape(-1)
+        want = np.zeros(512)
+        want[56:456] = torch.hann_window(400).numpy()   # the model's own f32 buffer, carried exactly
+        np.testing.assert_array_equal(window, want)
+
+    def test_istft_traces_to_one_istft_node(self):
+        """ADR-080: under a trace, ISTFT is one engine ISTFT node and no convolutions, with the window
+        as its third input and the frame count carried into its output length."""
+        exporter, topo = _export_round_trip(no_fft=False)
+        self.assertEqual(sum(n["op"] == "STFT" for n in topo["nodes"]), 1)
+        nodes = [n for n in topo["nodes"] if n["op"] == "ISTFT"]
+        self.assertEqual(len(nodes), 1)
+        self.assertNotIn("CONV_TRANSPOSE_1D", {n["op"] for n in topo["nodes"]})
+        self.assertEqual(nodes[0]["attrs"], {"n_fft": 400, "hop": 160, "center": 1})
+        window = np.asarray(exporter.weights[nodes[0]["inputs"][2]], dtype=np.float64).reshape(-1)
+        np.testing.assert_array_equal(window, ISTFT(400, 160).window.numpy())   # istft.py's f64 Hann, cast
+
+    def test_the_traced_op_computes_what_the_module_does(self):
+        """`loom::istft`'s torch body is the engine ISTFT's contract; hold it against the module's
+        convolutions, center and not, on spectra that are not self-consistent."""
+        torch.manual_seed(1)
+        for n_fft, hop, center in ((400, 160, True), (16, 4, False), (20, 5, True)):
+            m = ISTFT(n_fft=n_fft, hop_length=hop, center=center).eval()
+            real = torch.randn(1, n_fft // 2 + 1, 23)
+            imag = torch.randn(1, n_fft // 2 + 1, 23)
+            want = m(real, imag)
+            got = torch.ops.loom.istft(real, imag, m.window, n_fft, hop, center)
+            self.assertEqual(want.shape, got.shape)
+            finite = torch.isfinite(want)
+            self.assertTrue(torch.equal(finite, torch.isfinite(got)))   # center=False: 0/0 at sample 0
+            self.assertLess((want[finite] - got[finite]).abs().max().item(), 1e-5)
 
     def test_istft_matches_real_torch_istft_numerically(self):
         """The exported topology's own correctness rests on ISTFT's math matching torch.istft -- verified
@@ -106,14 +180,16 @@ class TestDftBasisPrecision(unittest.TestCase):
     def test_the_folded_basis_is_the_dft_to_f32_precision(self):
         n_fft = 1024
         x = torch.randn(1, 4 * n_fft)
-        prog = ct.convert(torch.jit.trace(MagnitudeModule(n_fft).eval(), (x,)),
-                          inputs=[ct.TensorType(name="x", shape=x.shape)], convert_to="milinternal",
-                          compute_precision=ct.precision.FLOAT32)
-        exporter = LoomGGUFExporter(prog, output_path="test_dft_basis.gguf", architecture="dft_test")
-        try:
-            exporter.export()
-        finally:
-            Path("test_dft_basis.gguf").unlink(missing_ok=True)
+        # the basis exists only where the STFT is not an FFT (ADR-080)
+        with _NoFft(True):
+            prog = ct.convert(torch.jit.trace(MagnitudeModule(n_fft).eval(), (x,)),
+                              inputs=[ct.TensorType(name="x", shape=x.shape)], convert_to="milinternal",
+                              compute_precision=ct.precision.FLOAT32)
+            exporter = LoomGGUFExporter(prog, output_path="test_dft_basis.gguf", architecture="dft_test")
+            try:
+                exporter.export()
+            finally:
+                Path("test_dft_basis.gguf").unlink(missing_ok=True)
 
         rows = n_fft // 2 + 1
         k, n = np.arange(rows)[:, None], np.arange(n_fft)[None]
