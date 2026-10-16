@@ -37,6 +37,8 @@ def quantize_choices() -> list:
         except Exception:
             continue
         names.append(qtype.name)
+    from .quant_flavours import FLAVOURS
+    names += [flavour for flavour, base in FLAVOURS.items() if base in names]
     return names
 
 
