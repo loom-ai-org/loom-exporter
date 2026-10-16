@@ -24,6 +24,7 @@ from .driver_components import (
     DriverReturn, MonolithicCall, PrefillDecodeLoop, TokenLabelsEpilogue,
 )
 from .passes import apply_loom_mil_passes
+from .quant_flavours import PER_CHANNEL_KEY, ggml_type_name, is_per_channel, quantize_q8_0_per_channel
 from .shape_expr import (
     as_expr, floor_div, has_dynamic_symbol, render, sub_dynamic_symbols,
 )
@@ -124,6 +125,9 @@ class WeightPacking:
     quantized_bytes_before: int = 0
     quantized_bytes_after: int = 0
     float_bytes_total: int = 0
+    #: The names written per channel at `--quantize Q8_0_PC` (ADR-076): the rest of its Q8_0 tensors are
+    #: ordinary blocks. `write_gguf` lists these under `loom.quantize.per_channel`.
+    per_channel: set = field(default_factory=set)
 
     @property
     def n_quantized(self) -> int:
@@ -139,6 +143,7 @@ class WeightPacking:
         self.quantized_bytes_before += other.quantized_bytes_before
         self.quantized_bytes_after += other.quantized_bytes_after
         self.float_bytes_total += other.float_bytes_total
+        self.per_channel |= other.per_channel
         return self
 
 
@@ -2969,6 +2974,28 @@ class LoomGGUFExporter:
                 attrs["kernel_k"] = spatial[1]
         return len(folded)
 
+    def _int8_readable_weight_names(self) -> set:
+        """The weights an int8 kernel can read per channel (ADR-079 P4.33): every eligible node that takes
+        the name as its first input is a MUL_MAT or a pointwise CONV_1D (a 1x1 kernel, no padding, one
+        group; read after the fold, which records `kernel_k`). Those are the only ones `Q8_0_PC` writes per
+        channel. A k > 1 kernel is computed by ggml's own convolution, which gains nothing from a row-uniform
+        scale and loses accuracy to it: on Moonshine tiny, its two stem convolutions per channel cost 6 of
+        the 9 extra word errors on the 73 LibriSpeech clips, and as block Q8_0 they cost none."""
+        readers = {}
+        for topo in self.topologies.values():
+            for node in topo.get("nodes", []):
+                if node.get("op") in self.PACKED_WEIGHT_FIRST_OPS and node.get("inputs"):
+                    readers.setdefault(node["inputs"][0], []).append(node)
+
+        def int8_reads(node) -> bool:
+            if node["op"] == "MUL_MAT":
+                return True
+            a = node.get("attrs", {})
+            return (node["op"] == "CONV_1D" and a.get("kernel_k") == 1 and a.get("p0", 0) == 0
+                    and a.get("groups", 1) == 1)
+
+        return {name for name, nodes in readers.items() if all(int8_reads(n) for n in nodes)}
+
     def _collect_mul_mat_weight_names(self) -> set:
         """Every eligible node's *first* input, across all topologies -- see `PACKED_WEIGHT_FIRST_OPS`
         for which ops those are and why convolution transposes are not among them.
@@ -3216,16 +3243,18 @@ class LoomGGUFExporter:
         # which the fold does not touch.
         qtype = None
         quantizable = set()
+        int8_readable = set()
         block_size = 1
         if self.quantize:
             from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
-            qtype = GGMLQuantizationType[self.quantize]
+            qtype = GGMLQuantizationType[ggml_type_name(self.quantize)]
             block_size, _ = GGML_QUANT_SIZES[qtype]
             quantizable = self._collect_mul_mat_weight_names()
             # Already-packed kernels are skipped by the fold on their own terms: a quantized array is
             # uint8 blocks, which its `np.issubdtype(..., np.floating)` gate declines. So this counts
             # only what THIS packing folded, which is what `absorb` then sums.
             packing.n_folded = self._fold_conv_kernels_for_quantization(block_size)
+            int8_readable = self._int8_readable_weight_names() if is_per_channel(self.quantize) else set()
 
         for name in pending:
             array = self.weights[name]
@@ -3259,8 +3288,12 @@ class LoomGGUFExporter:
             if eligible_by_op and not aligned:
                 packing.n_declined_shape += 1
             if eligible_by_op and aligned:
-                from gguf import quants
-                array_to_write = quants.quantize(np.ascontiguousarray(array), qtype)
+                if name in int8_readable:
+                    array_to_write = quantize_q8_0_per_channel(array)
+                    packing.per_channel.add(name)
+                else:
+                    from gguf import quants
+                    array_to_write = quants.quantize(np.ascontiguousarray(array), qtype)
                 raw_dtype = qtype
                 packing.quantized_bytes_before += array.nbytes
                 packing.quantized_bytes_after += array_to_write.nbytes
@@ -3448,6 +3481,7 @@ class LoomGGUFExporter:
         payload_hash_to_name = {}
         alias_names = []
         alias_targets = []
+        per_channel_names = []
 
         # Write weights / tensors. Everything here is already in its on-disk form -- see
         # `pack_weights`, which is where the dtype normalisation, the fold and the quantization moved
@@ -3475,6 +3509,8 @@ class LoomGGUFExporter:
             # lets it default to the quantized array's own (correct) byte-shape.
             if raw_dtype is not None:
                 w.add_tensor(name, array_to_write, raw_dtype=raw_dtype)
+                if name in packing.per_channel:
+                    per_channel_names.append(name)
             else:
                 w.add_tensor(name, array_to_write)
 
@@ -3482,6 +3518,8 @@ class LoomGGUFExporter:
         # model with no duplicate payloads -- GgufModel::load treats that as zero aliases, not an error.
         w.add_array("loom.tensor_alias.names", alias_names)
         w.add_array("loom.tensor_alias.targets", alias_targets)
+        if self.quantize and is_per_channel(self.quantize):
+            w.add_array(PER_CHANNEL_KEY, per_channel_names)
 
         w.write_header_to_file()
         w.write_kv_data_to_file()
@@ -3493,7 +3531,7 @@ class LoomGGUFExporter:
             # Summed over every packing that contributed, which for a multi-phase export is one per
             # phase: each packed its own weights as it converted, so no single call here saw them all.
             from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
-            block_size, _ = GGML_QUANT_SIZES[GGMLQuantizationType[self.quantize]]
+            block_size, _ = GGML_QUANT_SIZES[GGMLQuantizationType[ggml_type_name(self.quantize)]]
             n_quantized = packing.n_quantized
             n_declined_shape = packing.n_declined_shape
             float_bytes_total = packing.float_bytes_total
@@ -3505,8 +3543,11 @@ class LoomGGUFExporter:
             if packing.n_folded:
                 suffix += (f", {packing.n_folded} conv kernel(s) folded to [IC*K, OC] to align their "
                            f"blocks")
-            if self.keep_float:
-                suffix += f", kept F32 by the family: {', '.join(sorted(self.keep_float))}"
+            # From what was written, not from the request: Retro-088's export said "kept F32" over a
+            # tensor its phases had already quantized.
+            kept = sorted(n for n in self.keep_float if n in packing.raw_dtypes and packing.raw_dtypes[n] is None)
+            if kept:
+                suffix += f", kept F32 by the family: {', '.join(kept)}"
             # A quantization that covered nothing is the failure mode this reporting exists for: the
             # export succeeds, the file is byte-for-byte the size it was, and nothing said so. What
             # remains ineligible after `PACKED_WEIGHT_FIRST_OPS` gained the convolutions is a weight

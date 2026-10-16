@@ -393,6 +393,7 @@ class MultiPhase(Decomposition):
         # that stays correct for a family whose answer ever needs more than an attribute.
         out_kwargs = dict(config.resolved_backend_kwargs())
         quantize = out_kwargs.get("quantize")
+        keep_float = tuple(out_kwargs.get("keep_float") or ())
 
         with contextlib.ExitStack() as scope:
             if isolate:
@@ -426,11 +427,12 @@ class MultiPhase(Decomposition):
                 if isolate:
                     result = convert_phase_isolated(
                         blob_path, index, spill_root / f"phase-{index}", quantize=quantize,
+                        keep_float=keep_float,
                     )
                     print(f"  {phase.name}: read back {len(result.weights)} packed weight(s) from its "
                           f"worker's spill{_rss_note()}")
                 else:
-                    result = convert_phase(phase, quantize=quantize)
+                    result = convert_phase(phase, quantize=quantize, keep_float=keep_float)
                 offset_cached_attention_layers(result.topologies,
                                                len(fused_geometry.get("attention", [])))
                 phase_topologies.update(result.topologies)
@@ -479,6 +481,13 @@ class MultiPhase(Decomposition):
         # Resolved by `export` while the model was still loaded; see there.
         if capacities:
             out_kwargs["kv_cache_size"] = capacities.pop()
+        # Every keep_float name must be a weight some phase held: the phases applied them (see
+        # `convert_phase`), and a name none of them had is a typo the output exporter can no longer see.
+        keep_float = set(out_kwargs.get("keep_float") or ())
+        held = set().union(*(weights for _, _, weights in phase_outputs)) if phase_outputs else set()
+        if out_kwargs.get("quantize") and keep_float - held:
+            raise ValueError(f"keep_float names {sorted(keep_float - held)}, which no phase of this export "
+                             f"writes; its weights are named e.g. {sorted(held)[:6]}.")
         out_exporter = LoomGGUFExporter(
             None, output_path=config.output_path, architecture=config.architecture, **out_kwargs,
         )
