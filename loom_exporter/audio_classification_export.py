@@ -980,8 +980,17 @@ class SileroVadExportConfig(BaseMultiPhaseModelExportConfig):
         return audio_contract(self.output, self.sample_rate, self.labels, self.frame_rate,
                               self.frame_offset)
 
+    #: Kept F32 at every `--quantize`: the front end (the STFT basis and its convolutions) and the head.
+    #: Measured on jfk against the F32 export (ADR-079 P4.33): every eligible weight at Q8_0 moved a
+    #: speech probability by 0.21 and flipped frames at 0.5 and 0.35, and at Q8_0_PC by 0.16. One group at
+    #: a time, per channel: the convolutions 0.16, the STFT basis 0.093 (a flip at each threshold), the
+    #: head 0.021. The LSTM's two gate matrices alone moved it 0.0155 with no flip, so they are what a
+    #: quantized Silero quantizes -- and they are its one-column mul_mats, the class int8 is for.
+    KEEP_FLOAT = ("frontend.model_stft_re", "frontend.model_stft_im", "frontend.model_conv1_w",
+                  "frontend.model_conv2_w", "frontend.model_conv3_w", "head.model_final_w")
+
     def backend_kwargs(self) -> dict:
-        return dict(hparams=self.hparams())
+        return dict(hparams=self.hparams(), keep_float=self.KEEP_FLOAT)
 
 
 def _silero_frames(n_samples: int) -> int:

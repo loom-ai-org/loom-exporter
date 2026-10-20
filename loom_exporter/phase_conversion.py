@@ -55,8 +55,13 @@ class PhaseResult:
     geometry: Dict[str, list] = field(default_factory=dict)
 
 
-def convert_phase(phase, quantize: Optional[str] = None) -> PhaseResult:
+def convert_phase(phase, quantize: Optional[str] = None, keep_float=()) -> PhaseResult:
     """Trace, convert, lower and pack one phase, then release everything the conversion needed.
+
+    `keep_float` is the family's (`backend_kwargs()['keep_float']`): the names among them this phase holds
+    stay F32. A phase packs its own weights, so a name that reached only the output exporter would find
+    its weight already quantized (ADR-079 P4.33 found Silero's that way); `MultiPhase.export` checks that
+    every name was held by some phase.
 
     The release is P5.0's first change and the comment below it is the whole finding: the traced
     module, the wrapper and the converted MIL program are the SAME arrays, so they have to die
@@ -82,7 +87,7 @@ def convert_phase(phase, quantize: Optional[str] = None) -> PhaseResult:
         # a cell's `MUL_MAT` nodes make its gate weights quantization-eligible, and they were eligible
         # before this split because the merged topologies included the cells. Packing them here is
         # what keeps that true now that the merge sees bytes rather than arrays.
-        packer = LoomGGUFExporter(None, quantize=quantize)
+        packer = LoomGGUFExporter(None, quantize=quantize, keep_float=[n for n in keep_float if n in weights])
         packer.topologies = cells
         packer.weights = weights
         packing = packer.pack_weights()
@@ -147,6 +152,7 @@ def convert_phase(phase, quantize: Optional[str] = None) -> PhaseResult:
         topologies[alias] = dict(topo, kv_cache_scope="private")
 
     exporter.topologies = topologies
+    exporter.keep_float = frozenset(n for n in keep_float if n in exporter.weights)
     packing = exporter.pack_weights()
     weights = exporter.weights
     geometry = exporter.fused_geometry()
