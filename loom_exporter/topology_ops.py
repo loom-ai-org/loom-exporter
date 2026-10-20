@@ -580,6 +580,32 @@ def _op_loom_group_norm(self, op, ctx):
                   "attrs": {"shape": [-1] + x_shape[1:]}})
 
 
+@topology_rule('loom_stft')
+def _op_loom_stft(self, op, ctx):
+    # One STFT node with two outputs (ADR-080), from torch_patches.py's item 5. MIL's [b, L] signal is
+    # ne=[L, b] and its two [b, bins, frames] outputs are ne=[frames, bins, b], which is what op_stft
+    # reads and writes -- the layout the two CONV_1D it replaces produced.
+    nodes, resolve = ctx.nodes, ctx.resolve
+    nodes.append({"op": "STFT",
+                  "inputs": [resolve(self.safe_name(op.inputs[k].name)) for k in ("x", "window")],
+                  "outputs": [self.safe_name(v.name) for v in op.outputs],
+                  "attrs": {"n_fft": int(static_scalar(op.inputs["n_fft"])),
+                            "hop": int(static_scalar(op.inputs["hop"]))}})
+
+
+@topology_rule('loom_istft')
+def _op_loom_istft(self, op, ctx):
+    # One ISTFT node (ADR-080), from istft.py's `loom::istft`. No layout work: MIL's [b, bins, frames]
+    # is ne=[frames, bins, b], which is what op_istft reads, and its [b, samples] output is ne=[samples, b].
+    nodes, resolve = ctx.nodes, ctx.resolve
+    out = self.safe_name(op.outputs[0].name)
+    ins = [resolve(self.safe_name(op.inputs[k].name)) for k in ("real", "imag", "window")]
+    nodes.append({"op": "ISTFT", "inputs": ins, "outputs": [out],
+                  "attrs": {"n_fft": int(static_scalar(op.inputs["n_fft"])),
+                            "hop": int(static_scalar(op.inputs["hop"])),
+                            "center": int(static_scalar(op.inputs["center"]))}})
+
+
 @topology_rule('loom_short_conv')
 def _op_loom_short_conv(self, op, ctx):
     # One SHORT_CONV node -- the engine's stateful causal depthwise convolution, and the ONLY node type
