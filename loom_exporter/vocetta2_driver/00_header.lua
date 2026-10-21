@@ -1,0 +1,12 @@
+-- Vocetta2 (vocetta2_export.py): the duration net, then the acoustic net to mel-100 and a noise-fed
+-- ConvNeXt/iSTFT decoder as one graph, then a DC blocker here.
+--
+-- inputs: tokens (phoneme ids over the 62-symbol misaki-normalised table, `[1, p1, ..., pn, 2]` -- the
+-- text door's own vocabulary builds exactly that), and optionally length_scale (the duration multiplier,
+-- larger is slower; default 1.0, which is upstream's only setting), noise_scale (default 0.0, upstream's
+-- default and its best-measured rendering) and seed (which noise, when noise_scale is not 0).
+-- Returns the waveform at `loom.sample_rate` (24 kHz), 256 samples per frame.
+--
+-- Every per-token and per-frame feature below is computed as upstream's torch code computes it, in
+-- float32 (`to_f32`) where it does: a duration is `round` of a float32 `exp`, and a frame count is the
+-- sum of those.
