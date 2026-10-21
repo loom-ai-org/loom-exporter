@@ -65,13 +65,33 @@ def _declared_outputs(topo: dict) -> set:
     return set()
 
 
+def _rebound_names(topo: dict) -> set:
+    """The names the topology defines more than once (a graph input counts as a definition).
+
+    A topology is not single-assignment: a name may be written again further down, and the engine
+    reads whichever definition came last. Chatterbox's estimator writes `transpose_0 = PERMUTE(input_7)`,
+    pads it, and writes `transpose_0` again; merging a later `transpose_1 = PERMUTE(input_7)` into the
+    first one redirected the residual conv to the PADDED tensor (ADD: 366 vs 364 frames)."""
+    count: Dict[str, int] = {}
+    names = [i["name"] if isinstance(i, dict) else i for i in topo.get("inputs", [])]
+    names += [o for node in topo.get("nodes", []) for o in _outputs(node)]
+    for n in names:
+        count[n] = count.get(n, 0) + 1
+    return {n for n, c in count.items() if c > 1}
+
+
 def eliminate_common_subexpressions(topo: dict) -> Tuple[dict, int]:
     """`topo` with every repeated pure node merged into its first occurrence, and how many were removed.
 
     One forward pass suffices: nodes are in dependency order, and each node's inputs are rewritten to
     the surviving names before its key is taken, so a whole duplicated chain collapses link by link.
+    A node that writes a name the topology defines twice neither merges nor survives a merge, since its
+    name would not mean the same tensor at every later use; and an input is keyed by which definition
+    of it a node reads, so two nodes on the same name either side of a rewrite stay apart.
     The input dict is not modified."""
     keep_names = _declared_outputs(topo)
+    rebound = _rebound_names(topo)
+    version: Dict[str, int] = {}
     rename: Dict[str, str] = {}
     seen: Dict[tuple, List[str]] = {}
     nodes = []
@@ -81,9 +101,10 @@ def eliminate_common_subexpressions(topo: dict) -> Tuple[dict, int]:
         if "inputs" in node:
             node["inputs"] = [rename.get(i, i) if isinstance(i, str) else i for i in node["inputs"]]
         outs = _outputs(node)
-        if node.get("op") in PURE_OPS and outs:
+        if node.get("op") in PURE_OPS and outs and not (set(outs) & rebound):
             rest = {k: v for k, v in node.items() if k not in ("op", "inputs", "outputs", "output")}
-            key = (node["op"], json.dumps(node.get("inputs", []), cls=_Encoder),
+            reads = [[i, version.get(i, 0)] if isinstance(i, str) else i for i in node.get("inputs", [])]
+            key = (node["op"], json.dumps(reads, cls=_Encoder),
                    json.dumps(rest, sort_keys=True, cls=_Encoder), len(outs))
             first = seen.get(key)
             if first is not None and not (set(outs) & keep_names):
@@ -93,6 +114,8 @@ def eliminate_common_subexpressions(topo: dict) -> Tuple[dict, int]:
                 continue
             if first is None:
                 seen[key] = outs
+        for o in outs:
+            version[o] = version.get(o, 0) + 1
         nodes.append(node)
     out = dict(topo)
     out["nodes"] = nodes
