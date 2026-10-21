@@ -66,7 +66,7 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-@pytest.mark.parametrize("quantize", [None, "Q8_0"])
+@pytest.mark.parametrize("quantize", [None, "Q8_0", "Q8_0_PC"])
 def test_isolating_the_phases_writes_the_identical_file(tmp_path, quantize):
     """The whole claim. Three phases converted in three child processes, each loading the checkpoint
     itself and spilling its packed weights to disk, against three converted in this one -- and the two
@@ -88,11 +88,14 @@ def test_isolating_the_phases_writes_the_identical_file(tmp_path, quantize):
     )
     # A gate that cannot fail proves nothing: at Q8_0 SOMETHING has to have been quantized, or both
     # arms wrote the same F32 file and the identity above is about nothing.
-    types = {t.tensor_type.name for t in GGUFReader(str(isolated)).tensors}
+    reader = GGUFReader(str(isolated))
+    types = {t.tensor_type.name for t in reader.tensors}
     if quantize:
         assert "Q8_0" in types, f"nothing was quantized, so this arm is an F32 arm: {sorted(types)}"
     else:
         assert types <= {"F32", "I32"}, sorted(types)
+    if quantize == "Q8_0_PC":   # the per-channel record crossed the spill (ADR-079 P4.33)
+        assert len(reader.fields["loom.quantize.per_channel"].data) > 0
 
 
 def test_the_env_var_turns_isolation_on_and_the_field_overrides_it(tmp_path, monkeypatch):
@@ -238,3 +241,31 @@ def test_the_mil_op_name_counter_is_process_global():
     finally:
         Builder.name_count.clear()
         Builder.name_count.update(before)
+
+
+@pytest.mark.parametrize("isolate", [False, True])
+def test_a_family_keep_float_reaches_every_phase(tmp_path, monkeypatch, isolate):
+    """A multi-phase export packs each phase's weights as the phase converts, so a `keep_float` that
+    reached only the output exporter found its weights already quantized: Silero's front end went to
+    Q8_0 that way (ADR-079 P4.33). The names now reach each phase's packer, in-process and in a worker,
+    and one no phase holds still raises."""
+    pytest.importorskip("coremltools")
+    from gguf import GGUFReader
+
+    checkpoint = aligned_t5(tmp_path)
+    plain = _export(checkpoint, tmp_path / "all.gguf", quantize="Q8_0", isolate_phases=isolate)
+    quantized = sorted(t.name for t in GGUFReader(str(plain)).tensors if t.tensor_type.name == "Q8_0")
+    assert len(quantized) >= 2, quantized
+    keep = quantized[0]
+
+    base = Text2TextT5ExportConfig.backend_kwargs
+    monkeypatch.setattr(Text2TextT5ExportConfig, "backend_kwargs", lambda self: dict(base(self), keep_float=(keep,)))
+    kept = _export(checkpoint, tmp_path / "kept.gguf", quantize="Q8_0", isolate_phases=isolate)
+    types = {t.name: t.tensor_type.name for t in GGUFReader(str(kept)).tensors}
+    assert types[keep] == "F32"
+    assert all(types[n] == "Q8_0" for n in quantized[1:])
+
+    monkeypatch.setattr(Text2TextT5ExportConfig, "backend_kwargs",
+                        lambda self: dict(base(self), keep_float=("no.such_weight",)))
+    with pytest.raises(ValueError, match="no.such_weight"):
+        _export(checkpoint, tmp_path / "typo.gguf", quantize="Q8_0", isolate_phases=isolate)
