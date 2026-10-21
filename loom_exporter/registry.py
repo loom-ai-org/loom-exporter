@@ -196,6 +196,7 @@ _FAMILY_MODULES = (
     "moonshine_export",
     "moonshine_v1_export",
     "sanotts_export",
+    "vocetta2_export",
     "qwen3_asr_export",
     "granite_speech_export",
     "kokoro_export",

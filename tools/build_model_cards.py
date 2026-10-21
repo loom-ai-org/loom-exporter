@@ -188,6 +188,36 @@ class ModelCard:
 # checkpoint's own upstream README.md (see this repo's `/home/flavio/Dev/models/*/README.md` where one
 # was downloaded alongside the weights) or, where the checkpoint itself carries no README, off the
 # upstream HF repo directly.
+# The lexicon every Vocetta2 repo ships for the text door: sanoTTS's misaki file (us_gold over us_silver,
+# each word's default reading), the dictionaries Vocetta2's own front end bundles too.
+_VOCETTA2_LEXICON = [("lexicons/en_US-misaki.tsv", "sanotts-lexicons/en_US-misaki.tsv"),
+                     ("lexicons/LICENSE.misaki", "sanotts-lexicons/LICENSE.misaki")]
+_VOCETTA2_EXTRA_FILES = [
+    "`lexicons/en_US-misaki.tsv` -- [hexgrad/misaki](https://github.com/hexgrad/misaki)'s US English "
+    "pronunciation dictionaries (`us_gold.json` over `us_silver.json`, each word's default reading, the "
+    "same dictionaries upstream's front end uses), Apache-2.0 (`lexicons/LICENSE.misaki`), as "
+    "`word<TAB>ipa` -- the shape `loom.phonemizers.set_lexicon` reads.",
+]
+
+
+def _vocetta2_limitations(upstream_wer: str, door_wer: str) -> str:
+    return (
+        "**The text door is not upstream's front end.** Through `text2speech.infer(text)` with the bundled "
+        f"lexicon, this model scored {door_wer} word error rate on 30 LibriSpeech sentences (Whisper small) "
+        f"against {upstream_wer} with upstream's own G2P (dictionaries plus a neural fallback for unknown "
+        "words). Without the lexicon, English is far worse. For upstream's quality, phonemize with "
+        "upstream's `microtts.g2p` and pass `phonemes=`.\n\n"
+        "**At most 207 phoneme symbols per call** (upstream's own limit, BOS and EOS included); split "
+        "longer text at its sentences. English only, one voice.\n\n"
+        "**Upstream's 2400-frame cut is not reproduced.** Upstream truncates the spectrogram at 2400 frames "
+        "(25.6 s); this export synthesises every frame the durations ask for. Below 2400 frames, which "
+        "upstream's own durations essentially always are, the audio is upstream's.\n\n"
+        "The decoder is fed zero noise by default, as upstream renders it. `noise_scale=` (with `seed=`) "
+        "adds Gaussian noise, which upstream measured as worse on every metric; `length_scale=` slows or "
+        "speeds the speech."
+    )
+
+
 CATALOG = [
     ModelCard(
         slug="qwen3-0.6b-base", checkpoint=Path("qwen3-0.6b-base"),
@@ -621,6 +651,63 @@ CATALOG = [
             "\"sibilant injection\" (applied by its dashboard and Arduino runtime, not by its pip "
             "package) is not reproduced."
         ),
+    ),
+    # VantoraLabs/Vocetta2-{276k,500k,1m}: sanoTTS's nano line re-trained, MIT, torch state_dicts
+    # (loom_exporter/vocetta2_export.py). Measured 2026-10-21 on the released rc18 wheel, six sentences
+    # through upstream's own ids: every waveform upstream's length, max |diff| 1.3e-5 / 3.1e-5 / 1.8e-4 (the
+    # 1m's worst is upstream's own f32-vs-f64 spread, 1.5e-4). Door WER: 30 LibriSpeech references, Whisper
+    # small, upstream's G2P vs `text2speech.infer(text)` with the bundled lexicon.
+    ModelCard(
+        slug="vocetta2-276k", checkpoint=Path("vocetta2-276k"),
+        export_task="text-to-speech", export_model="vocetta2", task_type="text-to-speech",
+        snippet="text-to-speech-lexicon",
+        base_repo="VantoraLabs/Vocetta2-276k", license_id="mit", language=["en"],
+        sample_rate=24000,  # config.json's `sample_rate`
+        title="Vocetta2 276K",
+        summary="VantoraLabs' Vocetta2 276K: a complete English text-to-speech model in 276,765 parameters "
+                "-- a duration net, an acoustic net to a mel spectrogram and a ConvNeXt/iSTFT decoder at "
+                "24 kHz -- exported for loom.cpp.",
+        copied_files=_VOCETTA2_LEXICON,
+        extra_files=_VOCETTA2_EXTRA_FILES,
+        limitations=_vocetta2_limitations(upstream_wer="7.7%", door_wer="11.9%"),
+    ),
+    ModelCard(
+        slug="vocetta2-500k", checkpoint=Path("vocetta2-500k"),
+        export_task="text-to-speech", export_model="vocetta2", task_type="text-to-speech",
+        snippet="text-to-speech-lexicon",
+        base_repo="VantoraLabs/Vocetta2-500k", license_id="mit", language=["en"],
+        sample_rate=24000,  # config.json's `sample_rate`
+        title="Vocetta2 500K",
+        # Q8_0_PC: 13 tensors (the acoustic net's width-64 convs) and 0.7 MB; the 276k's and 1m's widths
+        # (31/62/186, 72/130/337) hold no row a multiple of 32, so their Q8_0_PC export is byte-identical
+        # to F32 and is not shipped. Bar (user, 2026-10-21): Whisper-small WER <= F32 + 1 pp on 60
+        # syntheses (30 LibriSpeech references through upstream's ids, 30 through the door): F32 55/470,
+        # Q8_0_PC 56/470.
+        variants=[
+            ("F32", "full precision, 2.0 MB; upstream's waveform to 3.1e-5."),
+            ("Q8_0_PC", "1.3 MB: the acoustic net's convolutions in per-channel int8. Whisper's word error "
+                        "rate on 60 syntheses is 11.9% against F32's 11.7%."),
+        ],
+        summary="VantoraLabs' Vocetta2 500K: a complete English text-to-speech model in 499,528 parameters "
+                "-- a duration net, an acoustic net to a mel spectrogram and a ConvNeXt/iSTFT decoder at "
+                "24 kHz -- exported for loom.cpp.",
+        copied_files=_VOCETTA2_LEXICON,
+        extra_files=_VOCETTA2_EXTRA_FILES,
+        limitations=_vocetta2_limitations(upstream_wer="7.7%", door_wer="15.7%"),
+    ),
+    ModelCard(
+        slug="vocetta2-1m", checkpoint=Path("vocetta2-1m"),
+        export_task="text-to-speech", export_model="vocetta2", task_type="text-to-speech",
+        snippet="text-to-speech-lexicon",
+        base_repo="VantoraLabs/Vocetta2-1m", license_id="mit", language=["en"],
+        sample_rate=24000,  # config.json's `sample_rate`
+        title="Vocetta2 1M",
+        summary="VantoraLabs' Vocetta2 1M: a complete English text-to-speech model in 1,031,754 parameters "
+                "-- a duration net, an acoustic net to a mel spectrogram and a ConvNeXt/iSTFT decoder at "
+                "24 kHz -- exported for loom.cpp.",
+        copied_files=_VOCETTA2_LEXICON,
+        extra_files=_VOCETTA2_EXTRA_FILES,
+        limitations=_vocetta2_limitations(upstream_wer="7.2%", door_wer="9.8%"),
     ),
     ModelCard(
         slug="granite-speech-4.0-1b", checkpoint=Path("granite-speech-4.0.1b"),
@@ -2049,6 +2136,21 @@ audio.save("hello.wav")
 
 # Full quality: phonemes from your own G2P, in the voice's own conventions (espeak's for the piperlite
 # voices, misaki's for heart and heart-nano), are encoded as given.
+# audio = model.text2speech.infer(phonemes="...")
+""",
+    # A phoneme-input model with a door: its own repo ships the lexicon the door reads (Vocetta2).
+    "text-to-speech-lexicon": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
+
+# The built-in text door: orthography2ipa, plus the US English pronunciation lexicon that ships in this
+# repo (hexgrad/misaki's, Apache-2.0). The model declares the IPA conventions it was trained in and the
+# door rewrites the G2P's output to them before encoding.
+loom.phonemizers.set_lexicon("hf://{repo_id}/lexicons/en_US-misaki.tsv", language="en-US")
+audio = model.text2speech.infer("hello world")
+audio.save("hello.wav")
+
+# Full quality: misaki-style IPA from your own G2P is encoded as given.
 # audio = model.text2speech.infer(phonemes="...")
 """,
     "automatic-speech-recognition-multilingual": """import loom
