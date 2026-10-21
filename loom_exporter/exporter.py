@@ -225,6 +225,8 @@ class LoomGGUFExporter:
         "loom_spline": "RQ_SPLINE_INVERSE",
         "loom_rope": "ROPE",
         "loom_group_norm": "GROUP_NORM",
+        "loom_istft": "ISTFT",
+        "loom_stft": "STFT",
     }
 
     def __init__(self, program, **kwargs):
@@ -772,6 +774,34 @@ class LoomGGUFExporter:
             if scale == 1.0:
                 return in_expr
             return sympy.floor(in_expr * as_expr(scale))
+
+        if op.op_type == "loom_stft":
+            # torch_patches.py item 5 (ADR-080): the frames of a valid-mode window over the padded
+            # signal, as the strided convolution it replaces counted them.
+            if torch_axis == 0:
+                return as_expr(1)
+            if torch_axis == 1:
+                return None
+            x = op.inputs.get("x")
+            in_expr = self._infer_dynamic_dim_expr(x, 1, _seen) if x is not None else None
+            if in_expr is None:
+                return None
+            n_fft, hop = int(op.inputs["n_fft"].val), int(op.inputs["hop"].val)
+            return sympy.floor((in_expr - n_fft) / as_expr(hop)) + 1
+
+        if op.op_type == "loom_istft":
+            # istft.py's ISTFT (ADR-080): every frame becomes `hop` samples, plus one window's tail,
+            # less a window when it is centered -- the same length the conv_transposes it replaces gave
+            # and their center crop then took.
+            if torch_axis == 0:
+                return as_expr(1)
+            real = op.inputs.get("real")
+            in_expr = self._infer_dynamic_dim_expr(real, 2, _seen) if real is not None else None
+            if in_expr is None:
+                return None
+            n_fft, hop = int(op.inputs["n_fft"].val), int(op.inputs["hop"].val)
+            crop = n_fft if int(op.inputs["center"].val) else 0
+            return (in_expr - 1) * hop + n_fft - crop
 
         if op.op_type == "conv_transpose":
             # Mirrors the "conv" case just above, using ConvTranspose1d/2d's own inverse length

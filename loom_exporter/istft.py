@@ -26,9 +26,63 @@ third `conv_transpose1d` over an all-ones tensor shaped by the real (dynamic) nu
 natural, traceable way to get the same value for an arbitrary sequence length, matching this whole
 pipeline's "exactly one dynamic axis, computed via ops, never hand-derived per input" convention.
 """
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
+
+from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.frontend.torch import register_torch_op
+from coremltools.converters.mil.frontend.torch.ops import _get_inputs
+
+from . import dialect  # noqa: F401  registers the "loom_istft" MIL op (mb.loom_istft)
+
+
+# ---------------------------------------------------------------------------------------------------
+# ADR-080: the engine's ISTFT primitive, an inverse real FFT per frame, in place of the convolutions.
+#
+# The three `conv_transpose1d` below cost N MACs per bin per frame. On the Pi Zero that was heart's
+# 2.23 s of a 4.96 s synthesis, and the FFT does the same in 0.18 s (loom.cpp `scripts/bench54.cpp`).
+# A TRACE records one opaque `loom::istft` call, which becomes one `ISTFT` node; an EAGER call (the
+# fixtures, every reference check) never reaches it and keeps the convolutions bit for bit.
+# `LOOM_EXPORT_NO_FFT=1` traces the convolutions instead, for an A/B or an engine without ISTFT.
+
+
+@torch.library.custom_op("loom::istft", mutates_args=())
+def istft_op(real: Tensor, imag: Tensor, window: Tensor, n_fft: int, hop: int, center: bool) -> Tensor:
+    """What the engine's ISTFT computes, in torch: the windowed inverse real FFT of every frame,
+    overlap-added and divided by the overlap-added window square. Only a trace calls this, and only
+    for its shape -- but it is the real thing, so a trace that ever reads the value reads the truth."""
+    frames = torch.fft.irfft(torch.complex(real.double(), imag.double()).transpose(1, 2), n=n_fft)
+    frames = frames * window.double()                             # (batch, n_frames, n_fft)
+    n_frames = real.shape[-1]
+    out_len = (n_frames - 1) * hop + n_fft
+    sig = F.fold(frames.transpose(1, 2), (1, out_len), (1, n_fft), stride=(1, hop)).reshape(real.shape[0], out_len)
+    wsq = (window.double() ** 2).view(1, n_fft, 1).expand(1, n_fft, n_frames)
+    wsum = F.fold(wsq, (1, out_len), (1, n_fft), stride=(1, hop)).reshape(1, out_len)
+    out = (sig / wsum).to(real.dtype)
+    if center:
+        out = out[:, n_fft // 2:out_len - n_fft // 2]
+    return out
+
+
+@istft_op.register_fake
+def _(real, imag, window, n_fft, hop, center):
+    out_len = (real.shape[-1] - 1) * hop + n_fft - (n_fft if center else 0)
+    return real.new_empty((real.shape[0], out_len))
+
+
+@register_torch_op(torch_alias=["loom::istft"])
+def _convert_loom_istft(context, node):
+    real, imag, window, n_fft, hop, center = _get_inputs(context, node, expected=6)
+    context.add(mb.loom_istft(real=real, imag=imag, window=window, n_fft=n_fft, hop=hop,
+                              center=mb.cast(x=center, dtype="int32"), name=node.name))
+
+
+def _use_fft() -> bool:
+    return os.environ.get("LOOM_EXPORT_NO_FFT", "") in ("", "0")
 
 
 def _periodic_hann(n_fft: int) -> torch.Tensor:
@@ -72,8 +126,11 @@ class ISTFT(nn.Module):
         self.register_buffer("cos_synth", cos_synth)
         self.register_buffer("neg_sin_synth", neg_sin_synth)
         self.register_buffer("window_sq", (window ** 2).to(torch.float32).view(1, 1, n_fft))
+        self.register_buffer("window", window.to(torch.float32), persistent=False)
 
     def forward(self, real: torch.Tensor, imag: torch.Tensor) -> torch.Tensor:
+        if torch.jit.is_tracing() and _use_fft():
+            return torch.ops.loom.istft(real, imag, self.window, self.n_fft, self.hop_length, self.center)
         synth_real = F.conv_transpose1d(real, self.cos_synth, stride=self.hop_length)
         synth_imag = F.conv_transpose1d(imag, self.neg_sin_synth, stride=self.hop_length)
         combined = synth_real + synth_imag  # (batch, 1, out_len)

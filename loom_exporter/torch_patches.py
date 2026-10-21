@@ -131,3 +131,46 @@ def apply_torch_frontend_patches() -> None:
                 mb.const(val=np.sin(angle).astype(np.float32)))
 
     _complex._calculate_dft_matrix = _exact_dft_matrix
+
+    # 5. ... and in the common case it is not a basis at all: one `loom_stft`, the engine's STFT on an
+    #    FFT (ADR-080), in place of the two convolutions. The basis convs cost N MACs per bin per frame,
+    #    and on the Pi Zero Citrinet-256-ls's took 786 ms where the FFT takes a third of that.
+    #
+    #    Only for what the engine's op computes: a real input, the one-sided half, no normalization,
+    #    and a window known at export time. Anything else -- and every STFT under LOOM_EXPORT_NO_FFT=1
+    #    -- keeps coremltools' convolutions, with item 4's basis.
+    import os
+    from coremltools.converters.mil.mil import types as _types
+    from . import dialect  # noqa: F401  registers mb.loom_stft
+    _original_stft = _complex._stft
+
+    def _fft_stft(input_real, input_imaginary, n_fft, hop_length, win_length, window, normalized, onesided):
+        def const(v):
+            return None if v is None else getattr(v, "val", None)
+        n, hop = const(n_fft), const(hop_length)
+        if hop_length is None and n is not None:
+            hop = int(n) // 4
+        win = None if window is None else const(window)
+        fast = (os.environ.get("LOOM_EXPORT_NO_FFT", "") in ("", "0")
+                and input_imaginary is None and onesided is not None and bool(const(onesided))
+                and not (normalized is not None and bool(const(normalized)))
+                and n is not None and hop is not None and int(n) % 2 == 0
+                and (window is None or win is not None)
+                and input_real.rank in (1, 2) and _types.is_float(input_real.dtype))
+        if not fast:
+            return _original_stft(input_real, input_imaginary, n_fft, hop_length, win_length, window,
+                                  normalized, onesided)
+        n, hop = int(np.asarray(n).reshape(-1)[0]), int(np.asarray(hop).reshape(-1)[0])
+        wl = n if win_length is None else int(np.asarray(const(win_length)).reshape(-1)[0])
+        core = np.ones(wl, np.float32) if win is None else np.asarray(win, np.float32).reshape(-1)
+        full = np.zeros(n, np.float32)
+        left = (n - wl) // 2                     # torch.stft (and `_stft` above) centre a short window
+        full[left:left + wl] = core
+        x = input_real if input_real.rank == 2 else mb.expand_dims(x=input_real, axes=(0,))
+        real, imag = mb.loom_stft(x=x, window=full, n_fft=np.int32(n), hop=np.int32(hop))
+        if input_real.rank == 1:
+            real = mb.squeeze(x=real, axes=(0,))
+            imag = mb.squeeze(x=imag, axes=(0,))
+        return real, imag
+
+    _complex._stft = _fft_stft

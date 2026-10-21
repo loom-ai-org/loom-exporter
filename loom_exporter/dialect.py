@@ -391,3 +391,61 @@ class loom_short_conv(Operation):
 # fuse_loom_attention`), with every other MIL->MIL rewrite this exporter runs. It was a `pass`-bodied
 # `FuseLoomAttention` stub here for the whole of P3/P4.0 -- see KV-CACHE.md §1.3, which measured what
 # that cost: 28 SOFTMAX and zero ATTENTION nodes in a MIL-exported Qwen3, hence no reachable KV cache.
+
+@register_op(namespace="loom")
+class loom_istft(Operation):
+    """
+    The inverse STFT as one op (ADR-080), lowered by `topology_ops.py` to the engine's `ISTFT` primitive:
+    an inverse real FFT per frame, overlap-added and normalized by the overlap-added window square.
+    Produced by `istft.py`'s `loom::istft` custom op, which `ISTFT.forward` calls under a trace.
+
+        real, imag  [b, n_fft/2 + 1, n_frames]
+        window      [n_fft]
+        out         [b, (n_frames - 1) * hop + n_fft - (n_fft if center else 0)]
+    """
+    input_spec = InputSpec(
+        real=TensorInputType(type_domain="T"),
+        imag=TensorInputType(type_domain="T"),
+        window=TensorInputType(const=True, type_domain="T"),
+        n_fft=TensorInputType(const=True, type_domain=types.int32),
+        hop=TensorInputType(const=True, type_domain=types.int32),
+        center=TensorInputType(const=True, type_domain=types.int32),
+    )
+
+    type_domains = {
+        "T": (types.fp16, types.fp32),
+    }
+
+    def type_inference(self):
+        n_fft, hop = int(self.n_fft.val), int(self.hop.val)
+        n_frames = self.real.shape[-1]
+        out_len = (n_frames - 1) * hop + n_fft - (n_fft if int(self.center.val) else 0)
+        return types.tensor(self.real.dtype, (self.real.shape[0], out_len))
+
+@register_op(namespace="loom")
+class loom_stft(Operation):
+    """
+    The forward STFT as one op (ADR-080), lowered by `topology_ops.py` to the engine's `STFT` primitive:
+    a real FFT of every windowed frame. Produced by `torch_patches.py`'s item 5, in place of the two
+    DFT-basis convolutions coremltools' `_stft` builds, and shaped exactly as their outputs were.
+
+        x            [b, L]  (any centre padding is already applied, as it was for the convolutions)
+        window       [n_fft] (a short window already centred in zeros)
+        real, imag   [b, n_fft/2 + 1, (L - n_fft) // hop + 1]
+    """
+    input_spec = InputSpec(
+        x=TensorInputType(type_domain="T"),
+        window=TensorInputType(const=True, type_domain="T"),
+        n_fft=TensorInputType(const=True, type_domain=types.int32),
+        hop=TensorInputType(const=True, type_domain=types.int32),
+    )
+
+    type_domains = {
+        "T": (types.fp16, types.fp32),
+    }
+
+    def type_inference(self):
+        n_fft, hop = int(self.n_fft.val), int(self.hop.val)
+        frames = (self.x.shape[-1] - n_fft) // hop + 1
+        t = types.tensor(self.x.dtype, (self.x.shape[0], n_fft // 2 + 1, frames))
+        return t, t
