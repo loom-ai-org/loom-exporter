@@ -100,10 +100,139 @@ class TestQuantizeNamesAreValidated(unittest.TestCase):
         from gguf import GGMLQuantizationType, quants
 
         from loom_exporter.main_export import quantize_choices
+        from loom_exporter.quant_flavours import ggml_type_name
 
         for name in quantize_choices():
             with self.subTest(qtype=name):
-                quants.quantize(np.zeros((1, 256), dtype=np.float32), GGMLQuantizationType[name])
+                quants.quantize(np.zeros((1, 256), dtype=np.float32),
+                                GGMLQuantizationType[ggml_type_name(name)])
+
+    def test_q8_0_pc_is_offered_and_resolves(self):
+        from loom_exporter.main_export import quantize_choices, validate_quantize
+
+        self.assertIn("Q8_0_PC", quantize_choices())
+        self.assertEqual(validate_quantize("q8_0_pc"), "Q8_0_PC")
+
+
+class TestQ8_0PerChannel(unittest.TestCase):
+    """`Q8_0_PC` (ADR-076): per-channel int8 written as Q8_0 whose blocks share their row's scale."""
+
+    def test_a_row_uniform_input_is_byte_identical_to_q8_0(self):
+        """Every block of each row holds the row's absmax, so a per-block and a per-row scale agree:
+        the two quantizers must then write the same bytes, rounding included."""
+        from gguf import GGMLQuantizationType, quants
+
+        from loom_exporter.quant_flavours import quantize_q8_0_per_channel
+
+        rng = np.random.default_rng(0)
+        w = rng.standard_normal((6, 128)).astype(np.float32)
+        w[:, ::32] = np.abs(w).max(axis=1, keepdims=True)  # each block's first element is the row's absmax
+        self.assertEqual(quantize_q8_0_per_channel(w).tobytes(),
+                         quants.quantize(w, GGMLQuantizationType.Q8_0).tobytes())
+
+    def test_every_block_of_a_row_carries_the_row_scale(self):
+        from gguf import GGMLQuantizationType, quants
+
+        from loom_exporter.quant_flavours import quantize_q8_0_per_channel
+
+        rng = np.random.default_rng(1)
+        w = rng.standard_normal((5, 3, 96)).astype(np.float32) * np.arange(1, 6, dtype=np.float32)[:, None, None]
+        w[2, 1] = 0  # an all-zero row: scale 0, values 0
+        q = quantize_q8_0_per_channel(w)
+        self.assertEqual(q.shape, (5, 3, 96 // 32 * 34))
+        blocks = q.reshape(-1, 3, 34)
+        scales = blocks[:, :, :2].copy().view(np.float16)[..., 0].astype(np.float32)
+        amax = np.abs(w.reshape(-1, 96)).max(axis=1)
+        np.testing.assert_array_equal(scales, np.repeat((amax / 127).astype(np.float16), 3).reshape(-1, 3))
+        values = blocks[:, :, 2:].copy().view(np.int8).astype(np.float32).reshape(-1, 96)
+        self.assertLessEqual(np.abs(values).max(), 127)
+        back = quants.dequantize(q, GGMLQuantizationType.Q8_0).reshape(-1, 96)
+        err = np.abs(back - w.reshape(-1, 96)).max(axis=1)
+        np.testing.assert_array_less(err, amax / 127 * 0.51 + 1e-3 * amax + 1e-30)
+        self.assertTrue(np.all(back[7] == 0))
+
+    def test_the_writer_lists_the_per_channel_tensors(self):
+        from gguf import GGUFReader
+
+        from loom_exporter.exporter import LoomGGUFExporter
+        from loom_exporter.quant_flavours import PER_CHANNEL_KEY
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "q.gguf")
+            exporter = LoomGGUFExporter(None, output_path=out, architecture="test", quantize="Q8_0_PC")
+            exporter.topologies = {"t": {"nodes": [
+                {"op": "MUL_MAT", "inputs": ["w_a", "act"]},
+                {"op": "MUL_MAT", "inputs": ["w_b", "act"]},
+                {"op": "MUL_MAT", "inputs": ["w_twin", "act"]},
+                {"op": "MUL_MAT", "inputs": ["w_odd", "act"]},
+            ]}}
+            rng = np.random.default_rng(2)
+            w_a = rng.standard_normal((4, 64)).astype(np.float32)
+            exporter.weights = {"w_a": w_a, "w_b": w_a * 2, "w_twin": w_a.copy(),
+                                "w_odd": rng.standard_normal((4, 40)).astype(np.float32),
+                                "act": np.ones((1, 64), dtype=np.float32)}
+            exporter.write_gguf("-- driver")
+            reader = GGUFReader(out)
+            types = {t.name: t.tensor_type.name for t in reader.tensors}
+            field = reader.fields[PER_CHANNEL_KEY]
+            listed = sorted(bytes(field.parts[i]).decode() for i in field.data)
+            data_a = np.array(next(t for t in reader.tensors if t.name == "w_a").data).reshape(4, 2, 34)
+        scales = data_a[:, :, :2].copy().view(np.float16)[..., 0]
+        np.testing.assert_array_equal(scales[:, 0], scales[:, 1], "the writer must use the per-row quantizer")
+        # w_twin aliases w_a (same payload), so only the canonical name is a tensor and is listed;
+        # w_odd's rows are not block-aligned, so it stays F32 and is not listed.
+        self.assertEqual(listed, ["w_a", "w_b"])
+        self.assertEqual(types["w_a"], "Q8_0")
+        self.assertEqual(types["w_odd"], "F32")
+        self.assertNotIn("w_twin", types)
+
+    def test_only_what_an_int8_kernel_reads_is_per_channel(self):
+        """A k = 3 convolution's kernel is ordinary block Q8_0 and unlisted; a pointwise one and a MUL_MAT
+        weight are per channel and listed (ADR-079 P4.33: per channel cost Moonshine's stem convolutions
+        word errors and bought nothing, since ggml's own convolution computes them)."""
+        from gguf import GGUFReader
+
+        from loom_exporter.exporter import LoomGGUFExporter
+        from loom_exporter.quant_flavours import PER_CHANNEL_KEY
+
+        rng = np.random.default_rng(3)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "q.gguf")
+            exporter = LoomGGUFExporter(None, output_path=out, architecture="test", quantize="Q8_0_PC")
+            exporter.topologies = {"t": {"nodes": [
+                {"op": "MUL_MAT", "inputs": ["w_mm", "act"]},
+                {"op": "CONV_1D", "inputs": ["k_pointwise", "act"], "attrs": {"s0": 1, "p0": 0, "d0": 1, "groups": 1}},
+                {"op": "CONV_1D", "inputs": ["k_three", "act"], "attrs": {"s0": 1, "p0": 1, "d0": 1, "groups": 1}},
+            ]}}
+            exporter.weights = {"w_mm": rng.standard_normal((8, 64)).astype(np.float32),
+                                "k_pointwise": rng.standard_normal((8, 64, 1)).astype(np.float32),
+                                "k_three": rng.standard_normal((8, 32, 3)).astype(np.float32),
+                                "act": np.ones((1, 64), dtype=np.float32)}
+            exporter.write_gguf("-- driver")
+            reader = GGUFReader(out)
+            field = reader.fields[PER_CHANNEL_KEY]
+            listed = sorted(bytes(field.parts[i]).decode() for i in field.data)
+            tensors = {t.name: t for t in reader.tensors}
+            three = np.array(tensors["k_three"].data).reshape(8, -1, 34)
+            types = {n: t.tensor_type.name for n, t in tensors.items()}
+        self.assertEqual(listed, ["k_pointwise", "w_mm"])
+        self.assertEqual(types["k_three"], "Q8_0")
+        scales = three[:, :, :2].copy().view(np.float16)[..., 0]
+        self.assertTrue(np.any(scales != scales[:, :1]), "a k = 3 kernel must be block Q8_0, not row-uniform")
+
+    def test_plain_q8_0_writes_no_key(self):
+        from gguf import GGUFReader
+
+        from loom_exporter.exporter import LoomGGUFExporter
+        from loom_exporter.quant_flavours import PER_CHANNEL_KEY
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = str(Path(tmp) / "q.gguf")
+            exporter = LoomGGUFExporter(None, output_path=out, architecture="test", quantize="Q8_0")
+            exporter.topologies = {"t": {"nodes": [{"op": "MUL_MAT", "inputs": ["w", "act"]}]}}
+            exporter.weights = {"w": np.ones((4, 64), dtype=np.float32), "act": np.ones((1, 64), dtype=np.float32)}
+            exporter.write_gguf("-- driver")
+            self.assertNotIn(PER_CHANNEL_KEY, GGUFReader(out).fields)
 
 
 class TestOnlyFirstOperandsAreEligible(unittest.TestCase):
