@@ -2583,7 +2583,7 @@ def export_args(card: ModelCard) -> List[str]:
     return args
 
 
-def render_readme(card: ModelCard, gguf_name: str) -> str:
+def render_readme(card: ModelCard, gguf_name: str, runtime: Optional[Tuple[str, List[str]]] = None) -> str:
     # A TTS snippet interpolates `sample_rate`, so an entry that never set one would render the literal
     # `sample_rate=None` into a card telling readers to pass it -- a wrong example is worse than no
     # example, and this is the only field where the value cannot be checked against anything on disk.
@@ -2664,6 +2664,15 @@ def render_readme(card: ModelCard, gguf_name: str) -> str:
     needs_phonemes = card.task_type == "text-to-speech" and not card.takes_text
     install_extras = "hub,phonemes" if needs_phonemes else "hub"
     phonemizer_note = PHONEMIZER_NOTE if needs_phonemes else ""
+    # `pip install -U` reaches the newest runtime, but a reader who already has an older one pinned
+    # meets the file before they meet the error; the error names the op and not the release.
+    runtime_note = ""
+    if runtime:
+        version, ops = runtime
+        named = " and ".join(f"`{op}`" for op in ops)
+        runtime_note = (f"\n**Needs `loom-py-rt` {version} or later.** This file uses the engine's {named} "
+                        f"op{'s' if len(ops) > 1 else ''}, new in that release; an older runtime stops "
+                        f"with `unknown op '{ops[0]}'`.\n")
     extra_files_section = "".join(f"- {bullet}\n" for bullet in card.extra_files)
     weights_line = ("Weights are unmodified; this repo packages the same parameters into\n"
                     "loom.cpp's GGUF format.")
@@ -2729,7 +2738,7 @@ Run it with [loom-py]({LOOM_PY_URL}) -- `loom-py-rt` on PyPI:
 ```sh
 pip install -U "loom-py-rt[{install_extras}]"
 ```
-{phonemizer_note}
+{runtime_note}{phonemizer_note}
 ```python
 {render_snippet(USAGE_SNIPPETS[snippet_key(card)], repo_id=repo_id(card), slug=card.slug, sample_rate=card.sample_rate, frame_ms=card.frame_ms, gguf=gguf_name)}```
 {usage_extra_section}
@@ -2799,8 +2808,55 @@ def build_one(card: ModelCard, models_root: Path, output_dir: Path, readme_only:
     if card.frame_ms:
         for name, _ in files:
             check_frame_ms(card, model_dir / name)
-    (model_dir / "README.md").write_text(render_readme(card, gguf_name))
+    runtime = required_runtime([model_dir / name for name, _ in files])
+    (model_dir / "README.md").write_text(render_readme(card, gguf_name, runtime))
     print(f"  [ok] {card.slug}: {model_dir}")
+
+
+# The release that first carried each engine op, for the ops a runtime older than the current one
+# cannot load. Only ops added after the zoo's earliest supported runtime belong here: an op every
+# runtime knows gives a card nothing to say.
+OP_FIRST_RUNTIME = {
+    "STFT": "1.0.0rc18",   # ADR-080
+    "ISTFT": "1.0.0rc18",  # ADR-080
+}
+
+
+def graph_ops(gguf_path: Path) -> set:
+    """Every op named by any of the file's graph topologies."""
+    import json
+    from gguf import GGUFReader
+
+    found = set()
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            if isinstance(node.get("op"), str):
+                found.add(node["op"])
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    for key, field in GGUFReader(str(gguf_path)).fields.items():
+        if key.startswith("model.graph_topology."):
+            walk(json.loads(bytes(field.parts[field.data[0]])))
+    return found
+
+
+def required_runtime(gguf_paths: List[Path]) -> Optional[Tuple[str, List[str]]]:
+    """The oldest `loom-py-rt` that loads every one of `gguf_paths`, with the ops that require it --
+    or None when any supported runtime does. Read from the files rather than recorded on the
+    catalogue entry, because which ops an export lowers to is the exporter's choice and changes
+    under a card that does not."""
+    from packaging.version import Version
+
+    ops = set().union(*(graph_ops(path) for path in gguf_paths)) & OP_FIRST_RUNTIME.keys()
+    if not ops:
+        return None
+    version = max((OP_FIRST_RUNTIME[op] for op in ops), key=Version)
+    return version, sorted(op for op in ops if OP_FIRST_RUNTIME[op] == version)
 
 
 def check_frame_ms(card: ModelCard, gguf_path: Path) -> None:

@@ -131,3 +131,37 @@ def test_a_single_file_card_is_unchanged_by_variants(cards):
     """Every card published before multi-file repos keeps its `<slug>.gguf` and its one Files line."""
     card = next(c for c in cards.CATALOG if not c.variants)
     assert cards.gguf_names(card) == [(f"{card.slug}.gguf", None)]
+
+
+def _gguf_with_topologies(path, *topologies):
+    import json
+
+    import gguf
+
+    writer = gguf.GGUFWriter(str(path), "loom")
+    for i, topology in enumerate(topologies):
+        writer.add_string(f"model.graph_topology.phase_{i}", json.dumps(topology))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.close()
+    return path
+
+
+def test_a_card_names_the_runtime_its_ops_need(cards, tmp_path):
+    """The note is read off the file: an op nested anywhere in any phase's topology counts, the
+    files of one repo are pooled, and a file of ops every runtime knows gets no note at all."""
+    plain = _gguf_with_topologies(tmp_path / "plain.gguf", {"nodes": [{"op": "ADD"}]})
+    assert cards.required_runtime([plain]) is None
+
+    stft = _gguf_with_topologies(tmp_path / "stft.gguf", {"nodes": [{"op": "MUL"}]},
+                                 {"nodes": [{"body": {"nodes": [{"op": "STFT"}]}}]})
+    istft = _gguf_with_topologies(tmp_path / "istft.gguf", {"nodes": [{"op": "ISTFT"}]})
+    assert cards.required_runtime([plain, stft]) == ("1.0.0rc18", ["STFT"])
+    assert cards.required_runtime([stft, istft]) == ("1.0.0rc18", ["ISTFT", "STFT"])
+
+    card = next(c for c in cards.CATALOG if not c.variants and not c.packages)
+    name = cards.gguf_names(card)[0][0]
+    assert "or later.**" not in cards.render_readme(card, name)
+    readme = cards.render_readme(card, name, ("1.0.0rc18", ["ISTFT", "STFT"]))
+    assert "**Needs `loom-py-rt` 1.0.0rc18 or later.**" in readme
+    assert "`ISTFT` and `STFT` ops" in readme and "`unknown op 'ISTFT'`" in readme
