@@ -23,6 +23,7 @@ from .driver_components import (
     DriverInputs, ModularChain,
     DriverReturn, MonolithicCall, PrefillDecodeLoop, TokenLabelsEpilogue,
 )
+from .pad_axes import pad_weight_axes
 from .passes import apply_loom_mil_passes
 from .quant_flavours import PER_CHANNEL_KEY, ggml_type_name, is_per_channel, quantize_q8_0_per_channel
 from .shape_expr import (
@@ -95,6 +96,12 @@ def _payload_digest(array: np.ndarray) -> str:
     return hasher.hexdigest()
 
 
+PAD_AXES_CHOICES = ("auto", "off")
+PAD_WEIGHTS_KEY = "loom.pad.weights"
+PAD_OUT_KEY = "loom.pad.out_features"
+PAD_IN_KEY = "loom.pad.in_features"
+
+
 @dataclass
 class WeightPacking:
     """What `pack_weights` did, and -- via `raw_dtypes` -- which names it has already done it to.
@@ -129,6 +136,10 @@ class WeightPacking:
     #: The names written per channel at `--quantize Q8_0_PC` (ADR-076): the rest of its Q8_0 tensors are
     #: ordinary blocks. `write_gguf` lists these under `loom.quantize.per_channel`.
     per_channel: set = field(default_factory=set)
+    #: {name: (true out_features, true in_features or 0 for a bias)} for every tensor the axis pad
+    #: widened (ADR-081). `write_gguf` lists them under `loom.pad.*` so a tool reading a weight by name
+    #: can strip the zeros.
+    padded: dict = field(default_factory=dict)
 
     @property
     def n_quantized(self) -> int:
@@ -145,6 +156,7 @@ class WeightPacking:
         self.quantized_bytes_after += other.quantized_bytes_after
         self.float_bytes_total += other.float_bytes_total
         self.per_channel |= other.per_channel
+        self.padded.update(other.padded)
         return self
 
 
@@ -286,6 +298,15 @@ class LoomGGUFExporter:
         # log by more than the quantized layers after it do. Every name must exist (`pack_weights`
         # raises otherwise), so a renamed tensor cannot silently fall out of its exemption.
         self.keep_float = frozenset(kwargs.get("keep_float") or ())
+        # ADR-081: zero-pad weight axes to what the kernels need ("auto") or write them as traced
+        # ("off", the escape hatch). An export with every axis aligned is byte-identical either way.
+        self.pad_axes = kwargs.get("pad_axes") or os.environ.get("LOOM_PAD_AXES") or "auto"
+        if self.pad_axes not in PAD_AXES_CHOICES:
+            raise ValueError(f"pad_axes={self.pad_axes!r}: expected one of {PAD_AXES_CHOICES}")
+        # {topology name: {var name: MIL Var}}, kept by `generate_graph_topology` for the axis pad, which
+        # needs an unpadded tensor's symbolic shape to slice its padded rows back. Vars rather than
+        # shapes so only the few slice points it asks about pay for `get_var_info`.
+        self.topology_vars = {}
         # This topology's ONE true dynamic quantity's real name (EXPORT-ROADMAP.md R1, axes.py) --
         # "n_tokens" unless the caller says otherwise. The engine's own dynamic-shape support is
         # genuinely single-axis (see get_var_info's own docstring): every symbolic dim ordinarily
@@ -2458,6 +2479,9 @@ class LoomGGUFExporter:
         output_symbols = [resolve(self.safe_name(v.name)) for v in func_outputs] if func_outputs else ["output"]
 
         pruned_nodes = self._prune_dead_nodes(nodes, output_symbols)
+        self.topology_vars[func_name] = {
+            self.safe_name(out.name): out for op in operations for out in op.outputs
+        }
 
         # A declared input with no node (post-pruning) that actually reads it is unreachable from this
         # topology's own output(s) -- GraphBuilder's ggml_gallocr_alloc_graph only allocates a backend
@@ -3281,6 +3305,20 @@ class LoomGGUFExporter:
             qtype = GGMLQuantizationType[ggml_type_name(self.quantize)]
             block_size, _ = GGML_QUANT_SIZES[qtype]
             quantizable = self._collect_mul_mat_weight_names()
+        if self.pad_axes == "auto":
+            # Before the fold, which then sees a conv kernel's padded IC x K. `quantizable` is read off
+            # node first inputs, which the pad never changes.
+            report = pad_weight_axes(
+                self.topologies, self.weights, set(pending),
+                {name: self._var_shape_lookup(vars_) for name, vars_ in self.topology_vars.items()},
+                lambda name: name in quantizable and name not in self.keep_float, block_size,
+            )
+            packing.padded = report.padded
+            if report.padded:
+                print(f"  axis pad (ADR-081): {sum(1 for n, k in report.padded.values() if k)} weight(s) "
+                      f"widened, {report.n_carried} carried, {report.n_views} VIEW(s), "
+                      f"{report.n_pads} PAD_1D(s)")
+        if self.quantize:
             # Already-packed kernels are skipped by the fold on their own terms: a quantized array is
             # uint8 blocks, which its `np.issubdtype(..., np.floating)` gate declines. So this counts
             # only what THIS packing folded, which is what `absorb` then sums.
@@ -3338,6 +3376,12 @@ class LoomGGUFExporter:
             packing.raw_dtypes[name] = raw_dtype
 
         return self.packing.absorb(packing)
+
+    def _var_shape_lookup(self, vars_: dict):
+        def shape(name):
+            var = vars_.get(name)
+            return None if var is None else self.get_var_info(var)["shape"]
+        return shape
 
     def write_gguf(self, driver_script: str):
         from gguf import GGUFWriter
@@ -3558,6 +3602,12 @@ class LoomGGUFExporter:
         w.add_array("loom.tensor_alias.targets", alias_targets)
         if self.quantize and is_per_channel(self.quantize):
             w.add_array(PER_CHANNEL_KEY, per_channel_names)
+        # Parallel arrays (a GGUF array is homogeneous), in the checkpoint's own axis terms so a conv
+        # kernel reads the same folded or not; a bias has no in_features and records 0.
+        padded = sorted(n for n in packing.padded if n in self.weights)
+        w.add_array(PAD_WEIGHTS_KEY, padded)
+        w.add_array(PAD_OUT_KEY, [packing.padded[n][0] for n in padded])
+        w.add_array(PAD_IN_KEY, [packing.padded[n][1] for n in padded])
 
         w.write_header_to_file()
         w.write_kv_data_to_file()

@@ -65,13 +65,15 @@ def companion_output(output_path: str, companion) -> str:
 
 
 def main_export(model_path: str, output_path: str, task: str = None, model: str = None,
-                quantize: str = None, companions: bool = False, isolate_phases: bool = None) -> str:
+                quantize: str = None, companions: bool = False, isolate_phases: bool = None,
+                pad_axes: str = None) -> str:
     """Exports whatever `model_path` names to `output_path`. `task`/`model` are optional overrides --
     with neither, both axes are auto-detected; with `task` alone, detection is restricted to that task's
     recognizers; `model` requires `task` (it names one specific recognizer within it). `quantize` names
     a GGML type for the weights that are eligible for one; unset falls back to $LOOM_QUANTIZE.
     `isolate_phases` converts each phase of a multi-phase model in its own process; unset falls back to
-    $LOOM_PHASE_ISOLATION. Returns `output_path`."""
+    $LOOM_PHASE_ISOLATION. `pad_axes` is "auto" or "off" for ADR-081's weight-axis pad; unset falls back
+    to $LOOM_PAD_AXES, else "auto". Returns `output_path`."""
     if model is not None and task is None:
         raise ValueError("--model requires --task (which family's recognizer to look up)")
     if quantize:
@@ -93,6 +95,8 @@ def main_export(model_path: str, output_path: str, task: str = None, model: str 
     # the ones whose own `backend_kwargs` never learned about quantization.
     if quantize:
         config.quantize = quantize
+    if pad_axes:
+        config.pad_axes = pad_axes
     # Onto the DECOMPOSITION rather than the config, because that is what reads it -- and only one of
     # the three has phases to isolate. A request for it against a single-graph model is accepted and
     # does nothing rather than raising: detection picks the decomposition, so a caller exporting a
@@ -117,7 +121,7 @@ def main_export(model_path: str, output_path: str, task: str = None, model: str 
             # 10's talker ships a codec that is one), so a caller who needed the flag for the primary
             # needs it for what the primary drags along.
             main_export(str(companion.checkpoint), destination, quantize=quantize, companions=True,
-                        isolate_phases=isolate_phases)
+                        isolate_phases=isolate_phases, pad_axes=pad_axes)
     return primary
 
 
@@ -144,6 +148,12 @@ def main():
              "model that OOMs. Default: $LOOM_PHASE_ISOLATION.",
     )
     parser.add_argument(
+        "--pad-axes", default=None, choices=("auto", "off"),
+        help="Zero-pad weight axes to what the kernels need (ADR-081): K to the block size for a "
+             "quantized weight, K and N to 4 for an F32 one. Exact, and a no-op for a model whose axes "
+             "are already aligned. Default: $LOOM_PAD_AXES, else auto.",
+    )
+    parser.add_argument(
         "--no-companions", action="store_true",
         help="Do not export the other models this checkpoint contains. A family-10 talker ships its "
              "own codec (Qwen3-TTS does; Dia's is a separate repo), and by default that second GGUF "
@@ -154,7 +164,7 @@ def main():
 
     output_path = main_export(args.model_path, args.output, task=args.task, model=args.model,
                               quantize=args.quantize, companions=not args.no_companions,
-                              isolate_phases=args.isolate_phases or None)
+                              isolate_phases=args.isolate_phases or None, pad_axes=args.pad_axes)
     print(f"SUCCESS! Exported to: {output_path}")
 
 
