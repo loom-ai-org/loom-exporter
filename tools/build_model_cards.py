@@ -218,6 +218,15 @@ def _vocetta2_limitations(upstream_wer: str, door_wer: str) -> str:
     )
 
 
+def _vocetta2_q8(size: str, what: str, q8_wer: str, f32_wer: str) -> str:
+    return (
+        f"{size}: {what}. Whisper's word error rate on 60 syntheses is {q8_wer} against F32's {f32_wer}. "
+        "On a Pi Zero it runs at F32's "
+        "speed and on a Pi 4 slower, and its peak memory is 1-4 MB below F32's 57-58 MB, nearly all of which "
+        "is the runtime: a smaller download rather than a faster or leaner model."
+    )
+
+
 CATALOG = [
     ModelCard(
         slug="qwen3-0.6b-base", checkpoint=Path("qwen3-0.6b-base"),
@@ -653,10 +662,19 @@ CATALOG = [
         ),
     ),
     # VantoraLabs/Vocetta2-{276k,500k,1m}: sanoTTS's nano line re-trained, MIT, torch state_dicts
-    # (loom_exporter/vocetta2_export.py). Measured 2026-10-21 on the released rc18 wheel, six sentences
-    # through upstream's own ids: every waveform upstream's length, max |diff| 1.3e-5 / 3.1e-5 / 1.8e-4 (the
-    # 1m's worst is upstream's own f32-vs-f64 spread, 1.5e-4). Door WER: 30 LibriSpeech references, Whisper
-    # small, upstream's G2P vs `text2speech.infer(text)` with the bundled lexicon.
+    # (loom_exporter/vocetta2_export.py). Measured 2026-10-22 on the released rc18 wheel, exported with the
+    # weight-axis pad (ADR-081), six sentences through upstream's own ids: every waveform upstream's length,
+    # max |diff| 3.9e-5 / 3.0e-5 / 1.8e-4 (the 276k's is 2.2e-5 from upstream at f64 against upstream's own
+    # f32 at 1.6e-5; the 1m's worst is upstream's own f32-vs-f64 spread). Door WER: 30 LibriSpeech
+    # references, Whisper small, upstream's G2P vs `text2speech.infer(text)` with the bundled lexicon.
+    #
+    # Q8_0_PC: without the pad, no weight of the 276k or the 1m had a row a multiple of 32 and their
+    # Q8_0_PC export was byte-identical to F32. Bar (user, 2026-10-21): Whisper-small WER <= F32 + 1 pp
+    # on 60 syntheses (30 LibriSpeech references through upstream's ids, 30 through the door). Speed,
+    # 5 paired rounds, one 11.2 s utterance: on the Pi Zero Q8_0_PC runs at the padded F32's speed
+    # (276k 3803 vs 3767 ms, 500k 4109 vs 4113, 1m 5235 vs 5316); on a Pi 4 at one thread it is slower
+    # (399 vs 355, 415 vs 405, 673 vs 553). Peak RSS on the Pi Zero, one load + one synthesis: F32
+    # 57 / 57 / 58 MB, Q8_0_PC 56 / 56 / 54 -- the weights are 1-4 MB of it.
     ModelCard(
         slug="vocetta2-276k", checkpoint=Path("vocetta2-276k"),
         export_task="text-to-speech", export_model="vocetta2", task_type="text-to-speech",
@@ -664,6 +682,11 @@ CATALOG = [
         base_repo="VantoraLabs/Vocetta2-276k", license_id="mit", language=["en"],
         sample_rate=24000,  # config.json's `sample_rate`
         title="Vocetta2 276K",
+        variants=[
+            ("F32", "full precision, 1.2 MB; upstream's waveform to 3.9e-5."),
+            ("Q8_0_PC", _vocetta2_q8("0.6 MB", "the decoder's pointwise layers and head in per-channel "
+                                     "int8, half the acoustic net's convolutions in Q8_0", "9.6%", "9.8%")),
+        ],
         summary="VantoraLabs' Vocetta2 276K: a complete English text-to-speech model in 276,765 parameters "
                 "-- a duration net, an acoustic net to a mel spectrogram and a ConvNeXt/iSTFT decoder at "
                 "24 kHz -- exported for loom.cpp.",
@@ -678,15 +701,12 @@ CATALOG = [
         base_repo="VantoraLabs/Vocetta2-500k", license_id="mit", language=["en"],
         sample_rate=24000,  # config.json's `sample_rate`
         title="Vocetta2 500K",
-        # Q8_0_PC: 13 tensors (the acoustic net's width-64 convs) and 0.7 MB; the 276k's and 1m's widths
-        # (31/62/186, 72/130/337) hold no row a multiple of 32, so their Q8_0_PC export is byte-identical
-        # to F32 and is not shipped. Bar (user, 2026-10-21): Whisper-small WER <= F32 + 1 pp on 60
-        # syntheses (30 LibriSpeech references through upstream's ids, 30 through the door): F32 55/470,
-        # Q8_0_PC 56/470.
         variants=[
-            ("F32", "full precision, 2.0 MB; upstream's waveform to 3.1e-5."),
-            ("Q8_0_PC", "1.3 MB: the acoustic net's convolutions in per-channel int8. Whisper's word error "
-                        "rate on 60 syntheses is 11.9% against F32's 11.7%."),
+            ("F32", "full precision, 2.1 MB; upstream's waveform to 3.0e-5."),
+            ("Q8_0_PC", _vocetta2_q8("1.2 MB", "the acoustic net's convolutions in Q8_0 and the decoder's "
+                                     "second pointwise layers in per-channel int8; its first pointwise "
+                                     "layers and head stay F32, since width 67 would need 43% more zeros "
+                                     "to quantize", "11.5%", "11.7%")),
         ],
         summary="VantoraLabs' Vocetta2 500K: a complete English text-to-speech model in 499,528 parameters "
                 "-- a duration net, an acoustic net to a mel spectrogram and a ConvNeXt/iSTFT decoder at "
@@ -702,6 +722,13 @@ CATALOG = [
         base_repo="VantoraLabs/Vocetta2-1m", license_id="mit", language=["en"],
         sample_rate=24000,  # config.json's `sample_rate`
         title="Vocetta2 1M",
+        variants=[
+            ("F32", "full precision, 4.2 MB; upstream's waveform to 1.8e-4, upstream's own f32-vs-f64 "
+                    "spread."),
+            ("Q8_0_PC", _vocetta2_q8("2.9 MB", "the decoder's pointwise layers and head in per-channel "
+                                     "int8; the acoustic net stays F32, since its width-72 convolutions "
+                                     "would need a third more zeros to quantize", "8.5%", "8.5%")),
+        ],
         summary="VantoraLabs' Vocetta2 1M: a complete English text-to-speech model in 1,031,754 parameters "
                 "-- a duration net, an acoustic net to a mel spectrogram and a ConvNeXt/iSTFT decoder at "
                 "24 kHz -- exported for loom.cpp.",
