@@ -194,8 +194,17 @@ class TestDftBasisPrecision(unittest.TestCase):
         rows = n_fft // 2 + 1
         k, n = np.arange(rows)[:, None], np.arange(n_fft)[None]
         angle = 2 * np.pi * ((k * n) % n_fft) / n_fft
-        bases = [np.asarray(w, dtype=np.float64).reshape(rows, n_fft)
-                 for w in exporter.weights.values() if np.asarray(w).size == rows * n_fft]
+        # The axis pad (ADR-081) widens the basis to 516 rows for the direct conv's OC % 4; its record
+        # says how many are real, and the rest must be zeros.
+        bases = []
+        for name, w in exporter.weights.items():
+            w = np.asarray(w, dtype=np.float64)
+            if name in exporter.packing.padded:
+                real = exporter.packing.padded[name][0]
+                self.assertFalse(np.any(w[real:]), f"{name}'s padded rows must be zero")
+                w = w[:real]
+            if w.size == rows * n_fft:
+                bases.append(w.reshape(rows, n_fft))
         self.assertEqual(len(bases), 2, "expected one cos and one sin kernel")
         for basis in bases:
             err = min(np.abs(basis - np.cos(angle)).max(), np.abs(basis - np.sin(angle)).max(),
