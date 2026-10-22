@@ -98,6 +98,11 @@ class LoomExportConfig:
             "convolutional model may honour this fully and shrink by nothing (see "
             "tests/ci/test_quantize_export.py). The writer reports what it reached."
         ),
+        "pad_axes": Unchecked(
+            "ADR-081's weight-axis pad, set by `main_export` from `--pad-axes`. Like `quantize`, a "
+            "property of the requested export with no checkpoint fact behind it; the exporter rejects "
+            "anything but 'auto' or 'off' when it is constructed."
+        ),
     }
 
     def export(self) -> str:
@@ -152,6 +157,10 @@ class LoomExportConfig:
     # already had, so setting it reaches that family's own plumbing unchanged.
     quantize: str = ""
 
+    # ADR-081's axis pad, "auto" or "off", or "" to leave it to the exporter's default ("auto", or
+    # $LOOM_PAD_AXES). Set by `main_export` from `--pad-axes`, like `quantize` and for the same reason.
+    pad_axes: str = ""
+
     def resolved_backend_kwargs(self) -> dict:
         """`backend_kwargs()` plus what EVERY export must carry, merged here so a family cannot drop it.
 
@@ -177,6 +186,8 @@ class LoomExportConfig:
         # writing "" over that would break the environment door.
         if self.quantize:
             kwargs["quantize"] = self.quantize
+        if self.pad_axes:
+            kwargs["pad_axes"] = self.pad_axes
         return kwargs
 
     def driver_input_aliases(self) -> dict:

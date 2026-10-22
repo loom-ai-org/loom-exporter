@@ -55,7 +55,8 @@ class PhaseResult:
     geometry: Dict[str, list] = field(default_factory=dict)
 
 
-def convert_phase(phase, quantize: Optional[str] = None, keep_float=()) -> PhaseResult:
+def convert_phase(phase, quantize: Optional[str] = None, keep_float=(),
+                  pad_axes: Optional[str] = None) -> PhaseResult:
     """Trace, convert, lower and pack one phase, then release everything the conversion needed.
 
     `keep_float` is the family's (`backend_kwargs()['keep_float']`): the names among them this phase holds
@@ -87,7 +88,8 @@ def convert_phase(phase, quantize: Optional[str] = None, keep_float=()) -> Phase
         # a cell's `MUL_MAT` nodes make its gate weights quantization-eligible, and they were eligible
         # before this split because the merged topologies included the cells. Packing them here is
         # what keeps that true now that the merge sees bytes rather than arrays.
-        packer = LoomGGUFExporter(None, quantize=quantize, keep_float=[n for n in keep_float if n in weights])
+        packer = LoomGGUFExporter(None, quantize=quantize, keep_float=[n for n in keep_float if n in weights],
+                                  pad_axes=pad_axes)
         packer.topologies = cells
         packer.weights = weights
         packing = packer.pack_weights()
@@ -114,6 +116,8 @@ def convert_phase(phase, quantize: Optional[str] = None, keep_float=()) -> Phase
         # one. Quantization is what makes packing early worth doing at all -- an F32 pack is a dtype
         # cast and frees nothing.
         quantize=quantize,
+        # The packing decision travels with the quantize one: both are made here, per phase.
+        pad_axes=pad_axes,
     )
     main_func = mil_prog.functions["main"]
     topo = exporter.generate_graph_topology(main_func, phase.name)
