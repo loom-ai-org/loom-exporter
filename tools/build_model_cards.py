@@ -766,7 +766,7 @@ anything.""",
     ModelCard(
         slug="pocket-tts", checkpoint=Path("pocket-tts/languages/english_2026-09"),
         export_task="text-to-speech", export_model="pocket-tts", task_type="text-to-speech",
-        takes_text=True,
+        takes_text=True, snippet="text-to-speech-with-vocab-variants",
         base_repo="kyutai/pocket-tts", license_id="cc-by-4.0",
         source_url="https://github.com/kyutai-labs/pocket-tts", source_name="Pocket TTS (English, 2026-09)",
         language=["en"],
@@ -774,7 +774,27 @@ anything.""",
         sample_rate=24000,
         title="Pocket TTS (English)",
         summary="Kyutai's Pocket TTS (English, 2026-09 release), exported for loom.cpp: a 100M-parameter "
-                "flow language model over Mimi codec latents. Encodes text itself and has a built-in voice.",
+                "flow language model over Mimi codec latents, in two precisions. Encodes text itself and has "
+                "a built-in voice.",
+        variants=[
+            ("F32", "full precision, 405 MB: the parameters unmodified, the file verified against the "
+                    "reference (see Known limitations)."),
+            # WER: whisper-small (the card gate's oracle) over 20 Harvard sentences x seeds 1-3, x86,
+            # loom-py-rt 1.0.0rc18, 2026-10-21: F32 0.21% (1 word in 60 syntheses), Q8_0_PC 1.05% (5);
+            # the user's bar was F32 + 1 pp. Speeds: equal work (60 frames, EOS disarmed, 28 text ids,
+            # the alba voice) -- Pi 4: loom.cpp scripts/bench_driver.cpp vs bench_pocket_onnx.py
+            # (onnxruntime 1.28.0 PyPI, KevinAHM/pocket-tts-onnx @58a6d00), 4 threads, 5 paired
+            # rounds cooled to 60 C: loom F32 9.50 s / Q8_0_PC 5.32 s, onnxruntime fp32 18.97 s / int8 14.17 s
+            # (medians); Pi Zero W: one process per run, rc18 armv6 wheel, Q8_0_PC 115.0 s (median of 3
+            # first calls; 79 weights in CPU_ARMV6_I8); its F32 file (405 MB) exceeds the board's 427 MB.
+            ("Q8_0_PC", "130 MB. The projection weights in int8 with one scale per output channel "
+                        "(`--quantize Q8_0_PC`), which a Raspberry Pi Zero's int8 kernels read directly; "
+                        "the codec's few wider convolutions are block Q8_0. Word error rate under "
+                        "whisper-small 1.05% against F32's 0.21% (60 syntheses: 20 Harvard sentences, "
+                        "3 seeds). For 4.8 s of speech a Raspberry Pi 4 (4 threads) takes 5.3 s, against 9.5 s "
+                        "at F32 and 14.2 s for onnxruntime 1.28 on a community int8 ONNX export; a Pi Zero "
+                        "takes 115 s, and cannot hold the F32 file at all. The voice files fit both files."),
+        ],
         usage_extra="""### Choosing a voice
 
 The file carries one voice, `alba`, and uses it when you name none. The other 25 of Kyutai's voices
@@ -830,8 +850,8 @@ dataset each recording comes from; every file also records its own (`loom.voice.
             "`pocket-tts export-voice` converts with `python -m loom_exporter.pocket_tts_voices "
             "--from`.\n\n"
             "**Sampled by default**, at the checkpoint's own temperature (0.3), so two calls differ; "
-            "pass `seed` to reproduce one. Verified against the reference with its random draws pinned: "
-            "within 1.8e-06 rms of the reference waveform step for step.\n\n"
+            "pass `seed` to reproduce one. The F32 file is verified against the reference with its random "
+            "draws pinned: within 1.8e-06 rms of the reference waveform step for step.\n\n"
             "**Long text is split, as the reference splits it**: into sentence chunks of at most 50 "
             "tokens, each generated separately from the same voice and joined. A single sentence "
             "longer than that is cut at its commas.\n\n"
@@ -2486,6 +2506,25 @@ greedy = model.text2codes.infer("Hello there.", language="en", temperature=0, te
     "text-to-speech-with-vocab": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
+
+# This model encodes text itself -- no phonemiser needed at all.
+print(model.tokenizer)                       # kind, vocabulary size, default language
+
+# sample_rate={sample_rate}: a rate is not something a checkpoint necessarily carries, so it is a value
+# you have to know from the model's documentation and pass. It is used only if the GGUF declares none;
+# a wrong rate does not fail, it plays the voice at the wrong speed.
+audio = model.text2speech.infer("hello world", sample_rate={sample_rate})
+audio.save("out.wav")
+
+# That uses the voice the file itself defaults to. Whether it carries others is under "Known
+# limitations" (and, where it does, a section below says how to pick one).
+""",
+    # `text-to-speech-with-vocab` for a repo of several precisions (Pocket TTS): the same door, with the
+    # file named, because `from_pretrained` refuses to choose between GGUFs.
+    "text-to-speech-with-vocab-variants": """import loom
+
+# This repo holds more than one precision of the model; name the file you want (see "Files" below).
+model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
 
 # This model encodes text itself -- no phonemiser needed at all.
 print(model.tokenizer)                       # kind, vocabulary size, default language
