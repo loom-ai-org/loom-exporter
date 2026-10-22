@@ -382,6 +382,9 @@ _INFRASTRUCTURE_MODULES = {
 
 # Individual classes that are results or internals rather than declarations.
 _NOT_SPECS = {
+    "pad_axes._Site": "the axis pad's working record for one weight, built and consumed inside one "
+                      "`pad_weight_axes` call",
+    "pad_axes.PadReport": "a pass RESULT -- what `pad_weight_axes` padded, not what a caller declared",
     "modular_export.ModularExportResult": "an export RESULT -- what export_modular produced, not what "
                                           "a caller declared. Its fields are outputs; checking them "
                                           "against the model they were derived FROM is circular",

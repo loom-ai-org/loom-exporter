@@ -174,6 +174,7 @@ def write_spill(result: PhaseResult, directory: Path) -> None:
                 # silently mean something else the day that package renumbers it.
                 "raw_dtype": None if raw_dtype is None else raw_dtype.name,
                 "per_channel": name in result.packing.per_channel,
+                "padded": list(result.packing.padded[name]) if name in result.packing.padded else None,
             })
 
     packing = result.packing
@@ -226,7 +227,9 @@ def read_spill(directory: Path) -> PhaseResult:
                                      else GGMLQuantizationType[entry["raw_dtype"]])
 
     packing = WeightPacking(raw_dtypes=raw_dtypes, **manifest["packing"],
-                            per_channel={e["name"] for e in manifest["weights"] if e.get("per_channel")})
+                            per_channel={e["name"] for e in manifest["weights"] if e.get("per_channel")},
+                            padded={e["name"]: tuple(e["padded"]) for e in manifest["weights"]
+                                    if e.get("padded")})
     geometry = {kind: [(name, tuple(values)) for name, values in records]
                 for kind, records in manifest["geometry"].items()}
     return PhaseResult(topologies=manifest["topologies"], weights=weights, packing=packing,
@@ -238,7 +241,8 @@ def read_spill(directory: Path) -> PhaseResult:
 # --------------------------------------------------------------------------------------------------
 
 def convert_phase_isolated(config_blob: Path, index: int, directory: Path,
-                           quantize: Optional[str] = None, keep_float=()) -> PhaseResult:
+                           quantize: Optional[str] = None, keep_float=(),
+                           pad_axes: Optional[str] = None) -> PhaseResult:
     """Convert phase `index` of the pickled config in a child process and read its spill back.
 
     Raises on a non-zero exit rather than falling back to converting in-process: an export that
@@ -253,6 +257,8 @@ def convert_phase_isolated(config_blob: Path, index: int, directory: Path,
         argv += ["--quantize", quantize]
     for name in keep_float:
         argv += ["--keep-float", name]
+    if pad_axes:
+        argv += ["--pad-axes", pad_axes]
     completed = subprocess.run(argv, check=False)
     if completed.returncode != 0:
         raise RuntimeError(
@@ -281,6 +287,7 @@ def _phase_worker(argv: List[str]) -> int:
     parser.add_argument("directory")
     parser.add_argument("--quantize", default=None)
     parser.add_argument("--keep-float", action="append", default=[])
+    parser.add_argument("--pad-axes", default=None)
     args = parser.parse_args(argv)
 
     with open(args.config_blob, "rb") as handle:
@@ -308,7 +315,8 @@ def _phase_worker(argv: List[str]) -> int:
 
     from .phase_conversion import convert_phase
 
-    write_spill(convert_phase(phase, quantize=args.quantize, keep_float=args.keep_float), Path(args.directory))
+    write_spill(convert_phase(phase, quantize=args.quantize, keep_float=args.keep_float,
+                              pad_axes=args.pad_axes), Path(args.directory))
     return 0
 
 

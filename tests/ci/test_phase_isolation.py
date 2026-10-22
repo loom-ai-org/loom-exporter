@@ -171,7 +171,8 @@ def test_the_spill_round_trips_shapes_dtypes_and_the_ggml_type(tmp_path):
     packing = WeightPacking(raw_dtypes={"enc.mm": GGMLQuantizationType.Q8_0, "enc.norm": None,
                                         "enc.ids": None, "enc.empty": None},
                             n_folded=2, n_declined_shape=1, quantized_bytes_before=1024,
-                            quantized_bytes_after=272, float_bytes_total=2048)
+                            quantized_bytes_after=272, float_bytes_total=2048,
+                            padded={"enc.norm": (3, 2)})
     topologies = {"enc": {"nodes": [{"op": "MUL_MAT", "inputs": ["enc.mm", "x"]}]}}
     geometry = {"attention": [("block_0", (2, 4, 4))]}
 
@@ -190,6 +191,9 @@ def test_the_spill_round_trips_shapes_dtypes_and_the_ggml_type(tmp_path):
     assert back.packing.raw_dtypes["enc.norm"] is None
     assert back.packing.n_folded == 2 and back.packing.n_declined_shape == 1
     assert back.packing.quantized_bytes_before == 1024
+    # The axis pad's record (ADR-081) is per weight, so the parent can write `loom.pad.*` for weights
+    # a child padded.
+    assert back.packing.padded == {"enc.norm": (3, 2)}
     # `fused_geometry()`'s records are tuples and JSON has no tuple -- `_kv_cache_geometry` unpacks
     # them, so a list would work and a dict would not, but the point is they come back unchanged.
     assert back.geometry == geometry
