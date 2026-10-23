@@ -25,7 +25,7 @@ import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 # REPO_ROOT computed locally, not imported from loom_exporter.paths -- this script is invoked directly
 # (`python tools/build_model_cards.py`), which puts `tools/` on sys.path[0], not the repo root, so
@@ -121,6 +121,12 @@ class ModelCard:
     # Which venv's interpreter can import this model's loader. "piper" covers everything except
     # qwen3-asr, which needs "ovos" (transformers >= 5.13). See [[env-python-venvs-export]].
     venv: str = "piper"
+    # Why THIS process cannot export the card, or None when it can -- a check the venv split does not
+    # cover. Pocket-TTS is the case: its export runs the kyutai-labs reference named by
+    # `LOOM_POCKET_TTS_REPO`, the published english_2026-09 file was gated on v3.2.0 (v4 changes its
+    # text path and adds a fade-in), and the small 2026-10 models need v4. One process imports one
+    # reference, so a sweep runs the two groups in two invocations, as it does the two venvs.
+    export_requires: Optional[Callable[[], Optional[str]]] = None
     # The upstream checkpoint this was exported from: an HF repo id (most models), or -- for the two
     # models with no HF repo for the checkpoint itself -- a source_url instead. Exactly one is set.
     base_repo: Optional[str] = None
@@ -226,6 +232,151 @@ def _vocetta2_q8(size: str, what: str, q8_wer: str, f32_wer: str) -> str:
         "is the runtime: a smaller download rather than a faster or leaner model."
     )
 
+
+def pocket_tts_reference(minimum: str, maximum: Optional[str] = None) -> Callable[[], Optional[str]]:
+    """`export_requires` for a Pocket-TTS card: the reference checkout `LOOM_POCKET_TTS_REPO` names
+    (default the v3.2.0 clone) must have a version in [minimum, maximum]."""
+    def check() -> Optional[str]:
+        from packaging.version import Version
+        from loom_exporter.pocket_tts_export import POCKET_TTS_REPO
+
+        pyproject = Path(POCKET_TTS_REPO) / "pyproject.toml"
+        if not pyproject.is_file():
+            return f"no pocket-tts reference at {POCKET_TTS_REPO} (LOOM_POCKET_TTS_REPO)"
+        found = next((line.split("=", 1)[1].strip().strip('"') for line in pyproject.read_text().splitlines()
+                      if line.startswith("version")), "0")
+        if Version(found) < Version(minimum) or (maximum and Version(found) > Version(maximum)):
+            want = f"{minimum}" if maximum == minimum else f">= {minimum}" + (f", <= {maximum}" if maximum else "")
+            return (f"needs pocket-tts {want} as its reference, and LOOM_POCKET_TTS_REPO={POCKET_TTS_REPO} "
+                    f"is {found}; run it in its own invocation with the right one")
+        return None
+    return check
+
+
+# The 27 predefined voices of the 2026-10 voice packs, with each recording's licence as
+# `loom_exporter.pocket_tts_voices` stamps it (by the source folder, per `kyutai/tts-voices`' README).
+# `daan` (CML-TTS Dutch) is new with these packs and its clip has no licence of its own: shipped marked
+# "not stated", as juergen and rafael already are (the user's call, 2026-10-23).
+POCKET_TTS_2026_10_VOICES = [
+    ("alba", "CC-BY-4.0"), ("anna", "CC-BY-4.0"), ("azelma", "CC-BY-4.0"), ("bill_boerst", "CC0-1.0"),
+    ("caro_davy", "CC0-1.0"), ("charles", "CC-BY-4.0"), ("cosette", "**CC-BY-NC-4.0 (non-commercial)**"),
+    ("daan", "not stated by Kyutai"), ("eponine", "CC-BY-4.0"), ("estelle", "CC0-1.0"), ("eve", "CC-BY-4.0"),
+    ("fantine", "CC-BY-4.0"), ("george", "CC-BY-4.0"), ("giovanni", "CC0-1.0"), ("jane", "CC-BY-4.0"),
+    ("javert", "CC0-1.0"), ("jean", "**CC-BY-NC-4.0 (non-commercial)**"), ("juergen", "not stated by Kyutai"),
+    ("lola", "CC0-1.0"), ("marius", "CC0-1.0"), ("mary", "CC-BY-4.0"), ("michael", "CC-BY-4.0"),
+    ("paul", "CC-BY-4.0"), ("peter_yearsley", "CC0-1.0"), ("rafael", "not stated by Kyutai"),
+    ("stuart_bell", "CC0-1.0"), ("vera", "CC-BY-4.0"),
+]
+
+# Measured per model (2026-10-23). WER: whisper-small over 20 Harvard sentences x seeds 1-3 (x86,
+# loom-py-rt 1.0.0rc18; the full model's bar: Q8_0_PC <= F32 + 1 pp). Pi Zero W: rc18 armv6 wheel, the
+# full model's equal-work call (60 frames = 4.8 s of speech, EOS disarmed, alba), median of 3 first calls
+# with the arms flipped per round -- loom.cpp README's Pi Zero table.
+POCKET_TTS_SMALL = {
+    "18m": dict(lm="15.6M", decoder="2.6M", f32_mb=77, q8_mb=31, wer_f32=0.0127, wer_q8=0.0105,
+                zero_f32=67.0, zero_q8=58.9),
+    "7m": dict(lm="4.2M", decoder="2.6M", f32_mb=29, q8_mb=11, wer_f32=0.0084, wer_q8=0.0105,
+               zero_f32=46.6, zero_q8=45.2),
+    "2m": dict(lm="0.9M", decoder="1.0M", f32_mb=8.5, q8_mb=4.2, wer_f32=0.0274, wer_q8=0.0232,
+               zero_f32=19.1, zero_q8=19.6),
+}
+
+
+def _voice_table(voices) -> str:
+    half = (len(voices) + 1) // 2
+    rows = ["| voice | licence of the recording | voice | licence of the recording |", "|---|---|---|---|"]
+    for i in range(half):
+        left = voices[i]
+        right = voices[half + i] if half + i < len(voices) else None
+        name = f"`{left[0]}` (built in)" if left[0] == "alba" else f"`{left[0]}`"
+        rows.append(f"| {name} | {left[1]} | " + (f"`{right[0]}` | {right[1]} |" if right else "| |"))
+    return "\n".join(rows)
+
+
+def pocket_tts_small_card(size: str) -> "ModelCard":
+    """One of Kyutai's distilled English models (`english_<size>_refl_2026-10`, loom.cpp ADR-084): its
+    own repo, F32 and Q8_0_PC, and its own 27 voice files -- a voice is these weights' state, so the
+    packs of the other sizes and of the full model do not fit it."""
+    m = POCKET_TTS_SMALL[size]
+    label = size.upper()
+    n_voices = len(POCKET_TTS_2026_10_VOICES)
+    wer = (f"Word error rate under whisper-small {m['wer_q8']:.2%} against F32's {m['wer_f32']:.2%} "
+           f"(60 syntheses: 20 Harvard sentences, 3 seeds). " if m["wer_q8"] is not None else "")
+    return ModelCard(
+        slug=f"pocket-tts-{size}", checkpoint=Path(f"pocket-tts/languages/english_{size}_refl_2026-10"),
+        export_task="text-to-speech", export_model="pocket-tts", task_type="text-to-speech",
+        takes_text=True, snippet="text-to-speech-with-vocab-variants",
+        export_requires=pocket_tts_reference("4.0.1"),
+        base_repo="kyutai/pocket-tts", license_id="cc-by-4.0",
+        source_url="https://github.com/kyutai-labs/pocket-tts",
+        source_name=f"Pocket TTS (English {label}, 2026-10, reward fine-tuned)",
+        language=["en"],
+        # Declared by the export (`pocket_tts_export.SAMPLE_RATE`), restated here like the full model's.
+        sample_rate=24000,
+        title=f"Pocket TTS {label} (English)",
+        summary=f"Kyutai's distilled Pocket TTS (English, {label}, reward fine-tuned, 2026-10 release), "
+                f"exported for loom.cpp: a {m['lm']}-parameter flow language model over Mimi codec "
+                f"latents and a {m['decoder']}-parameter decoder, in two precisions. Encodes text itself "
+                f"and has a built-in voice.",
+        variants=[
+            ("F32", f"full precision, {m['f32_mb']} MB: the parameters unmodified, the file verified "
+                    f"against the reference (see Known limitations). A Raspberry Pi Zero takes "
+                    f"{m['zero_f32']:.1f} s for 4.8 s of speech."),
+            ("Q8_0_PC", f"{m['q8_mb']} MB. The projection weights in int8 with one scale per output "
+                        f"channel (`--quantize Q8_0_PC`), which a Raspberry Pi Zero's int8 kernels read "
+                        f"directly. {wer}A Pi Zero takes {m['zero_q8']:.1f} s for 4.8 s of speech. The "
+                        f"voice files fit both files."),
+        ],
+        usage_extra=f"""### Choosing a voice
+
+The file carries one voice, `alba`, and uses it when you name none. The other {n_voices - 1} of Kyutai's
+voices ship in this repo as voice files under `voices/`, and a name is enough -- it is fetched from this
+repo the first time:
+
+```python
+print(model.voices)                          # the built-in one first, then the voice files
+
+audio = model.text2speech.infer("Hello there.", voice="marius")
+audio.save("marius.wav")
+```
+
+A voice file is the model's own state after hearing the speaker, stamped with a fingerprint of these
+weights, so it only fits this model: the voice files of the other Pocket TTS sizes and of the full
+model are refused here, and these are refused there. `voice=` also takes a path to a voice file of your
+own.
+
+{_voice_table(POCKET_TTS_2026_10_VOICES)}
+
+Licences are per [`kyutai/tts-voices`](https://huggingface.co/kyutai/tts-voices)' README, by the
+dataset each recording comes from; every file also records its own (`loom.voice.license`,
+`loom.voice.origin`). CC-BY voices need attribution to their source dataset or speaker. `daan` is a
+Dutch speaker (CML-TTS) whose clip ships with no licence of its own.""",
+        extra_files=[
+            f"`voices/*.gguf` -- Kyutai's other predefined voices for this model as loom voice files, "
+            f"converted unchanged from `kyutai/pocket-tts`'s `languages/english_{size}_refl_2026-10/"
+            f"embeddings/` by `loom_exporter.pocket_tts_voices`. Only needed to pick a voice other than "
+            f"`alba`.",
+        ],
+        limitations=
+            "**Kyutai's use restrictions apply.** The upstream release prohibits, among other things, "
+            "voice impersonation or cloning without explicit and lawful consent, and presenting "
+            "generated audio as a genuine recording of a real person. They travel with the weights.\n\n"
+            f"**A distilled model.** It is Kyutai's {label} distillation of Pocket TTS, reward "
+            "fine-tuned, and trades quality for size against the full model "
+            "([`pocket-tts-loom`](https://huggingface.co/loom-ai-org/pocket-tts-loom)).\n\n"
+            f"**One voice is built in (`alba`); the other {n_voices - 1} are voice files** under "
+            "`voices/`, selected with `voice=` (see above). Each voice's licence is its RECORDING's, not "
+            "the model's -- two are non-commercial and three are not stated -- and the table above lists "
+            "them. Cloning a voice from a recording needs the Mimi encoder, which this export does not "
+            "carry.\n\n"
+            "**Sampled by default**, at the checkpoint's own temperature (0.3), so two calls differ; "
+            "pass `seed` to reproduce one. The F32 file is verified against the reference with its random "
+            "draws pinned, step for step.\n\n"
+            "**Long text is split, as the reference splits it**: into sentence chunks of at most 50 "
+            "tokens, each generated separately from the same voice and joined, each chunk's first 5 ms "
+            "faded in as the reference does.\n\n"
+            "**English only.**",
+    )
 
 CATALOG = [
     ModelCard(
@@ -880,6 +1031,7 @@ anything.""",
     ModelCard(
         slug="pocket-tts", checkpoint=Path("pocket-tts/languages/english_2026-09"),
         export_task="text-to-speech", export_model="pocket-tts", task_type="text-to-speech",
+        export_requires=pocket_tts_reference("3.2.0", "3.2.0"),
         takes_text=True, snippet="text-to-speech-with-vocab-variants",
         base_repo="kyutai/pocket-tts", license_id="cc-by-4.0",
         source_url="https://github.com/kyutai-labs/pocket-tts", source_name="Pocket TTS (English, 2026-09)",
@@ -971,6 +1123,7 @@ dataset each recording comes from; every file also records its own (`loom.voice.
             "longer than that is cut at its commas.\n\n"
             "**English only.** Kyutai's other languages are separate checkpoints and are not this file.",
     ),
+    *[pocket_tts_small_card(size) for size in ("18m", "7m", "2m")],
     ModelCard(
         slug="soprano-1.1-80m", checkpoint=Path("soprano-1.1-80m"),
         export_task="text-to-speech", export_model="soprano", task_type="text-to-speech",
@@ -2751,7 +2904,8 @@ def export_args(card: ModelCard) -> List[str]:
     return args
 
 
-def render_readme(card: ModelCard, gguf_name: str, runtime: Optional[Tuple[str, List[str]]] = None) -> str:
+def render_readme(card: ModelCard, gguf_name: str, runtime: Optional[Tuple[str, List[str]]] = None,
+                  text_runtime: Optional[Tuple[str, List[str]]] = None) -> str:
     # A TTS snippet interpolates `sample_rate`, so an entry that never set one would render the literal
     # `sample_rate=None` into a card telling readers to pass it -- a wrong example is worse than no
     # example, and this is the only field where the value cannot be checked against anything on disk.
@@ -2841,6 +2995,12 @@ def render_readme(card: ModelCard, gguf_name: str, runtime: Optional[Tuple[str, 
         runtime_note = (f"\n**Needs `loom-py-rt` {version} or later.** This file uses the engine's {named} "
                         f"op{'s' if len(ops) > 1 else ''}, new in that release; an older runtime stops "
                         f"with `unknown op '{ops[0]}'`.\n")
+    if text_runtime:
+        version, rules = text_runtime
+        runtime_note += (f"\n**Needs `loom-py-rt` {version} or later to read text exactly as the reference "
+                         f"does.** This file's text front end uses {' and '.join(rules)}, new in that release. "
+                         f"An older runtime loads it and speaks, but prepares some text differently: dashes, "
+                         f"curly quotes, and a period between two numbers.\n")
     extra_files_section = "".join(f"- {bullet}\n" for bullet in card.extra_files)
     weights_line = ("Weights are unmodified; this repo packages the same parameters into\n"
                     "loom.cpp's GGUF format.")
@@ -2977,7 +3137,8 @@ def build_one(card: ModelCard, models_root: Path, output_dir: Path, readme_only:
         for name, _ in files:
             check_frame_ms(card, model_dir / name)
     runtime = required_runtime([model_dir / name for name, _ in files])
-    (model_dir / "README.md").write_text(render_readme(card, gguf_name, runtime))
+    text_runtime = required_text_runtime([model_dir / name for name, _ in files])
+    (model_dir / "README.md").write_text(render_readme(card, gguf_name, runtime, text_runtime))
     print(f"  [ok] {card.slug}: {model_dir}")
 
 
@@ -2988,6 +3149,35 @@ OP_FIRST_RUNTIME = {
     "STFT": "1.0.0rc18",   # ADR-080
     "ISTFT": "1.0.0rc18",  # ADR-080
 }
+
+
+# The release that first carried each TEXT RULE a file can declare, by the key that declares it. Unlike an
+# op, an older runtime does not refuse the file: it ignores the key and prepares the text the old way, so
+# the card says what changes rather than what fails.
+TEXT_RULE_FIRST_RUNTIME = {
+    # (key, the value that needs it or None for "present"): (release, what it is)
+    ("tokenizer.ggml.pocket_tts.char_replace_from", None): ("1.0.0rc19", "the reference's `replace_characters`"),
+    ("tokenizer.ggml.pocket_tts.decimal_period_rule", 2): ("1.0.0rc19", "its v4 decimal-period rule"),
+}
+
+
+def required_text_runtime(gguf_paths: List[Path]) -> Optional[Tuple[str, List[str]]]:
+    """The oldest `loom-py-rt` that prepares text exactly as every one of `gguf_paths` declares, with
+    the rules that need it -- or None when any supported runtime does."""
+    from gguf import GGUFReader
+    from packaging.version import Version
+
+    needed = {}
+    for path in gguf_paths:
+        fields = GGUFReader(str(path)).fields
+        for (key, value), (version, what) in TEXT_RULE_FIRST_RUNTIME.items():
+            field = fields.get(key)
+            if field is not None and (value is None or int(field.parts[field.data[0]][0]) == value):
+                needed[what] = version
+    if not needed:
+        return None
+    version = max(needed.values(), key=Version)
+    return version, [what for what, v in needed.items() if v == version]
 
 
 def graph_ops(gguf_path: Path) -> set:
@@ -3085,6 +3275,10 @@ def main() -> None:
     for card in selected:
         if not args.force_venv and card.venv != venv and not args.readme_only:
             print(f"  [skip] {card.slug}: needs the '{card.venv}' venv, this interpreter is '{venv}'")
+            continue
+        reason = None if args.readme_only or card.export_requires is None else card.export_requires()
+        if reason:
+            print(f"  [skip] {card.slug}: {reason}")
             continue
         build_one(card, args.models_root, args.output_dir, args.readme_only)
 
