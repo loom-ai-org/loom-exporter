@@ -165,3 +165,47 @@ def test_a_card_names_the_runtime_its_ops_need(cards, tmp_path):
     readme = cards.render_readme(card, name, ("1.0.0rc18", ["ISTFT", "STFT"]))
     assert "**Needs `loom-py-rt` 1.0.0rc18 or later.**" in readme
     assert "`ISTFT` and `STFT` ops" in readme and "`unknown op 'ISTFT'`" in readme
+
+
+def _gguf_with_keys(path, **keys):
+    import gguf
+
+    writer = gguf.GGUFWriter(str(path), "loom")
+    for key, value in keys.items():
+        name = "tokenizer.ggml.pocket_tts." + key
+        if isinstance(value, list):
+            writer.add_array(name, value)
+        else:
+            writer.add_int32(name, value)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.close()
+    return path
+
+
+def test_a_card_names_the_runtime_its_text_rules_need(cards, tmp_path):
+    """Pocket-TTS v4's text rules: an older runtime ignores the keys and still speaks, so the note says
+    what changes, not that the file fails. Decimal rule 1 is what every runtime does, and needs none."""
+    old = _gguf_with_keys(tmp_path / "old.gguf", decimal_period_rule=1)
+    assert cards.required_text_runtime([old]) is None
+    v4 = _gguf_with_keys(tmp_path / "v4.gguf", char_replace_from=["—"], decimal_period_rule=2)
+    version, rules = cards.required_text_runtime([old, v4])
+    assert version == "1.0.0rc19" and len(rules) == 2
+
+    card = cards.CATALOG_BY_SLUG["pocket-tts-2m"]
+    name = cards.gguf_names(card)[0][0]
+    readme = cards.render_readme(card, name, None, (version, rules))
+    assert "**Needs `loom-py-rt` 1.0.0rc19 or later to read text exactly" in readme
+    assert "unknown op" not in readme
+
+
+def test_each_pocket_tts_card_names_the_reference_it_needs(cards):
+    """The published card is pinned to the reference it was gated on, the 2026-10 sizes need v4, and
+    each small card is its own repo with the 2026-10 voice packs' 27 voices."""
+    full = cards.CATALOG_BY_SLUG["pocket-tts"]
+    assert full.export_requires is not None
+    for size in ("18m", "7m", "2m"):
+        card = cards.CATALOG_BY_SLUG[f"pocket-tts-{size}"]
+        assert cards.repo_id(card) == f"loom-ai-org/pocket-tts-{size}-loom"
+        assert card.export_requires is not None and [v for v, _ in card.variants] == ["F32", "Q8_0_PC"]
+        assert "`daan`" in card.usage_extra and card.usage_extra.count("| `") == 27   # every voice, once
