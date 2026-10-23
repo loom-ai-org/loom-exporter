@@ -371,10 +371,13 @@ def test_the_small_models_wrappers_reproduce_the_reference_modules(model_dir):
     from loom_exporter.pocket_tts_export import (
         LMPhase, MimiDecoderPhase, OneStepFlowHeadPhase, TextEmbedPhase, causal_mask, load_reference,
     )
+
+    # The skip first: `pocket_tts` is importable only once load_reference has put the reference on the
+    # path, and CI has no reference at all.
+    tts, config = load_reference(str(_small(model_dir)))
     from pocket_tts.models import flow_lm as flow_lm_module
     from pocket_tts.modules.stateful_module import init_states
 
-    tts, config = load_reference(str(_small(model_dir)))
     fl = tts.flow_lm
     torch.manual_seed(0)
     with torch.no_grad():
