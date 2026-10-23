@@ -669,14 +669,19 @@ def _op_loom_fused_attention(self, op, ctx):
 
     scale = float(static_scalar(op.inputs.get("scale"), 1.0))
     layer = int(static_scalar(op.inputs.get("layer"), 0))
+    # `kv_cache` is stated rather than left to op_attention's default-true, because this is the
+    # single place in the whole exporter that decides a model gets persistent state, and a reader
+    # should not have to know a C++ default to see that.
+    attrs = {"layer": layer, "scale": scale, "kv_cache": True}
+    window = int(static_scalar(op.inputs.get("window"), 0))
+    if window:
+        # P4.41 (ADR-085): one whole-sequence pass, no state, and only the causal band computed.
+        attrs = {"layer": layer, "scale": scale, "kv_cache": False, "window": window}
     nodes.append({
         "op": "ATTENTION",
         "inputs": [q_in, k_in, v_in, mask_in],
         "outputs": [out],
-        # `kv_cache` is stated rather than left to op_attention's default-true, because this is the
-        # single place in the whole exporter that decides a model gets persistent state, and a reader
-        # should not have to know a C++ default to see that.
-        "attrs": {"layer": layer, "scale": scale, "kv_cache": True},
+        "attrs": attrs,
     })
 
 
