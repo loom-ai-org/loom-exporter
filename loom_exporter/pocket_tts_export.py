@@ -38,6 +38,7 @@ Usage:
       --task text-to-speech --model pocket-tts
 """
 import math
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,8 +58,11 @@ from .pocket_tts_tokenizer_export import (
 from .spec_protocol import Axis, Unchecked
 
 # Where the reference checkout lives: `pocket-tts` on PyPI would do too, but the export must read the
-# checkpoint's YAML by name, and the clone is what `pocket_tts_reference.py` runs.
-POCKET_TTS_REPO = "/home/flavio/Dev/pocket-tts"
+# checkpoint's YAML by name, and the clone is what `pocket_tts_reference.py` runs. `LOOM_POCKET_TTS_REPO`
+# points elsewhere: the small English models (`english_{18m,7m,2m}_refl_2026-10`) need v4.0.1 or later,
+# whose configs and modules (grouped-query attention, a low-rank text table, `z_proj`, one-step flow heads,
+# a separate Mimi decoder) v3.2.0 does not have.
+POCKET_TTS_REPO = os.environ.get("LOOM_POCKET_TTS_REPO", "/home/flavio/Dev/pocket-tts")
 
 SAMPLE_RATE = 24000
 # Mimi's latent rate and its decoder's: 12.5 Hz latents, upsampled x16 to the SEANet's 200 Hz.
@@ -82,6 +86,12 @@ FRAMES_AFTER_EOS_PADDING = 2
 # 6 layers x 2 x 1024 x 1024 x 4 bytes = 48 MB.
 LM_MAX_POSITIONS = 1024
 
+# The flow heads the driver runs. `lsd` (the full-size models) takes two time conditions and is
+# integrated over `n_steps`; `drifting` and `pointwise` (the small 2026-10 models) take none and are one
+# step by construction: `head(noise)` and `noise + head(noise)`. `flow_matching` needs >= 16 Euler steps
+# and no released checkpoint uses it.
+FLOW_TYPES = ("lsd", "drifting", "pointwise")
+
 # Trace lengths: odd and distinct from every static dimension (the Qwen3-TTS lesson about length 8).
 TRACE_TOKENS = 13
 TRACE_STEPS = 7
@@ -95,13 +105,25 @@ def import_pocket_tts():
 
 # ------------------------------------------------------------------------------------ shared parts --
 
+def _attn_dims(attn) -> Tuple[int, int, int]:
+    """`(attn_dim, num_kv_heads, head_dim)`. v4's attention has queries `attn_dim` wide and keys and
+    values on `num_kv_heads` heads; before v4 (and in every full-size model) both are the defaults,
+    `embed_dim` and `num_heads`, and v3.2.0's module has neither attribute."""
+    attn_dim = getattr(attn, "attn_dim", attn.embed_dim)
+    return attn_dim, getattr(attn, "num_kv_heads", attn.num_heads), attn_dim // attn.num_heads
+
+
 def _split_in_proj(attn) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """`in_proj`'s weight as three `[embed, embed]` blocks. The reference views its output as
-    `(b, t, 3, heads, head_dim)`, so the first third of the rows is Q, then K, then V -- and three 4-D
-    projections replace a 5-D view that ggml has no rank for."""
+    """`in_proj`'s weight as Q `[attn_dim, embed]`, K and V `[kv_heads * head_dim, embed]`. The reference
+    slices Q off the front and views the rest as `(b, t, 2, kv_heads, head_dim)` -- before v4, all of it as
+    `(b, t, 3, heads, head_dim)`, the same rows -- and three 4-D projections replace a 5-D view that ggml
+    has no rank for."""
     w = attn.in_proj.weight.detach()
-    e = attn.embed_dim
-    return w[:e].clone(), w[e:2 * e].clone(), w[2 * e:].clone()
+    attn_dim, kv_heads, head_dim = _attn_dims(attn)
+    kv = kv_heads * head_dim
+    if w.shape[0] != attn_dim + 2 * kv:
+        raise ValueError(f"in_proj has {w.shape[0]} rows, not attn_dim + 2 * kv = {attn_dim + 2 * kv}")
+    return w[:attn_dim].clone(), w[attn_dim:attn_dim + kv].clone(), w[attn_dim + kv:].clone()
 
 
 def _rope_tables(positions: torch.Tensor, head_dim: int, max_period: float):
@@ -138,22 +160,33 @@ class _Attention(nn.Module):
     def __init__(self, attn, max_period: float):
         super().__init__()
         wq, wk, wv = _split_in_proj(attn)
-        self.q = nn.Linear(attn.embed_dim, attn.embed_dim, bias=False)
-        self.k = nn.Linear(attn.embed_dim, attn.embed_dim, bias=False)
-        self.v = nn.Linear(attn.embed_dim, attn.embed_dim, bias=False)
+        attn_dim, self.kv_heads, self.head_dim = _attn_dims(attn)
+        self.q = nn.Linear(attn.embed_dim, attn_dim, bias=False)
+        self.k = nn.Linear(attn.embed_dim, wk.shape[0], bias=False)
+        self.v = nn.Linear(attn.embed_dim, wv.shape[0], bias=False)
         self.q.weight.data.copy_(wq)
         self.k.weight.data.copy_(wk)
         self.v.weight.data.copy_(wv)
         self.out_proj = attn.out_proj
         self.heads = attn.num_heads
-        self.head_dim = attn.dim_per_head
         self.max_period = max_period
+
+    def _repeat_kv(self, x):
+        """`(b, kv_heads, t, d) -> (b, heads, t, d)`, query head `h` reading KV head `h // n_rep`: the
+        reference's `repeat_interleave(n_rep, dim=1)`, in HF's `repeat_kv` spelling, which
+        `fuse_gqa_repeat_kv` recognises -- so the ATTENTION node gets the un-repeated K and V and the
+        cache stores `kv_heads` heads, the rows a voice state holds."""
+        n_rep = self.heads // self.kv_heads
+        if n_rep == 1:
+            return x
+        b, h, t, d = x.shape
+        return x[:, :, None, :, :].expand(b, h, n_rep, t, d).reshape(b, h * n_rep, t, d)
 
     def forward(self, x, cos, sin, mask, past=None):
         b, t, _ = x.shape
         q = self.q(x).view(b, t, self.heads, self.head_dim)
-        k = self.k(x).view(b, t, self.heads, self.head_dim)
-        v = self.v(x).view(b, t, self.heads, self.head_dim)
+        k = self.k(x).view(b, t, self.kv_heads, self.head_dim)
+        v = self.v(x).view(b, t, self.kv_heads, self.head_dim)
         q = q * cos + _rotate_pairs(q) * sin
         k = k * cos + _rotate_pairs(k) * sin
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
@@ -162,6 +195,7 @@ class _Attention(nn.Module):
                 k = torch.cat([past[0], k], dim=2)
                 v = torch.cat([past[1], v], dim=2)
             past[0], past[1] = k, v
+        k, v = self._repeat_kv(k), self._repeat_kv(v)
         scores = torch.matmul(q * (1.0 / math.sqrt(self.head_dim)), k.transpose(-1, -2)) + mask
         ctx = torch.matmul(torch.softmax(scores, dim=-1), v)
         ctx = ctx.transpose(1, 2).reshape(b, t, self.heads * self.head_dim)
@@ -189,27 +223,32 @@ class _Layer(nn.Module):
 # ----------------------------------------------------------------------------------------- flow LM --
 
 class TextEmbedPhase(nn.Module):
-    """`(text_ids) -> conditioner.embed(text_ids)`, `[1, n, 1024]`."""
+    """`(text_ids) -> conditioner(text_ids)`, `[1, n, d_model]`: the table's rows, through the bias-free
+    `proj` when the table is low-rank (v4's `lookup_table.rank`, the 7m and 2m models)."""
 
     def __init__(self, flow_lm):
         super().__init__()
         self.embed = flow_lm.conditioner.embed
+        self.proj = getattr(flow_lm.conditioner, "proj", None)
 
     def forward(self, text_ids):                                        # (1, n) i32
-        return self.embed(text_ids)
+        x = self.embed(text_ids)
+        return x if self.proj is None else self.proj(x)
 
 
 class LMPhase(nn.Module):
     """`(inputs_embeds, position_ids, attention_mask) -> (hidden, eos_logit)` for the LAST row.
 
-    `FlowLMModel.backbone` + `out_eos`: the transformer, `out_norm`, the last row, and the EOS head
-    whose logit the driver compares with the threshold. The reference computes the comparison in the
-    graph; returning the logit keeps the threshold a caller's knob."""
+    `FlowLMModel.backbone` + `out_eos`: the transformer, `out_norm`, the last row, v4's bias-free
+    `z_proj` when the config sets `z_dim` (the small models: 64 wide), and the EOS head whose logit the
+    driver compares with the threshold. `hidden` is what the flow head is conditioned on. The reference
+    computes the comparison in the graph; returning the logit keeps the threshold a caller's knob."""
 
     def __init__(self, flow_lm, max_period: float):
         super().__init__()
         self.layers = nn.ModuleList(_Layer(l, max_period) for l in flow_lm.transformer.layers)
         self.out_norm = flow_lm.out_norm
+        self.z_proj = getattr(flow_lm, "z_proj", None)
         self.out_eos = flow_lm.out_eos
         self.head_dim = self.layers[0].attn.head_dim
         self.max_period = max_period
@@ -220,6 +259,8 @@ class LMPhase(nn.Module):
         for i, layer in enumerate(self.layers):
             x = layer(x, cos, sin, attention_mask, None if pasts is None else pasts[i])
         hidden = self.out_norm(x)[:, -1:]
+        if self.z_proj is not None:
+            hidden = self.z_proj(hidden)
         return hidden, self.out_eos(hidden)
 
 
@@ -282,6 +323,13 @@ class FlowHeadPhase(nn.Module):
         x = net.input_proj(x)
         y = net.cond_embed(c)
         y = y + (self._time(net.time_embed[0], s) + self._time(net.time_embed[1], t)) / 2
+        return self.blocks(x, y)
+
+    def blocks(self, x, y):
+        """`SimpleMLPAdaLN.forward` after the time conditions, on the PROJECTED input: the residual
+        blocks and the final layer. (`input_proj` stays first in each caller, the op order the published
+        full-size export traced, so a re-export names its constants as before.)"""
+        net = self.net
         for block in net.res_blocks:
             shift, scale, gate = block.adaLN_modulation(y).chunk(3, dim=-1)
             h = _layer_norm(x, block.in_ln.weight, block.in_ln.bias, block.in_ln.eps)
@@ -291,6 +339,26 @@ class FlowHeadPhase(nn.Module):
         shift, scale = final.adaLN_modulation(y).chunk(2, dim=-1)
         x = _layer_norm(x, None, None, final.norm_final.eps) * (1 + scale) + shift
         return final.linear(x)
+
+
+class OneStepFlowHeadPhase(FlowHeadPhase):
+    """`(c, x, x_scale) -> head(x')` (`drifting`) or `x' + head(x')` (`pointwise`), `x' = x * x_scale`:
+    the small models' heads, which take no time condition and are one step by construction
+    (`drifting_decode`, `pointwise_decode`). `y` is `cond_embed(c)` alone -- the reference adds the time
+    embeddings' mean only `if self.num_time_conds`."""
+
+    def __init__(self, flow_net, flow_type: str):
+        super().__init__(flow_net)
+        if flow_type not in ("drifting", "pointwise") or len(flow_net.time_embed) != 0:
+            raise ValueError(f"a one-step head is drifting or pointwise with no time embedding, not "
+                             f"{flow_type!r} with {len(flow_net.time_embed)}")
+        self.residual = flow_type == "pointwise"
+
+    def forward(self, c, x, x_scale):                                   # (1, cond) (1, 32) (1, 1)
+        x = x * x_scale
+        h = self.net.input_proj(x)
+        update = self.blocks(h, self.net.cond_embed(c))
+        return x + update if self.residual else update
 
 
 # -------------------------------------------------------------------------------------------- Mimi --
@@ -403,14 +471,29 @@ def load_reference(model_dir: str):
     if config.get("pad_with_spaces_for_short_inputs"):
         raise NotImplementedError(f"{config_path.name} pads short inputs with spaces, which this "
                                   f"export's text front end does not do")
-    if config["flow_lm"]["flow"].get("type", "lsd") != "lsd":
+    if config["flow_lm"]["flow"].get("type", "lsd") not in FLOW_TYPES:
         raise NotImplementedError(f"{config_path.name}'s flow head is "
-                                  f"{config['flow_lm']['flow']['type']!r}; the driver integrates LSD")
+                                  f"{config['flow_lm']['flow']['type']!r}; the driver runs "
+                                  f"{', '.join(FLOW_TYPES)} (one step each, no Euler integration)")
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / config_path.name
         path.write_text(yaml.safe_dump(config))
         tts = TTSModel.load_model(config=str(path))
     return tts.eval(), config
+
+
+def reference_fade_in(tts) -> Optional[np.ndarray]:
+    """The ramp the reference multiplies each chunk's first samples by, or None if it applies none.
+
+    v4's `_decode_audio_worker` fades the first 5 ms of every chunk in (`linspace(0, 1, sr // 200)`): a
+    fresh Mimi decoder state starts with a small step, heard as a click. v3.2.0 has no fade, so the ramp
+    is shipped only when the reference in use applies it -- read off its source rather than assumed, so a
+    re-export of a published model against the reference it was gated on keeps its waveform."""
+    import inspect
+
+    if "fade_in" not in inspect.getsource(type(tts)._decode_audio_worker):
+        return None
+    return torch.linspace(0, 1, SAMPLE_RATE // 200).numpy().astype(np.float32)
 
 
 def read_voice(path: Path, n_layers: int) -> Tuple[np.ndarray, int]:
@@ -463,6 +546,9 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
     driver_script_path: Path = Path(__file__).resolve().parent / "pocket_tts_driver"
     _driver_weights: Optional[Dict[str, np.ndarray]] = field(default=None, init=False, repr=False)
     _temperature: float = field(default=0.7, init=False, repr=False)
+    _eos_threshold: float = field(default=DEFAULT_EOS_THRESHOLD, init=False, repr=False)
+    _flow_type: str = field(default="lsd", init=False, repr=False)
+    _fade_in: int = field(default=0, init=False, repr=False)
     _voice_rows: int = field(default=0, init=False, repr=False)
     _voice_compat: Optional[str] = field(default=None, init=False, repr=False)
     _chunk_headers: Tuple[int, int] = field(default=(-1, -1), init=False, repr=False)
@@ -480,6 +566,12 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
         "_driver_weights": Unchecked("READ off the checkpoint during phases() and shipped as driver "
                                       "weights"),
         "_temperature": Unchecked("the config's `default_temperature`, read during phases()"),
+        "_eos_threshold": Unchecked("the config's `default_eos_threshold` (v4; -4 before), read during "
+                                    "phases()"),
+        "_flow_type": Unchecked("the config's `flow.type`, read during phases(); load_reference "
+                                "refuses one the driver does not run"),
+        "_fade_in": Unchecked("the reference's per-chunk fade-in length (0 for none), read during "
+                              "phases()"),
         "_voice_rows": Unchecked("the built-in voice's length, read during phases()"),
         "_voice_compat": Unchecked("the flow LM weights' fingerprint, read once by contract()"),
         "_chunk_headers": Unchecked("the SentencePiece `<s>`/`</s>` ids, read during phases()"),
@@ -491,6 +583,10 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
         tts, config = load_reference(self.model_dir)
         flow_lm, mimi = tts.flow_lm, tts.mimi
         self._temperature = float(tts.temp)
+        # v4 reads the threshold off the config (`default_eos_threshold`, -1 for the small models); before
+        # v4 it is `DEFAULT_EOS_THRESHOLD`, which v4's config default also is.
+        self._eos_threshold = float(config.get("default_eos_threshold", DEFAULT_EOS_THRESHOLD))
+        self._flow_type = config["flow_lm"]["flow"].get("type", "lsd")
         sp = flow_lm.conditioner.tokenizer.sp
         self._chunk_headers = (int(sp.bos_id()), int(sp.eos_id()))
         n_layers = len(flow_lm.transformer.layers)
@@ -502,7 +598,13 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
             "bos_emb": flow_lm.bos_emb.detach().float().numpy(),
             "word_start": word_start_flags(flow_lm.conditioner.tokenizer.sp),
         }
+        fade_in = reference_fade_in(tts)
+        if fade_in is not None:
+            self._driver_weights["fade_in"] = fade_in
+        self._fade_in = 0 if fade_in is None else len(fade_in)
         dim, ldim = flow_lm.dim, flow_lm.ldim
+        # What the flow and EOS heads read: `z_proj`'s output when the config has one, else the backbone's.
+        cond = flow_lm.z_proj.out_features if getattr(flow_lm, "z_proj", None) is not None else dim
         max_period = float(config["flow_lm"]["transformer"]["max_period"])
         text_dim = ct.RangeDim(1, LM_MAX_POSITIONS)
         seq_dim = ct.RangeDim(1, LM_MAX_POSITIONS)
@@ -537,18 +639,7 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
                 dummy_inputs=(torch.randn(1, 1, ldim),),
                 mil_inputs=[ct.TensorType(name="latent", shape=(1, 1, ldim), dtype=np.float32)],
             ),
-            ExportPhase(
-                name="flow_head",
-                wrapper=FlowHeadPhase(flow_lm.flow_net).eval(),
-                dummy_inputs=(torch.randn(1, dim), torch.tensor([[0.0]]), torch.tensor([[1.0]]),
-                              torch.randn(1, ldim), torch.tensor([[0.5]]), torch.tensor([[1.0]])),
-                mil_inputs=[ct.TensorType(name="c", shape=(1, dim), dtype=np.float32),
-                            ct.TensorType(name="s", shape=(1, 1), dtype=np.float32),
-                            ct.TensorType(name="t", shape=(1, 1), dtype=np.float32),
-                            ct.TensorType(name="x", shape=(1, ldim), dtype=np.float32),
-                            ct.TensorType(name="x_scale", shape=(1, 1), dtype=np.float32),
-                            ct.TensorType(name="n_steps", shape=(1, 1), dtype=np.float32)],
-            ),
+            self._flow_head_phase(flow_lm, cond, ldim),
             ExportPhase(
                 name="mimi_decoder",
                 wrapper=MimiDecoderPhase(flow_lm, mimi).eval(),
@@ -565,6 +656,33 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
                 declared_axes={"positions": {1: f"{MIMI_UPSAMPLE} * n_codes"}},
             ),
         ]
+
+    def _flow_head_phase(self, flow_lm, cond: int, ldim: int) -> ExportPhase:
+        import coremltools as ct
+
+        if self._flow_type == "lsd":
+            return ExportPhase(
+                name="flow_head",
+                wrapper=FlowHeadPhase(flow_lm.flow_net).eval(),
+                dummy_inputs=(torch.randn(1, cond), torch.tensor([[0.0]]), torch.tensor([[1.0]]),
+                              torch.randn(1, ldim), torch.tensor([[0.5]]), torch.tensor([[1.0]])),
+                mil_inputs=[ct.TensorType(name="c", shape=(1, cond), dtype=np.float32),
+                            ct.TensorType(name="s", shape=(1, 1), dtype=np.float32),
+                            ct.TensorType(name="t", shape=(1, 1), dtype=np.float32),
+                            ct.TensorType(name="x", shape=(1, ldim), dtype=np.float32),
+                            ct.TensorType(name="x_scale", shape=(1, 1), dtype=np.float32),
+                            ct.TensorType(name="n_steps", shape=(1, 1), dtype=np.float32)],
+            )
+        # No time inputs at all, rather than ones the graph ignores: an input nothing reads would be a
+        # binding the engine is asked for and a trace could drop.
+        return ExportPhase(
+            name="flow_head",
+            wrapper=OneStepFlowHeadPhase(flow_lm.flow_net, self._flow_type).eval(),
+            dummy_inputs=(torch.randn(1, cond), torch.randn(1, ldim), torch.tensor([[0.5]])),
+            mil_inputs=[ct.TensorType(name="c", shape=(1, cond), dtype=np.float32),
+                        ct.TensorType(name="x", shape=(1, ldim), dtype=np.float32),
+                        ct.TensorType(name="x_scale", shape=(1, 1), dtype=np.float32)],
+        )
 
     def driver_components(self) -> List:
         from .driver_components import (
@@ -593,19 +711,25 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
                 # The checkpoint's own `default_temperature` (0.3 for English, where the reference's
                 # human evals preferred it), and the reference's other generation defaults.
                 "DEFAULT_TEMPERATURE": self._temperature,
-                "DEFAULT_EOS_THRESHOLD": DEFAULT_EOS_THRESHOLD,
+                "DEFAULT_EOS_THRESHOLD": self._eos_threshold,
                 "DEFAULT_DECODE_STEPS": DEFAULT_DECODE_STEPS,
+                # Samples of each chunk faded in by the `fade_in` driver weight; 0 for none.
+                "FADE_IN_SAMPLES": self._fade_in,
             }),
             DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
             LuaFragment(fragment / "00_header.lua", top_level=True,
                         defines=("pocket_count_words", "pocket_split_chunks")),
+            # The one `flow_head` call this export's graph takes: LSD's timed one or a one-step head's.
+            LuaFragment(fragment / ("00_flow_head_lsd.lua" if self._flow_type == "lsd"
+                                    else "00_flow_head_one_step.lua"),
+                        top_level=True, defines=("pocket_flow_head",)),
             LuaFragment(fragment / "01_flow_lm.lua",
                         reads=("tokens", "CHUNK_HEADER_SHORT", "CHUNK_HEADER_LONG", "SHORT_CHUNK_MAX_WORDS",
                                "SHORT_CHUNK_FRAMES_AFTER_EOS", "LONG_CHUNK_FRAMES_AFTER_EOS",
                                "FRAMES_AFTER_EOS_PADDING", "LATENT_DIM", "LM_MAX_POSITIONS",
                                "MIMI_UPSAMPLE", "FRAME_RATE", "TOKENS_PER_SECOND_ESTIMATE",
                                "GEN_SECONDS_PADDING", "MIN_FRAMES_BEFORE_EOS", "DEFAULT_TEMPERATURE",
-                               "DEFAULT_EOS_THRESHOLD", "DEFAULT_DECODE_STEPS"),
+                               "DEFAULT_EOS_THRESHOLD", "DEFAULT_DECODE_STEPS", "FADE_IN_SAMPLES"),
                         defines=("wave",)),
             DriverReturn(values=("wave",)),
         ]
