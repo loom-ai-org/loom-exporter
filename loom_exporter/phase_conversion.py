@@ -101,6 +101,9 @@ def convert_phase(phase, quantize: Optional[str] = None, keep_float=(),
         gc.collect()
         return PhaseResult(topologies=cells, weights=packer.weights, packing=packing)
 
+    if phase.attention_window is not None and phase.kv_cache_size is not None:
+        raise ValueError(f"phase '{phase.name}' declares both a KV cache and an attention window; a "
+                         f"windowed ATTENTION node is uncached (ADR-085)")
     traced = torch.jit.trace(phase.wrapper, phase.dummy_inputs)
     mil_prog = ct.convert(
         traced, inputs=phase.mil_inputs, convert_to="milinternal",
@@ -110,7 +113,8 @@ def convert_phase(phase, quantize: Optional[str] = None, keep_float=(),
         mil_prog, root_axis=phase.root_axis, declared_axes=phase.declared_axes,
         # Per-phase, not per-export: an encoder-decoder model caches its decoder's attention and must
         # not cache its encoder's. See ExportPhase.fuse_attention.
-        fuse_attention=phase.fuse_attention, kv_cache_size=phase.kv_cache_size,
+        fuse_attention=phase.fuse_attention or phase.attention_window is not None,
+        kv_cache_size=phase.kv_cache_size, attention_window=phase.attention_window,
         fuse_conv=getattr(phase, "fuse_conv", False),
         # Reaches a PHASE exporter as of P5.0's second change, where it used to reach only the output
         # one. Quantization is what makes packing early worth doing at all -- an F32 pack is a dtype
@@ -146,6 +150,13 @@ def convert_phase(phase, quantize: Optional[str] = None, keep_float=(),
             f"the traced block breaks (scaling on the scores rather than Q, a mask computed from the "
             f"input rather than passed through, a merged transpose -- Retro-041, Retro-078)."
         )
+    # A declared window that fused nothing is not wrong output, but it is the whole speed-up gone without
+    # a word: the dense form runs instead. Raise, the way a cache that fused nothing raises above.
+    if phase.attention_window is not None:
+        if not any(node["op"] == "ATTENTION" and node.get("attrs", {}).get("window") == phase.attention_window
+                   for node in topo["nodes"]):
+            raise ValueError(f"phase '{phase.name}' declares attention_window={phase.attention_window} but "
+                             f"`fuse_loom_attention` fused none of its attention blocks")
     print(f"  {phase.name}: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights{_rss_note()}")
 
     topologies = {phase.name: topo}
