@@ -9,6 +9,10 @@ that path reads is written here FROM the reference, so `loom::PocketTtsVocab` ho
 | key (`tokenizer.ggml.pocket_tts.`) | from                                                        |
 |------------------------------------|-------------------------------------------------------------|
 | `replace_from`/`replace_to`        | `prepare_text_prompt`'s `str.replace` calls, in order        |
+| `char_replace_from`/`_to`          | the config's `replace_characters` (v4), when it has any      |
+| `sentence_marks`/`stray_clause_marks` | the two classes of v4's `re.sub` after it, PROBED off      |
+|                                    | `prepare_text_prompt` rather than restated                   |
+| `decimal_period_rule`              | 1 or 2, PROBED off `_is_decimal_period_boundary` ("3. 14")   |
 | `terminal`/`weak`/`closers`        | `text_chunking._TERMINAL_PUNCTUATION` / `_WEAK_` / `_CLOSERS` |
 | `full_stop`                        | the "." `_ensure_terminal_punctuation` appends               |
 | `upper_from`/`upper_to`            | `c.upper()` where `not c.isupper()` and it changes `c`       |
@@ -58,6 +62,40 @@ def _case_table():
     return src, dst
 
 
+def _probe_stray_clause_rule(text_chunking):
+    """`(sentence_marks, clause_marks)` of v4's `re.sub(r"([.!?\u2026])\s*[,;:]", r"\1", ...)` inside
+    `prepare_text_prompt`, read off the function's behaviour over every punctuation character: `c` is a
+    sentence mark when "Ab<c> , cd" loses its comma, a clause mark when "Ab. <c> cd" loses `c`. The
+    table passed is a no-op one (NUL -> NUL) so that the step runs at all -- it runs only for a
+    non-empty table -- without rewriting a probe character first."""
+    import inspect
+    import unicodedata
+
+    if "replace_characters" not in inspect.signature(text_chunking.prepare_text_prompt).parameters:
+        return None
+    prepare = lambda t: text_chunking.prepare_text_prompt(t, False, False, False, False, {"\x00": "\x00"})[0]
+    punct = [chr(cp) for cp in range(0x20, 0x3000) if unicodedata.category(chr(cp)).startswith("P")]
+    sentence = [c for c in punct if prepare(f"Ab{c} , cd") == f"Ab{c} cd"]
+    clause = [c for c in punct if prepare(f"Ab. {c} cd") == "Ab. cd"]
+    if not sentence or not clause:
+        raise ValueError("prepare_text_prompt takes replace_characters but drops no stray clause mark; "
+                         "the probe no longer describes the reference")
+    return sentence, clause
+
+
+def _probe_decimal_period_rule(text_chunking, sp) -> int:
+    """1 when `_is_decimal_period_boundary` reads "I counted to 3. 14 people." as 3.14 (the whole prefix
+    and suffix decoded: before v4), 2 when it sees the space (v4: the ids next to the cut only)."""
+
+    class _Tok:
+        def decode(self, ids):
+            return sp.decode(list(ids))
+
+    ids = sp.encode("I counted to 3. 14 people.", out_type=int)
+    cut = next(i + 1 for i, t in enumerate(ids) if sp.id_to_piece(t) == "." and i + 1 < len(ids))
+    return 1 if text_chunking._is_decimal_period_boundary(ids, cut, _Tok()) else 2
+
+
 def write_pocket_tts_vocab(w: GGUFWriter, tokenizer_dir: str) -> None:
     import sentencepiece as spm
 
@@ -81,6 +119,19 @@ def write_pocket_tts_vocab(w: GGUFWriter, tokenizer_dir: str) -> None:
         replace_to.append(",")
     w.add_array(PREFIX + "replace_from", replace_from)
     w.add_array(PREFIX + "replace_to", replace_to)
+    # v4's per-character rewrites (`Config.replace_characters`), and the stray-clause-mark rule the
+    # reference runs only when there are some. A config without any writes neither, which is also what
+    # every file written before v4 looks like.
+    char_table = config.get("replace_characters") or {}
+    rule = _probe_stray_clause_rule(text_chunking)
+    if char_table:
+        if rule is None:
+            raise ValueError(f"{model_dir.name}'s config lists replace_characters but this reference's "
+                             f"prepare_text_prompt does not take them; it is older than the config")
+        w.add_array(PREFIX + "char_replace_from", list(char_table))
+        w.add_array(PREFIX + "char_replace_to", list(char_table.values()))
+        w.add_array(PREFIX + "sentence_marks", rule[0])
+        w.add_array(PREFIX + "stray_clause_marks", rule[1])
     w.add_array(PREFIX + "terminal", list(text_chunking._TERMINAL_PUNCTUATION))
     w.add_array(PREFIX + "weak", list(text_chunking._WEAK_PUNCTUATION))
     w.add_array(PREFIX + "closers", list(text_chunking._CLOSERS))
@@ -92,6 +143,7 @@ def write_pocket_tts_vocab(w: GGUFWriter, tokenizer_dir: str) -> None:
                                      if not 0xD800 <= cp <= 0xDFFF and chr(cp).isdigit()])
 
     sp = spm.SentencePieceProcessor(model_proto=proto)
+    w.add_int32(PREFIX + "decimal_period_rule", _probe_decimal_period_rule(text_chunking, sp))
     # `split_into_best_sentences` drops the FIRST id of each, whatever it is (the dummy prefix's piece
     # for this vocabulary); reproduced as written, not re-derived.
     w.add_array(PREFIX + "sentence_end_ids", sp.encode(".!...?", out_type=int)[1:])
