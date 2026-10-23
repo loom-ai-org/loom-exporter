@@ -1596,7 +1596,8 @@ class LoomGGUFExporter:
             # persistent state it must never have.
             apply_loom_mil_passes(self.program,
                                    fuse_attention=bool(self.kwargs.get("fuse_attention")),
-                                   fuse_conv=bool(self.kwargs.get("fuse_conv")))
+                                   fuse_conv=bool(self.kwargs.get("fuse_conv")),
+                                   attention_window=self.kwargs.get("attention_window"))
             self.facts.annotate_dynamic_shapes(self.program)
         self._mil_passes_applied = True
 
@@ -2787,10 +2788,12 @@ class LoomGGUFExporter:
         """
         return {
             # MIL k/v are [batch, n_head_kv, seq, head_dim].
+            # Cached blocks only: a windowed one (P4.41) is a single pass with nothing to store.
             "attention": [
                 (op.name, (int(list(op.inputs["k"].shape)[1]), int(list(op.inputs["k"].shape)[3]),
                            int(list(op.inputs["v"].shape)[3])))
                 for op in self._fused_ops("loom_fused_attention")
+                if op.inputs.get("window") is None or not int(op.inputs["window"].val)
             ],
             # MIL x is [batch, channels, seq]; weight is [channels, 1, kernel].
             "short_conv": [

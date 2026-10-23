@@ -258,6 +258,21 @@ def test_mimis_positions_are_one_symbol_with_its_frames(phases):
     assert phases["mimi_decoder"].declared_axes == {"positions": {1: f"{MIMI_UPSAMPLE} * n_codes"}}
 
 
+def test_mimis_attention_window_is_the_masks_own_band(phases):
+    """The window the phase declares (P4.41, loom.cpp ADR-085) is a promise that the mask is -inf outside
+    `q - window < k <= q`: the engine then never reads those entries. Checked against `window_mask` itself,
+    over more positions than the window, and the band's inside is all zeros."""
+    mimi = phases["mimi_decoder"]
+    window = mimi.attention_window
+    assert window == mimi.wrapper.context and mimi.kv_cache_size is None
+    t = 2 * window + 7
+    mask = mimi.wrapper.window_mask(torch.arange(t, dtype=torch.int32).view(1, -1))[0, 0]
+    q, k = torch.meshgrid(torch.arange(t), torch.arange(t), indexing="ij")
+    band = (k <= q) & (q - k < window)
+    assert torch.all(mask[band] == 0)
+    assert torch.all(mask[~band] <= -1e30)
+
+
 # -- voice files (loom.cpp ADR-045) and the chunk headers ------------------------------------------
 
 def test_the_fingerprint_follows_the_flow_lm_and_ignores_mimi(tmp_path):

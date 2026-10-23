@@ -609,6 +609,7 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
         text_dim = ct.RangeDim(1, LM_MAX_POSITIONS)
         seq_dim = ct.RangeDim(1, LM_MAX_POSITIONS)
         frame_dim = ct.RangeDim(1, LM_MAX_POSITIONS)
+        mimi_phase = MimiDecoderPhase(flow_lm, mimi).eval()
         return [
             ExportPhase(
                 name="text_embed",
@@ -642,7 +643,7 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
             self._flow_head_phase(flow_lm, cond, ldim),
             ExportPhase(
                 name="mimi_decoder",
-                wrapper=MimiDecoderPhase(flow_lm, mimi).eval(),
+                wrapper=mimi_phase,
                 dummy_inputs=(torch.randn(1, TRACE_FRAMES, ldim),
                               torch.arange(TRACE_FRAMES * MIMI_UPSAMPLE, dtype=torch.int32).view(1, -1)),
                 mil_inputs=[
@@ -654,6 +655,9 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
                 root_axis="n_codes",
                 # 16 decoder positions per latent -- one symbol, not two.
                 declared_axes={"positions": {1: f"{MIMI_UPSAMPLE} * n_codes"}},
+                # The decoder transformer's causal window, which `window_mask` builds: only the band is
+                # computed (P4.41, ADR-085). 6.6 s of a 19 s 2m synthesis on a Pi Zero was the dense form.
+                attention_window=mimi_phase.context,
             ),
         ]
 
