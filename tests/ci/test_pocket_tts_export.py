@@ -345,3 +345,102 @@ def test_the_chunk_header_constants_are_prepare_text_prompts():
     assert prepare_text_prompt(words + " more", False, False)[1] == LONG_CHUNK_FRAMES_AFTER_EOS
     # Counted as `str.split()` counts: a tab separates words.
     assert prepare_text_prompt("\t".join(["w"] * 5), False, False)[1] == LONG_CHUNK_FRAMES_AFTER_EOS
+
+
+# -- the small English models (v4 of the reference: english_{18m,7m,2m}_refl_2026-10) ----------------
+
+SMALL_DIRS = [MODEL_DIR.parent / f"english_{size}_refl_2026-10" for size in ("18m", "7m", "2m")]
+
+
+def _small(model_dir: Path):
+    """Skip unless the reference in use has this model's config (v4.0.1+, `LOOM_POCKET_TTS_REPO`) and
+    the checkpoint is on disk."""
+    config = Path(POCKET_TTS_REPO, "pocket_tts", "config", f"{model_dir.name}.yaml")
+    if not (config.is_file() and model_dir.is_dir()):
+        pytest.skip(f"needs {config.name} in the reference (v4.0.1+) and {model_dir}")
+    return model_dir
+
+
+@pytest.mark.parametrize("model_dir", SMALL_DIRS, ids=lambda d: d.name)
+def test_the_small_models_wrappers_reproduce_the_reference_modules(model_dir):
+    """What v4 added, each against the module or function it re-spells: the low-rank text table, the
+    grouped-query attention and `z_proj` in the LM's last row, the one-step head (`drifting_decode`,
+    `pointwise_decode`), and Mimi's separate decoder over more frames than its 50-position window."""
+    from functools import partial
+
+    from loom_exporter.pocket_tts_export import (
+        LMPhase, MimiDecoderPhase, OneStepFlowHeadPhase, TextEmbedPhase, causal_mask, load_reference,
+    )
+    from pocket_tts.models import flow_lm as flow_lm_module
+    from pocket_tts.modules.stateful_module import init_states
+
+    tts, config = load_reference(str(_small(model_dir)))
+    fl = tts.flow_lm
+    torch.manual_seed(0)
+    with torch.no_grad():
+        ids = torch.randint(4, 3000, (1, 11), dtype=torch.int32)
+        torch.testing.assert_close(TextEmbedPhase(fl)(ids), fl.conditioner(ids.long()), rtol=0, atol=0)
+
+        x = torch.randn(1, 9, fl.dim)
+        lm = LMPhase(fl, float(config["flow_lm"]["transformer"]["max_period"]))
+        hidden, eos = lm(x, torch.arange(9).view(1, -1), causal_mask(9))
+        want = fl.z_proj(fl.out_norm(fl.transformer(x, None))[:, -1:])
+        torch.testing.assert_close(hidden, want, rtol=0, atol=1e-4)
+        torch.testing.assert_close(eos, fl.out_eos(want), rtol=0, atol=1e-4)
+
+        flow_type = config["flow_lm"]["flow"]["type"]
+        decode = {"drifting": flow_lm_module.drifting_decode,
+                  "pointwise": flow_lm_module.pointwise_decode}[flow_type]
+        c, z = torch.randn(1, fl.z_proj.out_features), torch.randn(1, fl.ldim)
+        std = math.sqrt(0.3)
+        got = OneStepFlowHeadPhase(fl.flow_net, flow_type)(c, z, torch.tensor([[std]]))
+        torch.testing.assert_close(got, decode(partial(fl.flow_net, c), z * std), rtol=0, atol=1e-5)
+
+        n = 7                                   # 112 decoder positions > the 50-position window
+        latents = torch.randn(1, n, fl.ldim)
+        got = MimiDecoderPhase(fl, tts.mimi)(latents, torch.arange(n * MIMI_UPSAMPLE).view(1, -1))
+        state = init_states(tts.mimi, batch_size=1, sequence_length=n * MIMI_UPSAMPLE)
+        want = tts.mimi.decode_from_latent(latents * fl.emb_std + fl.emb_mean, state)[:, 0]
+        torch.testing.assert_close(got, want, rtol=0, atol=1e-4)
+
+
+@pytest.mark.parametrize("model_dir", SMALL_DIRS, ids=lambda d: d.name)
+def test_a_small_model_ships_the_one_step_head_and_its_own_defaults(model_dir):
+    """The flow head takes no time inputs, the driver ships the one `flow_head` call that matches it,
+    and the EOS threshold and fade-in are the reference's for this model."""
+    import yaml
+
+    cfg = PocketTTSExportConfig(output_path="/dev/null", model_dir=str(_small(model_dir)))
+    phases = {p.name: p for p in cfg.phases()}
+    assert [i.name for i in phases["flow_head"].mil_inputs] == ["c", "x", "x_scale"]
+    fragments = [c.path.name for c in cfg.driver_components() if hasattr(c, "path")]
+    assert "00_flow_head_one_step.lua" in fragments and "00_flow_head_lsd.lua" not in fragments
+    config = yaml.safe_load(Path(POCKET_TTS_REPO, "pocket_tts", "config", f"{model_dir.name}.yaml").read_text())
+    assert cfg._eos_threshold == config["default_eos_threshold"] == -1.0
+    assert cfg._fade_in == 120 and cfg._driver_weights["fade_in"][-1] == 1.0
+
+
+@needs_reference
+def test_the_v4_text_rules_are_probed_off_the_reference():
+    """`replace_characters`' stray-clause rule and the decimal-period rule, read off the reference in
+    use: v4's classes and rule 2, or (v3.2.0) no rule and rule 1 -- so an export against the reference a
+    published file was gated on writes what it wrote then."""
+    import inspect
+
+    import sentencepiece as spm
+
+    from loom_exporter.pocket_tts_tokenizer_export import (
+        _probe_decimal_period_rule, _probe_stray_clause_rule,
+    )
+
+    sys.path.insert(0, POCKET_TTS_REPO)
+    from pocket_tts.models import text_chunking
+
+    sp = spm.SentencePieceProcessor(str(MODEL_DIR / "tokenizer.model"))
+    rule = _probe_stray_clause_rule(text_chunking)
+    if "replace_characters" in inspect.signature(text_chunking.prepare_text_prompt).parameters:
+        assert rule == (list("!.?…"), list(",:;"))
+        assert _probe_decimal_period_rule(text_chunking, sp) == 2
+    else:
+        assert rule is None
+        assert _probe_decimal_period_rule(text_chunking, sp) == 1

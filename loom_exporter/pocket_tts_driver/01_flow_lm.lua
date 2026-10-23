@@ -65,16 +65,9 @@
                 _x = loom.gaussian_array(LATENT_DIM)
             end
             _draw = _draw + 1
-            -- `lsd_decode`: `n_steps` updates from s = i/n to t = (i+1)/n. The first scales the unit
-            -- draw by sqrt(temperature); the graph does both products, in f32, as the reference does.
-            local _scale = _std
-            for _i = 0, _n_steps - 1 do
-                loom.run_subgraph_and_retain('flow_head', {n_tokens = 1, n_past = 0},
-                    {c = {from = 'lm', index = 1}, s = {_i / _n_steps}, t = {(_i + 1) / _n_steps},
-                     x = _x, x_scale = {_scale}, n_steps = {_n_steps}})
-                _x = loom.get_output('flow_head', 1)
-                _scale = 1.0
-            end
+            -- One sample of the flow head: LSD integrated over `n_steps`, or a one-step head
+            -- (`pocket_flow_head`, from whichever of the two head fragments this export shipped).
+            _x = pocket_flow_head(_x, _std, _n_steps)
 
             -- `_autoregressive_generation`: the EOS head is ignored for the first frames, then the loop
             -- runs `_after` more steps and ends WITHOUT keeping the latent of the step it ends on.
@@ -104,6 +97,12 @@
         -- thread starts afresh per chunk too, and its streamed calls compute what one call does.
         local _wave = loom.run_subgraph('mimi_decoder', {n_codes = _n_frames, n_past = 0},
             {latents = _latents, positions = loom.range(0, _n_frames * MIMI_UPSAMPLE)})
+        -- The reference's fade-in of each chunk's first samples (a fresh decoder state clicks). Exact: an
+        -- f32 times an f32 is exact in a double, and the one rounding back to f32 is torch's `*=`.
+        if FADE_IN_SAMPLES > 0 then
+            local _fade = loom.get_weight('step_embed', 'fade_in')
+            for _i = 1, math.min(FADE_IN_SAMPLES, #_wave) do _wave[_i] = _wave[_i] * _fade[_i] end
+        end
         local _base = #wave
         for _i = 1, #_wave do wave[_base + _i] = _wave[_i] end
     end
