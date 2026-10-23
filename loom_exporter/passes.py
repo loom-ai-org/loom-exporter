@@ -17,6 +17,8 @@ Run via `apply_loom_mil_passes(prog)`, called once by `LoomGGUFExporter.export()
 `ct.convert(...)` has produced the `Program` it was constructed with, before any topology generation.
 """
 
+from typing import Optional
+
 import numpy as np
 
 from coremltools.converters.mil.mil import Builder as mb
@@ -1148,6 +1150,11 @@ class fuse_loom_attention(AbstractGraphPass):
     runs, just without a cache. A partial match must never half-rewrite.
     """
 
+    # Set by `apply_loom_mil_passes` for one call, from the phase's `attention_window` (P4.41,
+    # ADR-085): every block this call fuses is then an UNCACHED node with that causal window. A
+    # pattern match cannot see that a mask is banded -- the wrapper that builds it can, so it says so.
+    window = None
+
     def apply(self, prog):
         for f in prog.functions.values():
             self._next_layer = 0
@@ -1485,10 +1492,12 @@ class fuse_loom_attention(AbstractGraphPass):
                 # may still have other consumers, and deciding is `dead_code_elimination`'s job.
                 k_var = mb.transpose(x=k_source, perm=[0, 2, 1, 3],
                                      name=f"{k_source.name}_attn_k", before_op=anchor)
+            # The two inputs only when windowed, so a cached export's ops (and topology) are unchanged.
+            windowed = {} if not self.window else {"kv_cache": False, "window": np.int32(self.window)}
             fused = mb.loom_fused_attention(
                 q=q_var, k=k_var, v=v_var, mask=mask_var,
                 scale=np.float32(scale), layer=np.int32(self._next_layer),
-                name=out_var.name, before_op=anchor,
+                name=out_var.name, before_op=anchor, **windowed,
             )
 
         if not reshape_op.enclosing_block.try_replace_uses_of_var_after_op(
@@ -1687,7 +1696,8 @@ _LOOM_ATTENTION_PASS_NAME = "loom::fuse_loom_attention"
 _LOOM_SHORT_CONV_PASS_NAME = "loom::fuse_loom_short_conv"
 
 
-def apply_loom_mil_passes(prog, fuse_attention: bool = False, fuse_conv: bool = False) -> None:
+def apply_loom_mil_passes(prog, fuse_attention: bool = False, fuse_conv: bool = False,
+                          attention_window: Optional[int] = None) -> None:
     """
     Runs Loom's own MIL->MIL rewrite passes -- GQA `repeat_kv()` fusion, matmul transpose_x
     normalization (R2a), mutual-broadcast insertion (R2a), replicate-pad and depthwise-conv_transpose
@@ -1708,7 +1718,9 @@ def apply_loom_mil_passes(prog, fuse_attention: bool = False, fuse_conv: bool = 
             # Must land between the rewrites and the DCE that cleans up after them, which is why these
             # are spliced here rather than appended to the list.
             if fuse_attention:
-                PASS_REGISTRY[_LOOM_ATTENTION_PASS_NAME](prog)
+                attention = PASS_REGISTRY[_LOOM_ATTENTION_PASS_NAME]   # a fresh instance per lookup
+                attention.window = attention_window
+                attention(prog)
             if fuse_conv:
                 PASS_REGISTRY[_LOOM_SHORT_CONV_PASS_NAME](prog)
         PASS_REGISTRY[pass_name](prog)

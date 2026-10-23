@@ -43,6 +43,11 @@ class loom_fused_attention(Operation):
         mask=TensorInputType(optional=True, type_domain="T"),
         scale=TensorInputType(const=True, optional=True, type_domain="T"),
         layer=TensorInputType(const=True, optional=True, type_domain=types.int32),
+        # Uncached and windowed (P4.41, ADR-085): a single whole-sequence pass whose mask is -inf
+        # outside the causal window `q - window < k <= q`, so the engine computes only that band.
+        # `window` 0 means none. Set by the pass from the phase's declaration, never inferred.
+        kv_cache=TensorInputType(const=True, optional=True, type_domain=types.bool),
+        window=TensorInputType(const=True, optional=True, type_domain=types.int32),
     )
 
     type_domains = {
@@ -51,7 +56,7 @@ class loom_fused_attention(Operation):
 
     def default_inputs(self):
         from coremltools.converters.mil.mil.input_type import DefaultInputs
-        return DefaultInputs(scale=1.0, layer=0)
+        return DefaultInputs(scale=1.0, layer=0, kv_cache=True, window=0)
 
     def type_inference(self):
         q_shape = list(self.q.shape)

@@ -64,6 +64,11 @@ class ExportPhase:
     # The cache capacity in tokens, required when `fuse_attention` is set and meaningless otherwise --
     # `LoomGGUFExporter._kv_cache_geometry` raises naming it if a fused export does not supply one.
     kv_cache_size: Optional[int] = None
+    # Fuse this phase's SDPA blocks into UNCACHED `ATTENTION` nodes with this causal window (P4.41,
+    # ADR-085): a promise that every block's mask is -inf outside `q - window < k <= q`, which lets the
+    # engine compute only that band. The wrapper that builds the mask is the only thing that knows it is
+    # banded, so it is declared here rather than inferred. Exclusive with `kv_cache_size`.
+    attention_window: Optional[int] = None
     # An optional rewrite of this phase's emitted topology, run once, after the trace and before the
     # topology is handed to the writer. It exists for the one thing a wrapper CANNOT express: a
     # transform of a graph INPUT that is invariant across the calls the driver makes, and which the
@@ -147,6 +152,12 @@ class ExportPhase:
         "fuse_conv": Unchecked(
             "a request, read back off the emitted graph like `fuse_attention`: `fuse_loom_short_conv` "
             "leaves anything it does not recognise as it was, and `_conv_state_geometry` counts what fused"
+        ),
+        "attention_window": Unchecked(
+            "a fact about the wrapper's own mask, which no checkpoint states and no trace can be asked: "
+            "a mask built from positions is banded only by what its builder wrote. The wrapper's own "
+            "test checks the mask against it (Pocket-TTS: `test_pocket_tts_mimi_window`), and the "
+            "backend raises if the phase fused no windowed node."
         ),
         "kv_cache_size": Unchecked(
             "the capacity to declare, in tokens. Bounded by nothing the checkpoint states -- exporting "
