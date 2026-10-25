@@ -887,6 +887,95 @@ CATALOG = [
         extra_files=_VOCETTA2_EXTRA_FILES,
         limitations=_vocetta2_limitations(upstream_wer="7.2%", door_wer="9.8%"),
     ),
+    # Abiray/Vaniq-Edge: upstream VITS (jaywalnut310's `models.py`, byte for byte) at 8.9M parameters,
+    # 24 kHz, MIT (loom_exporter/vits_export.py, `TTSUpstreamVitsExportConfig`). Measured 2026-10-25 on the
+    # released rc19 wheel, four sentences through upstream's own ids with every draw pinned: every
+    # waveform upstream's length, 3.9e-6..1.0e-5 from upstream at f64, where upstream's own f32 run sits
+    # 3.9e-6..1.5e-5. WER: 30 LibriSpeech references, Whisper small, upstream's espeak ids vs the door.
+    ModelCard(
+        slug="vaniq-edge", checkpoint=Path("vaniq-edge"),
+        export_task="text-to-speech", export_model="vaniq-edge", task_type="text-to-speech",
+        snippet="text-to-speech-lexicon-espeak",
+        base_repo="Abiray/Vaniq-Edge", license_id="mit", language=["en"],
+        sample_rate=24000,  # config.json's `data.sampling_rate`
+        title="Vaniq-Edge",
+        variants=[
+            ("F32", "full precision, 34.4 MB; upstream's waveform to 1.0e-5, upstream's own f32-vs-f64 spread."),
+            ("Q8_0_PC", "11.5 MB: the convolutions and projections (91% of the weights) in per-channel int8. "
+                        "Whisper's word error rate on 60 syntheses is 14.3% against F32's 14.0%."),
+        ],
+        summary="Abiray's Vaniq-Edge: an 8.9M-parameter English VITS (text encoder, stochastic duration "
+                "predictor, flow and HiFi-GAN vocoder) at 24 kHz, exported for loom.cpp.",
+        copied_files=_VOCETTA2_LEXICON,
+        extra_files=[
+            "`lexicons/en_US-misaki.tsv` -- [hexgrad/misaki](https://github.com/hexgrad/misaki)'s US English "
+            "pronunciation dictionaries (`us_gold.json` over `us_silver.json`, each word's default reading), "
+            "Apache-2.0 (`lexicons/LICENSE.misaki`), as `word<TAB>ipa` -- the shape "
+            "`loom.phonemizers.set_lexicon` reads. Of the lexicons measured through the door it scored best "
+            "on this model (CMUdict's 24.7%, ipa-dict's 21.7%).",
+        ],
+        limitations=(
+            "**The text door is not upstream's front end.** Upstream phonemizes with espeak-ng "
+            "(`english_cleaners2`), which is GPL-3 and not part of loom. Through `text2speech.infer(text)` "
+            "with the bundled lexicon, this model scored 18.3% word error rate on 30 LibriSpeech "
+            "sentences (Whisper small) against 9.8% with espeak-ng's phonemes. Without the "
+            "lexicon, English is unintelligible. For upstream's quality, phonemize with espeak-ng yourself "
+            "and pass `phonemes=` (see Usage).\n\n"
+            "**Upstream's text normalisation is not reproduced:** `VaniqTTS` spells numbers and currency "
+            "with `num2words` before phonemizing; spell them out yourself.\n\n"
+            "Synthesis uses upstream's own defaults, `noise_scale=0.333` and `noise_scale_w=0.8` (both "
+            "overridable, with `seed=`); `length_scale=` slows or speeds the speech. English only, one voice."
+        ),
+    ),
+    # AuroraAI-Research/AuroraTTS-100K: 95,638 parameters, no neural vocoder -- a harmonic + noise DSP
+    # synthesizer -- Apache-2.0, LJSpeech (loom_exporter/auroratts_export.py). Measured 2026-10-25 through
+    # the engine with GRU cells (loom.cpp feat/p5-aurora-gru-cell), four sentences through upstream's own
+    # ids, the noise drawn as `torch.randn` from the same seed: every waveform upstream's length,
+    # 1.4e-4..4.8e-4 from upstream at f64, where upstream's own f32 run sits 2.1e-4..1.4e-3 (its phase
+    # integrates f0, so a 1e-6 relative f0 difference grows over the utterance).
+    ModelCard(
+        slug="auroratts-100k", checkpoint=Path("auroratts-100k"),
+        export_task="text-to-speech", export_model="auroratts", task_type="text-to-speech",
+        snippet="text-to-speech-arpabet",
+        base_repo="AuroraAI-Research/AuroraTTS-100K", license_id="apache-2.0", language=["en"],
+        sample_rate=22050,  # config.json's `sr`
+        title="AuroraTTS-100K",
+        variants=[
+            ("F32", "full precision, 0.5 MB; upstream's waveform to 4.8e-4, inside upstream's own "
+                    "f32-vs-f64 spread."),
+            ("Q8_0_PC", "0.5 MB: only the duration and pitch predictors' last two layers (32 wide) are "
+                        "quantized -- every other weight is a depthwise kernel or 56 wide, which per-channel "
+                        "int8 does not take -- so it is 6 KB smaller and no faster. Whisper's word error "
+                        "rate on 60 syntheses is 10.6% against F32's 10.4%."),
+        ],
+        summary="AuroraAI-Research's AuroraTTS-100K: a complete English text-to-speech model in 95,638 "
+                "parameters -- a convolutional encoder with a BiGRU, duration and pitch predictors, and a "
+                "harmonic-plus-noise DSP synthesizer instead of a neural vocoder -- at 22.05 kHz, exported "
+                "for loom.cpp.",
+        copied_files=[("lexicons/en_US-cmudict.tsv", "auroratts-lexicons/en_US-cmudict.tsv"),
+                      ("lexicons/LICENSE.cmudict", "auroratts-lexicons/LICENSE.cmudict")],
+        extra_files=[
+            "`lexicons/en_US-cmudict.tsv` -- [CMUdict](https://github.com/cmusphinx/cmudict) (commit "
+            "`7479086`), each word's first pronunciation, rewritten from ARPAbet to IPA as `word<TAB>ipa` "
+            "-- the shape `loom.phonemizers.set_lexicon` reads -- with a `.` wherever two phones would "
+            "otherwise spell a third, so the door's `arpabet` fold returns every entry's ARPAbet exactly. "
+            "BSD-2-Clause (`lexicons/LICENSE.cmudict`).",
+        ],
+        limitations=(
+            "**The text door is not upstream's front end.** Upstream reads text with g2p_en (CMUdict plus "
+            "a neural guesser for unknown words). Through `text2speech.infer(text)` with the bundled "
+            "lexicon, this model scored 12.3% word error rate on 30 LibriSpeech sentences "
+            "(Whisper small) against 8.5% with g2p_en's tokens. The door drops punctuation, "
+            "which g2p_en keeps as tokens; for upstream's quality, pass g2p_en's tokens as `phonemes=` "
+            "(see Usage).\n\n"
+            "**Seeds render as upstream renders them:** the noise half of the synthesizer is drawn from "
+            "ATen's own stream, so `seed=s` gives what `torch.manual_seed(s)` followed by upstream's "
+            "`synthesize` gives. The harmonic phase is accumulated in double precision for every "
+            "utterance; upstream does so only above 32,768 samples (1.5 s) and uses float32 below.\n\n"
+            "`speed=` divides the durations and `pitch_shift=` is added to log-F0, as upstream's. English "
+            "only, one voice (LJSpeech)."
+        ),
+    ),
     ModelCard(
         slug="granite-speech-4.0-1b", checkpoint=Path("granite-speech-4.0.1b"),
         task_type="automatic-speech-recognition",
@@ -2353,6 +2442,44 @@ audio.save("hello.wav")
 # Full quality: misaki-style IPA from your own G2P is encoded as given.
 # audio = model.text2speech.infer(phonemes="...")
 """,
+    # The same door for a model trained on espeak-ng's IPA (Vaniq-Edge), whose own front end is
+    # phonemizer + espeak-ng -- GPL-3, which is why the door is not that.
+    "text-to-speech-lexicon-espeak": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
+
+# The built-in text door: orthography2ipa, plus the US English pronunciation lexicon that ships in this
+# repo (hexgrad/misaki's, Apache-2.0). The model was trained on espeak-ng's IPA, declares it, and the
+# door rewrites the G2P's output to espeak's conventions before encoding.
+loom.phonemizers.set_lexicon("hf://{repo_id}/lexicons/en_US-misaki.tsv", language="en-US")
+audio = model.text2speech.infer("hello world")
+audio.save("hello.wav")
+
+# Full quality, upstream's own front end: espeak-ng's IPA with stress and punctuation, encoded as given.
+# from phonemizer import phonemize
+# ipa = phonemize("Hello world.", language="en-us", backend="espeak", strip=True,
+#                 preserve_punctuation=True, with_stress=True)
+# audio = model.text2speech.infer(phonemes=ipa)
+""",
+    # A model whose table is ARPAbet (AuroraTTS-100K): the door's IPA is folded to it, and CMUdict --
+    # what g2p_en, its training front end, looks words up in -- ships as the lexicon.
+    "text-to-speech-arpabet": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
+
+# The built-in text door: orthography2ipa, plus CMUdict's US English pronunciations, which ship in this
+# repo as IPA (BSD-2-Clause). The model reads ARPAbet with stress digits, as g2p_en writes it; the door
+# rewrites the G2P's IPA to that before encoding.
+loom.phonemizers.set_lexicon("hf://{repo_id}/lexicons/en_US-cmudict.tsv", language="en-US")
+audio = model.text2speech.infer("hello world")
+audio.save("hello.wav")
+
+# Full quality, upstream's own front end: g2p_en's tokens, space-separated, with `|` for its word
+# boundary (the table spells it `|`, so that `D HH` and `DH` stay apart).
+# from g2p_en import G2p
+# arpabet = " ".join("|" if t == " " else t for t in G2p()("Hello world."))
+# audio = model.text2speech.infer(phonemes=arpabet)
+""",
     "automatic-speech-recognition-multilingual": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
@@ -2905,7 +3032,8 @@ def export_args(card: ModelCard) -> List[str]:
 
 
 def render_readme(card: ModelCard, gguf_name: str, runtime: Optional[Tuple[str, List[str]]] = None,
-                  text_runtime: Optional[Tuple[str, List[str]]] = None) -> str:
+                  text_runtime: Optional[Tuple[str, List[str]]] = None,
+                  feature_runtime: Optional[Tuple[str, List[Tuple[str, str]]]] = None) -> str:
     # A TTS snippet interpolates `sample_rate`, so an entry that never set one would render the literal
     # `sample_rate=None` into a card telling readers to pass it -- a wrong example is worse than no
     # example, and this is the only field where the value cannot be checked against anything on disk.
@@ -2989,6 +3117,10 @@ def render_readme(card: ModelCard, gguf_name: str, runtime: Optional[Tuple[str, 
     # `pip install -U` reaches the newest runtime, but a reader who already has an older one pinned
     # meets the file before they meet the error; the error names the op and not the release.
     runtime_note = ""
+    if runtime and feature_runtime:
+        from packaging.version import Version
+        if Version(feature_runtime[0]) >= Version(runtime[0]):
+            runtime = None          # the newer release carries the ops too; one note, not two
     if runtime:
         version, ops = runtime
         named = " and ".join(f"`{op}`" for op in ops)
@@ -3001,6 +3133,12 @@ def render_readme(card: ModelCard, gguf_name: str, runtime: Optional[Tuple[str, 
                          f"does.** This file's text front end uses {' and '.join(rules)}, new in that release. "
                          f"An older runtime loads it and speaks, but prepares some text differently: dashes, "
                          f"curly quotes, and a period between two numbers.\n")
+    if feature_runtime:
+        version, features = feature_runtime
+        uses = " and ".join(what for what, _ in features)
+        older = "; ".join(o for _, o in features)
+        runtime_note += (f"\n**Needs `loom-py-rt` {version} or later.** This file uses {uses}, new in that "
+                         f"release: {older}.\n")
     extra_files_section = "".join(f"- {bullet}\n" for bullet in card.extra_files)
     weights_line = ("Weights are unmodified; this repo packages the same parameters into\n"
                     "loom.cpp's GGUF format.")
@@ -3138,7 +3276,9 @@ def build_one(card: ModelCard, models_root: Path, output_dir: Path, readme_only:
             check_frame_ms(card, model_dir / name)
     runtime = required_runtime([model_dir / name for name, _ in files])
     text_runtime = required_text_runtime([model_dir / name for name, _ in files])
-    (model_dir / "README.md").write_text(render_readme(card, gguf_name, runtime, text_runtime))
+    feature_runtime = required_feature_runtime([model_dir / name for name, _ in files])
+    (model_dir / "README.md").write_text(render_readme(card, gguf_name, runtime, text_runtime,
+                                                       feature_runtime))
     print(f"  [ok] {card.slug}: {model_dir}")
 
 
@@ -3178,6 +3318,55 @@ def required_text_runtime(gguf_paths: List[Path]) -> Optional[Tuple[str, List[st
         return None
     version = max(needed.values(), key=Version)
     return version, [what for what, v in needed.items() if v == version]
+
+
+def _declares_gru_cell(fields) -> bool:
+    """A topology the engine's recurrent sweep steps as a GRU: `h_prev` in, `h_new` alone out."""
+    import json
+    for key, field in fields.items():
+        if key.startswith("model.graph_topology."):
+            topology = json.loads(bytes(field.parts[field.data[0]]))
+            inputs = {i.get("name") for i in topology.get("inputs", [])}
+            if topology.get("outputs") == ["h_new"] and "h_prev" in inputs and "c_prev" not in inputs:
+                return True
+    return False
+
+
+def _declares_style(style: str):
+    def check(fields) -> bool:
+        field = fields.get("loom.tts.phoneme_style")
+        return field is not None and bytes(field.parts[field.data[0]]).decode() == style
+    return check
+
+
+# The release that first carried each engine or loom-py CAPABILITY a file can need that is not an op --
+# composed of ops every runtime knows, so `OP_FIRST_RUNTIME` cannot see it. Read from the file like the
+# ops: (detector, release, what the file uses, what an older runtime does with it).
+FEATURE_FIRST_RUNTIME = [
+    (_declares_gru_cell, "1.0.0rc20", "GRU cells in the engine's recurrent sweep",
+     "an older engine refuses the cell (`a cell topology must declare both 'h_new' and 'c_new'`)"),
+    (_declares_style("arpabet"), "1.0.0rc20", "the text door's `arpabet` phoneme style",
+     "an older loom-py refuses text with `unknown phoneme style 'arpabet'` (`phonemes=` and `tokens=` "
+     "still work)"),
+]
+
+
+def required_feature_runtime(gguf_paths: List[Path]) -> Optional[Tuple[str, List[Tuple[str, str]]]]:
+    """The oldest `loom-py-rt` with every capability in `FEATURE_FIRST_RUNTIME` that `gguf_paths` use,
+    and `(what, what an older runtime does)` for those that need it -- or None."""
+    from gguf import GGUFReader
+    from packaging.version import Version
+
+    needed = {}
+    for path in gguf_paths:
+        fields = GGUFReader(str(path)).fields
+        for detect, version, what, older in FEATURE_FIRST_RUNTIME:
+            if detect(fields):
+                needed[(what, older)] = version
+    if not needed:
+        return None
+    version = max(needed.values(), key=Version)
+    return version, [entry for entry, v in needed.items() if v == version]
 
 
 def graph_ops(gguf_path: Path) -> set:
