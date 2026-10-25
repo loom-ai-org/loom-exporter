@@ -185,7 +185,8 @@ def _mil_input_names(phase) -> List[str]:
 
 @dataclass
 class RecurrentPhase:
-    """One `torch.nn.LSTM` exported as per-timestep cell topologies instead of one static graph.
+    """One `torch.nn.LSTM` (or, read off the module rather than traced, one `torch.nn.GRU`) exported as
+    per-timestep cell topologies instead of one static graph.
 
     **Why this is a phase type rather than an `ExportPhase` with a different wrapper.** ggml has no LSTM
     op, so a recurrence cannot be a static topology at all -- it needs a genuine host-side loop over a
@@ -267,7 +268,17 @@ class RecurrentPhase:
         import coremltools as ct
         import torch
 
-        from .recurrent import build_lstm_cell_topologies
+        from .recurrent import build_gru_cell_topologies, build_lstm_cell_topologies
+
+        # A GRU is read off the module, not traced: it reaches MIL as an unrolled loop with no op to
+        # read (recurrent.py's docstring). Same names, same `_fwd`/`_bwd` pair, one cell shape smaller.
+        if isinstance(self.module, torch.nn.GRU):
+            stem = f"{self.name}_l0" if self.number_layers else self.name
+            result = build_gru_cell_topologies(self.module, weight_namespace=f"{stem}.")
+            topologies = {f"{stem}_fwd": result["forward"]}
+            if result["backward"] is not None:
+                topologies[f"{stem}_bwd"] = result["backward"]
+            return topologies, result["weights"]
 
         # `batch_first` decides which of the first two axes is time. It does not change the weights this
         # phase extracts -- a cell has no time axis either way -- but tracing with the axes swapped

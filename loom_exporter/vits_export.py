@@ -52,7 +52,7 @@ Usage:
 """
 import math
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
@@ -435,6 +435,12 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
     checkpoint_path: str
     # A DIRECTORY of `.lua` fragments -- VITS is peeled (P4.0.6/C.6). See `driver_components`.
     driver_script_path: Path = driver_dir("convert_piper_vits", "vits_driver")
+    # The architecture `SynthesizerTrn` is built from, and the synthesis defaults the driver binds.
+    # Piper's for this class; an upstream-VITS checkpoint states its own (`TTSUpstreamVitsExportConfig`).
+    hp: dict = field(default_factory=lambda: dict(HP))
+    noise_scale: float = PIPER_NOISE_SCALE
+    noise_scale_w: float = PIPER_NOISE_SCALE_W
+    length_scale: float = PIPER_LENGTH_SCALE
 
     def contract(self) -> dict:
         """The task default, plus what the newly-exported phoneme vocabulary lets a host say.
@@ -536,10 +542,10 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
             # so a wrong value cannot survive `phases()`. The three scales are piper's own synthesis
             # defaults and stay overridable; see PIPER_NOISE_SCALE above.
             ExportConstants(values={
-                "INTER_CHANNELS": HP["inter_channels"],
-                "NOISE_SCALE": PIPER_NOISE_SCALE,
-                "NOISE_SCALE_W": PIPER_NOISE_SCALE_W,
-                "LENGTH_SCALE": PIPER_LENGTH_SCALE,
+                "INTER_CHANNELS": self.hp["inter_channels"],
+                "NOISE_SCALE": self.noise_scale,
+                "NOISE_SCALE_W": self.noise_scale_w,
+                "LENGTH_SCALE": self.length_scale,
             }),
             LuaFragment(fragment / "01_lengths.lua", defines=("T",)),
             # `z_noise` is drawn BEFORE the call now rather than between two calls -- it is sized from
@@ -582,19 +588,32 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
             "(ct.RangeDim(1, 512)), so this number picks a concrete trace length and constrains nothing "
             "the checkpoint could disagree with."
         ),
+        "hp": Unchecked(
+            "the architecture SynthesizerTrn is built from; load_model() load_state_dict's the checkpoint "
+            "into it, which refuses any width or count that disagrees"
+        ),
+        "noise_scale": Unchecked("a synthesis DEFAULT the driver binds and a caller may override"),
+        "noise_scale_w": Unchecked("same"),
+        "length_scale": Unchecked("same"),
     }
+
+    def load_model(self):
+        """`SynthesizerTrn(**self.hp)` with the Lightning checkpoint's generator loaded, strictly."""
+        full_sd = load_piper_checkpoint(self.checkpoint_path)
+        sd = {k[len("model_g."):]: v for k, v in full_sd.items() if k.startswith("model_g.")}
+        model = SynthesizerTrn(**self.hp)
+        missing, unexpected = model.load_state_dict(sd, strict=True)
+        assert not missing and not unexpected, (missing, unexpected)
+        return model
 
     def phases(self) -> List[ExportPhase]:
         # The Piper checkout and this module's trace patches, before anything is traced.
         load_piper()
         print(f"Loading checkpoint {self.checkpoint_path}...")
-        full_sd = load_piper_checkpoint(self.checkpoint_path)
-        sd = {k[len("model_g."):]: v for k, v in full_sd.items() if k.startswith("model_g.")}
-
-        model = SynthesizerTrn(**HP)
-        missing, unexpected = model.load_state_dict(sd, strict=True)
-        assert not missing and not unexpected, (missing, unexpected)
-        model.eval()
+        model = self.load_model().eval()
+        HP = self.hp
+        # TextWrapper walks the duration predictor's flows by index, which is n_flows=4's layout.
+        assert len(model.dp.flows) == 9, f"duration predictor has {len(model.dp.flows)} flows, not 9"
 
         seq_dim = ct.RangeDim(1, 512)
         dummy_tokens = torch.randint(1, HP["n_vocab"], (1, self.dummy_t), dtype=torch.long)
@@ -644,11 +663,196 @@ def _build_vits(path: Path, output_path: str) -> TTSVitsExportConfig:
     return TTSVitsExportConfig(architecture="vits_mil", output_path=output_path, checkpoint_path=str(path))
 
 
+# ---- Upstream VITS (jaywalnut310/vits) checkpoints ----
+#
+# The architecture Piper forked: `piper_train.vits` is upstream's `models.py`/`modules.py`/
+# `attentions.py` reformatted, with the same module tree and parameter names, so an upstream generator
+# loads into Piper's `SynthesizerTrn` as it is and every trace patch above applies unchanged. What
+# differs is everything AROUND the generator: upstream trains from a JSON config (`configs/*.json`) and
+# saves `{"model": state_dict, ...}` with no `model_g.` prefix, it frames ids with `commons.intersperse`
+# (a blank between phonemes and at both ends, no BOS/EOS ids), and its symbol table is keithito's.
+#
+# `text/symbols.py` of jaywalnut310/vits, which a checkpoint trained on espeak phonemes
+# (`english_cleaners2`) indexes. Kept here rather than imported, because the checkpoint directories
+# that ship it ship it as code; the export checks the embedding's row count against it.
+VITS_SYMBOLS = (["_"] + list(';:,.!?¡¿—…"«»“” ')
+                + list("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+                + list("ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘'̩'ᵻ"))
+
+# Upstream's own `inference.ipynb` defaults. A checkpoint's repo may state others (see the card).
+VITS_NOISE_SCALE = 0.667
+VITS_NOISE_SCALE_W = 0.8
+
+
+def _upstream_vits_files(path: Path):
+    """`(config.json, weights)` of an upstream-VITS checkpoint directory, or None. The weights are
+    `model.pth` or upstream's own `G_<step>.pth`, exactly one of them."""
+    path = Path(path)
+    config = path / "config.json"
+    if not path.is_dir() or not config.is_file():
+        return None
+    weights = [w for w in [path / "model.pth"] if w.is_file()] or sorted(path.glob("G_*.pth"))
+    if len(weights) != 1:
+        return None
+    return config, weights[0]
+
+
+@dataclass(kw_only=True)
+class TTSUpstreamVitsExportConfig(TTSVitsExportConfig):
+    """An upstream-VITS checkpoint directory: the same two phases and driver as Piper's, with the
+    architecture read from the training config and upstream's framing. The directory is read when the
+    config is made, if it is there; a config made over nothing keeps Piper's architecture, which is what
+    the package-wide declaration checks build it for."""
+
+    model_dir: str = ""
+    checkpoint_path: str = ""
+    # Read from the training config; upstream's own `configs/ljs_base.json` rate until then.
+    sample_rate: int = 22050
+    # `loom.tts.phoneme_style` (loom.cpp ADR-071), declared per checkpoint because it is measured per
+    # checkpoint: Piper's full-size VITS heard ipa-dict's IPA better unfolded, and none is declared.
+    phoneme_style: str = ""
+
+    def __post_init__(self):
+        import json
+
+        super_post = getattr(super(), "__post_init__", None)
+        if super_post is not None:
+            super_post()
+        files = _upstream_vits_files(Path(self.model_dir)) if self.model_dir else None
+        if files is None:
+            return
+        config_path, weights = files
+        config = json.loads(config_path.read_text())
+        data, model = config["data"], config["model"]
+        if int(data.get("n_speakers", 0)) > 1:
+            raise NotImplementedError(
+                f"{config_path} declares {data['n_speakers']} speakers; this export traces the "
+                f"single-speaker path (no speaker embedding reaches the flow or the vocoder)")
+        if not data.get("add_blank", True):
+            raise NotImplementedError(
+                f"{config_path} trains without `add_blank`; every upstream-VITS checkpoint seen so far "
+                f"interleaves the blank, and this export declares only that framing")
+        self.checkpoint_path = str(weights)
+        self.sample_rate = int(data["sampling_rate"])
+        self.hp = dict(
+            n_vocab=len(VITS_SYMBOLS),
+            spec_channels=data["filter_length"] // 2 + 1,
+            segment_size=config["train"]["segment_size"] // data["hop_length"],
+            n_speakers=1, gin_channels=model.get("gin_channels", 0),
+            # `use_spectral_norm` is the discriminator's, which inference never builds.
+            **{k: (tuple(map(tuple, v)) if k == "resblock_dilation_sizes" else
+                   tuple(v) if isinstance(v, list) else v)
+               for k, v in model.items() if k not in ("use_spectral_norm", "gin_channels")},
+        )
+
+    @classmethod
+    def from_directory(cls, path: Path, output_path: str, **kwargs) -> "TTSUpstreamVitsExportConfig":
+        kwargs.setdefault("noise_scale", VITS_NOISE_SCALE)
+        kwargs.setdefault("noise_scale_w", VITS_NOISE_SCALE_W)
+        return cls(architecture="vits_mil", output_path=output_path, model_dir=str(path), **kwargs)
+
+    def load_model(self):
+        """The `model` state dict, loaded strictly except for the posterior encoder: `enc_q` encodes
+        a spectrogram in training only, and a release may strip it (Vaniq-Edge does)."""
+        ckpt = torch.load(self.checkpoint_path, map_location="cpu", weights_only=True)
+        sd = ckpt.get("model", ckpt)
+        rows = sd["enc_p.emb.weight"].shape[0]
+        if rows != len(VITS_SYMBOLS):
+            raise ValueError(f"{self.checkpoint_path}: the text embedding has {rows} rows, upstream's "
+                             f"symbol table {len(VITS_SYMBOLS)}; a different table needs its own symbols")
+        model = SynthesizerTrn(**self.hp)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        missing = [k for k in missing if not k.startswith("enc_q.")]
+        assert not missing and not unexpected, (missing, unexpected)
+        return model
+
+    def hparams(self) -> dict:
+        hparams = {"sample_rate": self.sample_rate}
+        if self.phoneme_style:
+            hparams["tts.phoneme_style"] = self.phoneme_style
+        return hparams
+
+    def contract(self) -> dict:
+        contract = super().contract()
+        contract["sample_rate"] = self.sample_rate
+        return contract
+
+    def phoneme_table(self) -> dict:
+        """keithito's table with `commons.intersperse(ids, 0)`: `[0, p1, 0, ..., pn, 0]`. Declared as
+        Matcha's is (Matcha copied the same front end): the opening 0 is `bos`, every phoneme is followed
+        by the blank, and `eos` stays -1 because the last blank already closes the sequence."""
+        return {"symbols": list(VITS_SYMBOLS), "ids": list(range(len(VITS_SYMBOLS))),
+                "bos": 0, "eos": -1, "blank": 0, "interleave_blank": True}
+
+    __unchecked__ = {
+        **TTSVitsExportConfig.__unchecked__,
+        "model_dir": Unchecked("the checkpoint directory; its config is read in __post_init__ and its "
+                               "weights load strictly but for the posterior encoder"),
+        "sample_rate": Unchecked("the training config's `data.sampling_rate`; nothing in the weights "
+                                 "states it"),
+        "phoneme_style": Unchecked("a measured property of the checkpoint (see the field)"),
+    }
+
+
+def _is_upstream_vits(path: Path) -> bool:
+    """A directory holding an upstream-VITS training config (`model.inter_channels`, `model.resblock`,
+    `data.add_blank`) beside one generator checkpoint."""
+    import json
+
+    files = _upstream_vits_files(path)
+    if files is None:
+        return False
+    try:
+        config = json.loads(files[0].read_text())
+    except (OSError, ValueError):
+        return False
+    model, data = config.get("model"), config.get("data")
+    return (isinstance(model, dict) and isinstance(data, dict)
+            and {"inter_channels", "resblock", "upsample_rates"} <= model.keys()
+            and "add_blank" in data)
+
+
+def _build_upstream_vits(path: Path, output_path: str) -> TTSUpstreamVitsExportConfig:
+    return TTSUpstreamVitsExportConfig.from_directory(path, output_path)
+
+
+# Abiray/Vaniq-Edge: an upstream-VITS checkpoint whose repo synthesises with its own defaults,
+# `VaniqTTS.synthesize`'s `noise_scale=0.333, noise_scale_w=0.8` in its `inference.py` (and the same two
+# in `onnx/inference_onnx.py`). Nothing machine-readable states them, so they are bound here, as
+# DEFAULTS a caller may still override like Piper's.
+#
+# It was trained on espeak-ng's IPA (`english_cleaners2`), and at 8.9M parameters it does not hear
+# through the door's conventions the way Piper's 31M VITS does: Whisper-small WER on 30 LibriSpeech
+# sentences through the door, 2026-10-25, ipa-dict 174% as phonemized and 21.7% folded to espeak's,
+# misaki 57% and 18.3%, the CMUdict lexicon folded 24.7% (9.8% on upstream's own espeak ids). So it
+# declares the style.
+VANIQ_NOISE_SCALE = 0.333
+VANIQ_NOISE_SCALE_W = 0.8
+
+
+def _is_vaniq_edge(path: Path) -> bool:
+    """An upstream-VITS directory whose `inference.py` is Vaniq-Edge's (`class VaniqTTS`)."""
+    script = Path(path) / "inference.py"
+    return (_is_upstream_vits(path) and script.is_file()
+            and "class VaniqTTS" in script.read_text(errors="replace"))
+
+
+def _build_vaniq_edge(path: Path, output_path: str) -> TTSUpstreamVitsExportConfig:
+    return TTSUpstreamVitsExportConfig.from_directory(
+        path, output_path, noise_scale=VANIQ_NOISE_SCALE, noise_scale_w=VANIQ_NOISE_SCALE_W,
+        phoneme_style="espeak")
+
+
 def register(registry) -> None:
     from .registry import ModelRecognizer, TaskRegistryEntry
 
     registry.register(TaskRegistryEntry(
         task="text-to-speech",
         config_class=BaseMultiPhaseModelExportConfig,
-        recognizers=[ModelRecognizer(name="vits", detect=_is_vits, build_config=_build_vits)],
+        recognizers=[ModelRecognizer(name="vits", detect=_is_vits, build_config=_build_vits),
+                     ModelRecognizer(name="vaniq-edge", detect=_is_vaniq_edge,
+                                     build_config=_build_vaniq_edge),
+                     # Every upstream-VITS directory, so it yields to a specific checkpoint's entry.
+                     ModelRecognizer(name="vits-upstream", detect=_is_upstream_vits,
+                                     build_config=_build_upstream_vits, fallback=True)],
     ))
