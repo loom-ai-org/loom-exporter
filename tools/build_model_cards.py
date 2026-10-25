@@ -2411,6 +2411,8 @@ print(result.text)
     # uses shipped beside them. Each voice declares the IPA conventions it was trained in, and the door
     # folds the G2P's output to them (loom.cpp ADR-071) -- which is what makes the built-in path usable on
     # a voice this small.
+    # The lexicon is named by its https://.../resolve/main/ URL, not `hf://{repo_id}/...`: orthography2ipa's
+    # `hf://` looks in a DATASET repo of that name, and these are model repos -- 401 on every card that did.
     "text-to-speech-voices": """import loom
 
 # This repo holds many voices, each its own model; name the file you want (see "Files" below).
@@ -2419,7 +2421,7 @@ model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
 # The built-in text door: orthography2ipa, plus a pronunciation lexicon for English that ships in this
 # repo (hexgrad/misaki's, Apache-2.0). The voice declares the IPA conventions it was trained in and the
 # door rewrites the G2P's output to them before encoding.
-loom.phonemizers.set_lexicon("hf://{repo_id}/lexicons/en_US-misaki.tsv", language="en-US")
+loom.phonemizers.set_lexicon("https://huggingface.co/{repo_id}/resolve/main/lexicons/en_US-misaki.tsv", language="en-US")
 audio = model.text2speech.infer("hello world")
 audio.save("hello.wav")
 
@@ -2435,7 +2437,7 @@ model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
 # The built-in text door: orthography2ipa, plus the US English pronunciation lexicon that ships in this
 # repo (hexgrad/misaki's, Apache-2.0). The model declares the IPA conventions it was trained in and the
 # door rewrites the G2P's output to them before encoding.
-loom.phonemizers.set_lexicon("hf://{repo_id}/lexicons/en_US-misaki.tsv", language="en-US")
+loom.phonemizers.set_lexicon("https://huggingface.co/{repo_id}/resolve/main/lexicons/en_US-misaki.tsv", language="en-US")
 audio = model.text2speech.infer("hello world")
 audio.save("hello.wav")
 
@@ -2451,7 +2453,7 @@ model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
 # The built-in text door: orthography2ipa, plus the US English pronunciation lexicon that ships in this
 # repo (hexgrad/misaki's, Apache-2.0). The model was trained on espeak-ng's IPA, declares it, and the
 # door rewrites the G2P's output to espeak's conventions before encoding.
-loom.phonemizers.set_lexicon("hf://{repo_id}/lexicons/en_US-misaki.tsv", language="en-US")
+loom.phonemizers.set_lexicon("https://huggingface.co/{repo_id}/resolve/main/lexicons/en_US-misaki.tsv", language="en-US")
 audio = model.text2speech.infer("hello world")
 audio.save("hello.wav")
 
@@ -2470,7 +2472,7 @@ model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
 # The built-in text door: orthography2ipa, plus CMUdict's US English pronunciations, which ship in this
 # repo as IPA (BSD-2-Clause). The model reads ARPAbet with stress digits, as g2p_en writes it; the door
 # rewrites the G2P's IPA to that before encoding.
-loom.phonemizers.set_lexicon("hf://{repo_id}/lexicons/en_US-cmudict.tsv", language="en-US")
+loom.phonemizers.set_lexicon("https://huggingface.co/{repo_id}/resolve/main/lexicons/en_US-cmudict.tsv", language="en-US")
 audio = model.text2speech.infer("hello world")
 audio.save("hello.wav")
 
