@@ -1,0 +1,10 @@
+-- Audio8-TTS: text in, `audio_codes` out, frame-major and 10 wide, at 21.5 frames a second.
+--
+-- The codes are what `audio8-tts-codec` decodes -- two GGUFs by ADR-022, both exported from the one
+-- checkpoint. Codebook 0 of each frame is the slow stack's semantic token; the fast stack draws the
+-- other nine, one forward each. Nothing but integers crosses this boundary inside the loop (ADR-031).
+--
+-- Voice cloning is two inputs, which a voice file sets (`loom_exporter.audio8_tts_voices`, ADR-045):
+-- `reference_tokens`, the reference transcript as the processor formats and encodes it, and
+-- `reference_codes`, the clip's codes frame-major. Without them the prompt asks for speech with no
+-- reference, which is the model's own unconditioned voice.
