@@ -199,6 +199,7 @@ _FAMILY_MODULES = (
     "sanotts_export",
     "vocetta2_export",
     "qwen3_asr_export",
+    "oruk_loop_export",
     "granite_speech_export",
     "kokoro_export",
     "matcha_export",

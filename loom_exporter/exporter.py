@@ -298,6 +298,15 @@ class LoomGGUFExporter:
         # log by more than the quantized layers after it do. Every name must exist (`pack_weights`
         # raises otherwise), so a renamed tensor cannot silently fall out of its exemption.
         self.keep_float = frozenset(kwargs.get("keep_float") or ())
+        # A family's opt-in to quantizing tables read only through GET_ROWS, which `quantize` otherwise
+        # leaves at F32 (they are nobody's MUL_MAT operand). ggml gathers rows out of a packed table
+        # directly and the engine serves that path bit-exactly (ADR-075). Opt-in rather than the
+        # default because turning it on moves every quantized export that has an embedding: it exists
+        # for a multi-phase export whose TIED table is two names, one per phase (`{phase}.{weight}`),
+        # so the head's copy quantizes and the embedding's stays F32 beside it -- oruk-loop-153M's
+        # 303 MB of a 546 MB Q8_0 file. Quantized alike, the two copies are identical bytes and the
+        # content addressing in `write_gguf` stores them once.
+        self.quantize_gathered = bool(kwargs.get("quantize_gathered"))
         # ADR-081: zero-pad weight axes to what the kernels need ("auto") or write them as traced
         # ("off", the escape hatch). An export with every axis aligned is byte-identical either way.
         self.pad_axes = kwargs.get("pad_axes") or os.environ.get("LOOM_PAD_AXES") or "auto"
@@ -3062,10 +3071,11 @@ class LoomGGUFExporter:
         end-to-end against a real quantized model, see BACKLOG.md's "quantized weight support"
         milestone) rather than tensor-name pattern matching -- this exporter never emits "repeat_for"
         blocks (unlike that script's GGUF-KV-driven input), so no expansion pass is needed."""
+        ops = self.PACKED_WEIGHT_FIRST_OPS + (("GET_ROWS",) if self.quantize_gathered else ())
         names = set()
         for topo in self.topologies.values():
             for node in topo.get("nodes", []):
-                if node.get("op") in self.PACKED_WEIGHT_FIRST_OPS and node.get("inputs"):
+                if node.get("op") in ops and node.get("inputs"):
                     names.add(node["inputs"][0])
         return names
 
