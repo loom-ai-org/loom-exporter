@@ -56,13 +56,15 @@ class PhaseResult:
 
 
 def convert_phase(phase, quantize: Optional[str] = None, keep_float=(),
-                  pad_axes: Optional[str] = None) -> PhaseResult:
+                  pad_axes: Optional[str] = None, quantize_gathered: bool = False) -> PhaseResult:
     """Trace, convert, lower and pack one phase, then release everything the conversion needed.
 
     `keep_float` is the family's (`backend_kwargs()['keep_float']`): the names among them this phase holds
     stay F32. A phase packs its own weights, so a name that reached only the output exporter would find
     its weight already quantized (ADR-079 P4.33 found Silero's that way); `MultiPhase.export` checks that
-    every name was held by some phase.
+    every name was held by some phase. `quantize_gathered` reaches the packer for the same reason: a
+    phase whose only reader of a table is a GET_ROWS (an `embed` phase) decides that table's precision
+    here, not in the output exporter.
 
     The release is P5.0's first change and the comment below it is the whole finding: the traced
     module, the wrapper and the converted MIL program are the SAME arrays, so they have to die
@@ -89,7 +91,7 @@ def convert_phase(phase, quantize: Optional[str] = None, keep_float=(),
         # before this split because the merged topologies included the cells. Packing them here is
         # what keeps that true now that the merge sees bytes rather than arrays.
         packer = LoomGGUFExporter(None, quantize=quantize, keep_float=[n for n in keep_float if n in weights],
-                                  pad_axes=pad_axes)
+                                  pad_axes=pad_axes, quantize_gathered=quantize_gathered)
         packer.topologies = cells
         packer.weights = weights
         packing = packer.pack_weights()
@@ -122,6 +124,7 @@ def convert_phase(phase, quantize: Optional[str] = None, keep_float=(),
         quantize=quantize,
         # The packing decision travels with the quantize one: both are made here, per phase.
         pad_axes=pad_axes,
+        quantize_gathered=quantize_gathered,
     )
     main_func = mil_prog.functions["main"]
     topo = exporter.generate_graph_topology(main_func, phase.name)
