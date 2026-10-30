@@ -35,7 +35,13 @@ reproduction of a real `nn.LSTM` forward pass before being trusted):
 that way" might suggest. `build_lstm_cell_topologies` returns up to two directions' worth of `{h, c}`
 topology pairs accordingly, matching `BiLstmStepper`'s own 4-topology (h_fwd/c_fwd/h_bwd/c_bwd) shape.
 
-**GRU is NOT handled here.** MIL does have an opaque `gru` op schema (confirmed via
+**GRU (2026-10-25, AuroraTTS-100K's BiGRU): built from the module, not from the trace.** The paragraph
+below is why: a traced `nn.GRU` reaches MIL as an unrolled `while_loop`, with no opaque op to read
+weights from. So `build_gru_cell_topologies` reads `torch.nn.GRU`'s own parameters, in its own gate
+order, and the engine's sweep carries a GRU cell as the second cell shape it accepts (`h_prev` in,
+`h_new` out, no cell state; loom.cpp `cell_sweep`).
+
+**(Was) GRU is NOT handled here.** MIL does have an opaque `gru` op schema (confirmed via
 `coremltools.converters.mil.mil.ops.defs.iOS15.recurrent.gru`), and the original plan for this module
 assumed `torch.nn.GRU` would trace to it exactly like `torch.nn.LSTM` traces to `lstm`. That assumption
 was wrong, found only by actually tracing a real `nn.GRU` (with and without an explicit initial hidden
@@ -170,5 +176,88 @@ def build_lstm_cell_topologies(op, weight_namespace: str) -> dict:
         "bidirectional": bidirectional,
         "forward": forward_topos,
         "backward": backward_topos,
+        "weights": weights,
+    }
+
+
+def _gru_cell_topology(hidden_dim: int, input_dim: int, weight_prefix: str) -> dict:
+    """One `torch.nn.GRU` cell step, in torch's own convention: gate blocks `[r, z, n]` down
+    `weight_ih`/`weight_hh`, and the two biases kept apart, because the candidate's hidden half is
+    gated by `r` with its bias INSIDE the product -- `n = tanh(W_in x + b_in + r * (W_hn h + b_hn))` --
+    so `b_hn` cannot be pre-summed into `b_in` the way an LSTM's two biases can.
+
+    `h_new = (1 - z) * n + z * h_prev`, written `n + z * (h_prev - n)`: one fewer node, the same value.
+
+    One input fewer and one output fewer than the LSTM cell, and that is what tells the engine's sweep
+    which kind of cell it is stepping: no `c_prev`, `h_new` alone."""
+    h = hidden_dim
+    f32 = 4
+
+    def views(src, names):
+        return [{"op": "VIEW", "inputs": [src], "outputs": [n], "attrs": {"shape": [h], "offset": k * h * f32}}
+                for k, n in enumerate(names)]
+
+    return {
+        "version": 1,
+        "inputs": [
+            {"name": "layer_input", "dtype": "f32", "shape": [str(input_dim)]},
+            {"name": "h_prev", "dtype": "f32", "shape": [str(h)]},
+        ],
+        "outputs": ["h_new"],
+        "nodes": [
+            {"op": "MUL_MAT", "inputs": [f"{weight_prefix}weight_ih", "layer_input"], "outputs": ["gx_w"]},
+            {"op": "ADD", "inputs": ["gx_w", f"{weight_prefix}bias_ih"], "outputs": ["gx"]},
+            {"op": "MUL_MAT", "inputs": [f"{weight_prefix}weight_hh", "h_prev"], "outputs": ["gh_w"]},
+            {"op": "ADD", "inputs": ["gh_w", f"{weight_prefix}bias_hh"], "outputs": ["gh"]},
+            *views("gx", ("x_r", "x_z", "x_n")),
+            *views("gh", ("h_r", "h_z", "h_n")),
+            {"op": "ADD", "inputs": ["x_r", "h_r"], "outputs": ["r_pre"]},
+            {"op": "SIGMOID", "inputs": ["r_pre"], "outputs": ["r"]},
+            {"op": "ADD", "inputs": ["x_z", "h_z"], "outputs": ["z_pre"]},
+            {"op": "SIGMOID", "inputs": ["z_pre"], "outputs": ["z"]},
+            {"op": "MUL", "inputs": ["r", "h_n"], "outputs": ["r_hn"]},
+            {"op": "ADD", "inputs": ["x_n", "r_hn"], "outputs": ["n_pre"]},
+            {"op": "TANH", "inputs": ["n_pre"], "outputs": ["n"]},
+            {"op": "SUB", "inputs": ["h_prev", "n"], "outputs": ["h_minus_n"]},
+            {"op": "MUL", "inputs": ["z", "h_minus_n"], "outputs": ["z_h_minus_n"]},
+            {"op": "ADD", "inputs": ["n", "z_h_minus_n"], "outputs": ["h_new"]},
+        ],
+    }
+
+
+def build_gru_cell_topologies(gru, weight_namespace: str) -> dict:
+    """`gru` is a single-layer `torch.nn.GRU`. The same return shape as `build_lstm_cell_topologies`,
+    with each direction's weights under `fwd.`/`bwd.`: `weight_ih` [3H, I], `weight_hh` [3H, H],
+    `bias_ih`/`bias_hh` [3H] (zeros for a `bias=False` module)."""
+    if gru.num_layers != 1:
+        raise NotImplementedError(f"nn.GRU with num_layers={gru.num_layers}: a stack needs a cell per layer "
+                                  f"and the sweep to chain them, which no model has needed yet")
+    if getattr(gru, "proj_size", 0):
+        raise NotImplementedError("nn.GRU has no proj_size; refusing a module that claims one")
+    hidden_dim, input_dim = gru.hidden_size, gru.input_size
+    weights = {}
+
+    def _register_direction(suffix: str, tag: str):
+        prefix = f"{weight_namespace}{suffix}"
+
+        def param(name):
+            value = getattr(gru, f"{name}_l0{tag}", None)
+            if value is None:
+                return np.zeros(3 * hidden_dim, dtype=np.float32)
+            return value.detach().cpu().double().numpy().astype(np.float32)
+
+        for name in ("weight_ih", "weight_hh", "bias_ih", "bias_hh"):
+            weights[f"{prefix}{name}"] = param(name)
+        return _gru_cell_topology(hidden_dim, input_dim, prefix)
+
+    forward = _register_direction("fwd.", "")
+    backward = _register_direction("bwd.", "_reverse") if gru.bidirectional else None
+    return {
+        "hidden_dim": hidden_dim,
+        "input_dim": input_dim,
+        "direction": "bidirectional" if gru.bidirectional else "forward",
+        "bidirectional": bool(gru.bidirectional),
+        "forward": forward,
+        "backward": backward,
         "weights": weights,
     }
