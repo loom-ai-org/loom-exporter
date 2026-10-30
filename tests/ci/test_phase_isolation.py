@@ -273,3 +273,49 @@ def test_a_family_keep_float_reaches_every_phase(tmp_path, monkeypatch, isolate)
                         lambda self: dict(base(self), keep_float=("no.such_weight",)))
     with pytest.raises(ValueError, match="no.such_weight"):
         _export(checkpoint, tmp_path / "typo.gguf", quantize="Q8_0", isolate_phases=isolate)
+
+
+@pytest.mark.parametrize("isolate", [False, True])
+def test_quantize_gathered_reaches_every_phase(tmp_path, monkeypatch, isolate):
+    """A table read only through GET_ROWS stays F32 under `quantize`, and a family's
+    `quantize_gathered` makes it eligible -- in the phase that holds it, in-process and in a worker,
+    since that phase's packer is where its precision is decided. oruk-loop-153M's embedding is the
+    case: its tied table's head copy quantized and its embed copy stayed at 303 MB of F32 beside it."""
+    pytest.importorskip("coremltools")
+    from gguf import GGUFReader
+
+    checkpoint = aligned_t5(tmp_path)
+    plain = _export(checkpoint, tmp_path / "plain.gguf", quantize="Q8_0", isolate_phases=isolate)
+    reader = GGUFReader(str(plain))
+    gathered = _gathered_weights(reader)
+    assert gathered, "the fixture has no GET_ROWS-read weight, so this test cannot see the flag"
+    types = {t.name: t.tensor_type.name for t in reader.tensors}
+    assert all(types[n] == "F32" for n in gathered), {n: types[n] for n in gathered}
+
+    base = Text2TextT5ExportConfig.backend_kwargs
+    monkeypatch.setattr(Text2TextT5ExportConfig, "backend_kwargs",
+                        lambda self: dict(base(self), quantize_gathered=True))
+    flagged = _export(checkpoint, tmp_path / "gathered.gguf", quantize="Q8_0", isolate_phases=isolate)
+    tensors = {t.name: t for t in GGUFReader(str(flagged)).tensors}
+    # Eligible by op is not eligible by shape: T5's relative-bias table is [buckets, heads], and a
+    # fastest axis of 4 heads holds no Q8_0 block, so it stays F32 exactly as a MUL_MAT weight would.
+    aligned = {n for n in gathered if int(tensors[n].shape[0]) % 32 == 0}
+    assert aligned, {n: list(tensors[n].shape) for n in gathered}
+    assert all(tensors[n].tensor_type.name == "Q8_0" for n in aligned), (
+        {n: tensors[n].tensor_type.name for n in aligned})
+
+
+def _gathered_weights(reader) -> set:
+    """Weights some topology reads as a GET_ROWS table, across every embedded topology."""
+    import json
+
+    names = {t.name for t in reader.tensors}
+    tables = set()
+    for field in reader.fields.values():
+        if not field.name.startswith("model.graph_topology."):
+            continue
+        topo = json.loads(bytes(field.parts[field.data[0]]).decode())
+        for node in topo.get("nodes", []):
+            if node.get("op") == "GET_ROWS" and node["inputs"][0] in names:
+                tables.add(node["inputs"][0])
+    return tables

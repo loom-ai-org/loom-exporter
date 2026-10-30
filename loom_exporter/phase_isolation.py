@@ -242,7 +242,8 @@ def read_spill(directory: Path) -> PhaseResult:
 
 def convert_phase_isolated(config_blob: Path, index: int, directory: Path,
                            quantize: Optional[str] = None, keep_float=(),
-                           pad_axes: Optional[str] = None) -> PhaseResult:
+                           pad_axes: Optional[str] = None,
+                           quantize_gathered: bool = False) -> PhaseResult:
     """Convert phase `index` of the pickled config in a child process and read its spill back.
 
     Raises on a non-zero exit rather than falling back to converting in-process: an export that
@@ -259,6 +260,8 @@ def convert_phase_isolated(config_blob: Path, index: int, directory: Path,
         argv += ["--keep-float", name]
     if pad_axes:
         argv += ["--pad-axes", pad_axes]
+    if quantize_gathered:
+        argv += ["--quantize-gathered"]
     completed = subprocess.run(argv, check=False)
     if completed.returncode != 0:
         raise RuntimeError(
@@ -288,6 +291,7 @@ def _phase_worker(argv: List[str]) -> int:
     parser.add_argument("--quantize", default=None)
     parser.add_argument("--keep-float", action="append", default=[])
     parser.add_argument("--pad-axes", default=None)
+    parser.add_argument("--quantize-gathered", action="store_true")
     args = parser.parse_args(argv)
 
     with open(args.config_blob, "rb") as handle:
@@ -316,7 +320,8 @@ def _phase_worker(argv: List[str]) -> int:
     from .phase_conversion import convert_phase
 
     write_spill(convert_phase(phase, quantize=args.quantize, keep_float=args.keep_float,
-                              pad_axes=args.pad_axes), Path(args.directory))
+                              pad_axes=args.pad_axes, quantize_gathered=args.quantize_gathered),
+                Path(args.directory))
     return 0
 
 

@@ -395,6 +395,7 @@ class MultiPhase(Decomposition):
         quantize = out_kwargs.get("quantize")
         keep_float = tuple(out_kwargs.get("keep_float") or ())
         pad_axes = out_kwargs.get("pad_axes")
+        quantize_gathered = bool(out_kwargs.get("quantize_gathered"))
 
         with contextlib.ExitStack() as scope:
             if isolate:
@@ -428,12 +429,13 @@ class MultiPhase(Decomposition):
                 if isolate:
                     result = convert_phase_isolated(
                         blob_path, index, spill_root / f"phase-{index}", quantize=quantize,
-                        keep_float=keep_float, pad_axes=pad_axes,
+                        keep_float=keep_float, pad_axes=pad_axes, quantize_gathered=quantize_gathered,
                     )
                     print(f"  {phase.name}: read back {len(result.weights)} packed weight(s) from its "
                           f"worker's spill{_rss_note()}")
                 else:
-                    result = convert_phase(phase, quantize=quantize, keep_float=keep_float, pad_axes=pad_axes)
+                    result = convert_phase(phase, quantize=quantize, keep_float=keep_float, pad_axes=pad_axes,
+                                           quantize_gathered=quantize_gathered)
                 offset_cached_attention_layers(result.topologies,
                                                len(fused_geometry.get("attention", [])))
                 phase_topologies.update(result.topologies)
