@@ -2064,6 +2064,104 @@ licence is its recording's, and so is the consent: clone only voices you have th
             "minutes."
         ),
     ),
+    # Audio8-TTS (Edge0, Apache-2.0 with a NOTICE that travels): a Fish-S2-style DualAR and its codec,
+    # two repos by ADR-022 -- the codec is byte-identical in Audio8-TTS-Preview-0.6b (same LFS sha256),
+    # so one codec repo serves both. Measured 2026-10-30 (dev box, 4 threads): greedy codes identical to
+    # `generate(do_sample=False)` at F32 (810/810 ids, 81 frames; cloned 4000/4000, 400 frames); codec
+    # 4.6e-6 max from `decode_audio`; sampled takes read back by Parakeet-TDT. Q8_0's greedy codes
+    # differ from frame 0 (a 4096-way argmax flips) -- graded by ear and ASR, as the sampled F32 is.
+    ModelCard(
+        slug="audio8-tts-realistic-0.6b", checkpoint=Path("audio8-tts-realistic-0.6b"),
+        task_type="text-to-codes", pipeline_tag="text-to-speech",
+        snippet="text-to-codes-audio8",
+        base_repo="Edge0/Audio8-TTS-Realistic-0.6b", license_id="apache-2.0",
+        language=["zh", "en", "ja", "ko", "de", "fr", "es", "it", "ru", "ar", "fi", "hi", "id", "ms", "nl",
+                  "no", "pl", "pt", "sv", "th", "tr", "vi", "yue"],
+        title="Audio8-TTS Realistic 0.6B",
+        summary="Edge0's Audio8-TTS-Realistic (0.6B), a 23-language DualAR text-to-speech model with "
+                "zero-shot voice cloning, exported for loom.cpp in two precisions. Family 10: text in, "
+                "neural-codec tokens out -- pair it with `audio8-tts-codec-loom` for 44.1 kHz audio.",
+        variants=[
+            ("F32", "full precision, 2.4 GB. Greedy codes identical to upstream's "
+                    "`generate(do_sample=False)`, with and without a cloned voice."),
+            ("Q8_0", "1.2 GB, half the download. Not code-identical to F32 -- a 4096-way choice flips "
+                     "early and the take differs from there -- and as intelligible: 12 LibriSpeech "
+                     "sentences, sampled at seed 1 and read back by Parakeet-TDT, came back at 2.8% WER "
+                     "against F32's 5.5%, most of both being \"Mr.\" heard for \"Mister\". About as "
+                     "fast as F32 on an x86 CPU."),
+        ],
+        copied_files=[("NOTICE", "audio8-tts-realistic-0.6b/NOTICE")],
+        usage_extra="""### Cloning a voice
+
+Upstream clones a voice from one reference clip AND its exact transcript, both in the prompt; the clip
+goes in as codec tokens. loom takes the two from a **voice file**, made once per voice with
+[loom-exporter](https://github.com/loom-ai-org/loom-exporter). Making one runs the codec's encoder in
+PyTorch, so it needs `torch`, `torchaudio` and `transformers` and the upstream checkpoint on disk --
+these repos carry the decoder only. Using one needs nothing but loom.
+
+```sh
+git clone https://github.com/loom-ai-org/loom-exporter && cd loom-exporter
+# --text is the clip's EXACT transcript; --license is the RECORDING's, which only you know.
+python -m loom_exporter.audio8_tts_voices ~/models/Audio8-TTS-Realistic-0.6b -o voices \\
+    --wav me.wav --text "The exact words spoken in the clip." --name me --license "CC0-1.0"
+```
+
+```python
+# A voice file is a path (or a name, for one under `voices/` beside the model file).
+codes = model.text2codes.infer("The quick brown fox jumps over the lazy dog.", voice="voices/me.gguf",
+                               seed=1)
+codec.codes2speech.infer(codes).save("cloned.wav")
+```
+
+Upstream recommends a clean clip of 3-15 seconds. A voice file holds codec tokens, so it is stamped with
+a fingerprint of the codec's quantizers and loom refuses one made with a different codec. The voice's
+licence is its recording's, and so is the consent: clone only voices you have the right to use.""",
+        limitations=(
+            "**This model does not produce audio.** It emits ten streams of codec tokens, and the codec "
+            "turns those into a 44.1 kHz waveform -- "
+            "[`audio8-tts-codec-loom`](https://huggingface.co/loom-ai-org/audio8-tts-codec-loom). They "
+            "stay separate because the codec is shared (Audio8-TTS-Preview ships the same file) and "
+            "because the codes are the useful intermediate.\n\n"
+            "**It samples by default, at its generation config's settings** -- temperature 0.7, top-k 50, "
+            "top-p 0.9, and upstream's repetition-aware redraw -- so two runs give two takes and `seed=` "
+            "pins one. The sampler is upstream's own rule, not `transformers'`: top-k and top-p are "
+            "measured before the temperature. `temperature=0` decodes greedily and reproduces upstream's "
+            "`generate(do_sample=False)` **exactly** at F32, code for code, and with a cloned voice too; "
+            "greedy tends to run on past the sentence, which sampling does not.\n\n"
+            "**There is no language switch**: the model reads the language from the text. Without a voice "
+            "it picks one, and the seed decides which.\n\n"
+            "**One call is one prompt of at most 2048 positions** -- the text, a cloned voice's transcript "
+            "and its frames (21.5 a second), and the audio generated -- and `max_new_tokens` (512 by "
+            "default, about 24 s) counts audio frames. For long text, synthesise it sentence by "
+            "sentence.\n\n"
+            "**Slow on a CPU.** One frame is one pass of the 24-layer slow transformer and nine of the "
+            "4-layer fast one; a 4-core x86 CPU makes about 3 frames a second at F32 (real time is "
+            "21.5), and the codec takes about four seconds per second of audio."
+        ),
+    ),
+    ModelCard(
+        slug="audio8-tts-codec", checkpoint=Path("audio8-tts-realistic-0.6b/codec.pth"),
+        task_type="audio-codec", pipeline_tag="text-to-audio",
+        base_repo="Edge0/Audio8-TTS-Realistic-0.6b", license_id="apache-2.0", language=[],
+        language_note="a codec, not a language model: it carries no vocabulary and no language.",
+        title="Audio8-TTS codec (decoder)",
+        summary="The 44.1 kHz neural audio codec of Edge0's Audio8-TTS, decode half, exported for "
+                "loom.cpp. Family 11: ten codebooks of codec tokens in, mono audio out.",
+        copied_files=[("NOTICE", "audio8-tts-realistic-0.6b/NOTICE")],
+        limitations=(
+            "**This is the DECODE half only**, like every codec in this collection: `encode` is "
+            "audio-in/codes-out, a different contract, and the TTS model never calls it. Voice cloning "
+            "encodes its reference clip once, in Python, into a voice file -- see "
+            "[`audio8-tts-realistic-0.6b-loom`](https://huggingface.co/loom-ai-org/audio8-tts-realistic-0.6b-loom).\n\n"
+            "**Feed it frame-major rows of 10 codes at 21.5 frames a second**; one frame is 2048 samples. "
+            "Codebook 0 is the 4096-entry semantic codebook and codebooks 1-9 hold 1024 entries each; an id "
+            "past a codebook's end decodes as its last entry, which is what upstream's decoder does.\n\n"
+            "**A clip is decoded in one call**, as upstream decodes, up to 2048 frames (95 s) -- the most "
+            "the TTS model can produce in one call. Verified against upstream's decoder at 4.6e-06 max "
+            "absolute difference. The decoder is a large convolution stack at 44.1 kHz: on a 4-core CPU "
+            "it takes about four seconds per second of audio. F32, 523 MB."
+        ),
+    ),
     ModelCard(
         slug="flan-t5-small", checkpoint=Path("flan-t5-small"),
         # `text2text-generation` is this export's task and is NOT a tag HuggingFace recognizes -- it
@@ -2914,6 +3012,29 @@ audio.save("out.wav")                         # 48 kHz stereo
 greedy = model.text2codes.infer("Hello there.", language="en", temperature=0, text_temperature=0,
                                 max_new_tokens=20)
 """,
+    # Audio8-TTS: MOSS's two-file shape with its own codec, no language and a sampled default.
+    "text-to-codes-audio8": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
+
+# What comes back is codec TOKENS, not audio -- frame-major, one row per frame, 10 codebooks wide, at
+# 21.5 frames per second. The model reads the language from the text.
+codes = model.text2codes.infer("The quick brown fox jumps over the lazy dog.", seed=1)
+print(len(codes), "frames x", len(codes[0]), "codebooks")
+
+# The second half of the pair, in a repo of its own: the codec this model's checkpoint ships.
+codec = loom.Model.from_pretrained("loom-ai-org/audio8-tts-codec-loom")
+audio = codec.codes2speech.infer(codes)
+print(len(audio), "samples at", audio.sample_rate, "Hz =", round(audio.duration, 2), "s")
+audio.save("out.wav")                         # 44.1 kHz mono
+
+# Nothing goes between those two calls. Both files declare the width of a frame:
+print(model.hparam("codec.n_codebooks"), "==", codec.hparam("codec.n_codebooks"))
+
+# This model SAMPLES by default; `seed=` pins a take. temperature=0 decodes greedily and reproduces
+# upstream's generate(do_sample=False) code for code:
+greedy = model.text2codes.infer("Hello there.", temperature=0, max_new_tokens=40)
+""",
     "text-to-speech-with-vocab": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}")
@@ -3341,6 +3462,12 @@ def _declares_style(style: str):
     return check
 
 
+def _driver_samples_untempered(fields) -> bool:
+    """A driver that asks `loom.sample_row` to truncate before the temperature (ADR-095)."""
+    field = fields.get("model.driver_script")
+    return field is not None and b"truncation = 'untempered'" in bytes(field.parts[field.data[0]])
+
+
 # The release that first carried each engine or loom-py CAPABILITY a file can need that is not an op --
 # composed of ops every runtime knows, so `OP_FIRST_RUNTIME` cannot see it. Read from the file like the
 # ops: (detector, release, what the file uses, what an older runtime does with it).
@@ -3350,6 +3477,9 @@ FEATURE_FIRST_RUNTIME = [
     (_declares_style("arpabet"), "1.0.0rc20", "the text door's `arpabet` phoneme style",
      "an older loom-py refuses text with `unknown phoneme style 'arpabet'` (`phonemes=` and `tokens=` "
      "still work)"),
+    (_driver_samples_untempered, "1.0.0rc20", "the sampler's untempered top-k/top-p and dropped crossing id",
+     "an older engine ignores both options and samples with `transformers'` truncation instead -- it "
+     "still speaks, from a slightly different distribution"),
 ]
 
 

@@ -225,6 +225,7 @@ _FAMILY_MODULES = (
     "voxtral_tts_export",
     "cosyvoice3_export",
     "moss_tts_export",
+    "audio8_tts_export",
     "musicgen_export",
 )
 
