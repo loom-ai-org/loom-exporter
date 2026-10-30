@@ -267,8 +267,15 @@ class CodecFamily(Enum):
     SNAC = "snac"
     QWEN3_TTS_12HZ = "qwen3_tts_tokenizer_12hz"
     MOSS_AUDIO_TOKENIZER = "moss-audio-tokenizer"
+    AUDIO8 = "audio8-tts-codec"
 
     def load(self, model_dir: str, frames_per_block: int = 0):
+        if self is CodecFamily.AUDIO8:
+            # Remote code from the checkpoint, and `codec.pth` beside it; see `audio8_codec_export`.
+            from . import audio8_codec_export
+
+            return audio8_codec_export.load(model_dir)
+
         if self is CodecFamily.MOSS_AUDIO_TOKENIZER:
             # Remote code from the checkpoint itself; see `moss_audio_tokenizer_export.load`. The
             # blocked decoder is built HERE, once, rather than per forward: it folds the quantizer
@@ -343,6 +350,11 @@ class CodecFamily(Enum):
         if self is CodecFamily.MOSS_AUDIO_TOKENIZER:
             # Not the model's own `decode`: its attention is masked-dense (or flash, or a ring cache),
             # and this is the same arithmetic blocked -- see `moss_audio_tokenizer_export`.
+            return model._loom_decoder(codes)
+
+        if self is CodecFamily.AUDIO8:
+            # `ArkttsCodec.decode` re-spelled for the trace, the clamp included -- see
+            # `audio8_codec_export`. It takes the caller's frame-major codes as they are.
             return model._loom_decoder(codes)
 
         if self is CodecFamily.QWEN3_TTS_12HZ:
@@ -437,6 +449,10 @@ class CodecFamily(Enum):
             from . import moss_audio_tokenizer_export as moss
 
             return moss.geometry(model)
+        if self is CodecFamily.AUDIO8:
+            from . import audio8_codec_export
+
+            return audio8_codec_export.geometry(model)
         if self is CodecFamily.QWEN3_TTS_12HZ:
             # Two configs, because this checkpoint states the two halves in different places: the
             # quantizer's width and codebook size belong to the decoder, while the sample rate and the
@@ -877,6 +893,28 @@ def _build_moss_audio_tokenizer(path: Path, output_path: str) -> LoomExportConfi
                                   n_frames=16, max_frames=4096)
 
 
+def _is_audio8_codec(path: Path) -> bool:
+    """Audio8-TTS's codec, which is a FILE: `codec.pth` beside a config declaring `model_type ==
+    "arktts"`. The directory itself is the family-10 talker (`audio8_tts_export`); the file is what
+    its `companions()` points at, so the pair is two exports from one checkpoint by [ADR-022]."""
+    if path.name != "codec.pth" or not path.is_file():
+        return False
+    cfg = _hf_config(path.parent)
+    return cfg is not None and cfg.get("model_type") == "arktts"
+
+
+def _build_audio8_codec(path: Path, output_path: str) -> LoomExportConfig:
+    """One call over the whole sequence, as the reference decodes (`ArkttsModel.decode_audio` does not
+    chunk). The post-module's window is 128 frames, so its scores are dense in T: at the 2048-frame
+    ceiling -- the talker's own `max_seq_len`, past which it cannot have produced the codes -- that is
+    16 heads x 2048^2 floats a layer, and at the talker's default 512 frames a sixteenth of it."""
+    from .audio8_codec_export import MAX_FRAMES
+
+    return AudioCodecExportConfig(architecture="audio8_tts_codec", output_path=output_path,
+                                  model_dir=str(path), family=CodecFamily.AUDIO8,
+                                  n_frames=16, max_frames=MAX_FRAMES)
+
+
 def _build_dac(path: Path, output_path: str) -> LoomExportConfig:
     return AudioCodecExportConfig(architecture=None, output_path=output_path, model_dir=str(path),
                                   family=CodecFamily.DAC)
@@ -909,5 +947,7 @@ def register(registry) -> None:
                             build_config=_build_qwen3_tts_tokenizer_12hz),
             ModelRecognizer(name="moss-audio-tokenizer", detect=_is_moss_audio_tokenizer,
                             build_config=_build_moss_audio_tokenizer),
+            ModelRecognizer(name="audio8-tts-codec", detect=_is_audio8_codec,
+                            build_config=_build_audio8_codec),
         ],
     ))
