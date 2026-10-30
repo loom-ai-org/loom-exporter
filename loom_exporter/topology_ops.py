@@ -801,22 +801,40 @@ def _op_split(self, op, ctx):
     num_splits = len(op.outputs)
     dim_to_split = ne_shape[ne_axis]
 
-    if isinstance(dim_to_split, int):
-        split_dim_size = dim_to_split // num_splits
-        split_expr = as_expr(split_dim_size)
+    # **`split_sizes` when MIL states them, an even division only when it does not.** `x.split((896,
+    # 128, 128))` -- a fused QKV projection under GQA, Audio8-TTS's -- arrives with explicit sizes, and
+    # this rule used to ignore them: it emitted three EQUAL views of 384 rows, every one of them wrong,
+    # and the first call died in the q reshape with `input element count is not evenly divisible`. An
+    # even split (`num_splits`, or sizes that happen to be equal) emits exactly what it did before.
+    sizes = static_value(op.inputs.get("split_sizes"))
+    if sizes is not None:
+        sizes = [int(v) for v in np.asarray(sizes).reshape(-1)]
+        if len(sizes) != num_splits:
+            raise ValueError(f"split {op.name}: {len(sizes)} split_sizes for {num_splits} outputs")
+        if len(set(sizes)) == 1:
+            sizes = None        # equal sizes: the even split below, rendered exactly as before
+    if sizes is not None:
+        size_exprs = [as_expr(v) for v in sizes]
+        sizes_rendered = list(sizes)
+    elif isinstance(dim_to_split, int):
+        size_exprs = [as_expr(dim_to_split // num_splits)] * num_splits
+        sizes_rendered = [dim_to_split // num_splits] * num_splits
     else:
-        split_expr = as_expr(dim_to_split) / num_splits
-        split_dim_size = render(split_expr)
+        size_exprs = [as_expr(dim_to_split) / num_splits] * num_splits
+        sizes_rendered = [render(size_exprs[0])] * num_splits
 
     # Create a VIEW node for each split output
+    start = as_expr(0)
     for idx, out_var in enumerate(op.outputs):
         out_name = self.safe_name(out_var.name)
 
         slice_shape = list(ne_shape)
-        slice_shape[ne_axis] = split_dim_size
+        slice_shape[ne_axis] = sizes_rendered[idx]
 
-        # Calculate byte offset rule
-        offset_elements = idx * split_expr
+        # Calculate byte offset rule. The cumulative form only when the sizes differ, so an even
+        # split's offsets render as `idx * size` exactly as they always have.
+        offset_elements = start if sizes is not None else idx * size_exprs[0]
+        start = start + size_exprs[idx]
         for prev_ax in range(ne_axis):
             offset_elements = offset_elements * as_expr(ne_shape[prev_ax])
         offset_bytes = render(offset_elements * 4)  # 4 bytes per float element
