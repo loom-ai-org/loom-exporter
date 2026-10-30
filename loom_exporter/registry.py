@@ -191,6 +191,7 @@ _FAMILY_MODULES = (
     "nemo_asr_export",
     "gigaam_export",
     "nemotron_asr_export",
+    "nemotron_unified_export",
     "whisper_export",
     "canary_export",
     "moonshine_export",
