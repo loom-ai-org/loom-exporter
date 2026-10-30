@@ -677,6 +677,50 @@ CATALOG = [
             "No timestamps: `segments` is one span covering the whole clip. Mono 16 kHz."
         ),
     ),
+    # The unified offline/streaming FastConformer RNN-T (`nemotron_unified_export`), exported in OFFLINE mode
+    # from its `.nemo` through NeMo 3.0 (the nemo3 venv). Measured 2026-10-30 against NeMo's own
+    # `forward(..., prompt_indices=...)` + greedy decode (its `transcribe(target_lang=)` is broken in 3.0):
+    # FLEURS test de/es/fr/pl, 15 clips each, and librispeech_asr_dummy (73), with the named language and
+    # with `auto`: F32 transcripts identical on 73/73 LibriSpeech and 59/60 FLEURS (the one is NeMo's own
+    # text spacing, "dix- sept", where SentencePiece and loom write "dix - sept" from the same ids); WER
+    # equal to NeMo's in every row. F32 peak RSS 3.15 GB on FLEURS. Q8_0 (same runs): 71/73 and 53/60
+    # identical, WER within 0.41 points of NeMo's per set, peak RSS 1.41 GB; on this x86 box Q8_0 was
+    # slower than F32 (LibriSpeech, two passes: 450 s against 369 s).
+    ModelCard(
+        slug="nemotron-labs-unified-asr-0.6b", checkpoint=Path("nemotron-labs-unified-asr-0.6b/nemotron-labs-unified-asr-0.6b.nemo"),
+        venv="nemo3", task_type="automatic-speech-recognition", selects_language=True,
+        snippet="automatic-speech-recognition-language-variants",
+        base_repo="nvidia/nemotron-labs-unified-asr-0.6b", license_id="other",
+        license_name="OpenMDW License 1.1", license_url="https://openmdw.ai/license/1-1/",
+        language=["bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it", "lv", "lt",
+                  "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk"],
+        title="Nemotron-Labs-Unified-ASR 0.6B",
+        summary="NVIDIA's Nemotron-Labs-Unified-ASR (0.6B): a FastConformer encoder with an RNN-T decoder and "
+                "language-ID prompting for 25 European languages, with punctuation and capitalization, "
+                "exported for loom.cpp in two precisions.",
+        variants=[
+            ("F32", "full precision, 2.5 GB. Token for token NeMo's own decode on 73 LibriSpeech and 60 "
+                    "FLEURS clips (German, Spanish, French, Polish), with the language named and with `auto`."),
+            ("Q8_0", "719 MB. Word error rates within 0.4 points of F32's on every set (LibriSpeech 3.91%, as F32; "
+                     "FLEURS German 2.91%, Spanish 3.37%, French 10.00%, Polish 9.02%, language named), "
+                     "and under half the memory: 1.4 GB peak against 3.2 GB. 71 of 73 LibriSpeech and "
+                     "53 of 60 FLEURS transcripts are token-identical to NeMo's."),
+        ],
+        limitations=(
+            "**Offline mode only.** The checkpoint is one model for offline and streaming recognition; "
+            "this file runs it offline -- the whole clip through the encoder at full context, as NeMo's "
+            "offline inference does. NeMo's buffered streaming (chunks with 5.6 s of recomputed left "
+            "context) is not exported.\n\n"
+            "**Name the language when you know it.** `language=` takes the checkpoint's own prompt names "
+            "-- two-letter codes such as `\"de\"` or `\"pl\"`, and locales such as `\"de-DE\"` (all 118, "
+            "`\"auto\"` included, are in `model.contract[\"asr_languages\"]`). Without it the model identifies the language "
+            "itself (`auto`). The table also names languages outside the 25 it was trained on; asking "
+            "for one of those is not a supported use.\n\n"
+            "**Cost grows with the clip.** Attention is over the whole clip, so split long recordings at "
+            "their pauses -- `silero-vad-loom` finds them. No timestamps: `segments` is one span covering "
+            "the whole clip. Mono 16 kHz."
+        ),
+    ),
     *[ModelCard(
         slug=f"moonshine-streaming-{size}", checkpoint=Path(f"moonshine-streaming-{size}"), venv="ovos",
         task_type="automatic-speech-recognition",
@@ -2522,6 +2566,20 @@ print(result.text)
 # Or name it, in the checkpoint's own locale names: "en-US", "de-DE", "zh-CN", ... (all 121 are in
 # `model.contract["asr_languages"]`, "auto" included). A wrong name returns an empty transcript.
 print(model.speech2text.infer(audio, language="de-DE").text)
+""",
+    # A language-prompted recognizer shipped in several precisions: the variants door plus `language=`.
+    "automatic-speech-recognition-language-variants": """import loom
+
+# This repo holds more than one precision of the model; name the file you want (see "Files" below).
+model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
+
+# Audio is a mono float list at 16 kHz. With no `language` the model identifies it itself ("auto").
+result = model.speech2text.infer(audio)
+print(result.text)
+
+# Or name it, in the checkpoint's own prompt names: "de", "fr", "pl", "de-DE", ...
+# (all of them, "auto" included, are in `model.contract["asr_languages"]`).
+print(model.speech2text.infer(audio, language="de").text)
 """,
     # Kyutai STT's door: the same call, at the Mimi codec's 24 kHz. loom does not resample, so a card
     # whose model takes another rate than the 16 kHz every other ASR card assumes has to say so in code.
