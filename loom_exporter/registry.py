@@ -204,6 +204,7 @@ _FAMILY_MODULES = (
     "styletts2_export",
     "supertonic_export",
     "vits_export",
+    "auroratts_export",
     "ctc_asr_export",
     "sanm_asr_export",
     "paraformer_export",

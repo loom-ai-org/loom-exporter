@@ -1,0 +1,11 @@
+-- AuroraTTS-100K (auroratts_export.py): encode -> the BiGRU -> predict -> durations here -> decode ->
+-- the harmonic phase and the noise here -> synth.
+--
+-- inputs: token_ids (ids over the 79-symbol ARPAbet table, `[<sil>, p1, ..., pn, <sil>]` -- the text
+-- door's own assembly builds exactly that), and optionally speed (default 1.0; durations are divided by
+-- it), pitch_shift (default 0.0, added to log-F0) and seed. Returns the waveform at `loom.sample_rate`
+-- (22.05 kHz), 256 samples per frame.
+--
+-- The noise is ATen's CPU stream (`aten_randn`): `torch.manual_seed(seed)` and then upstream's
+-- `synthesize` draws the same `torch.randn(1, L)`, so a seed renders as upstream renders it. No seed is
+-- seed 0.
