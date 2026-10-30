@@ -645,6 +645,67 @@ CATALOG = [
                        "[[reference-qwen3-asr-hf-checkpoint]]",
         title="Qwen3-ASR-0.6B", summary="Alibaba's Qwen3-ASR 0.6B multilingual ASR model, exported for loom.cpp.",
     ),
+    # Qwen3-ASR-1.7B distilled into two LOOPED stacks (`oruk_loop_export`): one shared block per stack,
+    # per-depth low-rank adapters, the vocabulary cut to 36,974 English tokens and REMAPPED to them.
+    # Measured 2026-10-30 against the checkpoint's own modeling code (transformers 5.14.1, fp32, greedy,
+    # 5.17's forced-English prompt): hf-internal-testing/librispeech_asr_dummy, 73 clips, F32 73/73
+    # transcripts identical to it, WER (upper-cased, punctuation dropped) 5.13% for both; Q8_0 69/73,
+    # 5.39%. 95 s of those clips concatenated (5 quiet-point pieces): F32 identical to the reference's
+    # own chunked `transcribe`, WER 8.27%; Q8_0 one word apart, 7.87%. jfk.wav on the 4-core dev box
+    # (loom.cpp main + the split, 4 threads): F32 22.8 s, peak RSS 1.35 GB; Q8_0 20.4 s, 669 MB. 95 s:
+    # F32 259 s / 1.94 GB, Q8_0 223 s / 963 MB. rc19 refuses audio past the 1024-cell cache (~55 s)
+    # with an error naming `loom.kv_cache_size`.
+    ModelCard(
+        slug="oruk-loop-153m", checkpoint=Path("oruk-loop-153M"), venv="ovos",
+        task_type="automatic-speech-recognition", snippet="automatic-speech-recognition-variants",
+        base_repo="oruk/oruk-loop-153M", license_id="other",
+        license_name="PolyForm Small Business 1.0.0 or PolyForm Noncommercial 1.0.0",
+        license_url="https://huggingface.co/oruk/oruk-loop-153M/blob/main/LICENSE-WEIGHTS.md",
+        language=["en"],
+        title="oruk-loop-153M",
+        summary="Oruk AI's oruk-loop-153M English speech recognizer -- Qwen3-ASR-1.7B distilled into one "
+                "encoder block run 24 times and one decoder block run 28 times, each depth with its own "
+                "low-rank adapter -- exported for loom.cpp with the loop kept, in two precisions.",
+        variants=[
+            ("F32", "full precision, 802 MB. On 73 LibriSpeech clips every transcript is the checkpoint's "
+                    "own (its modeling code, greedy), word for word; WER 5.13%."),
+            ("Q8_0", "243 MB. WER 5.39% on the same clips, 69 of 73 transcripts identical to F32; about "
+                     "half the memory (669 MB peak on an 11 s clip, against 1.35 GB)."),
+        ],
+        copied_files=[("LICENSE-WEIGHTS.md", "oruk-loop-153M/LICENSE-WEIGHTS.md"),
+                      ("NOTICE.md", "oruk-loop-153M/NOTICE.md")],
+        extra_files=[
+            "`LICENSE-WEIGHTS.md` -- the weights' license (PolyForm Small Business 1.0.0 or PolyForm "
+            "Noncommercial 1.0.0, at your option), with Oruk AI's Required Notice. It travels with every "
+            "copy of these files, converted or not.",
+            "`NOTICE.md` -- the attribution to Qwen3-ASR-1.7B (Apache-2.0), which this model derives from.",
+        ],
+        limitations=(
+            "**License: not for every commercial use.** The weights are free for personal, research, "
+            "educational and other noncommercial use, and for any use by a small business (fewer than 100 "
+            "people and under US$1M revenue); other commercial use needs a license from "
+            "[Oruk AI](https://oruk.ai). These GGUFs are the same weights converted, under the same terms "
+            "-- see `LICENSE-WEIGHTS.md`. Some of the training corpora carry non-commercial terms of their "
+            "own; the upstream card lists them.\n\n"
+            "**English only, with the language forced.** The prompt is the one the upstream card's numbers "
+            "come from (`apply_transcription_request(language=\"English\")` in transformers 5.17): the "
+            "answer is pre-filled with `language English`, so the model writes only the transcript. It "
+            "takes no `language=` argument. The output keeps the teacher's casing and punctuation.\n\n"
+            "**Long audio is cut the way the upstream `transcribe` cuts it** -- into pieces of at most 30 s, "
+            "each ending in the quietest 100 ms of its last 5 s, decoded one at a time and joined with "
+            "spaces; each piece may write `min(448, 10 per second + 24)` tokens. That needs loom "
+            "1.0.0-rc20 or later (see Usage): the cache holds one piece, so an older engine, which "
+            "decodes the clip in one pass, refuses one longer than about 55 s.\n\n"
+            "**Small on disk, not in arithmetic.** Every frame still passes through 24 encoder and 28 "
+            "decoder layers at the teacher's width, so it costs about what Qwen3-ASR-1.7B costs to run: "
+            "on a 4-thread laptop-class CPU 11 s of speech took about 20 s. The files also hold 200M "
+            "parameters rather than the upstream 153M: the token table, factorised in the checkpoint, is "
+            "stored as the 36,974 rows it multiplies out to -- the rows the checkpoint itself computes "
+            "when it loads -- and token ids are renumbered to those rows, so the file's vocabulary is "
+            "the kept 36,974 tokens, not Qwen's 151,936. No timestamps: `segments` is one span covering "
+            "the whole clip. Mono 16 kHz."
+        ),
+    ),
     ModelCard(
         slug="nemotron-3.5-asr-streaming-0.6b", checkpoint=Path("nemotron-3.5-asr-streaming-0.6b"),
         venv="ovos", task_type="automatic-speech-recognition", selects_language=True,
@@ -3399,6 +3460,11 @@ def _declares_style(style: str):
     return check
 
 
+def _declares_quiet_split(fields) -> bool:
+    """A family-3 file whose long audio `transcribe` cuts at quiet points (`loom.asr.split_*`)."""
+    return "loom.asr.split_max_samples" in fields
+
+
 # The release that first carried each engine or loom-py CAPABILITY a file can need that is not an op --
 # composed of ops every runtime knows, so `OP_FIRST_RUNTIME` cannot see it. Read from the file like the
 # ops: (detector, release, what the file uses, what an older runtime does with it).
@@ -3408,6 +3474,9 @@ FEATURE_FIRST_RUNTIME = [
     (_declares_style("arpabet"), "1.0.0rc20", "the text door's `arpabet` phoneme style",
      "an older loom-py refuses text with `unknown phoneme style 'arpabet'` (`phonemes=` and `tokens=` "
      "still work)"),
+    (_declares_quiet_split, "1.0.0rc20", "long audio cut at quiet points into pieces it decodes one at a time",
+     "an older engine decodes the clip in one pass, which this file's cache holds only for short audio "
+     "-- past it, the call stops with an error naming `loom.kv_cache_size`"),
 ]
 
 
