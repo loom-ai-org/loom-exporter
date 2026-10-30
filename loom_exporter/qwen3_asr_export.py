@@ -108,6 +108,13 @@ class WindowedAudioEncoder(nn.Module):
         ratio = int(audio_config.n_window_infer) // self.chunk_len
         self.block = self.rows_per_chunk * ratio
 
+    def layers(self):
+        """The transformer layers in depth order. A hook rather than `tower.layers` read inline,
+        because a looped checkpoint (`oruk_loop_export`) stores ONE block and makes it a different
+        layer at each depth by moving a cursor -- its layer list holds parameter-free call sites with
+        none of the attributes the loop below reads."""
+        return iter(self.tower.layers)
+
     def _attention(self, layer, hidden, mask):
         attn = layer.self_attn
         total = hidden.shape[0]
@@ -206,7 +213,7 @@ class WindowedAudioEncoder(nn.Module):
         # indistinguishable from `-inf` wherever any key survives (the difference underflows f32).
         mask = torch.where(same & key_ok, 0.0, float(-torch.finfo(torch.float32).max))
         mask = mask.view(1, 1, -1, total)
-        for layer in tower.layers:
+        for layer in self.layers():
             residual = hidden
             hidden = layer.self_attn_layer_norm(hidden)
             hidden = residual + self._attention(layer, hidden, mask)
@@ -411,6 +418,11 @@ def _is_qwen3_asr_hf(path: Path) -> bool:
     except (json.JSONDecodeError, OSError):
         return False
     if not isinstance(config, dict) or config.get("model_type") != "qwen3_asr":
+        return False
+    # A directory that names its own modeling code is a derivative whose weights the stock class does
+    # not describe: oruk-loop-153M declares this same `model_type` and loads into
+    # `Qwen3ASRForConditionalGeneration` as a 1.7B model with every layer missing. It has its own leaf.
+    if "auto_map" in config:
         return False
     return "audio_config" in config and "text_config" in config
 
