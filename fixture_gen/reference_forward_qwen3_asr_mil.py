@@ -55,6 +55,7 @@ chunk drops a different amount and still lands mid-chunk.
     python3 tools/fixture_gen/reference_forward_qwen3_asr_mil.py <model_dir> <out_dir> \\
         [wav] [n_new] [valid_samples]
 """
+import json
 import sys
 from pathlib import Path
 
@@ -102,9 +103,19 @@ def main() -> int:
     requested_valid = int(sys.argv[5]) if len(sys.argv) > 5 else None
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    model = Qwen3ASRForConditionalGeneration.from_pretrained(
-        model_dir, dtype=torch.float32, attn_implementation="eager",
-    ).eval()
+    looped = "oruk_loop" in json.loads((Path(model_dir) / "config.json").read_text())
+    if looped:
+        # oruk-loop-153M (`loom_exporter.oruk_loop_export`): the checkpoint's own looped modeling code,
+        # adapters applied on the fly as its CPU path does. Its `from_pretrained` ignores
+        # `attn_implementation`, so eager is set afterwards.
+        from transformers import AutoModel
+        model = AutoModel.from_pretrained(model_dir, trust_remote_code=True, device="cpu",
+                                          dtype=torch.float32, merge=False).eval()
+        model.set_attn_implementation("eager")
+    else:
+        model = Qwen3ASRForConditionalGeneration.from_pretrained(
+            model_dir, dtype=torch.float32, attn_implementation="eager",
+        ).eval()
     processor = AutoProcessor.from_pretrained(model_dir)
     extractor = processor.feature_extractor
     audio_config = model.config.audio_config
@@ -134,10 +145,22 @@ def main() -> int:
     # The REAL audio, not the padded waveform: HF's own pipeline never pads, and the whole point of
     # this fixture is that the exported encoder reproduces what HF computes for the real length.
     conversation = [{"role": "user", "content": [{"type": "audio", "audio": waveform}]}]
-    inputs = processor.apply_chat_template(
-        conversation, add_generation_prompt=True, tokenize=True,
-        return_dict=True, return_tensors="pt",
-    )
+    if looped:
+        # The looped checkpoint is run with its language FORCED, as transformers 5.17's
+        # `apply_transcription_request(language="English")` does: the assistant turn pre-filled with
+        # `language English<asr_text>`. Spelled out rather than called, because 5.14's version of that
+        # method builds a different prompt -- see `oruk_loop_export`'s module docstring.
+        conversation.append({"role": "assistant",
+                             "content": [{"type": "text", "text": "language English<asr_text>"}]})
+        inputs = processor.apply_chat_template(
+            conversation, continue_final_message=True, tokenize=True,
+            return_dict=True, return_tensors="pt",
+        )
+    else:
+        inputs = processor.apply_chat_template(
+            conversation, add_generation_prompt=True, tokenize=True,
+            return_dict=True, return_tensors="pt",
+        )
     prompt_len = int(inputs["input_ids"].shape[1])
 
     with torch.inference_mode():
@@ -148,6 +171,12 @@ def main() -> int:
         ).pooler_output
         generated = model.generate(**inputs, do_sample=False, max_new_tokens=max_new)
     new_tokens = generated[0][prompt_len:].tolist()
+    text = processor.tokenizer.decode(new_tokens)
+    if looped:
+        # The export numbers tokens by their index in the kept vocabulary, so the ids it generates are
+        # those indices. A generated id outside the table is impossible (its logit is -inf).
+        keep = model.model.language_model.token_table.keep.numpy()
+        new_tokens = [int(np.searchsorted(keep, t)) for t in new_tokens]
 
     np.save(out_dir / "ref_asr_waveform.npy", padded.astype(np.float32))
     np.save(out_dir / "ref_asr_valid.npy", np.asarray(valid_samples, dtype=np.int32))
@@ -163,7 +192,7 @@ def main() -> int:
           f"padded waveform's own row count is "
           f"{padded.shape[0] // samples_per_chunk * int(audio_config.max_position_embeddings)})")
     print(f"generated {len(new_tokens)} tokens: {new_tokens}")
-    print(f"text: {processor.tokenizer.decode(new_tokens)!r}")
+    print(f"text: {text!r}")
     print(f"wrote fixtures to {out_dir}")
     return 0
 
