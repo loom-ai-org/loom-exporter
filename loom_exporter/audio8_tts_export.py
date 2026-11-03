@@ -300,6 +300,10 @@ def check_equivalence(model, embed, slow, fast, tokenizer, n_frames: int = 4) ->
                          f"{ref}")
 
 
+# As written: a multi-phase export names a weight `{phase}.{weight}`, and `nn.Embedding` makes it `_weight`.
+ROPE_TABLES = ("slow.cos_weight", "slow.sin_weight", "fast.cos_weight", "fast.sin_weight")
+
+
 @dataclass
 class TextToCodesAudio8ExportConfig(BaseMultiPhaseModelExportConfig):
     """Audio8-TTS as three traced phases and a nested loop.
@@ -398,7 +402,16 @@ class TextToCodesAudio8ExportConfig(BaseMultiPhaseModelExportConfig):
         return contract
 
     def backend_kwargs(self) -> dict:
-        return dict(tokenizer_dir=self.model_dir, hparams=self.hparams())
+        return dict(
+            tokenizer_dir=self.model_dir, hparams=self.hparams(),
+            # The token and code tables are nobody's MUL_MAT operand, so `quantize` alone left 720 MB of
+            # them at F32 in a 1.17 GB Q8_0 file.
+            quantize_gathered=True,
+            # The flag reaches every GET_ROWS table and the rope's are two more per stack, 64 wide and so
+            # block-aligned. They stay: Q8_0 moves a cos/sin by up to 3.9e-3 (2e-3 rms), the same size as
+            # the bf16 rounding the export reads them off the module to keep, and saves 770 KB.
+            keep_float=ROPE_TABLES,
+        )
 
     def companions(self) -> List[CompanionExport]:
         """The codec, which this checkpoint ships as one file beside its weights."""
