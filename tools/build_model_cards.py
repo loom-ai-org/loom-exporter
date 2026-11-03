@@ -2189,11 +2189,12 @@ licence is its recording's, and so is the consent: clone only voices you have th
         variants=[
             ("F32", "full precision, 2.4 GB. Greedy codes identical to upstream's "
                     "`generate(do_sample=False)`, with and without a cloned voice."),
-            ("Q8_0", "1.2 GB, half the download. Not code-identical to F32 -- a 4096-way choice flips "
-                     "early and the take differs from there -- and as intelligible: 12 LibriSpeech "
-                     "sentences, sampled at seed 1 and read back by Parakeet-TDT, came back at 2.8% WER "
-                     "against F32's 5.5%, most of both being \"Mr.\" heard for \"Mister\". About as "
-                     "fast as F32 on an x86 CPU."),
+            ("Q8_0", "650 MB, about a quarter of the download. Not code-identical to F32 -- a 4096-way "
+                     "choice flips early and the take differs from there -- and close to it in "
+                     "intelligibility: 36 LibriSpeech sentences, sampled and read back by Parakeet-TDT, "
+                     "came back at 5.2% WER against F32's 3.5%, most of both being names, \"Mr.\" heard "
+                     "for \"Mister\" and a stray word heard at the end of a take. No faster than F32 on "
+                     "an x86 CPU."),
         ],
         copied_files=[("NOTICE", "audio8-tts-realistic-0.6b/NOTICE")],
         usage_extra="""### Cloning a voice
