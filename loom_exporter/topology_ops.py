@@ -2272,9 +2272,14 @@ def _op_conv(self, op, ctx):
         # before+after) -- op_conv_2d/op_conv_2d_dw (src/ops/primitives_conv.cpp) only take
         # one padding value per axis (symmetric padding), so this uses `pad[2]` (the second
         # spatial axis's "before" entry), matching s1/d1's own per-axis (not per-side) index.
-        attrs["s1"] = int(strides[1])
-        attrs["p1"] = int(pad[2]) if len(pad) > 2 else p0
-        attrs["d1"] = int(dilations[1]) if len(dilations) > 1 else d0
+        #
+        # ggml's axis 0 is the WIDTH, `ne[0]`, which is torch's LAST spatial axis, so the pairs swap. Every
+        # 2-D conv until Zipformer's `padding=(0, 1)` and `stride=(1, 2)` was the same on both axes, which
+        # is why writing them in torch's order went unnoticed. It made the feature axis the wrong width,
+        # and the first the engine knew of it was a RESHAPE that would not divide.
+        attrs["s0"], attrs["s1"] = int(strides[1]), s0
+        attrs["p0"], attrs["p1"] = (int(pad[2]) if len(pad) > 2 else p0), p0
+        attrs["d0"], attrs["d1"] = (int(dilations[1]) if len(dilations) > 1 else d0), d0
 
     # MIL's "conv" has an OPTIONAL per-output-channel "bias" input (torch Conv1d/2d's own
     # `bias=True`) -- unlike this file's own "conv_transpose" translation just below (which

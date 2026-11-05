@@ -1,0 +1,5 @@
+-- Zipformer: greedy transducer decode with a stateless prediction network, entirely in the driver.
+--
+-- Three traced topologies (zipformer_export.py): `encoder`, `decoder` and `joint`. Unlike
+-- transducer_driver/ there are no recurrent cells, and the reference's greedy search emits at most one
+-- symbol per frame, so this is one loop rather than two.
