@@ -2342,6 +2342,15 @@ class LoomGGUFExporter:
                 rule(self, op, ctx)
                 continue
 
+            if op_type == "log":
+                # The engine's LOG has no epsilon. MIL's default, 1e-45, is below anything f32 can add to;
+                # anything bigger changes the answer, and forwarding only `x` would do so silently.
+                epsilon = static_value(op.inputs.get("epsilon"))
+                if epsilon is not None and float(epsilon) > 1e-30:
+                    raise NotImplementedError(
+                        f"log op '{op.name}' has epsilon={float(epsilon)}, which the engine's LOG cannot "
+                        f"express. Add it to the operand in the program instead (torch_patches.py item 6).")
+
             mapped_op = self.OP_MAP.get(op_type)
             if mapped_op is None:
                 raise NotImplementedError(f"MIL op '{op_type}' is missing a ggml mapping.")
@@ -3182,6 +3191,11 @@ class LoomGGUFExporter:
             # `tokens.json` is a bare JSON array that several other schemes could also be written as.
             from .funasr_tokenizer_export import write_funasr_vocab
             write_funasr_vocab(w, tokenizer_dir)
+        elif family == "zipformer":
+            # A SentencePiece vocabulary with no protobuf and no `tokenizer.json`: `data/tokens.txt` and
+            # a `.vocab` beside it. Named by the family, because neither is self-describing.
+            from .zipformer_tokenizer_export import write_zipformer_vocab
+            write_zipformer_vocab(w, tokenizer_dir)
         elif family == "f5":
             # Family 9's character table, named by the family for the reason "ctc" and "funasr" are:
             # `vocab.txt` is a bare newline-separated list, and so is half a dozen other schemes'.

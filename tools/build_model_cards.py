@@ -738,6 +738,51 @@ CATALOG = [
             "No timestamps: `segments` is one span covering the whole clip. Mono 16 kHz."
         ),
     ),
+    # Zipformer small (`zipformer_export`), non-streaming, transducer head. Measured 2026-11-05 on the rc20
+    # wheel against the reference's own `AsrModel` + `greedy_search`, on librispeech_asr_dummy (73 clips, 481 s,
+    # upper-cased with punctuation dropped): F32 token-identical on 73/73, WER 7.22% for both; Q8_0 63/73,
+    # WER 7.39%. Upstream's 3.78% is LibriSpeech test-clean, a different set. 4 threads on the 4-core dev box:
+    # 7.05x and 7.16x real time, peak RSS 0.97 and 0.90 GB. Repeated en.wav, F32: 30 s 4.5 s / 0.98 GB,
+    # 60 s 9.8 s / 1.78 GB, 120 s 25.3 s / 3.37 GB (Q8_0 at 120 s: 25.7 s / 3.29 GB).
+    # GPUs, rc20, same clips: F32 token-identical to the reference on 73/73 on all of them. Q8_0 identical on
+    # 64/73 on Vulkan (WER 7.39%) and 65/73 on Metal and the M1 CPU (7.30%). Speed: Vega 3 (RADV) F32 3.81x,
+    # Q8_0 6.44x, 60 s in 16.0 s. M1 Pro, 8 threads: Metal F32 13.3x, Q8_0 16.8x; CPU F32 27.1x, Q8_0 33.0x.
+    # 120 s on the M1: Metal 7.3 s, CPU 4.7 s. CUDA not run: the workstation's GPU is on a training job.
+    ModelCard(
+        slug="zipformer-small", checkpoint=Path("zipformer-small"),
+        task_type="automatic-speech-recognition", snippet="automatic-speech-recognition-variants",
+        base_repo="pkufool/zipformer-small", license_id="apache-2.0", language=["zh", "en"],
+        title="Zipformer small",
+        summary="Xiaomi's Next-gen Kaldi Zipformer (arXiv:2310.11230), small variant: a multi-rate transformer "
+                "encoder with a stateless transducer, for Chinese and English, exported for loom.cpp in two "
+                "precisions.",
+        variants=[
+            ("F32", "full precision, 140 MB. Token for token the reference's own greedy search on all 73 test "
+                    "clips, on CPU, Vulkan and Metal alike, and its encoder output to about 3e-5."),
+            ("Q8_0", "58 MB. WER 7.30% to 7.39% against 7.22% on the same clips, depending on the backend, with "
+                     "63 to 65 of 73 transcripts identical to F32, the rest mostly a spelling apart. Barely "
+                     "faster than F32 on an x86 CPU, about 1.2x on Apple silicon's CPU and Metal, and 1.7x on a "
+                     "small Vulkan iGPU. At most 7% less CPU memory: attention's working memory is the same "
+                     "size either way."),
+        ],
+        limitations=(
+            "**The whole clip in one pass, not live streaming.** This is the non-streaming checkpoint. "
+            "`pkufool/zipformer-small-streaming` is a separate model and is not exported.\n\n"
+            "**Cost grows faster than the clip.** The first stack attends over every 20 ms frame. On a "
+            "4-thread laptop-class CPU, 16 s of speech took about 2.2 s; 60 s took 9.8 s and 1.8 GB; 120 s "
+            "took 25 s and 3.4 GB. Split long audio at its pauses -- `silero-vad-loom` finds them.\n\n"
+            "**On an M1 Pro, Metal is slower than the CPU** (13x real time against 27x at F32); it is here for "
+            "when the CPU is busy. Vulkan on a small integrated GPU (Radeon Vega 3) runs 3.8x at F32 and 6.4x "
+            "at Q8_0, against 7x on that machine's CPU. CUDA has not been run.\n\n"
+            "**The transducer head only.** The checkpoint also has a CTC head, which upstream rates as "
+            "less accurate (LibriSpeech test-clean 5.12% against 3.78%). It is not in these files.\n\n"
+            "**Case and punctuation follow the training data.** One model covers both languages and several "
+            "corpora, so English comes back mostly upper-case and unpunctuated, and sometimes in mixed case "
+            "with punctuation. Normalise before comparing. The language is not selectable: `language=` "
+            "does nothing here.\n\n"
+            "No timestamps: `segments` is one span covering the whole clip. Mono 16 kHz."
+        ),
+    ),
     # The unified offline/streaming FastConformer RNN-T (`nemotron_unified_export`), exported in OFFLINE mode
     # from its `.nemo` through NeMo 3.0 (the nemo3 venv). Measured 2026-10-30 against NeMo's own
     # `forward(..., prompt_indices=...)` + greedy decode (its `transcribe(target_lang=)` is broken in 3.0):
