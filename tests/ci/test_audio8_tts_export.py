@@ -111,6 +111,17 @@ def test_the_head_is_the_semantic_block_then_eos():
     assert torch.equal(slow.head.weight[:6], W[20:26]) and torch.equal(slow.head.weight[6], W[5])
 
 
+def test_the_tables_quantize_and_the_rope_does_not():
+    """`quantize_gathered` reaches every GET_ROWS table, and the rope's are block-aligned ones, so only
+    `keep_float` stands between Q8_0 and rotations a greedy decode cannot spare. A wrong name is the
+    export's own error (`MultiPhase.export`); dropping the exemption would be silent."""
+    config = SimpleNamespace(model_dir="unused", hparams=dict)
+    kwargs = a8.TextToCodesAudio8ExportConfig.backend_kwargs(config)
+    assert kwargs["quantize_gathered"] is True
+    assert set(kwargs["keep_float"]) == {f"{stack}.{table}_weight" for stack in ("slow", "fast")
+                                         for table in ("cos", "sin")}
+
+
 def test_the_recognizers_split_the_directory_from_its_codec_file(tmp_path):
     from loom_exporter.audio_codec_export import _is_audio8_codec
 
