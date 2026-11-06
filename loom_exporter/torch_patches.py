@@ -174,3 +174,30 @@ def apply_torch_frontend_patches() -> None:
         return real, imag
 
     _complex._stft = _fft_stft
+
+    # 6. `log1p` must be `log(1 + x)`, in the program and not in an argument nobody reads.
+    #
+    #    coremltools lowers it to `log(x, epsilon=1.0)`. The MIL op means `log(x + epsilon)`; the engine's
+    #    LOG takes one input, so the epsilon was dropped and the graph computed `log(x)`. FOUND ON ZIPFORMER,
+    #    whose feed-forward activation is `max(0, y) + log1p(exp(-|y|))`: `log(exp(-d))` is `-d`, so each
+    #    feed-forward was off by tens, and where the exp underflowed `log(0)` turned the encoder to NaN.
+    #    `generate_graph_topology` now refuses a `log` whose epsilon is not rounding-sized.
+    @register_torch_op(override=True)
+    def log1p(context, node):
+        x = mil_ops._get_inputs(context, node, expected=1)[0]
+        if types.is_int(x.dtype):
+            x = mb.cast(x=x, dtype="fp32")
+        context.add(mb.log(x=mb.add(x=x, y=1.0), name=node.name))
+
+    # 7. `logaddexp`, which coremltools has no converter for, in ops it does.
+    #
+    #    `max(x, y) + log(1 + exp(-|x - y|))`, the form the reference's own `logaddexp_onnx` uses for the
+    #    same reason. Zipformer's Swoosh activations are the one user. `log(1 + e)` rather than `log1p`,
+    #    which MIL does not have: it rounds `e` below 6e-8 to nothing, an absolute error of that size on a
+    #    result whose first term is `max(x, y)`.
+    @register_torch_op
+    def logaddexp(context, node):
+        x, y = mil_ops._get_inputs(context, node, expected=2)
+        gap = mb.abs(x=mb.sub(x=x, y=y))
+        tail = mb.log(x=mb.add(x=mb.exp(x=mb.mul(x=gap, y=-1.0)), y=1.0))
+        context.add(mb.add(x=mb.maximum(x=x, y=y), y=tail, name=node.name))
