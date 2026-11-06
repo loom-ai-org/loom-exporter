@@ -3576,6 +3576,7 @@ def build_one(card: ModelCard, models_root: Path, output_dir: Path, readme_only:
 OP_FIRST_RUNTIME = {
     "STFT": "1.0.0rc18",   # ADR-080
     "ISTFT": "1.0.0rc18",  # ADR-080
+    "ARGMAX": "1.0.0rc21", # P4.53: Zipformer's joint reduces its logits in the graph
 }
 
 
