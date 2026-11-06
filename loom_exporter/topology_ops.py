@@ -1656,6 +1656,30 @@ def _op_loom_scale(self, op, ctx):
     })
 
 
+@topology_rule('reduce_argmax')
+def _op_reduce_argmax(self, op, ctx):
+    # The engine's ARGMAX (P4.53) is ggml_argmax: each row's argmax over ne[0], I32, ne[0] dropped. That
+    # is MIL's last axis without keep_dims, which is what a greedy joint writes (`logits.argmax(-1)`) --
+    # the reason it exists is to keep a per-frame choice on the device instead of downloading the logits.
+    # Any other axis would need a permute first, and nothing has asked for one.
+    x_var_obj = op.inputs["x"]
+    in_rank = len(self.get_var_info(x_var_obj)["shape"])
+    axis = int(static_value(op.inputs.get("axis"), -1))
+    if axis < 0:
+        axis += in_rank
+    if axis != in_rank - 1 or bool(static_value(op.inputs.get("keep_dims"), False)):
+        raise NotImplementedError(
+            f"reduce_argmax op '{op.name}': only the last axis without keep_dims is lowered (got axis "
+            f"{axis} of rank {in_rank}, keep_dims={static_value(op.inputs.get('keep_dims'), False)!r}) -- "
+            "the engine's ARGMAX reduces ne[0].")
+    ctx.nodes.append({
+        "op": "ARGMAX",
+        "inputs": [ctx.resolve(self.safe_name(x_var_obj.name))],
+        "outputs": [self.safe_name(op.outputs[0].name)],
+        "attrs": {},
+    })
+
+
 @topology_rule('reduce_sum')
 def _op_reduce_sum(self, op, ctx):
     nodes, aliases, resolve = ctx.nodes, ctx.aliases, ctx.resolve
