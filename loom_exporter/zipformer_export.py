@@ -60,6 +60,11 @@ MIN_SECONDS, MAX_SECONDS = 0.25, 300.0
 # Every checkpoint in pkufool's table. `linear_pos` is `heads * pos_head_dim` wide, so it has to be known
 # to read the head count.
 POS_HEAD_DIM = 4
+# Frames the joint takes per call (P4.53). Its weight is the decode loop's floor -- 512 x 11661 F32, read
+# once per call -- and the driver stops at the block's first emission, discarding the rows after it. About
+# one frame in three emits, so a long block mostly computes rows it throws away. 60 s decode, dev box:
+# CPU 2.45 s per frame, 1.74 / 1.60 / 1.73 s at blocks 2 / 4 / 8; Vega 3 4.20 s, 2.41 / 1.88 / 1.84 s.
+JOINT_BLOCK = 4
 
 
 def import_zipformer():
@@ -302,14 +307,18 @@ class _Decoder(nn.Module):
 
 
 class _Joiner(nn.Module):
-    """`Joiner.forward(..., project_input=False)` on one frame: both projections already ran."""
+    """`Joiner.forward(..., project_input=False)` on a block of frames against one decoder output: both
+    projections already ran. A block rather than one frame is P4.53 (see `02_decode.lua`), and so is
+    returning each frame's greedy id rather than its 11661 logits: downloading those for the driver to
+    reduce cost ~1 ms a row on a Vega 3, a block of 8 10.1 ms a call against 2.6 ms with the argmax in
+    the graph."""
 
     def __init__(self, model: nn.Module):
         super().__init__()
         self.output_linear = model.joiner.output_linear
 
     def forward(self, encoder_frame: torch.Tensor, decoder_out: torch.Tensor) -> torch.Tensor:
-        return self.output_linear(torch.tanh(encoder_frame + decoder_out))
+        return self.output_linear(torch.tanh(encoder_frame + decoder_out)).argmax(-1)
 
 
 def _read_architecture(state: dict) -> dict:
@@ -415,9 +424,11 @@ class ZipformerExportConfig(BaseMultiPhaseModelExportConfig):
                                                    dtype=torch.int64),),
                         mil_inputs=[ct.TensorType(name="context", shape=(self.context_size,), dtype=np.int32)]),
             ExportPhase(name="joint", wrapper=_Joiner(model).eval(),
-                        dummy_inputs=(torch.randn(joiner_dim), torch.randn(joiner_dim)),
-                        mil_inputs=[ct.TensorType(name="encoder_frame", shape=(joiner_dim,), dtype=np.float32),
-                                    ct.TensorType(name="decoder_out", shape=(joiner_dim,), dtype=np.float32)]),
+                        dummy_inputs=(torch.randn(JOINT_BLOCK, joiner_dim), torch.randn(joiner_dim)),
+                        mil_inputs=[ct.TensorType(name="encoder_frame", dtype=np.float32,
+                                                  shape=(ct.RangeDim(1, JOINT_BLOCK), joiner_dim)),
+                                    ct.TensorType(name="decoder_out", shape=(joiner_dim,), dtype=np.float32)],
+                        root_axis="n_enc_frames"),
         ]
 
     def driver_components(self) -> List:
@@ -427,12 +438,14 @@ class ZipformerExportConfig(BaseMultiPhaseModelExportConfig):
         fragment = self.driver_script_path
         return [
             LuaFragment(fragment / "00_header.lua", top_level=True),
-            ExportConstants(values={"BLANK_ID": self.blank_id, "CONTEXT_SIZE": self.context_size}),
+            ExportConstants(values={"BLANK_ID": self.blank_id, "CONTEXT_SIZE": self.context_size,
+                                    "JOINT_BLOCK": JOINT_BLOCK}),
             LuaFragment(fragment / "01_inputs.lua", defines=("_waveform",)),
             # Retained and binding nothing: the decode loop names one row per call.
             SubgraphCallComponent(topology="encoder", outputs=(), retain=True,
                                   inputs={"waveform": Var("_waveform")}, length=Len("_waveform")),
-            LuaFragment(fragment / "02_decode.lua", reads=("BLANK_ID", "CONTEXT_SIZE"), defines=("tokens",)),
+            LuaFragment(fragment / "02_decode.lua", reads=("BLANK_ID", "CONTEXT_SIZE", "JOINT_BLOCK"),
+                        defines=("tokens",)),
             LuaFragment(fragment / "03_return.lua", reads=("tokens",)),
         ]
 
