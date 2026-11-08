@@ -9,9 +9,9 @@ pad, and the count of frames processed). The `encoder_chunk` phase is that call 
 the engine. Clip length only changes how many calls there are: cost is linear in it and memory is bounded,
 which the non-streaming leaf's attention over every frame is not.
 
-The clip still enters through the one-pass `speech2text` door: the whole waveform, one transcript. A live
-door (audio pushed in, partials read out) is later work; the driver is split into init / feed / finish so
-that it can call the same pieces.
+**Two doors, one chunk loop.** The driver exports `stream_open` / `stream_feed` / `stream_finish` for the
+live door (audio pushed as it arrives, ids back as they are decoded), keeping every piece of state in the
+engine's per-stream `StreamState` (ADR-098); the one-pass `speech2text` door is those three in one call.
 
 **Upstream's latency settings are export constants, not checkpoint facts.** `model.pt` is shared by its
 three jit files (chunk 16 / left 64, 32 / 128, 64 / 256); this export fixes 32 / 128, the middle one.
@@ -24,9 +24,10 @@ fixed shapes, so every Python branch on a length is a constant. What does not:
    `Q[t, k] = P[t, T - 1 - t + k]` for any score width of at least `2T - 1`.
 2. **`processed_lens` is F32.** The reference's is int32 and only ever compared with `arange(L)` and
    incremented by the chunk; both are exact in F32 below 2^24 frames (93 hours).
-3. **The fbank** is `zipformer_export._KaldiFbank` over the whole clip, as upstream's `_extract_features`
-   computes it, followed by the `log(1e-10)` frames upstream pads with: every chunk is then a row range of
-   one retained output.
+3. **The fbank** is `zipformer_export._KaldiFbank` followed by the `log(1e-10)` frames upstream pads with,
+   run per chunk over a window of samples rather than once over the clip as upstream's `_extract_features`
+   does. Kaldi's `snip_edges=False` reflects only past the clip's ends, so a window starting one hop before
+   a chunk's first frame gives the clip's own frames (the driver's header has the arithmetic).
 """
 import math
 from dataclasses import dataclass, field
@@ -56,6 +57,10 @@ CHUNK_FEATURES = 2 * CHUNK_SIZE
 TAIL = CHUNK_FEATURES + PAD_LENGTH
 # `DecodeStream.LOG_EPS`, the value upstream pads features with: the clip's end, and every chunk past it.
 LOG_EPS = math.log(1e-10)
+# The shortest window of samples the live path hands the fbank phase: its declared minimum input, and a
+# whole number of hops so a window starting on one ends the clip on the same frame grid.
+MIN_WINDOW = int(MIN_SECONDS * SAMPLE_RATE)
+assert MIN_WINDOW % (SAMPLE_RATE // 100) == 0
 # Rows of LOG_EPS after the clip's features: PAD_LENGTH, then enough that the last chunk, which starts
 # before `T + PAD_LENGTH`, reads `TAIL` rows without running off the end.
 FEATURE_TAIL = PAD_LENGTH + TAIL
@@ -275,16 +280,22 @@ class ZipformerStreamingExportConfig(BaseMultiPhaseModelExportConfig):
         from .driver_components import CALLER, DriverInputs, DriverReturn, ExportConstants, LuaFragment
         from .driver_ir import Len
 
+        fbank = _KaldiFbank()
         constants = {
             "BLANK_ID": self.blank_id, "CONTEXT_SIZE": self.context_size, "JOINT_BLOCK": JOINT_BLOCK,
             "CHUNK_FEATURES": CHUNK_FEATURES, "TAIL": TAIL, "PAD_LENGTH": PAD_LENGTH,
-            "FEATURE_TAIL": FEATURE_TAIL, "STATE_SIZES": self.state_sizes,
+            "STATE_SIZES": self.state_sizes,
+            # The fbank's framing, which places each chunk's window of samples (00_stream.lua).
+            "HOP": fbank.hop, "WINDOW": fbank.window_size, "PAD_LEFT": fbank.pad_left,
+            "MIN_WINDOW": MIN_WINDOW,
         }
+        # Top level: the stream's three functions are top-level functions, and read them all.
         return [
-            ExportConstants(values=constants),
+            ExportConstants(values=constants, top_level=True),
+            LuaFragment(self.driver_script_path / "00_stream.lua", top_level=True),
             DriverInputs(bindings=(("waveform", CALLER),), n_tokens=Len("waveform")),
-            LuaFragment(self.driver_script_path / "01_transcribe.lua",
-                        reads=("waveform",) + tuple(constants), defines=("tokens",)),
+            LuaFragment(self.driver_script_path / "01_transcribe.lua", reads=("waveform",),
+                        defines=("tokens",)),
             DriverReturn(values=("tokens",)),
         ]
 
