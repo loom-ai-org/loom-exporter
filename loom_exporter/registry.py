@@ -222,6 +222,7 @@ _FAMILY_MODULES = (
     "soprano_export",
     "kyutai_stt_export",
     "zipformer_export",
+    "zipformer_streaming_export",
     "lfm25_audio_export",
     "speecht5_export",
     "voxcpm2_export",

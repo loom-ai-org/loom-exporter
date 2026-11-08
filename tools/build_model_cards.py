@@ -767,7 +767,7 @@ CATALOG = [
         ],
         limitations=(
             "**The whole clip in one pass, not live streaming.** This is the non-streaming checkpoint. "
-            "`pkufool/zipformer-small-streaming` is a separate model and is not exported.\n\n"
+            "`zipformer-small-streaming-loom` is the streaming one, decoded in 640 ms chunks.\n\n"
             "**Cost grows faster than the clip.** The first stack attends over every 20 ms frame. On a "
             "4-thread laptop-class CPU, 16 s of speech took about 2.2 s; 60 s took 9.8 s and 1.8 GB; 120 s "
             "took 25 s and 3.4 GB. Split long audio at its pauses -- `silero-vad-loom` finds them.\n\n"
@@ -780,6 +780,50 @@ CATALOG = [
             "corpora, so English comes back mostly upper-case and unpunctuated, and sometimes in mixed case "
             "with punctuation. Normalise before comparing. The language is not selectable: `language=` "
             "does nothing here.\n\n"
+            "No timestamps: `segments` is one span covering the whole clip. Mono 16 kHz."
+        ),
+    ),
+    # Zipformer small STREAMING (`zipformer_streaming_export`), transducer head, chunk 32 / left 128 (640 ms), run
+    # chunk by chunk behind the one-pass door (loom.cpp ADR-097). Measured 2026-11-08 on a loom.cpp main build
+    # (rc21's ARGMAX) against upstream's released `jit_model-chunk-32-left-128.pt` run as `zipformer inference
+    # --streaming 1` runs it, on librispeech_asr_dummy (73 clips, 481 s, upper-cased with punctuation dropped):
+    # F32 token-identical on 73/73, WER 12.17% for both; Q8_0 46/73, WER 11.91%. Upstream's table rates this
+    # checkpoint 8.15% on LibriSpeech test-clean (16 / 128), against 3.78% for the non-streaming small. 4 threads on
+    # the 4-core dev box: F32 7.75x real time (RTF 0.129), Q8_0 7.80x (RTF 0.128); torch 2.8 running the jit file,
+    # same clips, 3.91x (RTF 0.256), timed back to back with loom F32 at 7.66x (RTF 0.131): 1.96x. Repeated en.wav, F32: 60 s 7.3 s / 280 MB, 120 s 14.0 s / 373 MB, 400 s 46.5 s /
+    # 785 MB, 8.2x to 8.6x (RTF 0.12) throughout (the memory growth is the whole-clip fbank and the waveform, not
+    # the encoder). GPUs not run.
+    ModelCard(
+        slug="zipformer-small-streaming", checkpoint=Path("zipformer-small-streaming"),
+        task_type="automatic-speech-recognition", snippet="automatic-speech-recognition-variants",
+        base_repo="pkufool/zipformer-small-streaming", license_id="apache-2.0", language=["zh", "en"],
+        title="Zipformer small streaming",
+        summary="Xiaomi's Next-gen Kaldi Zipformer (arXiv:2310.11230), small streaming variant: a chunk-causal "
+                "multi-rate transformer encoder with a stateless transducer, for Chinese and English, exported "
+                "for loom.cpp in two precisions and decoded in 640 ms chunks.",
+        variants=[
+            ("F32", "full precision, 143 MB. Token for token upstream's own streaming decode of its released "
+                    "640 ms file on all 73 test clips, and its encoder output to about 1e-4."),
+            ("Q8_0", "61 MB. WER 11.91% against 12.17% on the same clips, with 46 of 73 transcripts identical "
+                     "to F32, the rest mostly a word apart. No faster than F32 on an x86 CPU, and 40% less "
+                     "memory."),
+        ],
+        limitations=(
+            "**Chunked, but the whole clip in one call.** loom runs upstream's streaming decode, 640 ms at a "
+            "time with 2.56 s of attention to the left, so cost grows linearly with the clip and the "
+            "encoder's memory does not grow at all. The audio is still handed over as one clip and the "
+            "transcript comes back at the end: there is no live, push-as-you-record interface yet.\n\n"
+            "**Less accurate than the non-streaming model.** Upstream rates it 8.15% on LibriSpeech "
+            "test-clean against 3.78% for `zipformer-small`; on the 73 clips measured here, 12.17% against "
+            "7.22%. Use `zipformer-small-loom` for finished recordings where latency does not matter.\n\n"
+            "**One latency.** Upstream releases 320 ms, 640 ms and 1280 ms settings of the same weights; "
+            "these files are the 640 ms one.\n\n"
+            "**The front end still reads the whole clip.** About 1.5 MB of memory per second of audio at "
+            "F32: 120 s took 14 s and 373 MB on a 4-thread laptop-class CPU, 400 s took 47 s and 785 MB "
+            "(about 8.5x real time, RTF 0.12).\n\n"
+            "**Case and punctuation follow the training data**, as in `zipformer-small`: English comes back "
+            "mostly upper-case and unpunctuated. The language is not selectable: `language=` does nothing "
+            "here. The GPUs have not been measured with this model.\n\n"
             "No timestamps: `segments` is one span covering the whole clip. Mono 16 kHz."
         ),
     ),

@@ -866,6 +866,16 @@ def _op_slice_by_index(self, op, ctx):
     ne_shape = x_info["shape"]
     rank = len(ne_shape)
 
+    # A VIEW has no element stride, so `x[..., ::2]` cannot be one. This rule used to ignore `stride`
+    # altogether and emit the UNSTRIDED extent: Zipformer streaming's `mask[..., ::ds]` came out as a
+    # [160] view where torch has [80], which a later RESHAPE happened to catch. Downstream of a
+    # broadcasting op it would have read the wrong elements silently, so refuse it here instead.
+    stride = static_value(op.inputs.get("stride"))
+    if stride is not None and any(int(s) != 1 for s in np.atleast_1d(stride)):
+        raise NotImplementedError(
+            f"slice_by_index '{op.outputs[0].name}' has stride {list(np.atleast_1d(stride))}: a strided "
+            f"slice has no lowering (VIEW takes no element stride). Index with constant positions instead.")
+
     begin_mask_list = list(begin_mask) if isinstance(begin_mask, (list, tuple, np.ndarray)) else None
     end_mask_list = list(end_mask) if isinstance(end_mask, (list, tuple, np.ndarray)) else None
 

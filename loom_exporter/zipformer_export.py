@@ -340,7 +340,7 @@ def _read_architecture(state: dict) -> dict:
         depthwise = state.get(stack_key(i, "layers.0.conv_module1.depthwise_conv.weight"))
         if depthwise is None:
             raise ValueError("this checkpoint's convolutions are chunk-causal: it is a `-streaming` "
-                             "checkpoint, which this non-streaming export does not take")
+                             "checkpoint, which this non-streaming export does not take; `zipformer_streaming_export` does")
         kernels.append(depthwise.shape[-1])
         heads.append(state[stack_key(i, "layers.0.self_attn_weights.linear_pos.weight")].shape[0] // POS_HEAD_DIM)
         feedforward.append(state[stack_key(i, "layers.0.feed_forward2.out_proj.weight")].shape[1])
@@ -474,7 +474,9 @@ def _is_zipformer(path: Path) -> bool:
         return False
     state = torch.load(path / "model.pt", map_location="cpu", weights_only=True, mmap=True)
     state = state.get("model", state) if isinstance(state, dict) else {}
-    return "encoder.encoders.0.layers.0.bypass_scale" in state and "decoder.conv.weight" in state
+    # A chunk-causal checkpoint is `zipformer_streaming_export`'s.
+    return ("encoder.encoders.0.layers.0.bypass_scale" in state and "decoder.conv.weight" in state
+            and "encoder.encoders.0.layers.0.conv_module1.depthwise_conv.weight" in state)
 
 
 def _build_zipformer(path: Path, output_path: str) -> ZipformerExportConfig:
