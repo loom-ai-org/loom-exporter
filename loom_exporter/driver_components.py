@@ -2636,8 +2636,17 @@ class ExportConstants(DriverComponent):
     """
 
     values: dict = dataclass_field(default_factory=dict)
+    # Bind them as top-level locals before the entry function instead, for a driver whose other
+    # top-level functions read them too: a live stream's `stream_open` / `stream_feed` / `stream_finish`
+    # (ADR-098) run outside the entry function, so its locals are out of their reach.
+    top_level: bool = False
 
     __unchecked__ = {
+        "top_level": Unchecked(
+            "where the locals are bound. Wrong one way, a top-level function reads nil; the other way, "
+            "the entry function does, and driver_ir.validate fails the export naming the symbol. The "
+            "family's e2e test covers the first"
+        ),
         "values": Unchecked(
             "read off the restored checkpoint by the family's own config (Parakeet's blank id is its "
             "embedding's row count minus one, its durations are `model_defaults.tdt_durations`), so "
@@ -2648,7 +2657,7 @@ class ExportConstants(DriverComponent):
         ),
     }
 
-    def emit(self, ctx: DriverContext) -> List:
+    def _locals(self) -> List:
         out = []
         for name, value in self.values.items():
             if isinstance(value, (list, tuple)):
@@ -2656,6 +2665,14 @@ class ExportConstants(DriverComponent):
             else:
                 out.append(Local(name, Lit(value)))
         return out
+
+    def prelude(self, ctx: DriverContext) -> List[str]:
+        if not self.top_level:
+            return []
+        return [f"local {node.name} = {node.expr.render()}" for node in self._locals()] + [""]
+
+    def emit(self, ctx: DriverContext) -> List:
+        return [] if self.top_level else self._locals()
 
 
 @dataclass
