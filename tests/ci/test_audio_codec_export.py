@@ -107,7 +107,8 @@ def test_a_row_is_one_coarsest_frame_and_that_is_one_formula(tmp_path):
 
     This is the whole of what SNAC tested about "codes in, frame-major": 3 codebooks, 7 ids in a row.
     """
-    config = _build_snac(tmp_path, "/tmp/x.gguf")
+    # The one-pass config the streaming one wraps (ADR-104): the row geometry is its.
+    config = _build_snac(tmp_path, "/tmp/x.gguf")._one_pass()
     config._vq_strides = [4, 2, 1]
     assert (config._coarse_stride, config._codes_per_frame) == (4, 7)
     config._vq_strides = [1, 1, 1, 1]
@@ -124,7 +125,8 @@ def test_the_declared_frame_rate_is_the_rate_of_the_ROWS(tmp_path):
     check between a family-10 LM and its codec (loom-py's `test_codec_pair`), and an LM over SNAC
     emits 7 ids per step. Reporting the quantizer count here would read true and break that pair.
     """
-    config = _build_snac(tmp_path, "/tmp/x.gguf")
+    # The one-pass config the streaming one wraps (ADR-104): the row geometry is its.
+    config = _build_snac(tmp_path, "/tmp/x.gguf")._one_pass()
     config._vq_strides, config._n_codebooks = [4, 2, 1], 3
     config._codebook_size, config._sample_rate, config._hop_length = 4096, 24000, 512
     assert config.hparams() == {

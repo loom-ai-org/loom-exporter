@@ -939,10 +939,14 @@ def _build_dac(path: Path, output_path: str) -> LoomExportConfig:
 
 
 def _build_snac(path: Path, output_path: str) -> LoomExportConfig:
+    """SNAC, one call; and a stream of windows over that same graph (loom.cpp ADR-104), its noise drawn
+    per frame so a window decodes a frame with the noise every other window gave it."""
+    from .codec_stream_export import StreamingCodecExportConfig
+
     # The one leaf that must be TOLD its architecture: `load_model` reads `config.model_type` for it,
     # and a SNAC model has no `config` at all.
-    return AudioCodecExportConfig(architecture="snac", output_path=output_path, model_dir=str(path),
-                                  family=CodecFamily.SNAC)
+    return StreamingCodecExportConfig(architecture="snac", output_path=output_path, model_dir=str(path),
+                                      family=CodecFamily.SNAC)
 
 
 def register(registry) -> None:
