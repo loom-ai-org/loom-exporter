@@ -12,7 +12,7 @@ Nothing samples a token and nothing takes an argmax. The loop's state is a float
 shape is family 10's KV-cached decoder with the sampler replaced by one flow-head call; the Lua is
 hand-written, as Dia's and Chatterbox's are.
 
-Five phases:
+Seven phases:
   - `text_embed`:  the text's ids -> the conditioner's lookup-table rows, the prefill's embeddings.
   - `lm`:          the flow LM's transformer, KV-cached, returning the LAST row after `out_norm` and
                    its EOS logit. The voice is NOT an input: it is a precomputed KV cache (below).
@@ -23,6 +23,11 @@ Five phases:
   - `mimi_decoder`: every latent in one call -> the waveform. The reference decodes in streamed chunks
                    through causal convolutions and a windowed attention; one call computes the same
                    thing (`loom.cpp/scripts/pocket_tts_reference.py` checks it: 3.4e-06).
+  - `mimi_step`:   the live door's decoder (loom.cpp ADR-101): the next few latents -> their samples,
+                   with the decoder's state (each conv's last inputs, each transposed conv's overlap,
+                   each attention layer's last 250 keys and values) carried in and out as tensors the
+                   driver keeps on the device. 1.0e-06 from `mimi_decoder` on the same latents.
+  - `mimi_init`:   a fresh `mimi_step` state, made on the device.
 
 **A voice is a KV cache.** The reference's predefined voices are the flow LM's streaming state after
 prefilling `[bos_before_voice | speaker_proj(mimi_encoder(audio))]`, saved as safetensors
@@ -96,6 +101,11 @@ FLOW_TYPES = ("lsd", "drifting", "pointwise")
 TRACE_TOKENS = 13
 TRACE_STEPS = 7
 TRACE_FRAMES = 5
+# The most latents one `mimi_step` call decodes: a stream's piece is a few frames, never a chunk.
+MAX_STEP_FRAMES = 64
+# What a live piece grows to by default: 8 frames (640 ms) cost about 5% over the one-pass decode on the dev
+# box where one frame per call cost about 20% (ADR-101).
+PIECE_FRAMES_GROWN = 8
 
 
 def import_pocket_tts():
@@ -438,6 +448,160 @@ class MimiDecoderPhase(nn.Module):
         return x[:, 0]
 
 
+# Every slice below has a fixed width counted from one END of the tensor. The frame count is a graph
+# axis, and a slice whose bounds come from a shape mints a fresh symbol the axis algebra cannot follow.
+
+def _conv_step(conv: nn.Conv1d, x: torch.Tensor, previous: torch.Tensor):
+    """`StreamingConv1d` on a later call: the last `(k - 1) * d + 1 - s` input samples of the previous
+    call are prepended, and this call's last ones are the next call's."""
+    x = torch.cat([previous, x], dim=-1)
+    return conv(x), x[..., -previous.shape[-1]:]
+
+
+def _conv_transpose_step(convtr: nn.ConvTranspose1d, x: torch.Tensor, partial: torch.Tensor):
+    """`StreamingConvTranspose1d` on a later call: the previous call's `k - s` overlapping samples are added
+    to this call's first ones, and this call's own overlap (without the bias, which its first samples
+    already carry) is the next call's. Spelled as head + rest, then the overlap dropped, so no slice is
+    empty: the x16 upsampler's one-latent call makes exactly as many samples as it carries."""
+    y = convtr(x)
+    tail = partial.shape[-1]
+    out = torch.cat([y[..., :tail] + partial, y[..., tail:]], dim=-1)[..., :-tail]
+    rest = y[..., -tail:]
+    if convtr.bias is not None:
+        rest = rest - convtr.bias.view(1, -1, 1)
+    return out, rest
+
+
+class MimiStepPhase(nn.Module):
+    """`(latents, positions, key_positions, state_1..state_N) -> (waveform, state_1'..state_N')`: the next
+    `n` latents of `MimiDecoderPhase`, with the decoder's streaming state carried in and out -- upstream's
+    `decode_from_latent` with a `mimi_state`, which `generate_audio_stream` runs on whatever latents are
+    queued, one or several.
+
+    The states, in order: the x16 upsampler's overlap; each transformer layer's last `context` keys
+    (after RoPE) and values, `[1, kv_heads, context, head_dim]`; then each SEANet convolution that keeps
+    one (a causal conv's last input samples, a transposed conv's overlap), in the decoder's order.
+    `positions` are the `16 n` new decoder positions, absolute within the chunk; `key_positions` the
+    `context + 16 n` that the keys sit at, the state's first. A key at a negative position is a slot no
+    frame has written yet and is masked, so a chunk's first step reads the same keys a fresh decoder does,
+    whatever the state holds."""
+
+    def __init__(self, decoder: MimiDecoderPhase):
+        super().__init__()
+        self.d = decoder
+        self.context = decoder.context
+
+    def state_shapes(self) -> List[Tuple[int, ...]]:
+        d = self.d
+        shapes = [(1, d.upsample.out_channels, d.upsample.kernel_size[0] - d.upsample.stride[0])]
+        for layer in d.layers:
+            kv = (1, layer.attn.kv_heads, self.context, layer.attn.head_dim)
+            shapes += [kv, kv]
+        for kind, conv in self._stateful():
+            if kind == "conv":
+                k, dil, st = conv.kernel_size[0], conv.dilation[0], conv.stride[0]
+                shapes.append((1, conv.in_channels, (k - 1) * dil + 1 - st))
+            else:
+                shapes.append((1, conv.out_channels, conv.kernel_size[0] - conv.stride[0]))
+        return shapes
+
+    def _stateful(self):
+        """The SEANet convolutions that carry a state, in the order `forward` meets them."""
+        out = []
+        for block in self.d.decoder.model:
+            name = type(block).__name__
+            if name == "StreamingConv1d":
+                out.append(("conv", block.conv))
+            elif name == "StreamingConvTranspose1d":
+                out.append(("convtr", block.convtr))
+            elif name == "SEANetResnetBlock":
+                out += [("conv", sub.conv) for sub in block.block if type(sub).__name__ == "StreamingConv1d"]
+        return [(kind, conv) for kind, conv in out
+                if kind == "convtr" or (conv.kernel_size[0] - 1) * conv.dilation[0] + 1 - conv.stride[0] > 0]
+
+    def mask(self, positions: torch.Tensor, key_positions: torch.Tensor) -> torch.Tensor:
+        """0 where `0 <= q - k < context` and `k >= 0`, else a large negative: `window_mask`'s band with
+        the unwritten slots removed, from the same two outer products."""
+        q = positions.to(torch.float32)[0]
+        k = key_positions.to(torch.float32)[0]
+        delta = (torch.matmul(q.view(-1, 1), torch.ones_like(k).view(1, -1))
+                 - torch.matmul(torch.ones_like(q).view(-1, 1), k.view(1, -1)))
+        outside = torch.relu(-delta) + torch.relu(delta - (self.context - 1)) + torch.relu(-k).view(1, -1)
+        return (torch.clamp(outside, 0.0, 1.0) * -1e30).view(1, 1, q.shape[0], k.shape[0])
+
+    def _attend(self, attn: "_Attention", x, cos, sin, mask, k_past, v_past):
+        b, t, _ = x.shape
+        q = attn.q(x).view(b, t, attn.heads, attn.head_dim)
+        k = attn.k(x).view(b, t, attn.kv_heads, attn.head_dim)
+        v = attn.v(x).view(b, t, attn.kv_heads, attn.head_dim)
+        q = q * cos + _rotate_pairs(q) * sin
+        k = k * cos + _rotate_pairs(k) * sin
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        k = torch.cat([k_past, k], dim=2)
+        v = torch.cat([v_past, v], dim=2)
+        scores = torch.matmul(q * (1.0 / math.sqrt(attn.head_dim)), attn._repeat_kv(k).transpose(-1, -2)) + mask
+        ctx = torch.matmul(torch.softmax(scores, dim=-1), attn._repeat_kv(v))
+        ctx = ctx.transpose(1, 2).reshape(b, t, attn.heads * attn.head_dim)
+        return attn.out_proj(ctx), k[:, :, -self.context:], v[:, :, -self.context:]
+
+    def forward(self, latent, positions, key_positions, *states):     # (1, n, 32), (1, 16n), (1, ctx + 16n)
+        d = self.d
+        states = list(states)
+        out_states = []
+        x = latent * d.emb_std + d.emb_mean
+        x = d.quantizer(x.transpose(1, 2))
+        x, s = _conv_transpose_step(d.upsample, x, states.pop(0))
+        out_states.append(s)
+        cos, sin = _rope_tables(positions, d.head_dim, d.max_period)
+        mask = self.mask(positions, key_positions)
+        h = x.transpose(1, 2)
+        for layer in d.layers:
+            update, k, v = self._attend(layer.attn, layer.norm1(h), cos, sin, mask, states.pop(0), states.pop(0))
+            h = h + (update if layer.scale1 is None else layer.scale1 * update)
+            update = layer.linear2(F.gelu(layer.linear1(layer.norm2(h)), approximate="tanh"))
+            h = h + (update if layer.scale2 is None else layer.scale2 * update)
+            out_states += [k, v]
+        x = h.transpose(1, 2)
+        stateful = {id(conv) for _, conv in self._stateful()}
+
+        def conv(c, v):
+            if id(c) not in stateful:
+                return c(v)
+            y, s = _conv_step(c, v, states.pop(0))
+            out_states.append(s)
+            return y
+
+        for block in d.decoder.model:
+            name = type(block).__name__
+            if name == "StreamingConv1d":
+                x = conv(block.conv, x)
+            elif name == "StreamingConvTranspose1d":
+                x, s = _conv_transpose_step(block.convtr, x, states.pop(0))
+                out_states.append(s)
+            elif name == "SEANetResnetBlock":
+                v = x
+                for sub in block.block:
+                    v = conv(sub.conv, v) if type(sub).__name__ == "StreamingConv1d" else sub(v)
+                x = x + v
+            else:
+                x = block(x)
+        return (x[:, 0], *out_states)
+
+
+class MimiInitPhase(nn.Module):
+    """`(zero) -> state_1..state_N` of `MimiStepPhase`, each its shape filled with `zero`'s one value: a
+    fresh decoder's state made on the device, so a stream's first step needs no 2 MB array from the host.
+    Every slot of a fresh state is zero in the reference (`init_state`), and the key slots are masked
+    besides."""
+
+    def __init__(self, shapes):
+        super().__init__()
+        self.shapes = [tuple(s) for s in shapes]
+
+    def forward(self, zero):                                            # (1,)
+        return tuple(zero.view(*([1] * len(s))).expand(*s).contiguous() for s in self.shapes)
+
+
 # ------------------------------------------------------------------------------------------ export --
 
 def causal_mask(seq_len: int) -> torch.Tensor:
@@ -552,6 +716,7 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
     _voice_rows: int = field(default=0, init=False, repr=False)
     _voice_compat: Optional[str] = field(default=None, init=False, repr=False)
     _chunk_headers: Tuple[int, int] = field(default=(-1, -1), init=False, repr=False)
+    _mimi_states: Tuple[int, int] = field(default=(0, 0), init=False, repr=False)
 
     __links__ = {"root_axis": Axis()}
     __unchecked__ = {
@@ -575,6 +740,8 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
         "_voice_rows": Unchecked("the built-in voice's length, read during phases()"),
         "_voice_compat": Unchecked("the flow LM weights' fingerprint, read once by contract()"),
         "_chunk_headers": Unchecked("the SentencePiece `<s>`/`</s>` ids, read during phases()"),
+        "_mimi_states": Unchecked("`mimi_step`'s state count and its attention window, read off the "
+                                  "traced wrapper during phases()"),
     }
 
     def phases(self) -> List[ExportPhase]:
@@ -610,6 +777,9 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
         seq_dim = ct.RangeDim(1, LM_MAX_POSITIONS)
         frame_dim = ct.RangeDim(1, LM_MAX_POSITIONS)
         mimi_phase = MimiDecoderPhase(flow_lm, mimi).eval()
+        mimi_step = MimiStepPhase(mimi_phase).eval()
+        step_shapes = mimi_step.state_shapes()
+        self._mimi_states = (len(step_shapes), mimi_step.context)
         return [
             ExportPhase(
                 name="text_embed",
@@ -658,6 +828,40 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
                 # The decoder transformer's causal window, which `window_mask` builds: only the band is
                 # computed (P4.41, ADR-085). 6.6 s of a 19 s 2m synthesis on a Pi Zero was the dense form.
                 attention_window=mimi_phase.context,
+            ),
+            # The live door, a few latents per call (loom.cpp ADR-101): the decoder's state carried in and
+            # out as `state_1..state_N`, which the driver keeps on the device; `mimi_init` makes a fresh
+            # one there.
+            ExportPhase(
+                name="mimi_init",
+                wrapper=MimiInitPhase(step_shapes).eval(),
+                dummy_inputs=(torch.zeros(1),),
+                mil_inputs=[ct.TensorType(name="zero", shape=(1,), dtype=np.float32)],
+            ),
+            ExportPhase(
+                name="mimi_step",
+                wrapper=mimi_step,
+                dummy_inputs=(torch.randn(1, TRACE_FRAMES, ldim),
+                              torch.arange(TRACE_FRAMES * MIMI_UPSAMPLE, dtype=torch.int32).view(1, -1)
+                              + 3 * MIMI_UPSAMPLE,
+                              torch.arange(mimi_step.context + TRACE_FRAMES * MIMI_UPSAMPLE,
+                                           dtype=torch.int32).view(1, -1) + 3 * MIMI_UPSAMPLE - mimi_step.context)
+                             + tuple(torch.randn(sh) * 0.1 for sh in step_shapes),
+                mil_inputs=[
+                    ct.TensorType(name="latents", shape=(1, ct.RangeDim(1, MAX_STEP_FRAMES), ldim),
+                                  dtype=np.float32),
+                    ct.TensorType(name="positions",
+                                  shape=(1, ct.RangeDim(MIMI_UPSAMPLE, MIMI_UPSAMPLE * MAX_STEP_FRAMES)),
+                                  dtype=np.int32),
+                    ct.TensorType(name="key_positions",
+                                  shape=(1, ct.RangeDim(mimi_step.context + MIMI_UPSAMPLE,
+                                                        mimi_step.context + MIMI_UPSAMPLE * MAX_STEP_FRAMES)),
+                                  dtype=np.int32),
+                ] + [ct.TensorType(name=f"state_{i + 1}", shape=sh, dtype=np.float32)
+                     for i, sh in enumerate(step_shapes)],
+                root_axis="n_codes",
+                declared_axes={"positions": {1: f"{MIMI_UPSAMPLE} * n_codes"},
+                               "key_positions": {1: f"{MIMI_UPSAMPLE} * n_codes + {mimi_step.context}"}},
             ),
         ]
 
@@ -719,6 +923,12 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
                 "DEFAULT_DECODE_STEPS": DEFAULT_DECODE_STEPS,
                 # Samples of each chunk faded in by the `fade_in` driver weight; 0 for none.
                 "FADE_IN_SAMPLES": self._fade_in,
+                # `mimi_step`'s state count and attention window: the driver names `state_1..` from the
+                # count, and places each step's keys `MIMI_CONTEXT` positions back.
+                "MIMI_STATES": self._mimi_states[0],
+                "MIMI_CONTEXT": self._mimi_states[1],
+                # The frames a live piece grows to by default (1, 2, 4, then this).
+                "PIECE_FRAMES_GROWN": PIECE_FRAMES_GROWN,
             }, top_level=True),
             DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
             LuaFragment(fragment / "00_header.lua", top_level=True,
