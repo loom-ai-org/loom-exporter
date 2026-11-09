@@ -55,6 +55,30 @@ def _rss_note() -> str:
     return f" (rss {pages * resource.getpagesize() / (1 << 30):.1f} GiB)"
 
 
+def declare_own_kv_cache(phase, result) -> None:
+    """Write a phase's OWN cache geometry into its topologies (loom.cpp ADR-103): the engine allocates a
+    private `KvCache` of exactly this shape for the module, so its fused blocks keep their dense `layer`
+    indices from 0 and are not counted into the file's shared `loom.*` cache."""
+    blocks = result.geometry.get("attention", [])
+    if not blocks:
+        raise ValueError(f"phase '{phase.name}' declares its own KV cache but fused no cached ATTENTION block")
+    shapes = {geometry for _, geometry in blocks}
+    if len(shapes) != 1:
+        raise NotImplementedError(f"phase '{phase.name}': its own KV cache holds one width per layer, but its "
+                                  f"blocks have {sorted(shapes)}")
+    if not phase.kv_cache_size:
+        raise ValueError(f"phase '{phase.name}' declares its own KV cache without a kv_cache_size")
+    n_head_kv, head_k, head_v = shapes.pop()
+    window = int(phase.own_kv_cache.get("window", 0))
+    if window and window > phase.kv_cache_size:
+        raise ValueError(f"phase '{phase.name}': a window of {window} in a {phase.kv_cache_size}-cell cache")
+    geometry = {"n_layer": len(blocks), "n_embd_k": n_head_kv * head_k, "n_embd_v": n_head_kv * head_v,
+                "size": int(phase.kv_cache_size), "ring": bool(phase.own_kv_cache.get("ring", False)),
+                "window": window}
+    for topo in result.topologies.values():
+        topo["kv_cache"] = dict(geometry)
+
+
 def offset_cached_attention_layers(topologies: dict, offset: int) -> None:
     """Shift a phase's cached ATTENTION nodes to the cache slots after every earlier phase's.
 
@@ -436,8 +460,12 @@ class MultiPhase(Decomposition):
                 else:
                     result = convert_phase(phase, quantize=quantize, keep_float=keep_float, pad_axes=pad_axes,
                                            quantize_gathered=quantize_gathered)
-                offset_cached_attention_layers(result.topologies,
-                                               len(fused_geometry.get("attention", [])))
+                own = getattr(phase, "own_kv_cache", None)
+                if own:
+                    declare_own_kv_cache(phase, result)
+                else:
+                    offset_cached_attention_layers(result.topologies,
+                                                   len(fused_geometry.get("attention", [])))
                 phase_topologies.update(result.topologies)
                 phase_outputs.append((phase.name, result.topologies, result.weights))
                 packing.absorb(result.packing)
@@ -448,6 +476,8 @@ class MultiPhase(Decomposition):
                 # because `fused_geometry` asks the question and a list that depended on the answer
                 # would have to be rebuilt the day a second geometry is added.
                 for kind, records in result.geometry.items():
+                    if own and kind == "attention":
+                        continue                    # in the phase's own `kv_cache`, not the file's
                     fused_geometry.setdefault(kind, []).extend(records)
 
             _check_phase_weight_namespaces(phase_outputs)
@@ -472,7 +502,8 @@ class MultiPhase(Decomposition):
         # counts the fused nodes and needs the capacity beside them, and `ExportPhase.kv_cache_size` is
         # already the one place it is stated.
         capacities = {phase.kv_cache_size for phase in phases
-                      if getattr(phase, "fuse_attention", False) and phase.kv_cache_size is not None}
+                      if getattr(phase, "fuse_attention", False) and phase.kv_cache_size is not None
+                      and not getattr(phase, "own_kv_cache", None)}
         if len(capacities) > 1:
             raise ValueError(
                 f"phases declare different kv_cache_size values ({sorted(capacities)}). One KvCache is "

@@ -166,7 +166,8 @@ def test_the_modality_pair_is_codes_in_audio_out():
 def test_the_driver_builder_is_named_by_the_family(tmp_path):
     """The third family to override `synthesized_builder_key`, and the first whose epilogue reduces
     NOTHING -- `ArgmaxEpilogue` here would argmax the audio."""
-    config = _build_dac(tmp_path, "/tmp/x.gguf")
+    # DAC streams (loom.cpp ADR-102); its one-pass half is this family's own config, unchanged.
+    config = _build_dac(tmp_path, "/tmp/x.gguf")._one_pass()
     assert config.synthesized_builder_key() == "CodecDecode"
     assert config.backend_kwargs()["driver_builder"] == "CodecDecode"
     assert config.backend_kwargs()["root_axis"] == "n_codes"
@@ -330,7 +331,7 @@ def test_a_deterministic_codec_declares_no_noise_and_no_axes(tmp_path):
     """DAC's export must not move. The noise machinery is per-checkpoint -- walked off the real
     decoder's own `NoiseBlock`s -- so a codec that has none declares empty, and empty is what its
     GGUF has always carried."""
-    config = _build_dac(tmp_path, "/tmp/x.gguf")
+    config = _build_dac(tmp_path, "/tmp/x.gguf")._one_pass()
     config._noise_multiples = []
     assert config._noise_inputs == {}
     assert config.backend_kwargs()["declared_axes"] == {}

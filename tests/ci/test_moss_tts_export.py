@@ -127,8 +127,9 @@ def test_the_local_block_respelling_is_the_references_arithmetic():
 
 def test_the_driver_draws_n_vq_plus_one_per_frame_in_the_references_order():
     """Continue/stop first, then the codebooks: the layout `draws` pins, and the reference's order."""
-    lua = (Path(mt.__file__).parent / "moss_tts_driver" / "01_generate.lua").read_text()
-    assert "_step * (N_VQ + 1)" in lua
+    # The loop lives in the stream fragment since the live door (loom.cpp ADR-102); `infer` runs it.
+    lua = (Path(mt.__file__).parent / "moss_tts_driver" / "00_stream.lua").read_text()
+    assert "step * (N_VQ + 1)" in lua
     assert lua.index("lo = _stop_lo") < lua.index("lo = _g * CODEBOOK_SIZE")
     assert "inputs.language or 0" in lua
 
@@ -243,7 +244,7 @@ def test_the_contract_declares_the_codecs_fingerprint(tmp_path):
 def test_the_driver_puts_the_references_where_the_template_says_none():
     """The reference's direct clone path: head, then per reference `<audio_start>`, USER-slot rows and
     `<audio_end>` with no separator, then the rest; "None" only when there is no reference."""
-    lua = (Path(mt.__file__).parent / "moss_tts_driver" / "01_generate.lua").read_text()
+    lua = (Path(mt.__file__).parent / "moss_tts_driver" / "00_stream.lua").read_text()
     head = lua.index("_text_rows(PROMPT_HEAD)")
     assert head < lua.index("_text_rows(PROMPT_NO_REFERENCE)") < lua.index("_text_rows(PROMPT_AFTER")
     assert lua.index("_text_rows({AUDIO_START_ID})") < lua.index("USER_SLOT_ID") < \

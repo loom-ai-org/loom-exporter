@@ -172,12 +172,7 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "the sequence and the graph cannot pad its own dynamic axis. Exact because the decoder is "
             "causal end to end; chosen over `chunked_codec_call` because that loop is exact only when "
             "a chunk's context covers the receptive field, and here 8 s of context is still 48% away.",
-            no_user_reason=(
-                "its leaf, `moss-audio-tokenizer-v2`, is the codec half of MOSS-TTS, whose family-10 "
-                "half is not exported yet; the sweep lists shipped models, so the row fills in when "
-                "the pair lands"
-            ),
-        ),
+                    ),
         ComponentEntry(
             "modular_chain", ModularChain, (STATEMENTS,),
             "Threads one tensor through an independently-traced submodule chain: prefix -> [aux] -> "

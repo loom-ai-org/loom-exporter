@@ -36,6 +36,11 @@ from .spec_protocol import Unchecked
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .stream_steps import StateInit, conv_step, conv_transpose_step, window_mask
 
+# A codec whose decoder is NOT causal streams by windows over its one-pass graph (`00_window_stream.lua`),
+# with this many frames of context each side: DAC 44 kHz's receptive field is under 16 (16 each side is
+# 4.1e-07 from one call on random codes, 8 is 5.9e-03).
+WINDOW_FAMILIES = {CodecFamily.DAC: 16}
+
 # The most frames one `codec_step` call decodes: a stream's push is a few frames, never a chunk.
 MAX_STEP_FRAMES = 64
 # Trace lengths, odd and distinct from every static dimension.
@@ -352,10 +357,14 @@ class StreamingCodecExportConfig(BaseMultiPhaseModelExportConfig):
     chunk_frames: int = 0
     left_context_frames: int = 0
     max_frames: int = 4096
+    # The one-pass decode's attention block, for a codec whose `infer` pads to whole blocks (MOSS).
+    frames_per_block: int = 0
+    n_frames: int = 16
     decomposition: Decomposition = field(default_factory=MultiPhase)
     driver_script_path: Path = Path(__file__).resolve().parent / "codec_stream_driver"
     _codec: Optional[AudioCodecExportConfig] = field(default=None, init=False, repr=False)
     _step: Tuple[int, int] = field(default=(0, 0), init=False, repr=False)
+    _stages: List[Tuple[int, int, int]] = field(default_factory=list, init=False, repr=False)
 
     __unchecked__ = {
         "architecture": Unchecked("None: the checkpoint's own `model_type`, as `AudioCodecExportConfig` "
@@ -370,6 +379,10 @@ class StreamingCodecExportConfig(BaseMultiPhaseModelExportConfig):
         "driver_script_path": Unchecked("the stream fragment, parsed and checked by LuaFragment"),
         "_codec": Unchecked("the one-pass config this export reuses, built during phases()"),
         "_step": Unchecked("`codec_step`'s state count and attention window, read off the wrapper"),
+        "frames_per_block": Unchecked("the one-pass decode's attention block (MOSS: 4), for `infer`"),
+        "n_frames": Unchecked("the one-pass decode's trace length"),
+        "_stages": Unchecked("each MOSS stage's (positions per frame, window, ring cells), read off the "
+                             "stages during phases()"),
     }
 
     def _one_pass(self) -> AudioCodecExportConfig:
@@ -377,7 +390,8 @@ class StreamingCodecExportConfig(BaseMultiPhaseModelExportConfig):
             self._codec = AudioCodecExportConfig(
                 output_path=self.output_path, architecture=self.architecture, model_dir=self.model_dir,
                 family=self.family, chunk_frames=self.chunk_frames,
-                left_context_frames=self.left_context_frames, max_frames=self.max_frames)
+                left_context_frames=self.left_context_frames, max_frames=self.max_frames,
+                frames_per_block=self.frames_per_block, n_frames=self.n_frames)
         return self._codec
 
     def export_architecture(self) -> str:
@@ -389,6 +403,18 @@ class StreamingCodecExportConfig(BaseMultiPhaseModelExportConfig):
         codec = self._one_pass()
         model = codec.load_model()
         width = codec._codes_per_frame
+        decode = ExportPhase(
+            name="decode",
+            wrapper=_CodecDecodeWrapper(model, self.family).eval(),
+            dummy_inputs=(torch.zeros((1, codec.n_frames, width), dtype=torch.long),),
+            mil_inputs=[ct.TensorType(name="codes", shape=(1, ct.RangeDim(1, self.max_frames), width),
+                                      dtype=np.int32)],
+            root_axis="n_codes",
+        )
+        if self.family is CodecFamily.MOSS_AUDIO_TOKENIZER:
+            return [decode] + self._moss_stages(model, width)
+        if self.family in WINDOW_FAMILIES:
+            return [decode]
         step = codec_step(model, self.family).eval()
         shapes = step.state_shapes()
         self._step = (len(shapes), step.window)
@@ -397,14 +423,7 @@ class StreamingCodecExportConfig(BaseMultiPhaseModelExportConfig):
               f"{delta:.3g} from the one-call decode")
         n = TRACE_STEP_FRAMES
         return [
-            ExportPhase(
-                name="decode",
-                wrapper=_CodecDecodeWrapper(model, self.family).eval(),
-                dummy_inputs=(torch.zeros((1, codec.n_frames, width), dtype=torch.long),),
-                mil_inputs=[ct.TensorType(name="codes", shape=(1, ct.RangeDim(1, self.max_frames), width),
-                                          dtype=np.int32)],
-                root_axis="n_codes",
-            ),
+            decode,
             ExportPhase(
                 name="codec_init",
                 wrapper=StateInit(shapes).eval(),
@@ -434,11 +453,50 @@ class StreamingCodecExportConfig(BaseMultiPhaseModelExportConfig):
             ),
         ]
 
+    def _moss_stages(self, model, width: int) -> List[ExportPhase]:
+        """MOSS-Audio-Tokenizer's stream: one phase per transformer stage, each fused over a ring KV cache
+        of its own (`moss_codec_stream`, loom.cpp ADR-103)."""
+        import coremltools as ct
+
+        from .moss_codec_stream import MAX_PUSH_FRAMES, check_stream, stream_stages
+
+        stages = stream_stages(model._loom_decoder)
+        delta = check_stream(model._loom_decoder, stages, 24, width, [1, 3, 8, 2, 5])
+        self._stages = [(s.positions_per_frame, s.W, s.ring) for s in stages]
+        print(f"  {len(stages)} stream stages (positions per frame, window, ring): {self._stages}; "
+              f"{delta:.3g} from the one-call decode")
+        phases = []
+        for k, stage in enumerate(stages):
+            stage.eval()
+            p = stage.positions_per_frame
+            seq = ct.RangeDim(1, MAX_PUSH_FRAMES * p)
+            n = TRACE_STEP_FRAMES * p
+            if k == 0:
+                first = (torch.randint(0, model._loom_decoder.size - 1, (1, n, width)),)
+                first_input = ct.TensorType(name="codes", shape=(1, seq, width), dtype=np.int32)
+            else:
+                channels = stage.input_proj.in_features if hasattr(stage.input_proj, "in_features") else stage.C
+                first = (torch.randn(1, n, channels),)
+                first_input = ct.TensorType(name="x", shape=(1, seq, channels), dtype=np.float32)
+            mask = torch.triu(torch.full((n, n), -1e30), diagonal=1).view(1, 1, n, n)
+            phases.append(ExportPhase(
+                name=f"stage_{k + 1}",
+                wrapper=stage,
+                dummy_inputs=first + (torch.arange(n, dtype=torch.int32).view(1, -1), mask),
+                mil_inputs=[first_input,
+                            ct.TensorType(name="position_ids", shape=(1, seq), dtype=np.int32),
+                            ct.TensorType(name="attention_mask", shape=(1, 1, seq, seq), dtype=np.float32)],
+                fuse_attention=True,
+                kv_cache_size=stage.ring,
+                own_kv_cache={"ring": True, "window": stage.W},
+            ))
+        return phases
+
     def driver_components(self) -> List:
         """`infer` is the one-pass driver `AudioCodecExportConfig` synthesizes -- the same inputs, the
         same chunk loop -- and the stream's three functions sit beside it at top level."""
-        from .driver_components import (CALLER, ChunkedCodecCall, DriverInputs, DriverReturn,
-                                        ExportConstants, LuaFragment, MonolithicCall)
+        from .driver_components import (CALLER, ChunkedCodecCall, ComputedCall, DriverInputs, DriverReturn,
+                                        ExportConstants, LuaFragment, MonolithicCall, PaddedCodecCall)
         from .driver_ir import BinOp, Len, Lit
         from .lua_library import LuaLibrary
 
@@ -452,17 +510,45 @@ class StreamingCodecExportConfig(BaseMultiPhaseModelExportConfig):
                                     codes_per_frame=width, hop_length=hop, chunk_frames=self.chunk_frames,
                                     left_context_frames=self.left_context_frames)
             library = [LuaLibrary(uses=("array_slice",))]
+        elif self.frames_per_block:
+            # One call padded to whole blocks with the absent id, as the flattened export's driver makes it.
+            call = PaddedCodecCall(topology="decode", inputs=("codes",), codes_var="codes",
+                                   codes_per_frame=width, frames_per_block=self.frames_per_block,
+                                   samples_per_frame=hop * codec._channels,
+                                   pad_code=codec._absent_code if codec._absent_code is not None else 0)
+            library = [LuaLibrary(uses=("array_slice",))]
         else:
             # One call over the whole sequence, as the flattened export's driver makes it.
             call = MonolithicCall(topology="decode", inputs=("codes",),
                                   n_tokens=BinOp("floordiv", Len("codes"), Lit(max(width, 1))), retained=False)
             library = []
+        drives = ()
+        if self.family is CodecFamily.MOSS_AUDIO_TOKENIZER:
+            from .moss_codec_stream import MAX_PUSH_FRAMES
+
+            # Each stage's positions per code frame, window and ring, in order (`_moss_stages`).
+            constants = {"CODES_PER_FRAME": width, "MAX_PUSH_FRAMES": MAX_PUSH_FRAMES,
+                         "STAGE_PPF": [p for p, _, _ in self._stages],
+                         "STAGE_WINDOW": [w for _, w, _ in self._stages],
+                         "STAGE_RING": [r for _, _, r in self._stages]}
+            fragment = "00_moss_stream.lua"
+            # Stages 2.. run in a Lua loop, so their names exist only at run time; declared here so the
+            # call is still checked against each traced topology.
+            drives = (ComputedCall(topologies=tuple(f"stage_{k + 1}" for k in range(1, len(self._stages))),
+                                   inputs=("x", "position_ids", "attention_mask"), written="'stage_' .. k"),)
+        elif self.family in WINDOW_FAMILIES:
+            margin = WINDOW_FAMILIES[self.family]
+            constants = {"CODES_PER_FRAME": width, "SAMPLES_PER_FRAME": hop * (codec._channels or 1),
+                         "LEFT_FRAMES": margin, "LOOKAHEAD_FRAMES": margin}
+            fragment = "00_window_stream.lua"
+        else:
+            constants = {"CODES_PER_FRAME": width, "CODEC_STATES": self._step[0], "CODEC_WINDOW": self._step[1],
+                         "MAX_STEP_FRAMES": MAX_STEP_FRAMES}
+            fragment = "00_stream.lua"
         return [
-            ExportConstants(values={"CODES_PER_FRAME": width, "CODEC_STATES": self._step[0],
-                                    "CODEC_WINDOW": self._step[1], "MAX_STEP_FRAMES": MAX_STEP_FRAMES},
-                            top_level=True),
-            LuaFragment(self.driver_script_path / "00_stream.lua", top_level=True,
-                        defines=("stream_open", "stream_feed", "stream_finish")),
+            ExportConstants(values=constants, top_level=True),
+            LuaFragment(self.driver_script_path / fragment, top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish"), drives=drives),
             DriverInputs(bindings=(("codes", CALLER),), n_tokens=Len("codes")),
             *library,
             call,

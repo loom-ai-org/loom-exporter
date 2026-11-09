@@ -50,3 +50,40 @@ def test_an_uncached_attention_and_other_ops_are_untouched():
     topo = _topology(2, extra)
     offset_cached_attention_layers({"p": topo}, 5)
     assert [n.get("attrs", {}).get("layer") for n in topo["nodes"]] == [5, 6, 0, None]
+
+
+class _Phase:
+    def __init__(self, name, size, own):
+        self.name, self.kv_cache_size, self.own_kv_cache = name, size, own
+
+
+class _Result:
+    def __init__(self, topologies, blocks):
+        self.topologies = topologies
+        self.geometry = {"attention": [(f"op{i}", g) for i, g in enumerate(blocks)]}
+
+
+def test_a_phase_with_its_own_cache_declares_its_geometry_and_keeps_its_slots():
+    """loom.cpp ADR-103: a phase whose cache is its own (MOSS-TTS's codec stages) writes the `kv_cache`
+    object the engine allocates privately, from its own fused blocks, with its layers still from 0."""
+    from loom_exporter.decomposition import declare_own_kv_cache
+
+    topo = _topology(3)
+    declare_own_kv_cache(_Phase("stage_2", 516, {"ring": True, "window": 500}),
+                         _Result({"stage_2": topo}, [(12, 64, 64)] * 3))
+    assert topo["kv_cache"] == {"n_layer": 3, "n_embd_k": 768, "n_embd_v": 768, "size": 516, "ring": True,
+                                "window": 500}
+    assert [n["attrs"]["layer"] for n in topo["nodes"]] == [0, 1, 2]
+
+
+def test_an_own_cache_refuses_what_it_cannot_hold():
+    import pytest
+
+    from loom_exporter.decomposition import declare_own_kv_cache
+
+    with pytest.raises(ValueError, match="fused no cached ATTENTION"):
+        declare_own_kv_cache(_Phase("p", 8, {"ring": True}), _Result({"p": _topology(0)}, []))
+    with pytest.raises(NotImplementedError, match="one width per layer"):
+        declare_own_kv_cache(_Phase("p", 8, {"ring": True}), _Result({"p": _topology(2)}, [(2, 4, 4), (1, 4, 4)]))
+    with pytest.raises(ValueError, match="window of 9"):
+        declare_own_kv_cache(_Phase("p", 8, {"ring": True, "window": 9}), _Result({"p": _topology(1)}, [(1, 4, 4)]))
