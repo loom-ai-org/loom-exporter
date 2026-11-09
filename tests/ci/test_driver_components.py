@@ -186,6 +186,87 @@ class TestPrefillDecodeLoop(unittest.TestCase):
 
     def test_the_loop_is_a_second_entry_beside_infer(self):
         script = self._builder().build(self._ctx())
+        self.assertEqual([fn.name for fn in script.functions()],
+                         ["infer", "infer_with_past", "stream_open", "stream_feed", "stream_finish"])
+
+    def _entry(self, builder, name):
+        script = builder.build(self._ctx())
+        entry = next(e for e in script.extra_entries if e.name == name)
+        return "\n".join(LuaCodegen().emit_function(entry))
+
+    def test_stream_feed_is_the_loop_cut_per_token(self):
+        """loom.cpp ADR-099. Pinned whole: the stop rule must be `infer_with_past`'s, and every value
+        the next call needs goes to the stream's state, none to a Lua global."""
+        builder = self._builder()
+        builder.decode = dataclasses.replace(builder.decode, extra_eos_tokens=(7,))
+        self.assertEqual(self._entry(builder, "stream_feed"), "\n".join([
+            "function stream_feed(inputs)",
+            "    local _want = (inputs.max_tokens or 1)",
+            "    local _n_past = loom.state('n_past')",
+            "    local _count = loom.state('count')",
+            "    local _done = loom.state('done')",
+            "    local _max_new_tokens = loom.state('max_new_tokens')",
+            "    local _eos_token = loom.state('eos_token')",
+            "    local _step_tokens = {loom.state('last')}",
+            "    local _n_tokens = 1",
+            "    local _out = {}",
+            "    while ((_done == 0) and (#_out < _want)) do",
+            "        loom.run_subgraph_and_retain('main_topology', "
+            "{n_tokens = _n_tokens, n_past = _n_past}, {tokens = _step_tokens, "
+            "cache_position = loom.range(_n_past, _n_tokens), "
+            "attention_mask = loom.causal_mask(_n_tokens, _n_past)})",
+            "        local _next_token = loom.argmax_row('main_topology', (_n_tokens - 1))",
+            "        table.insert(_out, _next_token)",
+            "        _n_past = (_n_past + _n_tokens)",
+            "        _count = (_count + 1)",
+            "        if (_count >= _max_new_tokens) then",
+            "            _done = 1",
+            "        end",
+            "        if (_next_token == _eos_token) then",
+            "            _done = 1",
+            "        end",
+            "        if (_next_token == 7) then",
+            "            _done = 1",
+            "        end",
+            "        loom.set_state('last', _next_token)",
+            "        _step_tokens = {_next_token}",
+            "    end",
+            "    loom.set_state('n_past', _n_past)",
+            "    loom.set_state('count', _count)",
+            "    loom.set_state('done', _done)",
+            "    return _out",
+            "end",
+        ]))
+
+    def test_stream_open_prefills_and_keeps_the_settings(self):
+        text = self._entry(self._builder(), "stream_open")
+        self.assertIn("local _step_tokens = inputs.tokens", text)
+        self.assertIn("loom.set_state('max_new_tokens', _max_new_tokens)", text)
+        self.assertIn("loom.set_state('eos_token', _eos_token)", text)
+        self.assertIn("loom.set_state('done', _done)", text)
+        self.assertTrue(text.rstrip().endswith("return _out\nend"))
+
+    def test_sampling_knobs_live_in_the_stream_state(self):
+        builder = self._builder()
+        builder.decode = dataclasses.replace(
+            builder.decode, sampling={"temperature": 0.7, "top_k": 50, "top_p": 0.9})
+        opened = self._entry(builder, "stream_open")
+        self.assertIn("local _knobs = {temperature = (inputs.temperature or 0.7), "
+                      "top_k = (inputs.top_k or 50), top_p = (inputs.top_p or 0.9)}", opened)
+        self.assertIn("loom.set_state('top_k', _knobs.top_k)", opened)
+        fed = self._entry(builder, "stream_feed")
+        self.assertIn("local _knobs = {temperature = loom.state('temperature'), "
+                      "top_k = loom.state('top_k'), top_p = loom.state('top_p')}", fed)
+        self.assertIn("loom.sample_row('main_topology', (_n_tokens - 1), {temperature = "
+                      "_knobs.temperature, top_k = _knobs.top_k, top_p = _knobs.top_p})", fed)
+
+    def test_a_loop_with_per_call_context_gets_no_stream(self):
+        """A bound encoder output, a built prompt or a transcript marker would have to live in the
+        stream's state too; until a family needs it, such a loop exports `infer_with_past` alone."""
+        builder = self._builder()
+        builder.decode = dataclasses.replace(builder.decode, initial_n_past=Lit(3))
+        self.assertIsNotNone(builder.decode.stream_supported())
+        script = builder.build(self._ctx())
         self.assertEqual([fn.name for fn in script.functions()], ["infer", "infer_with_past"])
 
     def test_infer_is_byte_identical_with_and_without_the_loop(self):
