@@ -148,5 +148,9 @@ def test_every_crop_carries_the_cumulative_upsampling(tmp_path):
     assert "loom.run_recurrent_and_retain('lstm_l0_fwd', {from = 'pre'}," in driver
     assert "loom.run_recurrent_and_retain('lstm_l1_fwd', {from = 'lstm_l0_fwd'}," in driver
     assert "{lstm_out = {from = 'lstm_l1_fwd'}, residual = {from = 'pre'}}" in driver
-    # Nothing else crosses: the codes in and the waveform out are the only Lua values in the script.
-    assert driver.count("loom.run_recurrent(") == 0, "a marshalling recurrent call survived"
+    # Nothing else crosses in the one pass: the codes in and the waveform out are its only Lua values. The
+    # live door (ADR-104) does marshal -- a push's few rows go through the LSTM with its carry, between two
+    # windowed graphs -- so the count is over `infer` alone.
+    infer = driver[driver.index("function infer("):]
+    assert infer.count("loom.run_recurrent(") == 0, "a marshalling recurrent call survived"
+    assert "HIDDEN, HIDDEN, false, carry)" in driver[:driver.index("function infer(")]
