@@ -470,8 +470,8 @@ def test_a_streamed_conv_carries_its_state_into_one_call(pieces):
     convolutions the decoder runs (`_causal_conv`, `_causal_conv_transpose`): what makes the live door's
     frames join into the one-pass waveform (loom.cpp ADR-101). Dilation, stride and a bias included."""
     import torch
-    from loom_exporter.pocket_tts_export import (_causal_conv, _causal_conv_transpose, _conv_step,
-                                                 _conv_transpose_step)
+    from loom_exporter.pocket_tts_export import _causal_conv, _causal_conv_transpose
+    from loom_exporter.stream_steps import conv_step as _conv_step, conv_transpose_step as _conv_transpose_step
     torch.manual_seed(0)
     conv = torch.nn.Conv1d(3, 4, kernel_size=3, dilation=2)
     convtr = torch.nn.ConvTranspose1d(3, 4, kernel_size=10, stride=5)
