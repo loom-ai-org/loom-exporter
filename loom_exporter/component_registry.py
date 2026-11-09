@@ -160,15 +160,9 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "so every output sample is produced exactly once by the call with the most history for "
             "it. Used by a codec whose reference decodes in chunks (Qwen3-TTS's 12 Hz tokenizer, "
             "whose `chunked_decode` this reproduces) -- which is also what keeps a decoder with "
-            "ATTENTION over the frame axis from building a 4096x4096 score matrix per layer.",
-            no_user_reason=(
-                "its leaf is exported and verified but is not yet in the model sweep this column is "
-                "computed from -- `qwen3-tts-tokenizer-12hz` is the codec half of a pair whose family-10 "
-                "half is unwritten, and the sweep lists shipped models. So this reads as unused for the "
-                "same reason the leaf is not on the Hub yet, and the row will fill in when the pair "
-                "lands. Verified meanwhile against the reference's own `chunked_decode` at 42 and 700 "
-                "frames (max abs difference 4.2e-06 and 1.7e-05), which is [ADR-034]"
-            ),
+            "ATTENTION over the frame axis from building a 4096x4096 score matrix per layer. Since "
+            "that codec streams (loom.cpp ADR-102) its export is multi-phase and names this component "
+            "in its own driver, so the column sees it.",
         ),
         ComponentEntry(
             "padded_codec_call", PaddedCodecCall, (STATEMENTS,),

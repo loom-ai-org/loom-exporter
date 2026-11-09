@@ -1,0 +1,319 @@
+"""A codec whose decoder is causal throughout, exported with a STREAMING step beside its one-pass decode
+(loom.cpp ADR-102): codes in as an LM makes them, audio out a few frames later.
+
+The first leaf is Qwen3-TTS's 12 Hz tokenizer. Its decoder is causal end to end -- causal convolutions,
+transposed convolutions whose overlap is carried, ConvNeXt blocks, and an 8-layer transformer over a
+72-frame causal window -- so carrying every piece of state from one call to the next computes what one
+call over the whole sequence computes (`stream_steps` has the two convolutions). Upstream ships no
+streaming decode to grade against: its `decode` is `chunked_decode(300, 25)`, which equals one whole call
+through 299 frames (ADR-034) and is an approximation past it, where a 25-frame left context cuts a
+receptive field the step keeps.
+
+Three graphs:
+  - `decode`:        the one-pass decode `audio_codec_export` has always traced (its `main_topology`),
+                     unchanged, and the same 300 + 25 chunk loop in `infer` -- so one-pass audio does
+                     not move. Renamed because `main_topology` is the flattened export's namespace.
+  - `codec_step`:    `(codes [1, n, w], positions [n], key_positions [window + n], state_1..state_N)`
+                     -> `(samples, state_1'..state_N')`: the next `n` frames, the decoder's state carried.
+  - `codec_init`:    a fresh state, broadcast from one number on the device.
+
+The driver's `stream_open` / `stream_feed({codes})` / `stream_finish` decode each push as it arrives,
+keeping the state on the device (`loom.keep_state`), and the frame count is the stream's own position.
+"""
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from .audio_codec_export import AudioCodecExportConfig, CodecFamily, _CodecDecodeWrapper
+from .decomposition import Decomposition, MultiPhase
+from .spec_protocol import Unchecked
+from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
+from .stream_steps import StateInit, conv_step, conv_transpose_step, window_mask
+
+# The most frames one `codec_step` call decodes: a stream's push is a few frames, never a chunk.
+MAX_STEP_FRAMES = 64
+# Trace lengths, odd and distinct from every static dimension.
+TRACE_STEP_FRAMES = 5
+TRACE_DECODE_FRAMES = 16
+
+
+class Qwen3CodecStep(nn.Module):
+    """`Qwen3TTSTokenizerV2Decoder.forward` on the next `n` frames, its state carried in and out.
+
+    The states, in order: each transformer layer's last `window` keys (after RoPE) and values, then each
+    convolution that keeps one -- the pre-conv, the ConvNeXt blocks' depthwise convs, the decoder's convs
+    and its blocks' transposed convs and residual units -- in the order `forward` meets them. The x2
+    upsamplers' transposed convs have `kernel == stride`, so they overlap nothing and carry nothing.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.decoder = model.decoder
+        config = self.decoder.config
+        self.window = int(config.sliding_window)
+        self.n_layers = int(config.num_hidden_layers)
+        self.kv_heads = int(config.num_key_value_heads)
+        self.head_dim = int(self.decoder.pre_transformer.layers[0].self_attn.head_dim)
+
+    @staticmethod
+    def _pad(conv) -> int:
+        return conv.kernel_size - conv.stride
+
+    def _stateful(self) -> List[Tuple[str, nn.Module]]:
+        d = self.decoder
+        out = [("conv", d.pre_conv)]
+        for transposed, convnext in d.upsample:
+            out += [("convtr", transposed), ("conv", convnext.dwconv)]
+        for block in d.decoder:
+            name = type(block).__name__
+            if name.endswith("CausalConvNet"):
+                out.append(("conv", block))
+            elif name.endswith("DecoderBlock"):
+                for sub in block.block:
+                    kind = type(sub).__name__
+                    if kind.endswith("TransConvNet"):
+                        out.append(("convtr", sub))
+                    elif kind.endswith("ResidualUnit"):
+                        out += [("conv", sub.conv1), ("conv", sub.conv2)]
+        return [(k, m) for k, m in out
+                if (k == "convtr" and m.right_pad > 0) or (k == "conv" and self._pad(m) > 0)]
+
+    def state_shapes(self) -> List[Tuple[int, ...]]:
+        kv = (1, self.kv_heads, self.window, self.head_dim)
+        shapes = [kv, kv] * self.n_layers
+        for kind, m in self._stateful():
+            if kind == "conv":
+                shapes.append((1, m.conv.in_channels, self._pad(m)))
+            else:
+                shapes.append((1, m.conv.out_channels, m.right_pad))
+        return shapes
+
+    def forward(self, codes, positions, key_positions, *states):       # (1, n, w), (1, n), (1, window + n)
+        from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import apply_rotary_pos_emb
+
+        d = self.decoder
+        states = list(states)
+        kv = [states.pop(0) for _ in range(2 * self.n_layers)]
+        carried = {id(m) for _, m in self._stateful()}
+        new_kv, new_conv = [], []
+
+        def conv(m, x):
+            if id(m) not in carried:
+                return m(x)
+            y, s = conv_step(m.conv, x, states.pop(0))
+            new_conv.append(s)
+            return y
+
+        def convtr(m, x):
+            if id(m) not in carried:
+                return m(x)
+            y, s = conv_transpose_step(m.conv, x, states.pop(0))
+            new_conv.append(s)
+            return y
+
+        hidden = d.quantizer.decode(codes.transpose(1, 2))
+        hidden = conv(d.pre_conv, hidden).transpose(1, 2)
+        tr = d.pre_transformer
+        h = tr.input_proj(hidden)
+        cos, sin = tr.rotary_emb(h, positions)
+        mask = window_mask(positions, key_positions, self.window)
+        for i, layer in enumerate(tr.layers):
+            attn = layer.self_attn
+            x = layer.input_layernorm(h)
+            b, t, _ = x.shape
+            q = attn.q_proj(x).view(b, t, -1, attn.head_dim).transpose(1, 2)
+            k = attn.k_proj(x).view(b, t, -1, attn.head_dim).transpose(1, 2)
+            v = attn.v_proj(x).view(b, t, -1, attn.head_dim).transpose(1, 2)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            k = torch.cat([kv[2 * i], k], dim=2)
+            v = torch.cat([kv[2 * i + 1], v], dim=2)
+            new_kv += [k[:, :, -self.window:], v[:, :, -self.window:]]
+            if attn.num_key_value_groups != 1:
+                raise NotImplementedError("grouped-query attention in the codec's pre-transformer")
+            scores = torch.matmul(q, k.transpose(2, 3)) * attn.scaling + mask
+            out = torch.matmul(torch.softmax(scores, dim=-1), v)
+            out = attn.o_proj(out.transpose(1, 2).reshape(b, t, -1))
+            h = h + layer.self_attn_layer_scale(out)
+            h = h + layer.mlp_layer_scale(layer.mlp(layer.post_attention_layernorm(h)))
+        h = tr.output_proj(tr.norm(h)).permute(0, 2, 1)
+        for transposed, convnext in d.upsample:
+            h = convtr(transposed, h)
+            x = conv(convnext.dwconv, h).permute(0, 2, 1)
+            x = convnext.pwconv2(convnext.act(convnext.pwconv1(convnext.norm(x))))
+            h = h + (convnext.gamma * x).permute(0, 2, 1)
+        for block in d.decoder:
+            name = type(block).__name__
+            if name.endswith("CausalConvNet"):
+                h = conv(block, h)
+            elif name.endswith("DecoderBlock"):
+                for sub in block.block:
+                    kind = type(sub).__name__
+                    if kind.endswith("TransConvNet"):
+                        h = convtr(sub, h)
+                    elif kind.endswith("ResidualUnit"):
+                        x = conv(sub.conv1, sub.act1(h))
+                        h = h + conv(sub.conv2, sub.act2(x))
+                    else:
+                        h = sub(h)
+            else:
+                h = block(h)
+        return (h.clamp(min=-1, max=1).reshape(1, -1), *new_kv, *new_conv)
+
+
+def check_step(model, family: CodecFamily, step: Qwen3CodecStep, width: int, codebook_size: int,
+               atol: float = 1e-3) -> float:
+    """The step, fed uneven pieces with its state carried, against one call over the same codes -- run
+    before anything is traced, so a step that stopped matching the decoder fails the export."""
+    torch.manual_seed(0)
+    n = 40
+    codes = torch.randint(0, codebook_size, (1, n, width))
+    with torch.no_grad():
+        whole = family.decode(model, codes).reshape(-1)
+        states = [torch.zeros(s) for s in step.state_shapes()]
+        got, at = [], 0
+        for g in (1, 2, 1, 5, 31):
+            q = torch.arange(at, at + g, dtype=torch.int32).view(1, -1)
+            k = torch.arange(at - step.window, at + g, dtype=torch.int32).view(1, -1)
+            out = step(codes[:, at:at + g], q, k, *states)
+            got.append(out[0].reshape(-1))
+            states = list(out[1:])
+            at += g
+    delta = float((torch.cat(got) - whole).abs().max())
+    if delta > atol:
+        raise ValueError(f"the codec step disagrees with the one-call decode by {delta:.3g} (> {atol})")
+    return delta
+
+
+@dataclass(kw_only=True)
+class StreamingCodecExportConfig(BaseMultiPhaseModelExportConfig):
+    """A causal codec's decode half, one-pass and streaming -> one Loom GGUF. The one-pass half is
+    `AudioCodecExportConfig`'s own graph and driver; this config adds the step beside them."""
+
+    architecture: Optional[str] = None
+    model_dir: str
+    family: CodecFamily = CodecFamily.QWEN3_TTS_12HZ
+    root_axis: str = "n_codes"
+    chunk_frames: int = 0
+    left_context_frames: int = 0
+    max_frames: int = 4096
+    decomposition: Decomposition = field(default_factory=MultiPhase)
+    driver_script_path: Path = Path(__file__).resolve().parent / "codec_stream_driver"
+    _codec: Optional[AudioCodecExportConfig] = field(default=None, init=False, repr=False)
+    _step: Tuple[int, int] = field(default=(0, 0), init=False, repr=False)
+
+    __unchecked__ = {
+        "architecture": Unchecked("None: the checkpoint's own `model_type`, as `AudioCodecExportConfig` "
+                                  "resolves it, so the GGUF's architecture does not move"),
+        "model_dir": Unchecked("path to the codec directory; the recognizer read its `model_type`"),
+        "family": Unchecked("which codec this is, from the recognizer that matched it"),
+        "root_axis": Unchecked("`n_codes`, the codec family's axis (`AudioCodecExportConfig`)"),
+        "chunk_frames": Unchecked("the reference's own `chunked_decode` chunk, for `infer` (ADR-034)"),
+        "left_context_frames": Unchecked("the reference's own left context, for `infer` (ADR-034)"),
+        "max_frames": Unchecked("`chunk + context`: the one-pass graph is never asked for more"),
+        "decomposition": Unchecked("MultiPhase by construction -- three graphs"),
+        "driver_script_path": Unchecked("the stream fragment, parsed and checked by LuaFragment"),
+        "_codec": Unchecked("the one-pass config this export reuses, built during phases()"),
+        "_step": Unchecked("`codec_step`'s state count and attention window, read off the wrapper"),
+    }
+
+    def _one_pass(self) -> AudioCodecExportConfig:
+        if self._codec is None:
+            self._codec = AudioCodecExportConfig(
+                output_path=self.output_path, architecture=self.architecture, model_dir=self.model_dir,
+                family=self.family, chunk_frames=self.chunk_frames,
+                left_context_frames=self.left_context_frames, max_frames=self.max_frames)
+        return self._codec
+
+    def export_architecture(self) -> str:
+        return self._one_pass().export_architecture()
+
+    def phases(self) -> List[ExportPhase]:
+        import coremltools as ct
+
+        codec = self._one_pass()
+        model = codec.load_model()
+        width = codec._codes_per_frame
+        step = Qwen3CodecStep(model).eval()
+        shapes = step.state_shapes()
+        self._step = (len(shapes), step.window)
+        delta = check_step(model, self.family, step, width, codec._codebook_size)
+        print(f"  codec_step: {len(shapes)} states, {sum(int(np.prod(s)) for s in shapes)} floats, "
+              f"{delta:.3g} from the one-call decode")
+        n = TRACE_STEP_FRAMES
+        return [
+            ExportPhase(
+                name="decode",
+                wrapper=_CodecDecodeWrapper(model, self.family).eval(),
+                dummy_inputs=(torch.zeros((1, TRACE_DECODE_FRAMES, width), dtype=torch.long),),
+                mil_inputs=[ct.TensorType(name="codes", shape=(1, ct.RangeDim(1, self.max_frames), width),
+                                          dtype=np.int32)],
+                root_axis="n_codes",
+            ),
+            ExportPhase(
+                name="codec_init",
+                wrapper=StateInit(shapes).eval(),
+                dummy_inputs=(torch.zeros(1),),
+                mil_inputs=[ct.TensorType(name="zero", shape=(1,), dtype=np.float32)],
+            ),
+            ExportPhase(
+                name="codec_step",
+                wrapper=step,
+                dummy_inputs=(torch.randint(0, codec._codebook_size, (1, n, width)),
+                              torch.arange(n, dtype=torch.int32).view(1, -1) + 3,
+                              torch.arange(step.window + n, dtype=torch.int32).view(1, -1) + 3 - step.window)
+                             + tuple(torch.randn(s) * 0.1 for s in shapes),
+                mil_inputs=[
+                    ct.TensorType(name="codes", shape=(1, ct.RangeDim(1, MAX_STEP_FRAMES), width),
+                                  dtype=np.int32),
+                    ct.TensorType(name="positions", shape=(1, ct.RangeDim(1, MAX_STEP_FRAMES)),
+                                  dtype=np.int32),
+                    ct.TensorType(name="key_positions",
+                                  shape=(1, ct.RangeDim(step.window + 1, step.window + MAX_STEP_FRAMES)),
+                                  dtype=np.int32),
+                ] + [ct.TensorType(name=f"state_{i + 1}", shape=s, dtype=np.float32)
+                     for i, s in enumerate(shapes)],
+                root_axis="n_codes",
+                declared_axes={"positions": {1: "n_codes"},
+                               "key_positions": {1: f"n_codes + {step.window}"}},
+            ),
+        ]
+
+    def driver_components(self) -> List:
+        """`infer` is the one-pass driver `AudioCodecExportConfig` synthesizes -- the same inputs, the
+        same chunk loop -- and the stream's three functions sit beside it at top level."""
+        from .driver_components import (CALLER, ChunkedCodecCall, DriverInputs, DriverReturn,
+                                        ExportConstants, LuaFragment)
+        from .driver_ir import Len
+        from .lua_library import LuaLibrary
+
+        codec = self._one_pass()
+        # Zero for the one caller with no checkpoint: `component_registry.usage()` builds every
+        # registered config without one, and the width comes from the checkpoint's geometry.
+        width = codec._codes_per_frame if codec._n_codebooks else 0
+        hop = codec._hop_length or 0
+        call = ChunkedCodecCall(topology="decode", inputs=("codes",), codes_var="codes",
+                                codes_per_frame=width, hop_length=hop, chunk_frames=self.chunk_frames,
+                                left_context_frames=self.left_context_frames)
+        return [
+            ExportConstants(values={"CODES_PER_FRAME": width, "CODEC_STATES": self._step[0],
+                                    "CODEC_WINDOW": self._step[1], "MAX_STEP_FRAMES": MAX_STEP_FRAMES},
+                            top_level=True),
+            LuaFragment(self.driver_script_path / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
+            DriverInputs(bindings=(("codes", CALLER),), n_tokens=Len("codes")),
+            LuaLibrary(uses=("array_slice",)),
+            call,
+            DriverReturn(values=(call.out_var,)),
+        ]
+
+    def hparams(self) -> dict:
+        return self._one_pass().hparams()
+
+    def backend_kwargs(self) -> dict:
+        # Per-phase weight names: the step and the one-pass decode read the same checkpoint tensors,
+        # and each phase packs its own (duplicates are aliased in the file, not stored twice).
+        return dict(flat_namespace=False, root_axis=self.root_axis, hparams=self.hparams())
