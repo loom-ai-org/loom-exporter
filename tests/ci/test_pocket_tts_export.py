@@ -462,3 +462,29 @@ def test_the_v4_text_rules_are_probed_off_the_reference():
     else:
         assert rule is None
         assert _probe_decimal_period_rule(text_chunking, sp) == 1
+
+
+@pytest.mark.parametrize("pieces", [[1] * 9, [1, 3, 5], [4, 1, 4]])
+def test_a_streamed_conv_carries_its_state_into_one_call(pieces):
+    """`mimi_step`'s convolutions, cut into uneven pieces with their state carried, are the one-call
+    convolutions the decoder runs (`_causal_conv`, `_causal_conv_transpose`): what makes the live door's
+    frames join into the one-pass waveform (loom.cpp ADR-101). Dilation, stride and a bias included."""
+    import torch
+    from loom_exporter.pocket_tts_export import (_causal_conv, _causal_conv_transpose, _conv_step,
+                                                 _conv_transpose_step)
+    torch.manual_seed(0)
+    conv = torch.nn.Conv1d(3, 4, kernel_size=3, dilation=2)
+    convtr = torch.nn.ConvTranspose1d(3, 4, kernel_size=10, stride=5)
+    x = torch.randn(1, 3, sum(pieces))
+    with torch.no_grad():
+        prev = torch.zeros(1, 3, 4)
+        partial = torch.zeros(1, 4, 5)
+        got_conv, got_tr, at = [], [], 0
+        for n in pieces:
+            y, prev = _conv_step(conv, x[..., at:at + n], prev)
+            got_conv.append(y)
+            y, partial = _conv_transpose_step(convtr, x[..., at:at + n], partial)
+            got_tr.append(y)
+            at += n
+        assert torch.allclose(torch.cat(got_conv, -1), _causal_conv(conv, x), atol=1e-6)
+        assert torch.allclose(torch.cat(got_tr, -1), _causal_conv_transpose(convtr, x), atol=1e-6)
