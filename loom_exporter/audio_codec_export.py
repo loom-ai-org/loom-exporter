@@ -912,12 +912,16 @@ def _build_audio8_codec(path: Path, output_path: str) -> LoomExportConfig:
     """One call over the whole sequence, as the reference decodes (`ArkttsModel.decode_audio` does not
     chunk). The post-module's window is 128 frames, so its scores are dense in T: at the 2048-frame
     ceiling -- the talker's own `max_seq_len`, past which it cannot have produced the codes -- that is
-    16 heads x 2048^2 floats a layer, and at the talker's default 512 frames a sixteenth of it."""
-    from .audio8_codec_export import MAX_FRAMES
+    16 heads x 2048^2 floats a layer, and at the talker's default 512 frames a sixteenth of it.
 
-    return AudioCodecExportConfig(architecture="audio8_tts_codec", output_path=output_path,
-                                  model_dir=str(path), family=CodecFamily.AUDIO8,
-                                  n_frames=16, max_frames=MAX_FRAMES)
+    It streams too (loom.cpp ADR-102): the decoder is causal throughout, so `codec_stream_export` adds a
+    state-carrying step beside this one-call graph, which it keeps as it is.
+    """
+    from .audio8_codec_export import MAX_FRAMES
+    from .codec_stream_export import StreamingCodecExportConfig
+
+    return StreamingCodecExportConfig(architecture="audio8_tts_codec", output_path=output_path,
+                                      model_dir=str(path), family=CodecFamily.AUDIO8, max_frames=MAX_FRAMES)
 
 
 def _build_dac(path: Path, output_path: str) -> LoomExportConfig:
