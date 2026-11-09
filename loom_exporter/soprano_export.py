@@ -282,14 +282,13 @@ class SopranoExportConfig(BaseMultiPhaseModelExportConfig):
                 "DEFAULT_TOP_K": DEFAULT_TOP_K,
                 "DEFAULT_TOP_P": DEFAULT_TOP_P,
                 "DEFAULT_REPETITION_PENALTY": DEFAULT_REPETITION_PENALTY,
-            }),
+            }, top_level=True),
             DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
-            LuaFragment(fragment / "01_generate.lua",
-                        reads=("tokens", "EOS_ID", "TEXT_ID", "START_ID", "MAX_NEW_TOKENS",
-                               "MAX_PROMPT_TOKENS", "LM_MAX_POSITIONS", "HIDDEN_SIZE",
-                               "DEFAULT_TEMPERATURE", "DEFAULT_TOP_K", "DEFAULT_TOP_P",
-                               "DEFAULT_REPETITION_PENALTY"),
-                        defines=("wave",)),
+            # The live door (loom.cpp ADR-100): one sentence per `stream_feed`. Top level, so the
+            # constants above are too.
+            LuaFragment(fragment / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
+            LuaFragment(fragment / "01_generate.lua", reads=("tokens",), defines=("wave",)),
             DriverReturn(values=("wave",)),
         ]
 
