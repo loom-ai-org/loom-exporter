@@ -212,8 +212,8 @@ def test_the_decoding_defaults_are_generate_s_not_the_files(exported):
     assert exported["sampling"]["top_k"] == 50
     assert exported["sampling"]["temperature"] == pytest.approx(1.0)
     assert exported["sampling"]["guidance_scale"] == pytest.approx(3.0)
-    assert "scale = _guidance}" in exported["driver"]
-    assert "_guidance + 1.0" not in exported["driver"]
+    assert "scale = loom.state('guidance')}" in exported["driver"]
+    assert "loom.state('guidance') + 1.0" not in exported["driver"]
 
 
 def test_the_traced_lengths_do_not_reach_the_graph(tmp_path):

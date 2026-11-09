@@ -430,12 +430,8 @@ class TextToCodesMusicgenExportConfig(BaseMultiPhaseModelExportConfig):
                     add_eos_token=True, eos_token_id=self.eos_token_id)
 
     def driver_components(self) -> List:
-        from .driver_components import (
-            DriverReturn, ExportConstants, LuaFragment, SubgraphCallComponent,
-        )
-        from .driver_ir import Call, FieldAccess, Len, Lit, OutputRef, Var
+        from .driver_components import DriverReturn, ExportConstants, LuaFragment
 
-        src_len = Len(FieldAccess("inputs", "tokens"))
         t5_header = Path(__file__).resolve().parent / "t5_driver" / "00_header.lua"
         return [
             LuaFragment(self.driver_script_path / "00_header.lua", top_level=True),
@@ -457,34 +453,16 @@ class TextToCodesMusicgenExportConfig(BaseMultiPhaseModelExportConfig):
                 "TOP_K": self.sampling_defaults.get("top_k", 0),
                 "TOP_P": self.sampling_defaults.get("top_p", 1.0),
                 "GUIDANCE_SCALE": self.guidance_scale,
-            }),
-            SubgraphCallComponent(
-                topology="encoder",
-                outputs=(),
-                retain=True,
-                inputs={
-                    "input_ids": FieldAccess("inputs", "tokens"),
-                    "position_bias": Call("t5_position_bias",
-                                          [Var("ENC_REL_BIAS"), Var("N_TEXT_HEAD"), Var("REL_BUCKETS"),
-                                           Var("REL_MAX_DISTANCE"), src_len, Lit(0), Lit(1)]),
-                },
-                axes={"n_tokens": src_len, "n_past": Lit(0)},
-                note="T5 encoder + enc_to_dec_proj: one bidirectional pass over the prompt.",
-            ),
-            SubgraphCallComponent(
-                topology="cross_kv",
-                outputs=(),
-                retain=True,
-                inputs={"xa": OutputRef("encoder")},
-                axes={"n_enc_frames": src_len, "n_past": Lit(0)},
-                note="Cross-attention K/V for every decoder layer, once per prompt.",
-            ),
-            LuaFragment(
-                self.driver_script_path / "01_decode.lua",
-                reads=("N_CODEBOOKS", "N_LAYERS", "HIDDEN", "PAD", "MAX_CODES", "MAX_LENGTH",
-                       "TEMPERATURE", "TOP_K", "TOP_P", "GUIDANCE_SCALE"),
-                defines=("_codes",),
-            ),
+            }, top_level=True),
+            # The live door (loom.cpp ADR-104): the encoder and cross-attention K/V in `stream_open`, one
+            # decoder step per `stream_feed`, a frame back once every codebook's delayed column has reached
+            # it -- Dia's cut (ADR-103). Top level, so the constants above are too; `infer` is the stream
+            # run in one call. Its own call sites -- `encoder`, `cross_kv`, `decoder` and their
+            # unconditional streams -- are parsed out of the text and checked against the traced
+            # topologies, as the IR components that ran the first two used to be.
+            LuaFragment(self.driver_script_path / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
+            LuaFragment(self.driver_script_path / "01_decode.lua", defines=("_codes",)),
             DriverReturn(values=("_codes",)),
         ]
 
