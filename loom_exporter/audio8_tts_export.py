@@ -499,15 +499,12 @@ class TextToCodesAudio8ExportConfig(BaseMultiPhaseModelExportConfig):
                 "RAS_WINDOW": ras["window"],
                 "RAS_TEMPERATURE": ras["temperature"],
                 "RAS_TOP_P": ras["top_p"],
-            }),
-            LuaFragment(
-                self.driver_script_path / "01_generate.lua",
-                reads=("N_CODEBOOKS", "CODEBOOK_SIZE", "EOS_INDEX", "SEMANTIC_BEGIN", "MAX_POSITIONS",
-                       "MAX_NEW_TOKENS", "PROMPT_NO_REFERENCE_HEAD", "PROMPT_REFERENCE_HEAD",
-                       "PROMPT_REFERENCE_SPEECH", "PROMPT_REFERENCE_TO_TEXT", "PROMPT_TAIL",
-                       "TEMPERATURE", "TOP_K", "TOP_P", "RAS_WINDOW", "RAS_TEMPERATURE", "RAS_TOP_P"),
-                defines=("_codes",),
-            ),
+            }, top_level=True),
+            # The live door (loom.cpp ADR-102): one frame of codes per `stream_feed`. Top level, so the
+            # constants above are too; `infer` is the stream run in one call.
+            LuaFragment(self.driver_script_path / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
+            LuaFragment(self.driver_script_path / "01_generate.lua", defines=("_codes",)),
             DriverReturn(values=("_codes",)),
         ]
 

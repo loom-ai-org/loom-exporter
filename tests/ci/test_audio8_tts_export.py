@@ -181,11 +181,13 @@ def test_your_own_voice_needs_its_transcript_and_the_recordings_licence(tmp_path
 def test_the_driver_samples_with_the_references_rule():
     """Every draw names the ADR-095 options (an engine ignores a misspelled key, so a typo here would
     sample with `transformers'` rule unnoticed); the RAS window skips frame 0 as the reference's does."""
-    lua = (Path(a8.__file__).parent / "audio8_tts_driver" / "01_generate.lua").read_text()
+    # The loop lives in the stream fragment since the live door (loom.cpp ADR-102); `infer` runs it.
+    driver = Path(a8.__file__).parent / "audio8_tts_driver"
+    lua = "\n".join((driver / name).read_text() for name in ("00_stream.lua", "01_generate.lua"))
     assert "top_p_mass = 'row'" in lua
     assert "truncation = 'untempered'" in lua and "top_p_crossing = 'exclude'" in lua
-    assert lua.count("_options(") >= 4                 # semantic, RAS redraw, fast, + the definition
-    assert "if _step > 0 then" in lua
+    assert lua.count("audio8_options(") >= 4           # semantic, RAS redraw, fast, + the definition
+    assert "if step > 0 then" in lua
     # The reference prompt: transcript, then frames, then the user turn.
     assert lua.index("_text_rows(inputs.reference_tokens)") < lua.index("SEMANTIC_BEGIN + _ref[_at + 1]") \
         < lua.index("_text_rows(PROMPT_REFERENCE_TO_TEXT)")
