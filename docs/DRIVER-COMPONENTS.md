@@ -76,6 +76,7 @@ differs is entirely what the host does with the one output. The family names its
 | `padded_codec_call` | `PaddedCodecCall` | statements | 2 | 6 | *nobody* (see below) |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
 | `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 16 | canary, granite-speech, hf-causal-lm, lfm2-monolithic, moonshine, moonshine-streaming, oruk-loop, qwen3, qwen3-asr, t5, whisper |
+| `decode_loop_stream` | `DecodeLoopStream` | statements | 0 | 2 | *nobody* (see below) |
 | `waveform_valid_length` | `WaveformValidLength` | statements | 0 | 5 | granite-speech, oruk-loop, qwen3-asr |
 | `prompt_segments` | `PromptSegments` | statements | 2 | 5 | granite-speech, oruk-loop, qwen3-asr |
 | `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | citrinet, conformer-ctc, funasr-sensevoice, hf-ctc-asr |
@@ -141,7 +142,7 @@ Threads one tensor through an independently-traced submodule chain: prefix -> [a
 
 ### `prefill_decode_loop` — `PrefillDecodeLoop`
 
-The `infer_with_past` generation loop: prefill, then decode one token at a time against the KV cache until max_new_tokens or eos_token. One loop rather than a prefill plus a decode loop, because a cached ATTENTION node makes the prefill its first iteration. **The `used by` column over-states this one for the causal LMs**, and it is the only entry where that is true: it is a field of every flattened causal-LM builder, but the exporter sets it only for a topology whose cross-step state is ENTIRELY the KV cache. LFM2-monolithic's ten ShortConv layers are not, so it carries the field and exports `infer` alone. Whisper is not in that caveat: its family declares this component outright, with `bound` supplying the encoder's output to every step, which is what makes the same loop a cross-attention decode loop (BACKLOG.md P4.1).
+The `infer_with_past` generation loop: prefill, then decode one token at a time against the KV cache until max_new_tokens or eos_token. One loop rather than a prefill plus a decode loop, because a cached ATTENTION node makes the prefill its first iteration. **The `used by` column over-states this one for the causal LMs**, and it is the only entry where that is true: it is a field of every flattened causal-LM builder, but the exporter sets it only for a topology whose cross-step state is entirely the KV and conv-state caches (LFM2-monolithic's ShortConv history is the latter). Whisper is not in that caveat: its family declares this component outright, with `bound` supplying the encoder's output to every step, which is what makes the same loop a cross-attention decode loop (BACKLOG.md P4.1).
 
 *Emits:* statements. *Used by:* canary, granite-speech, hf-causal-lm, lfm2-monolithic, moonshine, moonshine-streaming, oruk-loop, qwen3, qwen3-asr, t5, whisper.
 
@@ -149,6 +150,16 @@ The `infer_with_past` generation loop: prefill, then decode one token at a time 
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
 * `embed_topology` — WhenSet(TopologyName)
 * `head_topology` — WhenSet(TopologyName)
+
+### `decode_loop_stream` — `DecodeLoopStream`
+
+`stream_open` / `stream_feed` / `stream_finish` over a `prefill_decode_loop`: the same loop cut at each drawn token, its cursor and stop flag kept in the host's StreamState (loom.cpp ADR-099). Added beside `infer_with_past`, which is unchanged.
+
+*Emits:* statements. *Used by:* **no model** — see below.
+
+* nothing — every field is `__unchecked__`, with its reason
+
+> No model uses it today: used, but invisibly to `usage()`, which reads builder FIELDS: PrefillArgmaxBuilder emits it from `extra_entries` for its `decode` field, so every causal LM with a `prefill_decode_loop` that `stream_supported()` accepts carries it.
 
 ### `waveform_valid_length` — `WaveformValidLength`
 
