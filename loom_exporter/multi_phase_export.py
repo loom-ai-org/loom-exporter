@@ -69,6 +69,11 @@ class ExportPhase:
     # engine compute only that band. The wrapper that builds the mask is the only thing that knows it is
     # banded, so it is declared here rather than inferred. Exclusive with `kv_cache_size`.
     attention_window: Optional[int] = None
+    # This phase's KV cache is its OWN (loom.cpp ADR-103): `{"ring": bool, "window": int}`, sized by
+    # `kv_cache_size`. Its geometry is read off its own fused blocks and written into its topology as the
+    # `kv_cache` object the engine allocates privately, rather than merged into the file's one `loom.*`
+    # cache -- which holds one width per layer and could not serve MOSS-TTS codec's six transformers.
+    own_kv_cache: Optional[dict] = None
     # An optional rewrite of this phase's emitted topology, run once, after the trace and before the
     # topology is handed to the writer. It exists for the one thing a wrapper CANNOT express: a
     # transform of a graph INPUT that is invariant across the calls the driver makes, and which the
@@ -158,6 +163,11 @@ class ExportPhase:
             "a mask built from positions is banded only by what its builder wrote. The wrapper's own "
             "test checks the mask against it (Pocket-TTS: `test_pocket_tts_mimi_window`), and the "
             "backend raises if the phase fused no windowed node."
+        ),
+        "own_kv_cache": Unchecked(
+            "whether this phase's cache is its own, and its ring/window: the driver's choice of how the "
+            "phase is stepped, which nothing in the graph states. The geometry itself is read off the "
+            "phase's fused blocks, and a phase declaring this with none fused raises at export"
         ),
         "kv_cache_size": Unchecked(
             "the capacity to declare, in tokens. Bounded by nothing the checkpoint states -- exporting "
