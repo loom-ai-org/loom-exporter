@@ -892,10 +892,15 @@ def _build_moss_audio_tokenizer(path: Path, output_path: str) -> LoomExportConfi
     **`max_frames` is the reference's own generation budget**, 4096 frames (5.5 min): MOSS-TTS's
     `generate` defaults `max_new_frames` to it. Memory is linear in the clip, and at that ceiling the
     400 Hz stack's scores are ~4 GB; a clip of the lengths TTS produces is a fraction of that.
+
+    It streams too (loom.cpp ADR-103): six transformer stages over ring KV caches of their own, beside this
+    one-call graph, which `codec_stream_export` keeps as it is.
     """
-    return AudioCodecExportConfig(architecture=None, output_path=output_path, model_dir=str(path),
-                                  family=CodecFamily.MOSS_AUDIO_TOKENIZER, frames_per_block=4,
-                                  n_frames=16, max_frames=4096)
+    from .codec_stream_export import StreamingCodecExportConfig
+
+    return StreamingCodecExportConfig(architecture=None, output_path=output_path, model_dir=str(path),
+                                      family=CodecFamily.MOSS_AUDIO_TOKENIZER, frames_per_block=4,
+                                      n_frames=16, max_frames=4096)
 
 
 def _is_audio8_codec(path: Path) -> bool:
@@ -925,8 +930,12 @@ def _build_audio8_codec(path: Path, output_path: str) -> LoomExportConfig:
 
 
 def _build_dac(path: Path, output_path: str) -> LoomExportConfig:
-    return AudioCodecExportConfig(architecture=None, output_path=output_path, model_dir=str(path),
-                                  family=CodecFamily.DAC)
+    """DAC, one call over the whole sequence; and a stream of windows over that same graph (loom.cpp
+    ADR-102), since its decoder is not causal but its receptive field is short."""
+    from .codec_stream_export import StreamingCodecExportConfig
+
+    return StreamingCodecExportConfig(architecture=None, output_path=output_path, model_dir=str(path),
+                                      family=CodecFamily.DAC)
 
 
 def _build_snac(path: Path, output_path: str) -> LoomExportConfig:
