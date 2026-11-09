@@ -428,12 +428,17 @@ def test_its_graph_is_bounded_by_the_chunk_the_driver_asks_for(tmp_path):
     from loom_exporter.audio_codec_export import (
         AudioCodecExportConfig, _build_qwen3_tts_tokenizer_12hz,
     )
+    from loom_exporter.codec_stream_export import StreamingCodecExportConfig
 
     path = _hf_dir(tmp_path, "speech_tokenizer", QWEN3_TTS_TOKENIZER_CONFIG)
     config = _build_qwen3_tts_tokenizer_12hz(path, "/tmp/x.gguf")
-    assert isinstance(config, AudioCodecExportConfig)
-    assert config.chunk_frames > 0 and config.left_context_frames > 0
-    assert config.max_frames == config.chunk_frames + config.left_context_frames
+    # The streaming export (loom.cpp ADR-102), whose one-pass half is this family's own config, unchanged.
+    assert isinstance(config, StreamingCodecExportConfig)
+    one_pass = config._one_pass()
+    assert isinstance(one_pass, AudioCodecExportConfig)
+    for c in (config, one_pass):
+        assert c.chunk_frames > 0 and c.left_context_frames > 0
+        assert c.max_frames == c.chunk_frames + c.left_context_frames
 
 
 def test_qwen3_tts_chunking_matches_reference():

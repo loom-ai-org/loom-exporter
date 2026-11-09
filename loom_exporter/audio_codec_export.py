@@ -859,12 +859,17 @@ def _build_qwen3_tts_tokenizer_12hz(path: Path, output_path: str) -> LoomExportC
 
     So `max_frames` here is `chunk + context`, and it is a property of the driver rather than of the
     checkpoint: the graph is never asked for more, because the driver never asks.
+
+    It also streams (loom.cpp ADR-102): its decoder is causal throughout, so `codec_stream_export` adds a
+    state-carrying step beside this one-pass graph, which it keeps as it is.
     """
+    from .codec_stream_export import StreamingCodecExportConfig
+
     chunk, context = 300, 25
-    return AudioCodecExportConfig(architecture=None, output_path=output_path, model_dir=str(path),
-                                  family=CodecFamily.QWEN3_TTS_12HZ,
-                                  chunk_frames=chunk, left_context_frames=context,
-                                  max_frames=chunk + context)
+    return StreamingCodecExportConfig(architecture=None, output_path=output_path, model_dir=str(path),
+                                      family=CodecFamily.QWEN3_TTS_12HZ,
+                                      chunk_frames=chunk, left_context_frames=context,
+                                      max_frames=chunk + context)
 
 
 def _is_moss_audio_tokenizer(path: Path) -> bool:
