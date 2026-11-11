@@ -4,8 +4,15 @@ RNN-T head and language-ID prompt conditioning, exported as the third transducer
 The checkpoint is the `transformers` layout (5.13+, the ovos venv), not a `.nemo` archive: the card's
 NeMo requirement (26.06) is past what either export venv has, and `transformers` implements it whole.
 What follows `transformers`' OFFLINE mode -- the whole clip through the encoder once, then Parakeet's
-greedy transducer loop -- which is what loom's one-pass `speech2text` door is. Chunked streaming
-(the encoder's K/V and conv caches) is not exported.
+greedy transducer loop -- which is what loom's one-pass `speech2text` door is.
+
+**The live door (loom.cpp ADR-109)** is the cache-aware mode beside it: `encoder_step` takes whole
+attention chunks (320 ms) with the encoder's streaming state carried in and out -- each subsampling
+stage's last column, each layer's last 56 keys and values and its depthwise conv's last inputs -- and
+`encoder_init` makes a fresh one. It is the one-pass encoder frame for frame, the clip's last partial
+chunk included (which `transformers`' own streaming recipe drops), so the stream ends on `infer`'s
+ids. `nemotron_asr_driver/01_stream.lua` runs it and the template's greedy decode with its state
+carried. `encoder` is unchanged.
 
 **Everything after the encoder is the transducer template unchanged.** The prediction network is a
 2-layer `nn.LSTM` behind an embedding, and the joint is `head(relu(enc + dec))`. `transformers` splits
@@ -64,6 +71,9 @@ LOG_ZERO_GUARD = 2.0 ** -24
 # clip runs -- at a cost that grows faster than its length (the attention is over the whole clip).
 TRACE_SECONDS = 4.0
 MIN_SECONDS, MAX_SECONDS = 0.5, 300.0
+# The most attention chunks (320 ms each) one `encoder_step` call takes: a push of a few seconds is a few
+# calls rather than one per chunk.
+MAX_STEP_CHUNKS = 25
 
 
 class _NemotronMel(nn.Module):
@@ -174,6 +184,184 @@ class _NemotronEncoderWrapper(nn.Module):
         return self.encoder_projector(fused)
 
 
+def _position_valid(first: torch.Tensor, n: int, like: torch.Tensor) -> torch.Tensor:
+    """`[n]`: 1 where `first + i >= 0`, else 0 -- the rows of a call that sit before the stream began.
+    Integers, so `> -0.5` is exact."""
+    idx = torch.arange(n, device=like.device).to(like.dtype) + first.to(like.dtype)
+    return (idx > -0.5).to(like.dtype)
+
+
+def chunk_key_mask(positions: torch.Tensor, key_positions: torch.Tensor, chunk: int,
+                   left_chunks: int) -> torch.Tensor:
+    """`_chunked_limited_mask` over explicit positions, additive `[1, 1, q, k]`: 0 where
+    `0 <= q // chunk - k // chunk <= left_chunks` and `k >= 0`, else a large negative. The keys are a
+    carried window first (its slots at negative positions not yet written), then the call's own.
+    Outer products against a ones vector and `relu`s, for `stream_steps.window_mask`'s reason."""
+    q = torch.floor(positions / chunk)
+    k = torch.floor(key_positions / chunk)
+    delta = (torch.matmul(q.view(-1, 1), torch.ones_like(k).view(1, -1))
+             - torch.matmul(torch.ones_like(q).view(-1, 1), k.view(1, -1)))
+    outside = torch.relu(-delta) + torch.relu(delta - left_chunks) + torch.relu(-key_positions).view(1, -1)
+    return (torch.clamp(outside, 0.0, 1.0) * -1e30).view(1, 1, q.shape[0], k.shape[0])
+
+
+class NemotronEncoderStepPhase(nn.Module):
+    """`(waveform, frame0, n_valid, prompt, state_1..state_N) -> (rows, state_1'..state_N')`: the next
+    attention chunks of `_NemotronEncoderWrapper`, its streaming state carried in and out -- what
+    `transformers`' cache-aware streaming keeps between chunks (`padding_cache`, `past_key_values`),
+    loom.cpp ADR-109.
+
+    **Every call is whole attention chunks.** Encoder frame `t` reads mel frames up to `8 t` (three
+    k=3, s=2 causal stages, frame `j` reading `[2j - 2, 2j]`), and chunk `c` (frames `4c .. 4c + 3`) is
+    final once all four are, so a call takes the 32 mel frames from `32c - 7`. Its `waveform` is the
+    centred, zero-padded clip from one sample before that frame's window: `160 M + 353` samples for `M`
+    mel frames (the extra one is the preemphasis's left neighbour). `frame0` is the call's first mel
+    frame; on a stream's first call it is -7, and every row before time 0 -- mel frames, and the first
+    two stages' outputs -- is zeroed, which is the zero padding the one-pass stages see there. The
+    stage caches start as zeros, so the first call needs no other case.
+
+    **The last call is the clip's end.** `n_valid` is how many of the preemphasised samples are the
+    clip's (the rest are the one-pass front end's right zero padding, zeros AFTER preemphasis), and
+    every stage appends the one zero column the one-pass causal padding puts on its right. On a whole
+    chunk that column never enters a window (each stage's input count is odd), so every call appends it
+    and the last call needs no flag.
+
+    The states, in order: each subsampling stage's last input column; per conformer layer its last
+    `left` keys and values `[1, heads, left, head_dim]` and its depthwise conv's last `kernel - 1`
+    inputs. The rows are the projected encoder rows `infer`'s `encoder` gives, frame for frame."""
+
+    def __init__(self, wrapper: "_NemotronEncoderWrapper"):
+        super().__init__()
+        self.mel = wrapper.mel
+        self.subsampling = wrapper.subsampling
+        self.input_scale = wrapper.input_scale
+        self.register_buffer("inv_freq", wrapper.inv_freq.detach().clone())
+        self.layers = wrapper.layers
+        self.chunk = wrapper.chunk
+        self.left_chunks = wrapper.left_chunks
+        self.left = self.chunk * self.left_chunks
+        self.prompt_hidden = wrapper.prompt_hidden
+        self.prompt_table = wrapper.prompt_table
+        self.prompt_act = wrapper.prompt_act
+        self.prompt_out = wrapper.prompt_out
+        self.encoder_projector = wrapper.encoder_projector
+        convs = self._stage_convs()
+        for conv in convs:
+            if tuple(conv.kernel_size) != (3, 3) or tuple(conv.stride) != (2, 2):
+                raise ValueError(f"the stream assumes k=3, s=2 subsampling stages, got {conv.kernel_size} "
+                                 f"/ {conv.stride}")
+        self.factor = 2 ** len(convs)
+        # Mel frames per chunk, and how far before a chunk's first frame its window reaches.
+        self.chunk_mel = self.factor * self.chunk
+        self.lead_mel = self.factor - 1
+        self.overlap = self.mel.n_fft - self.mel.hop + 1
+
+    def _stage_convs(self):
+        return [self.subsampling.conv_in] + [layer.depthwise_conv for layer in self.subsampling.layers]
+
+    def state_shapes(self) -> List[Tuple[int, ...]]:
+        n_mel = int(self.mel.fb.shape[0])
+        shapes, freq = [], n_mel
+        for conv in self._stage_convs():
+            fpad = conv.freq_pad
+            shapes.append((1, conv.in_channels, 1, freq + fpad[0] + fpad[1]))
+            freq = (freq + fpad[0] + fpad[1] - conv.kernel_size[1]) // conv.stride[1] + 1
+        for layer in self.layers:
+            attn = layer.self_attn
+            kv = (1, attn.config.num_attention_heads, self.left, attn.head_dim)
+            dw = layer.conv.depthwise_conv
+            shapes += [kv, kv, (1, dw.in_channels, dw.left_pad)]
+        return shapes
+
+    def _mel(self, waveform, n_valid):
+        m = self.mel
+        x = waveform.unsqueeze(1)
+        if m.preemphasis:
+            x = nn.functional.conv1d(x, m.preemph.to(x.dtype))                # [1, 1, L - 1]
+        x = x[:, 0]
+        x = x * (torch.arange(x.shape[1], device=x.device).to(x.dtype) < n_valid.to(x.dtype)).to(x.dtype)
+        spec = torch.stft(x, n_fft=m.n_fft, hop_length=m.hop, win_length=m.win_length,
+                          window=m.window.to(x.dtype), center=False, return_complex=True)
+        mel = torch.matmul(m.fb.to(x.dtype), spec.abs() ** 2)
+        return torch.log(mel + LOG_ZERO_GUARD).transpose(1, 2)              # [1, M, n_mel]
+
+    def _stage(self, conv, x, previous):
+        """One causal stride-2 stage on `[1, C, T, F]`: freq padding, the carried column before, one
+        zero column after; returns the conv and this call's last input column."""
+        x = nn.functional.pad(x, (conv.freq_pad[0], conv.freq_pad[1]))
+        x = torch.cat([previous, x], dim=2)
+        last = x[:, :, -1:]
+        x = nn.functional.pad(x, (0, 0, 0, 1))
+        return nn.Conv2d.forward(conv, x), last
+
+    def _attend(self, attn, x, pos, mask, k_past, v_past):
+        b, t, _ = x.shape
+        heads, dim = attn.config.num_attention_heads, attn.head_dim
+        q = attn.q_proj(x).view(b, t, heads, dim).transpose(1, 2)
+        k = torch.cat([k_past, attn.k_proj(x).view(b, t, heads, dim).transpose(1, 2)], dim=2)
+        v = torch.cat([v_past, attn.v_proj(x).view(b, t, heads, dim).transpose(1, 2)], dim=2)
+        rel = attn.relative_k_proj(pos).view(b, -1, heads, dim)
+        bd = torch.matmul(q + attn.bias_v.view(1, heads, 1, dim), rel.permute(0, 2, 3, 1))
+        bd = attn._rel_shift(bd)[..., :k.shape[2]] * attn.scaling
+        ac = torch.matmul(q + attn.bias_u.view(1, heads, 1, dim), k.transpose(-1, -2)) * attn.scaling
+        ctx = torch.matmul(torch.softmax(ac + bd + mask, dim=-1), v)
+        out = attn.o_proj(ctx.transpose(1, 2).reshape(b, t, heads * dim))
+        return out, k[:, :, -self.left:], v[:, :, -self.left:]
+
+    def _conv(self, module, x, previous):
+        h = nn.functional.glu(module.pointwise_conv1(x.transpose(1, 2)), dim=1)
+        h = torch.cat([previous, h], dim=-1)
+        last = h[..., -previous.shape[-1]:]
+        h = nn.Conv1d.forward(module.depthwise_conv, h)
+        h = module.norm(h.transpose(1, 2)).transpose(1, 2)
+        h = module.pointwise_conv2(module.activation(h))
+        return h.transpose(1, 2), last
+
+    def forward(self, waveform, frame0, n_valid, prompt, *states):
+        states = list(states)
+        out_states = []
+        mel = self._mel(waveform, n_valid)
+        mel = mel * _position_valid(frame0, mel.shape[1], mel).view(1, -1, 1)
+        x, first = mel.unsqueeze(1), frame0
+        convs = self._stage_convs()
+        for i, conv in enumerate(convs):
+            x, last = self._stage(conv, x, states.pop(0))
+            out_states.append(last)
+            if i > 0:
+                x = self.subsampling.layers[i - 1].pointwise_conv(x)
+            x = torch.relu(x)
+            # This stage's first output reads from the carried column: frame (first - 1 + 2) / 2.
+            first = (first + 1) / 2
+            x = x * _position_valid(first, x.shape[2], x).view(1, 1, -1, 1)
+        x = x.transpose(1, 2).reshape(x.shape[0], x.shape[2], -1)
+        hidden = self.subsampling.linear(x) * self.input_scale
+
+        n = hidden.shape[1]
+        positions = torch.arange(n, device=hidden.device).to(hidden.dtype) + first.to(hidden.dtype)
+        key_positions = torch.arange(n + self.left, device=hidden.device).to(hidden.dtype) \
+            + (first.to(hidden.dtype) - self.left)
+        mask = chunk_key_mask(positions, key_positions, self.chunk, self.left_chunks)
+        pos = _relative_positions(n + self.left, self.inv_freq).to(hidden.dtype)
+        for layer in self.layers:
+            residual = hidden
+            hidden = residual + 0.5 * layer.feed_forward1(layer.norm_feed_forward1(hidden))
+            update, k, v = self._attend(layer.self_attn, layer.norm_self_att(hidden), pos, mask,
+                                        states.pop(0), states.pop(0))
+            hidden = hidden + update
+            update, conv_state = self._conv(layer.conv, layer.norm_conv(hidden), states.pop(0))
+            hidden = hidden + update
+            hidden = hidden + 0.5 * layer.feed_forward2(layer.norm_feed_forward2(hidden))
+            hidden = layer.norm_out(hidden)
+            out_states += [k, v, conv_state]
+        fused = self.prompt_hidden(hidden) + self.prompt_table(prompt).unsqueeze(1)
+        fused = self.prompt_out(self.prompt_act(fused))
+        return (self.encoder_projector(fused), *out_states)
+
+
+# The step's fresh state, made on the device from one number.
+from .stream_steps import StateInit as NemotronEncoderInitPhase  # noqa: E402
+
+
 class _NemotronJoint(nn.Module):
     """`transformers`' joint as the template's triple: `joint_net(enc(f) + pred(g))`. `enc` is the
     identity because `encoder_projector` ran in the encoder phase; `pred` is `decoder_projector`, which
@@ -254,7 +442,83 @@ class ASRNemotronExportConfig(BaseTransducerExportConfig):
                       ct.TensorType(name="prompt", shape=(1,), dtype=np.int32)]
         phase = ExportPhase(name="encoder", wrapper=wrapper, dummy_inputs=dummy,
                             mil_inputs=mil_inputs, root_axis=self.root_axis)
+        self._encoder_wrapper = wrapper
         return phase, int(model.config.decoder_hidden_size)
+
+    def phases(self) -> List[ExportPhase]:
+        """The transducer template's four, then the live door's two (loom.cpp ADR-109): the encoder a
+        few attention chunks per call with its streaming state carried (`encoder_step`), and that
+        state's fresh value made on the device (`encoder_init`). `encoder` is unchanged."""
+        import coremltools as ct
+
+        phases = super().phases()
+        step = NemotronEncoderStepPhase(self._encoder_wrapper).eval()
+        shapes = step.state_shapes()
+        self.stream_facts = {
+            "ENC_STATES": len(shapes), "HOP": step.mel.hop, "CHUNK_MEL": step.chunk_mel,
+            "LEAD_MEL": step.lead_mel, "WINDOW_EXTRA": step.overlap, "PAD_LEFT": step.mel.pad_left,
+            "MAX_STEP_CHUNKS": MAX_STEP_CHUNKS,
+        }
+        n_mel = 2 * step.chunk_mel
+        extra = step.overlap
+        hop = step.mel.hop
+        phases += [
+            ExportPhase(
+                name="encoder_init",
+                wrapper=NemotronEncoderInitPhase(shapes).eval(),
+                dummy_inputs=(torch.zeros(1),),
+                mil_inputs=[ct.TensorType(name="zero", shape=(1,), dtype=np.float32)],
+            ),
+            ExportPhase(
+                name="encoder_step",
+                wrapper=step,
+                dummy_inputs=(torch.randn(1, hop * n_mel + extra) * 0.1,
+                              torch.tensor([float(-step.lead_mel)]),
+                              torch.tensor([float(hop * n_mel + extra - 1)]),
+                              torch.tensor([self.default_prompt], dtype=torch.int64))
+                             + tuple(torch.randn(sh) * 0.1 for sh in shapes),
+                mil_inputs=[
+                    ct.TensorType(name="waveform",
+                                  shape=(1, ct.RangeDim(hop + extra, hop * step.chunk_mel * MAX_STEP_CHUNKS + extra)),
+                                  dtype=np.float32),
+                    ct.TensorType(name="frame0", shape=(1,), dtype=np.float32),
+                    ct.TensorType(name="n_valid", shape=(1,), dtype=np.float32),
+                    ct.TensorType(name="prompt", shape=(1,), dtype=np.int32),
+                ] + [ct.TensorType(name=f"state_{i + 1}", shape=sh, dtype=np.float32)
+                     for i, sh in enumerate(shapes)],
+                # The window's own length: `HOP * mel frames + WINDOW_EXTRA`, which the driver computes.
+                root_axis="n_samples",
+            ),
+        ]
+        return phases
+
+    def driver_components(self) -> List:
+        """The template's one-pass decode, and beside it the live door (`nemotron_asr_driver/
+        01_stream.lua`), top level so its constants are too."""
+        from .driver_components import ComputedCall, ExportConstants, LuaFragment
+
+        # The checkpoint's numbers after `phases()`; this release's before it (a catalogue build, which
+        # never traces).
+        facts = dict(getattr(self, "stream_facts", None) or {
+            "ENC_STATES": 75, "HOP": 160, "CHUNK_MEL": 32, "LEAD_MEL": 7, "WINDOW_EXTRA": 353,
+            "PAD_LEFT": 256, "MAX_STEP_CHUNKS": MAX_STEP_CHUNKS})
+        constants = {"S_" + k: v for k, v in facts.items()}
+        constants.update({
+            "S_BLANK_ID": self.blank_id if self.blank_id is not None else 13087,
+            "S_PRED_HIDDEN": self.pred_hidden or 640, "S_N_PRED_LAYERS": self.num_pred_layers or 2,
+            "S_MAX_SYMBOLS_PER_STEP": self.max_symbols_per_step,
+            "S_DEFAULT_PROMPT": self.default_prompt if self.default_prompt is not None else 101,
+        })
+        if self.durations:
+            raise ValueError("the Nemotron stream decodes plain RNN-T; this checkpoint has durations")
+        return [
+            ExportConstants(values=constants, top_level=True),
+            LuaFragment(Path(__file__).resolve().parent / "nemotron_asr_driver" / "01_stream.lua",
+                        top_level=True, defines=("stream_open", "stream_feed", "stream_finish"),
+                        drives=(ComputedCall(topologies=tuple(f"pred_lstm_l{i}_fwd"
+                                                              for i in range(self.num_pred_layers or 0)),
+                                             inputs=("layer_input", "h_prev", "c_prev"), written="cell"),)),
+        ] + super().driver_components()
 
     def backend_kwargs(self) -> dict:
         """The base's, with the vocabulary read off `tokenizer.json`: this checkpoint ships no `.model`
