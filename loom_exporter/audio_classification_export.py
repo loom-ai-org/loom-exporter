@@ -869,7 +869,7 @@ class SileroVadExportConfig(BaseMultiPhaseModelExportConfig):
 
     checkpoint: str
     architecture: Optional[str] = "silero-vad"
-    driver_script_path: Path = Path(__file__).resolve().parent
+    driver_script_path: Path = Path(__file__).resolve().parent / "silero_driver"
     output: AudioOutput = AudioOutput.FRAME_CLASSES
     # The trace length and the RangeDim ceiling. The model is a streaming one with no window of its own,
     # so the ceiling is a declaration, not a limit in the model.
@@ -946,7 +946,8 @@ class SileroVadExportConfig(BaseMultiPhaseModelExportConfig):
         frames), spelled `(n - 1) // 512 + 1` because the driver IR has floor division only.
         """
         from .driver_components import (
-            CALLER, DriverInputs, DriverReturn, RecurrentCall, SubgraphCallComponent,
+            CALLER, DriverInputs, DriverReturn, ExportConstants, LuaFragment, RecurrentCall,
+            SubgraphCallComponent,
         )
         from .driver_ir import BinOp, Len, Lit, OutputRef, Var
 
@@ -955,6 +956,12 @@ class SileroVadExportConfig(BaseMultiPhaseModelExportConfig):
         n_frames = BinOp("+", BinOp("floordiv", BinOp("-", n_samples, Lit(1)), Lit(_SILERO_FRAME)),
                          Lit(1))
         return [
+            # The live door (loom.cpp ADR-106), beside the one pass and not instead of it: the same three
+            # graphs a push of whole frames at a time, the cell's h and c carried between pushes. `infer`
+            # stays the one retained sweep the published file runs. Top level, so the constants are too.
+            ExportConstants(values={"FRAME": _SILERO_FRAME, "HIDDEN": hidden}, top_level=True),
+            LuaFragment(self.driver_script_path / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
             DriverInputs(bindings=(("waveform", CALLER),), n_tokens=n_samples),
             SubgraphCallComponent(
                 topology="frontend", outputs=(), retain=True, length=n_samples,
