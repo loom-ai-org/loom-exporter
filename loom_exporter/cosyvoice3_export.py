@@ -798,7 +798,7 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
             CALLER, DriverInputs, DriverReturn, ExportConstants, FlowMatchingSampler, LuaFragment,
             SubgraphCallComponent,
         )
-        from .driver_ir import BinOp, FieldAccess, Len, OutputRef, Var
+        from .driver_ir import BinOp, Len, OutputRef, Var
 
         fragment = self.driver_script_path
         n_frames, n_gen = Var("n_frames"), Var("n_gen_frames")
@@ -831,6 +831,7 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
             # The LM loop `infer` and the live stream share, the flow's chunk ids, and the stream itself.
             LuaFragment(fragment / "00_stream.lua", top_level=True,
                         defines=("cosyvoice3_lm_begin", "cosyvoice3_lm_step", "cosyvoice3_chunk_ids",
+                                 "cosyvoice3_draw_frames", "cosyvoice3_nsf_from_blocks",
                                  "stream_open", "stream_feed", "stream_finish")),
             # The text's ids are the one required input; the voice, the knobs and the draws are optional.
             DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
@@ -840,7 +841,7 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
                         reads=("speech_tokens",),
                         defines=("flow_tokens", "flow_embedding", "n_codes", "n_frames",
                                  "n_prompt_frames", "n_gen_frames", "step_cond", "times", "flow_cfg",
-                                 "chunk_ids")),
+                                 "chunk_ids", "flow_noise", "nsf_blocks")),
             SubgraphCallComponent(
                 topology="flow_encoder", outputs=(), retain=True, length=Var("n_codes"),
                 inputs={"tokens": Var("flow_tokens"), "embedding": Var("flow_embedding")},
@@ -853,13 +854,13 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
                 step_inputs={"mu": OutputRef("flow_encoder", index=1),
                              "spks": OutputRef("flow_encoder", index=2),
                              "cond": Var("step_cond"), "chunk_ids": Var("chunk_ids"), "cfg": Var("flow_cfg")},
-                state=FieldAccess("inputs", "noise"),
+                state=Var("flow_noise"),
                 note="--- The whole mel grid, in-filled after the voice's prompt frames. ---"),
             LuaFragment(fragment / "03_mel_tail.lua",
                         reads=("n_prompt_frames", "n_gen_frames"),
                         defines=("mel_tail",), retains=("estimator",)),
             LuaFragment(fragment / "04_nsf.lua",
-                        reads=("n_gen_frames",),
+                        reads=("n_gen_frames", "nsf_blocks"),
                         defines=("nsf_noise",)),
             SubgraphCallComponent(
                 topology="vocoder", outputs=("wave",), length=n_gen,
