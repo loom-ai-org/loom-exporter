@@ -100,6 +100,12 @@ FLOW_CFG_RATE = 0.7
 LM_MAX_POSITIONS = 4096
 # The flow's frame budget: twice every token the LM could hold. The DiT's rope table is this long.
 FLOW_MAX_FRAMES = TOKEN_MEL_RATIO * LM_MAX_POSITIONS
+# `CosyVoice3Model`'s stream: a first hop of 25 tokens ("must match training static_chunk_size"), doubling
+# to 100; the DiT's chunk in frames (`static_chunk_size`, 25 tokens).
+STREAM_HOP_TOKENS = 25
+STREAM_HOP_SCALE = 2
+STREAM_MAX_HOP_TOKENS = 4 * STREAM_HOP_TOKENS
+CHUNK_FRAMES = STREAM_HOP_TOKENS * TOKEN_MEL_RATIO
 
 # Trace lengths: odd and distinct from every static dimension (2 K/V heads, 14 heads, 9 harmonics, 16
 # groups, 25 top-k...), so no fusion can confuse a sequence axis with a head or channel axis.
@@ -306,15 +312,59 @@ def _apply_rope_first_head(t, freqs, scale=1.0):
     return torch.cat([head * cos + torch.matmul(head, swap) * sin, rest], dim=-1)
 
 
+def chunk_mask(chunk_ids: torch.Tensor) -> torch.Tensor:
+    """`(1, T)` chunk index per frame -> the `(1, 1, T, T)` additive mask `DiT.forward` builds with
+    `add_optional_chunk_mask`: a frame attends to every frame whose chunk is not after its own. All zeros
+    is one chunk, which is the non-streaming reference's full attention (the mask is then -0.0
+    everywhere, and `s + -0.0` is `s`); `floor(i / static_chunk_size)` is the streaming reference's
+    block-causal mask (loom.cpp ADR-112).
+
+    `c_k - c_q` as two outer products against a ones vector: ggml repeats the SECOND operand only, and
+    this is a mutual broadcast (`stream_steps.window_mask` says the same). The ids are integers below
+    2^24, so a K=1 product of them is exact."""
+    c = chunk_ids[0]
+    ones = torch.ones_like(c)
+    later = torch.matmul(ones.view(-1, 1), c.view(1, -1)) - torch.matmul(c.view(-1, 1), ones.view(1, -1))
+    return (torch.clamp(torch.relu(later), 0.0, 1.0) * -1e30).view(1, 1, c.shape[0], c.shape[0])
+
+
+def _dit_attention(attn, x, rope, mask):
+    """`Attention` under `AttnProcessor`, with an ADDITIVE mask in place of its boolean one. The
+    processor's output `masked_fill` reads the mask's LAST query row, which a chunk mask leaves all
+    allowed (the last frame sees every chunk), so it is a no-op and is left out."""
+    b = x.shape[0]
+    freqs, _ = rope
+    q = _apply_rope_first_head(attn.to_q(x), freqs)
+    k = _apply_rope_first_head(attn.to_k(x), freqs)
+    v = attn.to_v(x)
+    heads = attn.heads
+    head_dim = k.shape[-1] // heads
+    q = q.view(b, -1, heads, head_dim).transpose(1, 2)
+    k = k.view(b, -1, heads, head_dim).transpose(1, 2)
+    v = v.view(b, -1, heads, head_dim).transpose(1, 2)
+    out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+    out = out.transpose(1, 2).reshape(b, -1, heads * head_dim)
+    return attn.to_out[1](attn.to_out[0](out))
+
+
+def _dit_block(block, x, t, rope, mask):
+    """`DiTBlock.forward`, its attention through `_dit_attention`."""
+    norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.attn_norm(x, emb=t)
+    x = x + gate_msa.unsqueeze(1) * _dit_attention(block.attn, norm, rope, mask)
+    ff_norm = block.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+    return x + gate_mlp.unsqueeze(1) * block.ff(ff_norm)
+
+
 class EstimatorPhase(nn.Module):
-    """`(x, mu, spks, cond, t) -> dx/dt`, all frame-major: `DiT.forward` for one unpadded utterance.
+    """`(x, mu, spks, cond, t, chunk_ids) -> dx/dt`, all frame-major: `DiT.forward` for one unpadded
+    utterance.
 
     F5-TTS's DiT with a causal position convolution and a speaker column. Its rope rotates head 0 only
     (see `_apply_rope_first_head`, which is also where `f5_tts_export`'s three rope substitutions are
-    re-applied). `static_chunk_size` only matters
-    when `streaming=True`; the non-streaming reference builds an all-ones mask, so no mask is built.
-    `spks` is broadcast over time by ADDITION to a zero tensor rather than einops' `repeat` (a dynamic
-    `tile`)."""
+    re-applied). `chunk_ids` chooses the reference's two modes (`chunk_mask`): zeros are
+    `streaming=False`, what `infer` runs; `floor(i / 50)` is `streaming=True`, what upstream's stream
+    runs, and the stream's oracle (ADR-112). `spks` is broadcast over time by ADDITION to a zero tensor
+    rather than einops' `repeat` (a dynamic `tile`)."""
 
     def __init__(self, dit):
         super().__init__()
@@ -331,7 +381,7 @@ class EstimatorPhase(nn.Module):
         if dit.long_skip_connection is not None:
             raise NotImplementedError("this DiT has a long skip connection; CosyVoice3's does not")
 
-    def forward(self, x, mu, spks, cond, t):                                  # frame-major, (1,)
+    def forward(self, x, mu, spks, cond, t, chunk_ids):                       # frame-major, (1,), (1, T)
         d = self.d
         time = d.time_embed(t)
         spk = torch.zeros_like(x) + spks.unsqueeze(1)
@@ -339,8 +389,9 @@ class EstimatorPhase(nn.Module):
         h = d.input_embed.conv_pos_embed(h) + h
         n = x.shape[1]
         rope = ((self.rope_cos[:, :n, :], self.rope_sin[:, :n, :], self.rope_swap), None)
+        mask = chunk_mask(chunk_ids)
         for block in d.transformer_blocks:
-            h = block(h, time, mask=None, rope=rope)
+            h = _dit_block(block, h, time, rope, mask)
         h = d.norm_out(h, time)
         return d.proj_out(h)                                                  # (1, T, 80)
 
@@ -571,6 +622,7 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
     voice_text: str = DEFAULT_VOICE_TEXT
     _voice: Optional[Dict[str, np.ndarray]] = field(default=None, init=False, repr=False)
     _chunk_header: Optional[int] = field(default=None, init=False, repr=False)
+    _stream: Optional[tuple] = field(default=None, init=False, repr=False)
     _staging: Optional[tempfile.TemporaryDirectory] = field(default=None, init=False, repr=False)
     _voice_compat: Optional[str] = field(default=None, init=False, repr=False)
 
@@ -587,6 +639,8 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
         "voice_text": Unchecked("the default voice's prompt text, <|endofprompt|> checked in compute_voice"),
         "_voice": Unchecked("computed from the clip during phases() and shipped as driver weights"),
         "_chunk_header": Unchecked("the chunk separator's id, read off the staged tokenizer in phases()"),
+        "_stream": Unchecked("the flow's look-ahead and the vocoder's right context in frames, read off the "
+                             "modules in phases()"),
         "_staging": Unchecked("a temporary directory holding the staged tokenizer.json"),
         "_voice_compat": Unchecked("the LM and flow weights' fingerprint, read once by contract()"),
     }
@@ -598,6 +652,15 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
         install_patches()
         llm, flow, hift = build_reference(self.model_dir)
         fold_weight_norm(hift)
+        if flow.decoder.estimator.static_chunk_size != CHUNK_FRAMES:
+            raise NotImplementedError(f"a DiT chunk of {flow.decoder.estimator.static_chunk_size} frames")
+        # `finalize=False`'s trims: the F0 predictor's right-looking conv, `conv_pre`'s look-right, and the
+        # iSTFT's last hop (`prod(upsample_rates) * hop_len` samples, one frame here).
+        tail = int(np.prod(hift.upsample_rates) * hift.istft_params["hop_len"])
+        if tail % SAMPLES_PER_FRAME:
+            raise NotImplementedError(f"an iSTFT tail of {tail} samples, not whole frames")
+        self._stream = (flow.pre_lookahead_len, hift.f0_predictor.condnet[0].causal_padding
+                        + hift.conv_pre_look_right + tail // SAMPLES_PER_FRAME)
         frontend = build_frontend(self.model_dir)
         self._voice = compute_voice(frontend, self.voice_wav or f"{COSYVOICE_REPO}/{DEFAULT_VOICE_WAV}",
                                     self.voice_text)
@@ -645,13 +708,15 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
                 wrapper=EstimatorPhase(flow.decoder.estimator).eval(),
                 dummy_inputs=(torch.randn(1, TRACE_FRAMES, N_MEL), torch.randn(1, TRACE_FRAMES, N_MEL),
                               torch.randn(1, N_MEL), torch.randn(1, TRACE_FRAMES, N_MEL),
-                              torch.tensor([0.3])),
+                              torch.tensor([0.3]),
+                              torch.floor(torch.arange(TRACE_FRAMES, dtype=torch.float32) / 4).view(1, -1)),
                 mil_inputs=[
                     ct.TensorType(name="x", shape=(1, frame_dim, N_MEL), dtype=np.float32),
                     ct.TensorType(name="mu", shape=(1, frame_dim, N_MEL), dtype=np.float32),
                     ct.TensorType(name="spks", shape=(1, N_MEL), dtype=np.float32),
                     ct.TensorType(name="cond", shape=(1, frame_dim, N_MEL), dtype=np.float32),
                     ct.TensorType(name="t", shape=(1,), dtype=np.float32),
+                    ct.TensorType(name="chunk_ids", shape=(1, frame_dim), dtype=np.float32),
                 ],
                 # `n_tokens`: `FlowMatchingSampler` binds its length under that name (Chatterbox's and
                 # F5-TTS's estimators are declared the same way).
@@ -681,7 +746,7 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
             estimator="estimator",
             carried_input="x",
             time_input="t",
-            fixed_inputs=["mu", "spks", "cond"],
+            fixed_inputs=["mu", "spks", "cond", "chunk_ids"],
             # `1 - cos(pi/2 * t)` over a linspace: `CausalConditionalCFM.forward`'s cosine schedule.
             schedule="caller",
             # `(1 + rate) * v_cond - rate * v_uncond`, the unconditional run seeing mu, spks and cond
@@ -713,25 +778,35 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
             "MAX_SILENT_RUN": MAX_SILENT_RUN,
             "TOKEN_MEL_RATIO": TOKEN_MEL_RATIO, "N_MEL": N_MEL, "SAMPLES_PER_FRAME": SAMPLES_PER_FRAME,
             "NSF_HARMONICS": NSF_HARMONICS, "FLOW_STEPS": FLOW_STEPS, "FLOW_CFG_RATE": FLOW_CFG_RATE,
+            # The live stream's cut (ADR-112): `CosyVoice3Model`'s hop (it must match the training chunk,
+            # upstream says), its growth and ceiling; the DiT's chunk in frames; the flow's look-ahead
+            # context; and the frames at the end of the mel the vocoder's samples still depend on.
+            "STREAM_HOP_TOKENS": STREAM_HOP_TOKENS, "STREAM_MAX_HOP_TOKENS": STREAM_MAX_HOP_TOKENS,
+            "STREAM_HOP_SCALE": STREAM_HOP_SCALE, "CHUNK_FRAMES": CHUNK_FRAMES,
+            "LOOKAHEAD_TOKENS": self._stream[0] if self._stream else 0,
+            "VOCODER_RIGHT_FRAMES": self._stream[1] if self._stream else 0,
         }
         return [
             LuaFragment(fragment / "00_header.lua", top_level=True,
                         defines=("cosyvoice3_voice", "cosyvoice3_cosine_times", "cosyvoice3_zeros",
                                  "COSYVOICE3_SILENT", "cosyvoice3_split_chunks")),
+            # Twice: at the top level for the stream's functions, which run outside `infer`, and as
+            # `infer`'s own locals, which the generated sampler call's IR is validated against.
+            ExportConstants(values=constants, top_level=True),
             ExportConstants(values=constants),
+            # The LM loop `infer` and the live stream share, the flow's chunk ids, and the stream itself.
+            LuaFragment(fragment / "00_stream.lua", top_level=True,
+                        defines=("cosyvoice3_lm_begin", "cosyvoice3_lm_step", "cosyvoice3_chunk_ids",
+                                 "stream_open", "stream_feed", "stream_finish")),
             # The text's ids are the one required input; the voice, the knobs and the draws are optional.
             DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
-            LuaFragment(fragment / "00_chunks.lua", reads=("tokens", "CHUNK_HEADER")),
-            LuaFragment(fragment / "01_lm.lua",
-                        reads=("tokens", "SOS", "TASK_ID", "END_OF_PROMPT",
-                               "LM_MAX_POSITIONS", "RAS_TOP_K", "RAS_TOP_P", "RAS_WIN", "RAS_TAU",
-                               "MIN_TOKEN_TEXT_RATIO", "MAX_TOKEN_TEXT_RATIO", "MAX_SILENT_RUN"),
-                        defines=("speech_tokens",)),
+            LuaFragment(fragment / "00_chunks.lua", reads=("tokens",)),
+            LuaFragment(fragment / "01_lm.lua", reads=("tokens",), defines=("speech_tokens",)),
             LuaFragment(fragment / "02_flow_plan.lua",
-                        reads=("speech_tokens", "TOKEN_MEL_RATIO", "N_MEL", "FLOW_STEPS", "FLOW_CFG_RATE"),
+                        reads=("speech_tokens",),
                         defines=("flow_tokens", "flow_embedding", "n_codes", "n_frames",
                                  "n_prompt_frames", "n_gen_frames", "step_cond", "zero_cond",
-                                 "zero_spks", "times", "flow_cfg")),
+                                 "zero_spks", "times", "flow_cfg", "chunk_ids")),
             SubgraphCallComponent(
                 topology="flow_encoder", outputs=(), retain=True, length=Var("n_codes"),
                 inputs={"tokens": Var("flow_tokens"), "embedding": Var("flow_embedding")},
@@ -743,17 +818,17 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
                 n_steps=None, times=Var("times"),
                 step_inputs={"mu": OutputRef("flow_encoder", index=1),
                              "spks": OutputRef("flow_encoder", index=2),
-                             "cond": Var("step_cond")},
+                             "cond": Var("step_cond"), "chunk_ids": Var("chunk_ids")},
                 uncond_inputs={"mu": Var("zero_cond"), "spks": Var("zero_spks"),
-                               "cond": Var("zero_cond")},
+                               "cond": Var("zero_cond"), "chunk_ids": Var("chunk_ids")},
                 guidance_scale=Var("flow_cfg"),
                 state=FieldAccess("inputs", "noise"),
                 note="--- The whole mel grid, in-filled after the voice's prompt frames. ---"),
             LuaFragment(fragment / "03_mel_tail.lua",
-                        reads=("n_prompt_frames", "n_gen_frames", "N_MEL"),
+                        reads=("n_prompt_frames", "n_gen_frames"),
                         defines=("mel_tail",), retains=("estimator",)),
             LuaFragment(fragment / "04_nsf.lua",
-                        reads=("n_gen_frames", "NSF_HARMONICS", "SAMPLES_PER_FRAME"),
+                        reads=("n_gen_frames",),
                         defines=("nsf_noise",)),
             SubgraphCallComponent(
                 topology="vocoder", outputs=("wave",), length=n_gen,
