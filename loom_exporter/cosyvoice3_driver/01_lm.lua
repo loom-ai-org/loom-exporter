@@ -16,7 +16,7 @@
         -- The loop the live stream runs too (00_stream.lua), to its end.
         if inputs.seed then loom.seed_rng(inputs.seed) end
         local _st = cosyvoice3_lm_begin(inputs, inputs.tokens)
-        while _st.lm_ended == 0 do cosyvoice3_lm_step(_st, inputs.draws) end
+        while _st.lm_ended == 0 do cosyvoice3_lm_step(_st) end
         speech_tokens = _st.lm_kept
         if #speech_tokens == 0 then
             error('cosyvoice3: the LM produced no speech tokens (the first draw was a stop id)')
