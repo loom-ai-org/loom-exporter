@@ -7,7 +7,7 @@ carries continuous latents: a 2.3B diffusion-autoregressive TTS over the latents
                       step's input row, and a stop head on the base LM's row ends the loop
          -> AudioVAE V2's causal decoder: 25 Hz latents -> x1920 -> 48 kHz
 
-Five phases, each a re-spelling of the reference module it replaces (`VoxCPM2Model._inference`):
+Seven phases, each a re-spelling of the reference module it replaces (`VoxCPM2Model._inference`):
   - `feat_encode`:  patches `[1, T, 4, 64]` -> `enc_to_lm_proj(feat_encoder(patches))`, `[1, T, 2048]`. The
                     prefill encodes the prompt's patches (zeros where the prompt is text), and every
                     step encodes the patch it just generated.
@@ -28,6 +28,13 @@ Five phases, each a re-spelling of the reference module it replaces (`VoxCPM2Mod
                     dot product of the two, which ADR-040's `v_c + s (v_c - v_u)` cannot express.
   - `vae_decode`:   every latent in one call -> the 48 kHz waveform. The decoder is causal, so one call
                     computes what the reference's `decode` does.
+  - `vae_step`:     the live door's decoder (loom.cpp ADR-111): the next few patches -> their samples, with
+                    every causal conv's last inputs and every transposed conv's overlap carried in and out
+                    as states -- upstream's `streaming_decode()`, which `generate_streaming` runs per patch.
+  - `vae_init`:     a fresh `vae_step` state, made on the device.
+
+`infer` and the live stream run one loop (`voxcpm2_driver/00_stream.lua`); the stream decodes each piece
+through `vae_step` as it is drawn, and its pieces joined are the one-pass waveform to within f32 rounding.
 
 Voice cloning (a reference clip through the AudioVAE's encoder) is not in this export: the loop is
 zero-shot, and a voice is DESIGNED in the text -- "(A young woman, gentle and sweet voice)Hello" -- which
@@ -83,6 +90,10 @@ LM_MAX_POSITIONS = 4096
 TRACE_TOKENS = 13
 TRACE_PATCHES = 7
 TRACE_LATENTS = 9
+# The most patches one `vae_step` call decodes: a live piece is a few patches, never the clip.
+MAX_STEP_PATCHES = 16
+# What a live piece grows to by default: 1 patch (160 ms of audio), then 2, 4 and 8 (1.28 s).
+PIECE_PATCHES_GROWN = 8
 
 
 def import_voxcpm():
@@ -368,10 +379,39 @@ def _causal_conv_transpose(convtr, x):
     return y[..., :-trim] if trim else y
 
 
-def _residual_unit(unit, x):
+def _residual_unit(unit, x, conv=_causal_conv):
     snake1, conv1, snake2, conv2 = unit.block
-    y = _causal_conv(conv2, _snake(snake2, _causal_conv(conv1, _snake(snake1, x))))
+    y = conv(conv2, _snake(snake2, conv(conv1, _snake(snake1, x))))
     return x + y
+
+
+def _causal_pad(conv) -> int:
+    """The input samples `CausalConv1d` prepends: the state its streamed form carries."""
+    return conv._CausalConv1d__padding * 2 - conv._CausalConv1d__output_padding
+
+
+def _conv_step(conv, x, previous):
+    """`StreamingVAEDecoder`'s causal conv: the previous call's last input samples prepended in place of
+    the zeros, and this call's last ones kept -- taken off the JOINED input, so a call shorter than the
+    state (a dilation-9 unit on one patch) keeps the older samples too, as the reference does."""
+    x = torch.cat([previous, x], dim=-1)
+    y = F.conv1d(x, conv.weight, conv.bias, conv.stride, 0, conv.dilation, conv.groups)
+    return y, x[..., -previous.shape[-1]:]
+
+
+def _conv_transpose_step(convtr, x, partial):
+    """`StreamingVAEDecoder`'s transposed conv, spelled as the overlap-add it is: the full transposed
+    convolution, the previous call's overlap (its last `k - s` samples, less the bias their first call
+    already carried) added to this call's first ones, and this call's own overlap kept. The reference
+    re-convolves its last input frame instead and drops what that frame alone makes; the two are the
+    same sums. Fixed widths from the ends only (`stream_steps`' note on traced slices)."""
+    y = F.conv_transpose1d(x, convtr.weight, convtr.bias, convtr.stride, 0, 0, convtr.groups, convtr.dilation)
+    tail = partial.shape[-1]
+    out = torch.cat([y[..., :tail] + partial, y[..., tail:]], dim=-1)[..., :-tail]
+    rest = y[..., -tail:]
+    if convtr.bias is not None:
+        rest = rest - convtr.bias.view(1, -1, 1)
+    return out, rest
 
 
 class VAEDecodePhase(nn.Module):
@@ -405,23 +445,24 @@ class VAEDecodePhase(nn.Module):
             self.scales.append(f"sr_scale_{i}")
             self.biases.append(f"sr_bias_{i}")
 
-    def forward(self, latents):                                          # (1, n, 64)
-        x = latents.transpose(1, 2)
+    def walk(self, x, conv, convtr):
+        """The decoder over channel-major `x`, each convolution through `conv(module, x)` or
+        `convtr(module, x)`: the one-call spellings here, the state-carrying ones in `VAEStepPhase`."""
         for i, layer in enumerate(self.model):
             if self.scales[i] is not None:
                 x = x * getattr(self, self.scales[i]) + getattr(self, self.biases[i])
             name = type(layer).__name__
             if name == "CausalConv1d":
-                x = _causal_conv(layer, x)
+                x = conv(layer, x)
             elif name == "CausalDecoderBlock":
                 for sub in layer.block:
                     sub_name = type(sub).__name__
                     if sub_name == "Snake1d":
                         x = _snake(sub, x)
                     elif sub_name == "CausalTransposeConv1d":
-                        x = _causal_conv_transpose(sub, x)
+                        x = convtr(sub, x)
                     elif sub_name == "CausalResidualUnit":
-                        x = _residual_unit(sub, x)
+                        x = _residual_unit(sub, x, conv)
                     else:
                         raise NotImplementedError(f"decoder block member {sub_name}")
             elif name == "Snake1d":
@@ -430,7 +471,89 @@ class VAEDecodePhase(nn.Module):
                 x = torch.tanh(x)
             else:
                 raise NotImplementedError(f"decoder layer {name}")
-        return x[:, 0]
+        return x
+
+    def convolutions(self) -> List[nn.Module]:
+        """Every convolution, in the order `walk` meets them."""
+        out = []
+        for layer in self.model:
+            name = type(layer).__name__
+            if name == "CausalConv1d":
+                out.append(layer)
+            elif name == "CausalDecoderBlock":
+                for sub in layer.block:
+                    sub_name = type(sub).__name__
+                    if sub_name == "CausalTransposeConv1d":
+                        out.append(sub)
+                    elif sub_name == "CausalResidualUnit":
+                        out += [sub.block[1], sub.block[3]]
+        return out
+
+    def forward(self, latents):                                          # (1, n, 64)
+        return self.walk(latents.transpose(1, 2), _causal_conv, _causal_conv_transpose)[:, 0]
+
+
+class VAEStepPhase(nn.Module):
+    """`(latents, state_1..state_N) -> (waveform, state_1'..state_N')`: the next `n` latents of
+    `VAEDecodePhase`, the decoder's causal state carried in and out -- upstream's
+    `AudioVAE.streaming_decode()`, which `generate_streaming` runs on each patch as it is drawn (loom.cpp
+    ADR-111).
+
+    The states, in the decoder's order: each causal conv with a left pad keeps its last `pad` input
+    samples, `[1, C_in, pad]`; each transposed conv its overlap, `[1, C_out, k - s]`. The 1x1 convs keep
+    nothing. Zeros are a fresh decoder (`vae_init`): the zeros `CausalConv1d` pads with, and no overlap
+    yet. Every other piece of the decoder (snake, the sample-rate scale and bias, tanh) is pointwise in
+    time, so the pieces joined are the one-call waveform to within f32 summation order."""
+
+    def __init__(self, decoder: VAEDecodePhase):
+        super().__init__()
+        self.d = decoder
+        self._stateful = []
+        for conv in decoder.convolutions():
+            if type(conv).__name__ == "CausalTransposeConv1d":
+                k, st = conv.kernel_size[0], conv.stride[0]
+                trim = conv._CausalTransposeConv1d__padding * 2 - conv._CausalTransposeConv1d__output_padding
+                if trim != k - st or conv.dilation[0] != 1 or conv.output_padding[0] != 0:
+                    raise NotImplementedError(f"a causal transposed conv trimming {trim} of a k={k}, s={st} overlap")
+                self._stateful.append(conv)
+            else:
+                if conv.stride[0] != 1:
+                    raise NotImplementedError("a strided causal conv in the decoder")
+                if _causal_pad(conv) > 0:
+                    self._stateful.append(conv)
+
+    def state_shapes(self) -> List[tuple]:
+        shapes = []
+        for conv in self._stateful:
+            if type(conv).__name__ == "CausalTransposeConv1d":
+                shapes.append((1, conv.out_channels, conv.kernel_size[0] - conv.stride[0]))
+            else:
+                shapes.append((1, conv.in_channels, _causal_pad(conv)))
+        return shapes
+
+    def forward(self, latents, *states):                                 # (1, n, 64), the states
+        stateful = {id(c) for c in self._stateful}
+        states = list(states)
+        out_states = []
+
+        def conv(c, x):
+            if id(c) not in stateful:
+                return _causal_conv(c, x)
+            y, s = _conv_step(c, x, states.pop(0))
+            out_states.append(s)
+            return y
+
+        def convtr(c, x):
+            y, s = _conv_transpose_step(c, x, states.pop(0))
+            out_states.append(s)
+            return y
+
+        x = self.d.walk(latents.transpose(1, 2), conv, convtr)
+        return (x[:, 0], *out_states)
+
+
+# `vae_step`'s fresh state, made on the device from one number.
+from .stream_steps import StateInit as VAEInitPhase  # noqa: E402
 
 
 # ------------------------------------------------------------------------------------------ export --
@@ -504,6 +627,7 @@ class VoxCPM2ExportConfig(BaseMultiPhaseModelExportConfig):
     decomposition: Decomposition = field(default_factory=MultiPhase)
     driver_script_path: Path = Path(__file__).resolve().parent / "voxcpm2_driver"
     _driver_weights: Optional[Dict[str, np.ndarray]] = field(default=None, init=False, repr=False)
+    _vae_states: Optional[int] = field(default=None, init=False, repr=False)
 
     __links__ = {"root_axis": Axis()}
     __unchecked__ = {
@@ -515,6 +639,7 @@ class VoxCPM2ExportConfig(BaseMultiPhaseModelExportConfig):
                                          "against the traced topologies by LuaFragment"),
         "_driver_weights": Unchecked("computed from the reference during phases() and shipped as "
                                       "driver weights"),
+        "_vae_states": Unchecked("`vae_step`'s state count, read off the decoder during phases()"),
     }
 
     def phases(self) -> List[ExportPhase]:
@@ -526,6 +651,10 @@ class VoxCPM2ExportConfig(BaseMultiPhaseModelExportConfig):
         dim = model.config.lm_config.hidden_size
         patch, ldim = model.patch_size, model.feat_dim
         seq_dim = ct.RangeDim(1, LM_MAX_POSITIONS)
+        vae = VAEDecodePhase(model.audio_vae).eval()
+        vae_step = VAEStepPhase(vae).eval()
+        step_shapes = vae_step.state_shapes()
+        self._vae_states = len(step_shapes)
         return [
             ExportPhase(
                 name="feat_encode",
@@ -583,10 +712,29 @@ class VoxCPM2ExportConfig(BaseMultiPhaseModelExportConfig):
             ),
             ExportPhase(
                 name="vae_decode",
-                wrapper=VAEDecodePhase(model.audio_vae).eval(),
+                wrapper=vae,
                 dummy_inputs=(torch.randn(1, TRACE_LATENTS, ldim),),
                 mil_inputs=[ct.TensorType(name="latents", shape=(1, ct.RangeDim(1, patch * LM_MAX_POSITIONS), ldim),
                                           dtype=np.float32)],
+                root_axis="n_codes",
+            ),
+            # The live door (loom.cpp ADR-111): a few patches per call, the decoder's causal state carried
+            # in and out as `state_1..state_N`, which the driver keeps on the device; `vae_init` makes a
+            # fresh one there.
+            ExportPhase(
+                name="vae_init",
+                wrapper=VAEInitPhase(step_shapes).eval(),
+                dummy_inputs=(torch.zeros(1),),
+                mil_inputs=[ct.TensorType(name="zero", shape=(1,), dtype=np.float32)],
+            ),
+            ExportPhase(
+                name="vae_step",
+                wrapper=vae_step,
+                dummy_inputs=(torch.randn(1, TRACE_LATENTS, ldim),) + tuple(torch.randn(sh) * 0.1 for sh in step_shapes),
+                mil_inputs=[ct.TensorType(name="latents", shape=(1, ct.RangeDim(1, patch * MAX_STEP_PATCHES), ldim),
+                                          dtype=np.float32)]
+                + [ct.TensorType(name=f"state_{i + 1}", shape=sh, dtype=np.float32)
+                   for i, sh in enumerate(step_shapes)],
                 root_axis="n_codes",
             ),
         ]
@@ -608,12 +756,20 @@ class VoxCPM2ExportConfig(BaseMultiPhaseModelExportConfig):
             "MIN_LEN": MIN_LEN,
             "MAX_LEN": MAX_LEN,
             "BADCASE_RATIO": BADCASE_RATIO,
+            # `vae_step`'s state count (the driver names `state_1..` from it), the most patches one call
+            # takes, and what a live piece grows to by default (1, 2, 4, then this).
+            "VAE_STATES": self._vae_states if self._vae_states is not None else 0,
+            "MAX_STEP_PATCHES": MAX_STEP_PATCHES,
+            "PIECE_PATCHES_GROWN": PIECE_PATCHES_GROWN,
         }
         return [
-            ExportConstants(values=constants),
+            ExportConstants(values=constants, top_level=True),
             DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
             LuaFragment(fragment / "00_header.lua", top_level=True, defines=("voxcpm_schedule",)),
-            LuaFragment(fragment / "01_generate.lua", reads=("tokens",) + tuple(constants), defines=("wave",)),
+            # The loop and the live door (loom.cpp ADR-111); `infer` runs the same loop.
+            LuaFragment(fragment / "00_stream.lua", top_level=True,
+                        defines=("voxcpm_begin", "voxcpm_step", "stream_open", "stream_feed", "stream_finish")),
+            LuaFragment(fragment / "01_generate.lua", reads=("tokens",), defines=("wave",)),
             DriverReturn(values=("wave",)),
         ]
 

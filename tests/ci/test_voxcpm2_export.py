@@ -12,6 +12,8 @@ declaration there is a wrong model with nothing failing:
   built from the reference's own classes -- so the check needs the checkout but not the 9 GB
   checkpoint. That includes the AudioVAE's weight norm folded BEFORE any forward: its hook refreshes
   `weight` per call, so a check run after the reference's own forward cannot see a stale fold;
+* the live decoder (`vae_step`, loom.cpp ADR-111): its pieces, cut unevenly with the state carried, are
+  upstream's own `streaming_decode()` and the one-call decoder;
 * the declarations: the text-door contract and the defaults the driver is generated from.
 
 The numbers -- the waveform against the reference, teacher-forced and free-running, and the text path
@@ -29,7 +31,7 @@ import torch
 from loom_exporter.voxcpm2_export import (
     AUDIO_START_TOKEN, BADCASE_RATIO, DEFAULT_CFG, DEFAULT_TIMESTEPS, MAX_LEN, MIN_LEN, SAMPLE_RATE,
     SWAY_COEF, VOXCPM_REPO, BaseLMPhase, DiTStepPhase, FeatEncodePhase, ResidualLMPhase, VAEDecodePhase,
-    VoxCPM2ExportConfig, _is_voxcpm2, causal_mask, euler_schedule, fold_weight_norm, import_voxcpm,
+    VAEInitPhase, VAEStepPhase, VoxCPM2ExportConfig, _is_voxcpm2, causal_mask, euler_schedule, fold_weight_norm, import_voxcpm,
     zero_init_steps,
 )
 from loom_exporter.voxcpm2_tokenizer_export import added_tokens, normalizer_strings, split_table
@@ -306,6 +308,76 @@ def test_the_vae_decode_folds_weight_norm_before_any_forward(tiny):
     assert got.shape == want.shape == (1, 6 * 2 * 3)
     assert torch.allclose(got, want, atol=1e-5)
     del copy
+
+
+
+def _fresh_tiny_vae(tiny):
+    """The tiny model's AudioVAE, reloaded into a never-run instance and folded."""
+    import_voxcpm()
+    from voxcpm.modules.audiovae import AudioVAEConfigV2, AudioVAEV2
+
+    fresh = AudioVAEV2(config=AudioVAEConfigV2(encoder_dim=4, encoder_rates=[2, 2], latent_dim=8, decoder_dim=16,
+                                               decoder_rates=[2, 3], sample_rate=16000, out_sample_rate=48000))
+    fresh.load_state_dict(tiny.audio_vae.state_dict())
+    fold_weight_norm(fresh)
+    return fresh.eval()
+
+
+def test_the_vae_step_carries_a_state_per_causal_conv(tiny):
+    """Every causal conv with a left pad and every transposed conv keeps one state, in the decoder's order;
+    the 1x1s keep none. The tiny decoder: the depthwise k7 and its 1x1, two blocks of (transposed conv,
+    three dilated units of k7 + 1x1), the last k7."""
+    step = VAEStepPhase(VAEDecodePhase(_fresh_tiny_vae(tiny)))
+    shapes = step.state_shapes()
+    assert len(shapes) == 1 + 2 * (1 + 3) + 1
+    assert shapes[0] == (1, 8, 6)                                    # the depthwise k7 over the latents
+    # Block 1: x2 over 16 -> 8 channels, its overlap k - s = 2; units of dilation 1, 3, 9 keep 6d inputs.
+    assert shapes[1:5] == [(1, 8, 2), (1, 8, 6), (1, 8, 18), (1, 8, 54)]
+    assert shapes[5] == (1, 4, 3)                                    # block 2: x3 to 4 channels
+    zeros = VAEInitPhase(shapes)(torch.zeros(1))
+    assert [tuple(z.shape) for z in zeros] == shapes and all(float(z.abs().sum()) == 0 for z in zeros)
+
+
+@pytest.mark.parametrize("pieces", [[1] * 7, [4, 1, 2], [2, 5]])
+def test_the_vae_step_in_pieces_is_upstreams_streaming_decode(tiny, pieces):
+    """`vae_step`, cut into uneven pieces with its state carried from `vae_init`'s zeros, joins into what
+    upstream's `streaming_decode()` gives for the same pieces and what the one-call decoder gives for the
+    whole: the live door's waveform is the one-pass one (ADR-111). A one-latent piece is shorter than the
+    dilation-9 unit's 54-sample state at the first block, which is the case that keeps older samples."""
+    vae = _fresh_tiny_vae(tiny)
+    decoder = VAEDecodePhase(vae)
+    step = VAEStepPhase(decoder)
+    lat = torch.randn(1, sum(pieces), 8)
+    with torch.no_grad():
+        want = decoder(lat)
+        states = VAEInitPhase(step.state_shapes())(torch.zeros(1))
+        got, upstream, at = [], [], 0
+        with tiny.audio_vae.streaming_decode() as dec:
+            for n in pieces:
+                wave, *states = step(lat[:, at:at + n], *states)
+                got.append(wave)
+                upstream.append(dec.decode_chunk(lat[:, at:at + n].transpose(1, 2))[:, 0])
+                at += n
+        got, upstream = torch.cat(got, -1), torch.cat(upstream, -1)
+    assert got.shape == want.shape == upstream.shape == (1, sum(pieces) * 2 * 3)
+    assert torch.allclose(upstream, want, atol=1e-5)
+    assert torch.allclose(got, want, atol=1e-5)
+    assert torch.allclose(got, upstream, atol=1e-5)
+
+
+def test_a_piece_from_the_wrong_state_is_not_the_one_pass(tiny):
+    """The check above can fail: the second piece decoded from a fresh state instead of the carried one is
+    off by the signal itself."""
+    vae = _fresh_tiny_vae(tiny)
+    decoder = VAEDecodePhase(vae)
+    step = VAEStepPhase(decoder)
+    lat = torch.randn(1, 6, 8)
+    with torch.no_grad():
+        want = decoder(lat)
+        fresh = VAEInitPhase(step.state_shapes())(torch.zeros(1))
+        first, *_ = step(lat[:, :3], *fresh)
+        second, *_ = step(lat[:, 3:], *fresh)
+    assert (torch.cat([first, second], -1) - want).abs().max() > 1e-2
 
 
 # -- the declarations ------------------------------------------------------------------------------
