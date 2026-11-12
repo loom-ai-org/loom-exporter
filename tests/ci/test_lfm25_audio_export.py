@@ -133,3 +133,130 @@ def test_the_voices_are_the_readmes_four_and_the_default_is_built_in():
     assert set(ids["voices"]) == set(TTS_VOICES) and DEFAULT_VOICE in TTS_VOICES
     # `<|startoftext|>` opens the prompt; it is also the id the driver drops from the head of the text.
     assert ids["pre"][0] == 1
+
+
+def test_the_stream_context_is_the_detokenizers_receptive_field():
+    """The checkpoint's layer list gives 5 convolutions x 2 rows + 3 windowed attentions x 29 rows."""
+    from loom_exporter.lfm25_audio_export import detokenizer_context_rows
+
+    cfg = {"conv_L_cache": 3, "sliding_window": 30,
+           "layer_types": ["conv", "conv", "sliding_attention", "conv", "sliding_attention", "conv",
+                           "sliding_attention", "conv"]}
+    assert detokenizer_context_rows(cfg) == 97
+    with pytest.raises(NotImplementedError, match="full_attention"):
+        detokenizer_context_rows(dict(cfg, layer_types=["full_attention"]))
+
+
+def _small_detokenizer(layer_types, window):
+    """`DetokenizerPhase` around a small random LFM2 of the checkpoint's layer layout, at f64."""
+    import torch
+    import torch.nn as nn
+    from transformers import Lfm2Config, Lfm2Model
+
+    from loom_exporter.lfm25_audio_export import ISTFT_N_FFT, N_CODEBOOKS, DetokenizerPhase
+
+    torch.manual_seed(0)
+    cfg = Lfm2Config(vocab_size=16, hidden_size=32, intermediate_size=64, num_hidden_layers=len(layer_types),
+                     num_attention_heads=4, num_key_value_heads=2, conv_L_cache=3,
+                     layer_types=["full_attention" if t == "sliding_attention" else t for t in layer_types],
+                     max_position_embeddings=4096, block_auto_adjust_ff_dim=False)
+    lfm = Lfm2Model(cfg).eval()
+    with torch.no_grad():
+        for p in lfm.parameters():
+            p.normal_(0.0, 0.3)
+    lin = nn.Linear(32, ISTFT_N_FFT + 2)
+    with torch.no_grad():
+        lin.weight.normal_(0.0, 0.05)
+    return DetokenizerPhase(torch.randn(N_CODEBOOKS * 16, 32), lfm, lin).double().eval()
+
+
+def _windowed(monkeypatch):
+    """The checkpoint's layer layout at small random f64 weights, with the context the export derives,
+    and 40 frames of random codes repeated x6 into rows."""
+    import torch
+
+    from loom_exporter import lfm25_audio_export
+    from loom_exporter.lfm25_audio_export import DETOK_UPSAMPLE, DETOK_WINDOW, detokenizer_context_rows
+
+    layer_types = ["conv", "conv", "sliding_attention", "conv", "sliding_attention", "conv",
+                   "sliding_attention", "conv"]
+    context = detokenizer_context_rows({"conv_L_cache": 3, "sliding_window": DETOK_WINDOW,
+                                        "layer_types": layer_types})
+    phase = _small_detokenizer(layer_types, DETOK_WINDOW)
+    # The phase builds its mask in f32, which is the export's dtype; handed to an f64 model, transformers
+    # discards it for a plain causal mask (no window), and every row then reads back to the turn's start.
+    window_mask = lfm25_audio_export.detokenizer_window_mask
+    monkeypatch.setattr(lfm25_audio_export, "detokenizer_window_mask",
+                        lambda positions, window: window_mask(positions, window).double())
+    rows = torch.randint(0, 16, (40, 8), dtype=torch.int32).repeat_interleave(DETOK_UPSAMPLE, dim=0)
+    return phase, context, rows
+
+
+def test_the_backbone_reads_exactly_the_context_back(monkeypatch):
+    """A window of rows starting at `a` gives the one-call hidden rows from `a + context` on, and not
+    the row before: the window's start (zero conv padding, keys missing) reaches exactly that far."""
+    import torch
+
+    from loom_exporter.lfm25_audio_export import DETOK_WINDOW, detokenizer_window_mask
+
+    phase, context, rows = _windowed(monkeypatch)
+
+    def hidden(a, b):
+        positions = torch.arange(a, b, dtype=torch.int32).view(1, -1)
+        with torch.no_grad():
+            x = phase.embed(rows[a:b].unsqueeze(0) + phase.offsets).sum(dim=2) * (1.0 / 8)
+            return phase.lfm(inputs_embeds=x, position_ids=positions, use_cache=False,
+                             attention_mask=detokenizer_window_mask(positions, DETOK_WINDOW).double()
+                             ).last_hidden_state[0]
+
+    n = rows.shape[0]
+    whole = hidden(0, n)
+    scale = whole.abs().max().item()
+    clean, last_dirty = 0.0, 0.0
+    for a in (37, 50, 61):
+        d = (hidden(a, n) - whole[a:]).abs().amax(dim=1) / scale
+        clean = max(clean, d[context:].max().item())
+        last_dirty = max(last_dirty, d[context - 1].item())
+    print(f"rows from a + {context}: {clean:.3g}; row a + {context - 1}: {last_dirty:.3g}")
+    assert clean < 1e-12
+    assert last_dirty > 100 * max(clean, 1e-16)
+
+
+def test_a_window_with_the_context_reproduces_one_call(monkeypatch):
+    """The stream (ADR-115) detokenizes rows `[a, b)`, `a` the context before the first ISTFT frame its
+    samples read, and holds back the trim's worth of samples the next row's frame still overlaps. At f64
+    every piece of a 40-frame turn is the one-call samples, and a hold-back one hop shorter is not."""
+    import math
+
+    import torch
+
+    from loom_exporter.lfm25_audio_export import DETOK_TRIM, DETOK_UPSAMPLE, ISTFT_HOP, ISTFT_N_FFT
+
+    phase, context, rows = _windowed(monkeypatch)
+
+    def detok(a, b):
+        with torch.no_grad():
+            return phase(rows[a:b].unsqueeze(0), torch.arange(a, b, dtype=torch.int32).view(1, -1))[0]
+
+    whole = detok(0, rows.shape[0])
+    assert whole.shape[0] == rows.shape[0] * ISTFT_HOP
+    scale = whole.abs().max().item()
+
+    def worst(hold):
+        d, emitted, starts = 0.0, 0, []
+        for frames in (1, 3, 7, 15, 23, 31, 38):
+            b = frames * DETOK_UPSAMPLE
+            e = b * ISTFT_HOP - hold
+            first = math.ceil((emitted + DETOK_TRIM - ISTFT_N_FFT + 1) / ISTFT_HOP)
+            a = max(0, first - context)
+            starts.append(a)
+            got = detok(a, b)[emitted - a * ISTFT_HOP:e - a * ISTFT_HOP]
+            d = max(d, (got - whole[emitted:e]).abs().max().item())
+            emitted = e
+        return d / scale, starts
+
+    (exact, starts), (short_hold, _) = worst(DETOK_TRIM), worst(DETOK_TRIM - ISTFT_HOP)
+    print(f"hold {DETOK_TRIM}: {exact:.3g}; hold {DETOK_TRIM - ISTFT_HOP}: {short_hold:.3g}; starts {starts}")
+    assert sum(a > 0 for a in starts) >= 2           # the windows that do not start at the turn's start
+    assert exact < 1e-12
+    assert short_hold > 1e-6
