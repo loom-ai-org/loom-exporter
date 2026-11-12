@@ -78,14 +78,16 @@ def _config(tmp_path):
 
 
 def test_the_sampler_declares_guidance_a_caller_schedule_and_caller_noise(tmp_path):
-    """Chatterbox's S3Gen declaration exactly: `CausalConditionalCFM` is the same solver."""
+    """Chatterbox's S3Gen declaration, `CausalConditionalCFM` being the same solver, plus the chunk ids
+    that choose the DiT's mode (ADR-112): the same for both guidance branches, as the reference's one
+    mask serves its batch of two."""
     spec, = _config(tmp_path).samplers()
     assert spec.guidance is True
     assert spec.schedule == "caller"
     assert spec.caller_noise is True
     assert spec.method == "euler"
     assert spec.carried_input == "x"
-    assert spec.fixed_inputs == ["mu", "spks", "cond"]
+    assert spec.fixed_inputs == ["mu", "spks", "cond", "chunk_ids"]
 
 
 def test_the_contract_declares_a_text_door(tmp_path):
@@ -124,9 +126,10 @@ def test_the_speech_rows_and_the_stop_range():
     decode, and `sampling_ids`' `ignore_eos` bans 6561 -- which is `sos`, not `eos_token` (6562)."""
     assert (SOS, TASK_ID, LM_HEAD) == (6561, 6563, 6761)
     assert END_OF_PROMPT == 151646
-    lm = (Path(__file__).resolve().parents[2] / "loom_exporter" / "cosyvoice3_driver" / "01_lm.lua").read_text()
-    assert "if _token >= SOS then break end" in lm
-    assert "if _step < _min_len then _banned[1] = SOS end" in lm
+    # The loop `infer` and the live stream share (ADR-112).
+    lm = (Path(__file__).resolve().parents[2] / "loom_exporter" / "cosyvoice3_driver" / "00_stream.lua").read_text()
+    assert "    if token >= SOS then\n        st.lm_ended = 1" in lm
+    assert "if step < st.lm_min_len then banned[1] = SOS end" in lm
     assert "top_p_mass = 'row'" in lm
 
 
@@ -254,3 +257,68 @@ def test_the_transcript_gets_the_references_system_prompt_unless_it_has_one():
     assert prompt_text("Hello.") == SYSTEM_PROMPT + "Hello."
     assert prompt_text("Speak slowly.<|endofprompt|>Hello.") == "Speak slowly.<|endofprompt|>Hello."
     assert SYSTEM_PROMPT.endswith("<|endofprompt|>")
+
+
+# -- the flow's two modes (loom.cpp ADR-112) --------------------------------------------------------
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_the_estimator_is_the_dit_in_either_mode(streaming):
+    """`EstimatorPhase` on a tiny DiT from the reference's own class, every parameter randomised: zero
+    `chunk_ids` is `DiT.forward(streaming=False)` (full attention, what `infer` runs) and
+    `floor(i / static_chunk_size)` is `streaming=True` (the block-causal chunk mask upstream's stream
+    runs). Three chunks, the last one partial."""
+    _cosyvoice_checkout()
+    from cosyvoice.flow.DiT.dit import DiT
+    from loom_exporter.cosyvoice3_export import EstimatorPhase
+
+    torch.manual_seed(0)
+    chunk, n = 6, 17
+    dit = DiT(dim=64, depth=2, heads=4, dim_head=16, ff_mult=2, mel_dim=8, mu_dim=8, spk_dim=8,
+              out_channels=8, static_chunk_size=chunk, num_decoding_left_chunks=-1).eval()
+    with torch.no_grad():
+        for p in dit.parameters():
+            p.copy_(torch.randn_like(p) * 0.2 + (0.5 if p.dim() == 1 else 0.0))
+    x, mu, cond = torch.randn(1, 8, n), torch.randn(1, 8, n), torch.randn(1, 8, n)
+    spks, t = torch.randn(1, 8), torch.tensor([0.4])
+    ids = (torch.floor(torch.arange(n, dtype=torch.float32) / chunk) if streaming else torch.zeros(n)).view(1, -1)
+    from cosyvoice.flow.DiT import modules as dit_modules
+    import x_transformers.x_transformers as xt
+
+    est = EstimatorPhase(dit)   # installs the export's rope as the module global, for the whole process
+    with torch.no_grad():
+        got = est(x.transpose(1, 2), mu.transpose(1, 2), spks, cond.transpose(1, 2), t, ids)
+        # The reference with the reference's own rope.
+        patched, dit_modules.apply_rotary_pos_emb = dit_modules.apply_rotary_pos_emb, xt.apply_rotary_pos_emb
+        try:
+            want = dit(x, torch.ones(1, 1, n), mu, t, spks, cond, streaming=streaming)
+            other = dit(x, torch.ones(1, 1, n), mu, t, spks, cond, streaming=not streaming)
+        finally:
+            dit_modules.apply_rotary_pos_emb = patched
+    assert torch.allclose(got.transpose(1, 2), want, atol=1e-5)
+    assert (got.transpose(1, 2) - other).abs().max() > 1e-2       # the two modes really differ
+
+
+def test_a_chunk_mask_lets_a_frame_see_its_own_chunk_and_the_ones_before():
+    from loom_exporter.cosyvoice3_export import chunk_mask
+
+    m = chunk_mask(torch.tensor([[0.0, 0.0, 1.0, 1.0, 2.0]]))[0, 0]
+    allowed = (m == 0).int()
+    assert allowed.tolist() == [[1, 1, 0, 0, 0], [1, 1, 0, 0, 0], [1, 1, 1, 1, 0], [1, 1, 1, 1, 0],
+                                [1, 1, 1, 1, 1]]
+    assert bool((chunk_mask(torch.zeros(1, 4)) == 0).all())
+
+
+def test_the_stream_cut_is_cosyvoice3_models_own():
+    """The live stream's hop, its growth and ceiling are `CosyVoice3Model`'s, read off its source, and the
+    DiT's chunk is the hop in frames (upstream: the hop "must match training static_chunk_size")."""
+    _cosyvoice_checkout()
+    import inspect
+    from cosyvoice.cli.model import CosyVoice3Model
+    from loom_exporter.cosyvoice3_export import (CHUNK_FRAMES, STREAM_HOP_SCALE, STREAM_HOP_TOKENS,
+                                                 STREAM_MAX_HOP_TOKENS, TOKEN_MEL_RATIO)
+
+    src = inspect.getsource(CosyVoice3Model.__init__)
+    assert f"self.token_hop_len = {STREAM_HOP_TOKENS}" in src
+    assert "self.token_max_hop_len = 4 * self.token_hop_len" in src and STREAM_MAX_HOP_TOKENS == 4 * STREAM_HOP_TOKENS
+    assert f"self.stream_scale_factor = {STREAM_HOP_SCALE}" in src
+    assert CHUNK_FRAMES == STREAM_HOP_TOKENS * TOKEN_MEL_RATIO == 50
