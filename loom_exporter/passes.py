@@ -785,7 +785,7 @@ class fuse_rms_norm(AbstractGraphPass):
     Replaces the five-op chain PyTorch's RMSNorm traces to with one `loom_rms_norm`, which
     `topology_ops.py` lowers to the engine's `RMS_NORM` primitive.
 
-        pow(x, 2) -> reduce_mean(axes=[-1], keep_dims) -> add(eps) -> rsqrt -> mul(x, .)
+        pow(x, 2) | square(x) | mul(x, x) -> reduce_mean(axes=[-1], keep_dims) -> add(eps) -> rsqrt -> mul(x, .)
 
     **Unconditional, unlike `fuse_loom_attention`.** That pass is opt-in because fusing changes what a
     model MEANS -- an ATTENTION node can reach a KV cache, which is wrong for a non-autoregressive
@@ -854,16 +854,18 @@ class fuse_rms_norm(AbstractGraphPass):
                 mean_op = cls._producer(variance, "reduce_mean")
                 if mean_op is None:
                     continue
-                pow_op = cls._producer(mean_op.inputs.get("x"), "pow")
-                if pow_op is None:
+                # The square, in any of its spellings (`_squares`): `pow(x, 2)` from `x.pow(2)`, `square`
+                # after `lower_pow`, and `mul(x, x)` from `x * x` -- CosyVoice3's Qwen2 LM traced the last,
+                # and its 49 norms per token stayed nine nodes each instead of one `RMS_NORM` (on an RTX
+                # 5090, a third of the LM's kernels, 2026-11-12). Only the mean may read the square: the
+                # rewrite makes it unreachable.
+                squared = mean_op.inputs.get("x")
+                if len(getattr(squared, "child_ops", []) or []) != 1:
                     continue
                 # The multiply must feed back the very var that was squared. Identity, not equality:
                 # two structurally identical tensors are still two tensors, and normalizing by the wrong
                 # one is exactly the bug this check exists to refuse.
-                if pow_op.inputs.get("x") is not x:
-                    continue
-                exponent = static_value(pow_op.inputs.get("y"))
-                if exponent is None or np.asarray(exponent).size != 1 or float(np.asarray(exponent).reshape(-1)[0]) != 2.0:
+                if not _squares(squared, x):
                     continue
                 if not cls._reduces_last_axis(mean_op, x):
                     continue
@@ -908,17 +910,20 @@ class fuse_rms_norm(AbstractGraphPass):
 
 
 def _squares(var, x) -> bool:
-    """Whether `var` is `x` squared, in either spelling MIL uses for it.
+    """Whether `var` is `x` squared, in any spelling MIL uses for it.
 
-    `pow(x, 2)` is what a trace produces and `square` is what `lower_pow` rewrites it to, so a matcher
-    that knew only one would silently depend on pass ordering -- and the ordering that breaks it is the
-    one where somebody moves `lower_pow` earlier for an unrelated reason.
+    `pow(x, 2)` is what `x.pow(2)` traces to, `square` is what `lower_pow` rewrites it to, and `mul(x, x)`
+    is what `x * x` traces to. A matcher that knew only one would silently depend on pass ordering -- the
+    ordering that breaks it is the one where somebody moves `lower_pow` earlier for an unrelated reason --
+    or on how a model happened to write its square.
     """
     producer = getattr(var, "op", None)
     if producer is None:
         return False
     if producer.op_type == "square":
         return producer.inputs.get("x") is x
+    if producer.op_type == "mul":
+        return producer.inputs.get("x") is x and producer.inputs.get("y") is x
     if producer.op_type != "pow" or producer.inputs.get("x") is not x:
         return False
     exponent = static_value(producer.inputs.get("y"))

@@ -355,6 +355,36 @@ class TestFuseRmsNorm(unittest.TestCase):
         PASS_REGISTRY["common::dead_code_elimination"](prog)
         self.assertEqual(_ops(prog), ["loom_rms_norm"])
 
+    def test_the_square_may_be_spelled_three_ways(self):
+        """`x.pow(2)`, MIL's `square` (what `lower_pow` makes of it) and `x * x` are one square. CosyVoice3's
+        Qwen2 LM traced `mul(x, x)`, and every one of its norms stayed nine nodes on a GPU."""
+        for spelling in ("pow", "square", "mul"):
+            @mb.program(input_specs=[mb.TensorSpec(shape=(1, 4, 8), dtype=types.fp32)])
+            def prog(x):
+                if spelling == "pow":
+                    squared = mb.pow(x=x, y=np.float32(2.0))
+                elif spelling == "square":
+                    squared = mb.square(x=x)
+                else:
+                    squared = mb.mul(x=x, y=x)
+                variance = mb.reduce_mean(x=squared, axes=[-1], keep_dims=True)
+                return mb.mul(x=x, y=mb.rsqrt(x=mb.add(x=variance, y=np.float32(1e-6))))
+
+            PASS_REGISTRY["loom::fuse_rms_norm"](prog)
+            PASS_REGISTRY["common::dead_code_elimination"](prog)
+            self.assertEqual(_ops(prog), ["loom_rms_norm"], spelling)
+
+    def test_a_product_of_two_tensors_is_not_a_square(self):
+        """`mul(x, y)` with y not x is not a square, however alike the two are."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 4, 8), dtype=types.fp32)])
+        def prog(x):
+            y = mb.identity(x=x)
+            variance = mb.reduce_mean(x=mb.mul(x=x, y=y), axes=[-1], keep_dims=True)
+            return mb.mul(x=x, y=mb.rsqrt(x=mb.add(x=variance, y=np.float32(1e-6))))
+
+        PASS_REGISTRY["loom::fuse_rms_norm"](prog)
+        self.assertNotIn("loom_rms_norm", _ops(prog))
+
     def test_a_multiply_by_a_different_tensor_is_not_rms_norm(self):
         """The tensor being scaled must be the very one that was squared. Two structurally identical
         tensors are still two tensors, and normalizing by the wrong one is the bug this refuses."""
