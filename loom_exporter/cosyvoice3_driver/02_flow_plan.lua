@@ -15,11 +15,10 @@
     local n_gen_frames = n_frames - n_prompt_frames
     local step_cond = cosyvoice3_zeros(n_frames * N_MEL)
     for _i = 1, #_prompt_feat do step_cond[_i] = _prompt_feat[_i] end
-    local zero_cond = cosyvoice3_zeros(n_frames * N_MEL)
-    local zero_spks = cosyvoice3_zeros(N_MEL)
     -- `n_steps`, the name every host passes a step count under (the contract's `tts.default_steps`).
     local times = cosyvoice3_cosine_times(inputs.n_steps or FLOW_STEPS)
-    local flow_cfg = inputs.flow_cfg_rate or FLOW_CFG_RATE
+    -- The guidance weight, an estimator INPUT: the estimator runs both halves of the guidance itself.
+    local flow_cfg = {inputs.flow_cfg_rate or FLOW_CFG_RATE}
     -- The DiT's mode: full attention, as upstream's non-streaming call runs it, unless `streaming` asks
     -- for the block-causal chunk mask its streaming call runs -- the one pass a live stream joins to
     -- (00_stream.lua, ADR-112).

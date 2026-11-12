@@ -77,17 +77,17 @@ def _config(tmp_path):
     return CosyVoice3ExportConfig(output_path=str(tmp_path / "o.gguf"), model_dir=str(_release(tmp_path)))
 
 
-def test_the_sampler_declares_guidance_a_caller_schedule_and_caller_noise(tmp_path):
-    """Chatterbox's S3Gen declaration, `CausalConditionalCFM` being the same solver, plus the chunk ids
-    that choose the DiT's mode (ADR-112): the same for both guidance branches, as the reference's one
-    mask serves its batch of two."""
+def test_the_sampler_declares_in_graph_guidance_a_caller_schedule_and_caller_noise(tmp_path):
+    """`CausalConditionalCFM`'s solver, with its guidance where the reference has it: inside one
+    estimator call over a batch of two (ADR-113), so the sampler makes no second call and the weight is
+    an input, `cfg`. Plus the chunk ids that choose the DiT's mode (ADR-112), one mask for both rows."""
     spec, = _config(tmp_path).samplers()
-    assert spec.guidance is True
+    assert spec.guidance is False
     assert spec.schedule == "caller"
     assert spec.caller_noise is True
     assert spec.method == "euler"
     assert spec.carried_input == "x"
-    assert spec.fixed_inputs == ["mu", "spks", "cond", "chunk_ids"]
+    assert spec.fixed_inputs == ["mu", "spks", "cond", "chunk_ids", "cfg"]
 
 
 def test_the_contract_declares_a_text_door(tmp_path):
@@ -284,18 +284,71 @@ def test_the_estimator_is_the_dit_in_either_mode(streaming):
     from cosyvoice.flow.DiT import modules as dit_modules
     import x_transformers.x_transformers as xt
 
+    cfg = torch.tensor([0.7])
     est = EstimatorPhase(dit)   # installs the export's rope as the module global, for the whole process
     with torch.no_grad():
-        got = est(x.transpose(1, 2), mu.transpose(1, 2), spks, cond.transpose(1, 2), t, ids)
-        # The reference with the reference's own rope.
+        got = est(x.transpose(1, 2), mu.transpose(1, 2), spks, cond.transpose(1, 2), t, ids, cfg)
+        # The reference with the reference's own rope, guided the way `CausalConditionalCFM.solve_euler`
+        # guides: one batch of two, the second row's mu, spks and cond zeroed.
+        def guided(mode):
+            z = torch.zeros_like
+            v = dit(torch.cat([x, x]), torch.ones(2, 1, n), torch.cat([mu, z(mu)]), torch.cat([t, t]),
+                    torch.cat([spks, z(spks)]), torch.cat([cond, z(cond)]), streaming=mode)
+            v_cond, v_uncond = torch.split(v, [1, 1], dim=0)
+            return (1.0 + 0.7) * v_cond - 0.7 * v_uncond
         patched, dit_modules.apply_rotary_pos_emb = dit_modules.apply_rotary_pos_emb, xt.apply_rotary_pos_emb
         try:
-            want = dit(x, torch.ones(1, 1, n), mu, t, spks, cond, streaming=streaming)
-            other = dit(x, torch.ones(1, 1, n), mu, t, spks, cond, streaming=not streaming)
+            want, other = guided(streaming), guided(not streaming)
+            unguided = dit(x, torch.ones(1, 1, n), mu, t, spks, cond, streaming=streaming)
         finally:
             dit_modules.apply_rotary_pos_emb = patched
-    assert torch.allclose(got.transpose(1, 2), want, atol=1e-5)
+    # The network itself, unguided, to the bound this test always held it to.
+    with torch.no_grad():
+        v = est._velocity(x.transpose(1, 2), mu.transpose(1, 2), spks, cond.transpose(1, 2), t, ids)
+    assert torch.allclose(v.transpose(1, 2), unguided, atol=1e-5)
+    # The guided combine weighs the two rows' f32 error by 1.7 and 0.7: up to 2.4x that bound, 3.5e-5
+    # measured.
+    assert torch.allclose(got.transpose(1, 2), want, atol=5e-5)
     assert (got.transpose(1, 2) - other).abs().max() > 1e-2       # the two modes really differ
+    assert (got.transpose(1, 2) - unguided).abs().max() > 1e-2    # and the guidance is really applied
+
+
+def test_the_signed_sine_rotation_is_rotate_half_exactly():
+    """`swap_halves(x) * [-sin_1, sin_2]` is `rotate_half(x) * sin` bit for bit: the same products, with
+    the sign moved from one factor to the other."""
+    from loom_exporter.cosyvoice3_export import _rotate_half, _swap_halves
+
+    torch.manual_seed(3)
+    x, cos, sin = torch.randn(1, 16, 9, 64), torch.randn(1, 1, 9, 64), torch.randn(1, 1, 9, 64)
+    signed = torch.cat([-sin[..., :32], sin[..., 32:]], dim=-1)
+    assert torch.equal(x * cos + _rotate_half(x) * sin, x * cos + _swap_halves(x) * signed)
+
+
+def test_the_fused_layer_is_qwen2s_decoder_layer():
+    """`_Qwen2Layer` (q, k, v as one projection, one rotation for q and k, the signed sine) against
+    transformers' own `Qwen2DecoderLayer` on a tiny random config with grouped K/V heads."""
+    from transformers import Qwen2Config
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer, Qwen2RotaryEmbedding
+    from loom_exporter.cosyvoice3_export import _Qwen2Layer
+
+    torch.manual_seed(5)
+    config = Qwen2Config(hidden_size=64, intermediate_size=96, num_attention_heads=4, num_key_value_heads=2,
+                         rms_norm_eps=1e-6, rope_theta=1e6, attn_implementation="eager")
+    ref = Qwen2DecoderLayer(config, layer_idx=0).eval()
+    with torch.no_grad():
+        for p in ref.parameters():
+            p.copy_(torch.randn_like(p) * 0.2)
+    n = 7
+    x = torch.randn(1, n, 64)
+    pos = torch.arange(n).view(1, -1)
+    cos, sin = Qwen2RotaryEmbedding(config)(x, pos)
+    mask = torch.triu(torch.full((n, n), -1e30), diagonal=1).view(1, 1, n, n)
+    signed = torch.cat([-sin[..., :8], sin[..., 8:]], dim=-1)
+    with torch.no_grad():
+        want = ref(x, attention_mask=mask, position_ids=pos, position_embeddings=(cos, sin))
+        want = want[0] if isinstance(want, tuple) else want
+        got = _Qwen2Layer(ref, config)(x, cos.unsqueeze(1), signed.unsqueeze(1), mask)
+    assert torch.allclose(got, want, atol=1e-5)
 
 
 def test_a_chunk_mask_lets_a_frame_see_its_own_chunk_and_the_ones_before():
