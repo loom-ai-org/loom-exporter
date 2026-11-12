@@ -178,6 +178,14 @@ def _rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _swap_halves(x):
+    """`_rotate_half` without its negation, which the signed sine table carries instead (`LMPhase`):
+    `rotate_half(x) * sin == swap_halves(x) * [-sin_1, sin_2]` element for element, because the two are
+    the same products, `(-a) * s == a * (-s)` exactly. One kernel fewer per rotation (ADR-113)."""
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((x2, x1), dim=-1)
+
+
 def _repeat_kv(x, n_rep: int):
     """HF's `repeat_kv`, spelled as HF spells it -- the spelling `passes.py`'s GQA fusion recognises
     and strips, so the cache holds the checkpoint's 2 K/V heads and not 14 (voxcpm2_export's
@@ -199,21 +207,30 @@ class _Qwen2Layer(nn.Module):
     def __init__(self, layer, config):
         super().__init__()
         attn = layer.self_attn
-        self.q_proj, self.k_proj, self.v_proj, self.o_proj = attn.q_proj, attn.k_proj, attn.v_proj, attn.o_proj
+        self.o_proj = attn.o_proj
+        # q, k and v as ONE projection: the rows of the three weights stacked, so each output is the same
+        # dot product it was, and the output's heads are q's 14, then k's 2, then v's 2. Two kernels a
+        # layer instead of six, and q and k come out adjacent, so one rotation covers both (ADR-113).
+        self.qkv = nn.Linear(attn.q_proj.in_features,
+                             attn.q_proj.out_features + attn.k_proj.out_features + attn.v_proj.out_features)
+        with torch.no_grad():
+            self.qkv.weight.copy_(torch.cat([attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight]))
+            self.qkv.bias.copy_(torch.cat([attn.q_proj.bias, attn.k_proj.bias, attn.v_proj.bias]))
         self.heads, self.kv_heads = config.num_attention_heads, config.num_key_value_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.n_rep = self.heads // self.kv_heads
         self.input_layernorm, self.post_attention_layernorm = layer.input_layernorm, layer.post_attention_layernorm
         self.mlp = layer.mlp
 
-    def forward(self, x, cos, sin, mask):
+    def forward(self, x, cos, sin_signed, mask):
         b, s, _ = x.shape
         h = _rms_norm(self.input_layernorm, x)
-        q = self.q_proj(h).view(b, s, self.heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(h).view(b, s, self.kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(h).view(b, s, self.kv_heads, self.head_dim).transpose(1, 2)
-        q = q * cos + _rotate_half(q) * sin
-        k = k * cos + _rotate_half(k) * sin
+        qkv = self.qkv(h).view(b, s, self.heads + 2 * self.kv_heads, self.head_dim).transpose(1, 2)
+        n_qk = self.heads + self.kv_heads
+        qk, v = qkv[:, :n_qk], qkv[:, n_qk:]
+        # HF's `q * cos + rotate_half(q) * sin`, the same products, on q and k at once.
+        qk = qk * cos + _swap_halves(qk) * sin_signed
+        q, k = qk[:, :self.heads], qk[:, self.heads:]
         k, v = _repeat_kv(k, self.n_rep), _repeat_kv(v, self.n_rep)
         scores = torch.matmul(q * (1.0 / math.sqrt(self.head_dim)), k.transpose(-1, -2)) + mask
         ctx = torch.matmul(torch.softmax(scores, dim=-1), v)
@@ -247,14 +264,17 @@ class LMPhase(nn.Module):
         positions = torch.arange(LM_MAX_POSITIONS).view(1, -1)
         cos, sin = qwen.model.rotary_emb(torch.zeros(1, dtype=torch.float32), positions)
         self.register_buffer("cos_table", cos[0].detach().clone().float())   # (LM_MAX_POSITIONS, 64)
-        self.register_buffer("sin_table", sin[0].detach().clone().float())
+        # The sine with `rotate_half`'s negation moved onto its first half (`_swap_halves`).
+        sin = sin[0].detach().clone().float()
+        half = sin.shape[-1] // 2
+        self.register_buffer("sin_table", torch.cat([-sin[:, :half], sin[:, half:]], dim=-1))
 
     def forward(self, text_ids, speech_ids, speech_mask, position_ids, attention_mask):
         x = self.embed_tokens(text_ids) * (1.0 - speech_mask) + self.speech_embedding(speech_ids) * speech_mask
         cos = F.embedding(position_ids, self.cos_table).unsqueeze(1)          # (1, 1, n, 64)
-        sin = F.embedding(position_ids, self.sin_table).unsqueeze(1)
+        sin_signed = F.embedding(position_ids, self.sin_table).unsqueeze(1)
         for layer in self.layers:
-            x = layer(x, cos, sin, attention_mask)
+            x = layer(x, cos, sin_signed, attention_mask)
         return self.head(_rms_norm(self.norm, x)[:, -1:])
 
 
@@ -381,7 +401,19 @@ class EstimatorPhase(nn.Module):
         if dit.long_skip_connection is not None:
             raise NotImplementedError("this DiT has a long skip connection; CosyVoice3's does not")
 
-    def forward(self, x, mu, spks, cond, t, chunk_ids):                       # frame-major, (1,), (1, T)
+    def forward(self, x, mu, spks, cond, t, chunk_ids, cfg):                  # frame-major, (1,), (1, T), (1,)
+        """The GUIDED velocity, as `CausalConditionalCFM.solve_euler` computes it: ONE run over a batch of
+        two -- the conditioning, and the same state with mu, spks and cond zeroed -- combined as
+        `(1 + cfg) * v_cond - cfg * v_uncond`, in that order and in f32. The engine's ODE loop used to make
+        the two runs as two calls and combine them on the host in double; on an RTX 5090 that was 20
+        estimator calls a sentence, and the flow the largest GPU stage (ADR-113)."""
+        zeros = lambda v: v * 0.0                                             # noqa: E731 -- exact zeros
+        v = self._velocity(torch.cat([x, x], dim=0), torch.cat([mu, zeros(mu)], dim=0),
+                           torch.cat([spks, zeros(spks)], dim=0), torch.cat([cond, zeros(cond)], dim=0),
+                           t, chunk_ids)                                      # (2, T, 80)
+        return (1.0 + cfg) * v[:1] - cfg * v[1:]                              # (1, T, 80)
+
+    def _velocity(self, x, mu, spks, cond, t, chunk_ids):
         d = self.d
         time = d.time_embed(t)
         spk = torch.zeros_like(x) + spks.unsqueeze(1)
@@ -709,7 +741,8 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
                 dummy_inputs=(torch.randn(1, TRACE_FRAMES, N_MEL), torch.randn(1, TRACE_FRAMES, N_MEL),
                               torch.randn(1, N_MEL), torch.randn(1, TRACE_FRAMES, N_MEL),
                               torch.tensor([0.3]),
-                              torch.floor(torch.arange(TRACE_FRAMES, dtype=torch.float32) / 4).view(1, -1)),
+                              torch.floor(torch.arange(TRACE_FRAMES, dtype=torch.float32) / 4).view(1, -1),
+                              torch.tensor([0.7])),
                 mil_inputs=[
                     ct.TensorType(name="x", shape=(1, frame_dim, N_MEL), dtype=np.float32),
                     ct.TensorType(name="mu", shape=(1, frame_dim, N_MEL), dtype=np.float32),
@@ -717,6 +750,7 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
                     ct.TensorType(name="cond", shape=(1, frame_dim, N_MEL), dtype=np.float32),
                     ct.TensorType(name="t", shape=(1,), dtype=np.float32),
                     ct.TensorType(name="chunk_ids", shape=(1, frame_dim), dtype=np.float32),
+                    ct.TensorType(name="cfg", shape=(1,), dtype=np.float32),
                 ],
                 # `n_tokens`: `FlowMatchingSampler` binds its length under that name (Chatterbox's and
                 # F5-TTS's estimators are declared the same way).
@@ -746,17 +780,17 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
             estimator="estimator",
             carried_input="x",
             time_input="t",
-            fixed_inputs=["mu", "spks", "cond", "chunk_ids"],
+            fixed_inputs=["mu", "spks", "cond", "chunk_ids", "cfg"],
             # `1 - cos(pi/2 * t)` over a linspace: `CausalConditionalCFM.forward`'s cosine schedule.
             schedule="caller",
-            # `(1 + rate) * v_cond - rate * v_uncond`, the unconditional run seeing mu, spks and cond
-            # zeroed: `solve_euler`'s batch of two, ADR-040's form exactly.
-            guidance=True,
+            # Guidance is INSIDE the estimator (`EstimatorPhase.forward`): `solve_euler`'s batch of two and
+            # its `(1 + rate) * v_cond - rate * v_uncond`, one call per step with `cfg` an input.
+            guidance=False,
             # The reference's noise is a slice of one construction-time tensor; a waveform is only
             # reproducible from it, so a caller may hand it over.
             caller_noise=True,
-            note="Euler over CosyVoice3's DiT on the cosine schedule, under classifier-free\n"
-                 "guidance: the unconditional evaluation sees mu, spks and cond zeroed.",
+            note="Euler over CosyVoice3's DiT on the cosine schedule. Classifier-free guidance is\n"
+                 "inside the estimator: one batch of two per step, the second row's mu, spks and cond zeroed.",
         )]
 
     def driver_components(self) -> List:
@@ -805,8 +839,8 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
             LuaFragment(fragment / "02_flow_plan.lua",
                         reads=("speech_tokens",),
                         defines=("flow_tokens", "flow_embedding", "n_codes", "n_frames",
-                                 "n_prompt_frames", "n_gen_frames", "step_cond", "zero_cond",
-                                 "zero_spks", "times", "flow_cfg", "chunk_ids")),
+                                 "n_prompt_frames", "n_gen_frames", "step_cond", "times", "flow_cfg",
+                                 "chunk_ids")),
             SubgraphCallComponent(
                 topology="flow_encoder", outputs=(), retain=True, length=Var("n_codes"),
                 inputs={"tokens": Var("flow_tokens"), "embedding": Var("flow_embedding")},
@@ -818,10 +852,7 @@ class CosyVoice3ExportConfig(BaseMultiPhaseModelExportConfig):
                 n_steps=None, times=Var("times"),
                 step_inputs={"mu": OutputRef("flow_encoder", index=1),
                              "spks": OutputRef("flow_encoder", index=2),
-                             "cond": Var("step_cond"), "chunk_ids": Var("chunk_ids")},
-                uncond_inputs={"mu": Var("zero_cond"), "spks": Var("zero_spks"),
-                               "cond": Var("zero_cond"), "chunk_ids": Var("chunk_ids")},
-                guidance_scale=Var("flow_cfg"),
+                             "cond": Var("step_cond"), "chunk_ids": Var("chunk_ids"), "cfg": Var("flow_cfg")},
                 state=FieldAccess("inputs", "noise"),
                 note="--- The whole mel grid, in-filled after the voice's prompt frames. ---"),
             LuaFragment(fragment / "03_mel_tail.lua",

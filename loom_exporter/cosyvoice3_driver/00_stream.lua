@@ -171,7 +171,6 @@ local function cosyvoice3_flow(st, n_tokens, offset, finalize)
     for i = 1, n_frames * N_MEL do mu[i] = mu_all[i] end
     local cond = cosyvoice3_zeros(n_frames * N_MEL)
     for i = 1, #prompt_feat do cond[i] = prompt_feat[i] end
-    local zero = cosyvoice3_zeros(n_frames * N_MEL)
     -- The grid's noise: the caller's, or the stream's own, drawn frame-major as the grid first reaches
     -- each frame and kept, so every re-run starts from the same draw.
     local pinned = loom.state('noise')
@@ -189,11 +188,10 @@ local function cosyvoice3_flow(st, n_tokens, offset, finalize)
     end
     local ids = cosyvoice3_chunk_ids(n_frames, true)
     loom.run_ode_and_retain('estimator', {n_tokens = n_frames, n_past = 0},
-        {mu = mu, spks = {from = 'flow_encoder', index = 2}, cond = cond, chunk_ids = ids},
+        {mu = mu, spks = {from = 'flow_encoder', index = 2}, cond = cond, chunk_ids = ids,
+         cfg = {loom.state('flow_cfg')}},
         {carried = 'x', time = 't', method = 'euler', times = cosyvoice3_cosine_times(loom.state('n_steps')),
-         n_elems = n_frames * N_MEL, state = noise,
-         guidance = {scale = loom.state('flow_cfg'),
-                     inputs = {mu = zero, spks = cosyvoice3_zeros(N_MEL), cond = zero, chunk_ids = ids}}})
+         n_elems = n_frames * N_MEL, state = noise})
     local grid = loom.get_output('estimator', 1)
     local from = #prompt_feat + TOKEN_MEL_RATIO * offset * N_MEL
     local mel = {}
