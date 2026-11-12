@@ -12,58 +12,12 @@
 -- graph. `stream_finish` runs the rest of the clip, its windows padded with zeros as the one-pass front
 -- end pads them (`n_valid` says where the clip ends), so the stream ends on `infer`'s encoder rows.
 --
--- The decode is the template's greedy RNN-T loop, frame by frame; its emissions are final, so a feed
--- returns the ids its chunks completed. What it carries across calls is state: the last label, whether
--- the prediction network must run again, and each LSTM layer's h and c (`pred1`.., on the device).
+-- The decode is `00_stream_decode.lua`'s greedy RNN-T loop over each call's rows; its emissions are
+-- final, so a feed returns the ids its chunks completed.
 --
 -- State: `pcm`, the samples a later window still reads, from clip sample `pcm_start`; `received`;
 -- `chunk`, the next chunk; `prompt`, the language prompt id (`stream_open`'s `language`, else the
 -- checkpoint's default, `auto`).
-
-local function nemotron_decode(n_frames, out)
-    local last_label, stale, primed = loom.state('last_label'), loom.state('stale'), loom.state('primed')
-    local zeros = nil
-    for t = 0, n_frames - 1 do
-        local frame = {from = 'encoder_step', row = t, rows = 1}
-        local symbols = 0
-        while symbols < S_MAX_SYMBOLS_PER_STEP do
-            if stale == 1 then
-                loom.run_subgraph_and_retain('embed', {n_tokens = 0, n_past = 0}, {last_label = {last_label}})
-                local layer_input = {from = 'embed'}
-                for l = 1, S_N_PRED_LAYERS do
-                    local cell = 'pred_lstm_l' .. (l - 1) .. '_fwd'
-                    local h_prev, c_prev
-                    if primed == 1 then
-                        h_prev, c_prev = {state = 'pred' .. l, index = 1}, {state = 'pred' .. l, index = 2}
-                    else
-                        if zeros == nil then
-                            zeros = {}
-                            for i = 1, S_PRED_HIDDEN do zeros[i] = 0.0 end
-                        end
-                        h_prev, c_prev = zeros, zeros
-                    end
-                    loom.run_subgraph_and_retain(cell, {n_tokens = 0, n_past = 0},
-                                                  {layer_input = layer_input, h_prev = h_prev, c_prev = c_prev})
-                    loom.keep_state('pred' .. l, cell)
-                    layer_input = {from = cell, index = 1}
-                end
-                primed, stale = 1, 0
-            end
-            loom.run_subgraph_and_retain('joint', {n_tokens = 0, n_past = 0},
-                                          {encoder_frame = frame,
-                                           decoder_out = {state = 'pred' .. S_N_PRED_LAYERS, index = 1}})
-            local k = loom.argmax_row('joint', 0)
-            symbols = symbols + 1
-            -- A blank advances a frame; a symbol stays on it, at most S_MAX_SYMBOLS_PER_STEP times.
-            if k == S_BLANK_ID then break end
-            out[#out + 1] = k
-            last_label, stale = k, 1
-        end
-    end
-    loom.set_state('last_label', last_label)
-    loom.set_state('stale', stale)
-    loom.set_state('primed', primed)
-end
 
 local function nemotron_encode(window, frame0, n_valid, out)
     local shift = 1
@@ -79,7 +33,7 @@ local function nemotron_encode(window, frame0, n_valid, out)
     loom.run_subgraph_and_retain('encoder_step', {n_samples = #window, n_tokens = 0, n_past = 0}, inputs)
     loom.keep_state('enc', 'encoder_step')
     loom.set_state('encoded', 1)
-    nemotron_decode(loom.output_shape('encoder_step', 1)[2], out)
+    transducer_stream_decode('encoder_step', 0, loom.output_shape('encoder_step', 1)[2], out)
 end
 
 -- Clip samples [a, a + n) of the pending audio; past what has arrived they are zeros.
@@ -106,9 +60,7 @@ function stream_open(inputs)
     loom.set_state('chunk', 0)
     loom.set_state('encoded', 0)
     loom.set_state('prompt', inputs.language or S_DEFAULT_PROMPT)
-    loom.set_state('last_label', S_BLANK_ID)
-    loom.set_state('stale', 1)
-    loom.set_state('primed', 0)
+    transducer_stream_open()
     return {}
 end
 
