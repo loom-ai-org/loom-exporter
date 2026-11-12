@@ -292,6 +292,9 @@ DETOK_UPSAMPLE = 6
 DETOK_WINDOW = 30
 # The ISTFT: n_fft 1280, hop 320, "same" padding -- (1280 - 320) // 2 trimmed at each end.
 ISTFT_N_FFT, ISTFT_HOP = 1280, 320
+DETOK_TRIM = (ISTFT_N_FFT - ISTFT_HOP) // 2
+# A stream's pieces grow 1, 2, 4, 8 frames (80 ms to 640 ms), then stay at this many (loom.cpp ADR-115).
+PIECE_FRAMES_GROWN = 8
 
 TRACE_FRAMES = 7
 
@@ -465,6 +468,20 @@ class DetokenizerPhase(nn.Module):
         return wave[:, self.trim:-self.trim]
 
 
+def detokenizer_context_rows(cfg: dict) -> int:
+    """How many rows before row r the detokenizer's backbone reads to make row r: every layer is causal,
+    a short convolution reading `conv_L_cache - 1` rows back and a windowed attention `sliding_window - 1`,
+    and the reaches add up through the stack. A window of rows starting this many before the first row
+    a sample needs computes that sample as one call over every row does; the window's own start (zero
+    conv padding, keys missing) spoils exactly the rows before it. 5 x 2 + 3 x 29 = 97 for LFM2.5-Audio."""
+    reach = {"conv": int(cfg["conv_L_cache"]) - 1,
+             "sliding_attention": int(cfg["sliding_window"]) - 1}
+    try:
+        return sum(reach[t] for t in cfg["layer_types"])
+    except KeyError as e:
+        raise NotImplementedError(f"detokenizer layer type {e}: its receptive field is not known here") from None
+
+
 def load_detokenizer(model_dir: str) -> DetokenizerPhase:
     from safetensors.torch import load_file
     from transformers import Lfm2Config, Lfm2Model
@@ -541,7 +558,9 @@ class Lfm25AudioTtsExportConfig(BaseMultiPhaseModelExportConfig):
         depth = DepthPhase(w, int(cfg["depthformer"]["layers"]), int(cfg["depthformer"]["dim"])).eval()
         if int(cfg["codebooks"]) != N_CODEBOOKS:
             raise NotImplementedError(f"{cfg['codebooks']} codebooks; the driver draws {N_CODEBOOKS}")
-        self._facts = dict(tts_prompt_ids(self.model_dir), hidden=int(lfm.config.hidden_size))
+        detok_cfg = json.loads((Path(self.model_dir) / "audio_detokenizer" / "config.json").read_text())
+        self._facts = dict(tts_prompt_ids(self.model_dir), hidden=int(lfm.config.hidden_size),
+                           detok_context_rows=detokenizer_context_rows(detok_cfg))
         hidden = self._facts["hidden"]
         token_axis = ct.RangeDim(1, MAX_SEQ_LEN)
         # The detokenizer's rows: every frame six times (the driver repeats them), one axis for both inputs.
@@ -608,12 +627,18 @@ class Lfm25AudioTtsExportConfig(BaseMultiPhaseModelExportConfig):
             "END_OF_AUDIO": END_OF_AUDIO, "N_CODEBOOKS": N_CODEBOOKS,
             "DETOK_UPSAMPLE": DETOK_UPSAMPLE, "MAX_NEW_TOKENS": TTS_MAX_NEW_TOKENS, "MAX_SEQ_LEN": MAX_SEQ_LEN,
             "DEFAULT_TEMPERATURE": TTS_AUDIO_TEMPERATURE, "DEFAULT_TOP_K": TTS_AUDIO_TOP_K,
+            # The live cut (loom.cpp ADR-115): a window's left context, and the samples held back.
+            "DETOK_CONTEXT_ROWS": f.get("detok_context_rows", 97), "DETOK_TRIM": DETOK_TRIM,
+            "ISTFT_N_FFT": ISTFT_N_FFT, "ISTFT_HOP": ISTFT_HOP, "PIECE_FRAMES_GROWN": PIECE_FRAMES_GROWN,
         }
         return [
-            ExportConstants(values=constants),
+            # Top level: the stream functions read them.
+            ExportConstants(values=constants, top_level=True),
             DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
-            LuaFragment(self.driver_script_path / "02_speak.lua",
-                        reads=("tokens",) + tuple(constants), defines=("wave",)),
+            # The live door (loom.cpp ADR-100, ADR-115): a few frames, or the whole turn, per `stream_feed`.
+            LuaFragment(self.driver_script_path / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
+            LuaFragment(self.driver_script_path / "02_speak.lua", reads=("tokens",), defines=("wave",)),
             DriverReturn(values=("wave",)),
         ]
 
