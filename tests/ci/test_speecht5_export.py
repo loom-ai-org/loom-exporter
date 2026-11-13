@@ -271,6 +271,102 @@ def test_the_traced_lengths_do_not_reach_the_graph(checkpoint, tmp_path, monkeyp
         assert json.dumps(first[name], sort_keys=True) == json.dumps(second[name], sort_keys=True), name
 
 
+def test_the_export_binds_the_stream_and_its_margins(exported, checkpoint):
+    """The live door (loom.cpp ADR-119): the stream functions are in the driver, and the margins it reads
+    are the tiny checkpoint's own receptive field, not the published model's 34."""
+    from loom_exporter.speecht5_export import mel_context_frames
+
+    model, vocoder = _tiny_models()
+    left, right = mel_context_frames(model.speech_decoder_postnet.layers, vocoder)
+    script = exported["fields"]["model.driver_script"].contents()
+    for fn in ("stream_open", "stream_feed", "stream_finish"):
+        assert f"function {fn}(" in script, fn
+    assert f"local MEL_LEFT_FRAMES = {left}\n" in script
+    assert f"local MEL_RIGHT_FRAMES = {right}\n" in script
+    assert "local HOP_LENGTH = 4\n" in script          # the tiny vocoder's two x2 upsamplers
+
+
+# -- the stream's margins (loom.cpp ADR-119) ------------------------------------------------------
+
+def _published_shape(channels: int = 8):
+    """A postnet and a HiFi-GAN shaped as the published pair -- five kernel-5 postnet convolutions,
+    upsamplers x4 (kernel 8) four times, residual kernels 3/7/11 at dilations 1/3/5 -- with few channels,
+    random weights, at float64."""
+    from transformers import SpeechT5Config, SpeechT5ForTextToSpeech, SpeechT5HifiGan, SpeechT5HifiGanConfig
+
+    torch.manual_seed(0)
+    config = SpeechT5Config(
+        vocab_size=81, hidden_size=16, encoder_layers=1, decoder_layers=1, encoder_attention_heads=2,
+        decoder_attention_heads=2, encoder_ffn_dim=32, decoder_ffn_dim=32, num_mel_bins=8,
+        speech_decoder_prenet_units=8, speech_decoder_postnet_units=channels, speech_decoder_postnet_layers=5,
+        speech_decoder_postnet_kernel=5, speaker_embedding_dim=SPEAKER_DIM, max_text_positions=32,
+        max_speech_positions=64, reduction_factor=2)
+    postnet = SpeechT5ForTextToSpeech(config).speech_decoder_postnet.double().eval()
+    vocoder = SpeechT5HifiGan(SpeechT5HifiGanConfig(model_in_dim=8, upsample_initial_channel=4 * channels)) \
+        .double().eval()
+    return postnet, vocoder
+
+
+def test_the_margins_are_the_structural_reach():
+    """`mel_context_frames` walks the layers; a NaN in one frame marks every sample that reads it,
+    whatever the weights. The samples of frame t must read frames `t - left` and `t + right` and nothing
+    beyond. A VALUE probe would not do: real speech moves a sample through the far taps by ~1e-13."""
+    from loom_exporter.speecht5_export import mel_context_frames
+
+    postnet, vocoder = _published_shape()
+    left, right = mel_context_frames(postnet.layers, vocoder)
+    assert (left, right) == (34, 34)
+    n, j, hop = 120, 60, 256
+    spec = torch.randn(1, n, 8, dtype=torch.float64)
+    spec[0, j] = float("nan")
+    with torch.no_grad():
+        wave = vocoder(postnet.postnet(spec))[0]
+    frames = torch.isnan(wave.view(n, hop)).any(dim=1).nonzero().flatten().tolist()
+    # Frame j's NaN reaches frames t whose window holds j: t - left <= j <= t + right.
+    assert frames == list(range(j - right, j + left + 1)), (frames[0], frames[-1])
+
+
+def test_windows_with_the_margins_are_the_one_call_samples():
+    """At f64, frames `[e, f)` decoded from `[e - left, f + right)` are the one-call samples, the windows
+    the stream cuts included: from the start, mid-way, and to the end."""
+    from loom_exporter.speecht5_export import mel_context_frames
+
+    postnet, vocoder = _published_shape()
+    left, right = mel_context_frames(postnet.layers, vocoder)
+    n, hop = 140, 256
+    spec = torch.randn(1, n, 8, dtype=torch.float64)
+
+    def decode(a, b):
+        with torch.no_grad():
+            return vocoder(postnet.postnet(spec[:, a:b]))[0]
+
+    whole = decode(0, n)
+    worst = 0.0
+    for e, f in [(0, 2), (2, 6), (40, 41), (50, 90), (100, n)]:
+        a, b = max(0, e - left), min(n, f + right)
+        got = decode(a, b)[(e - a) * hop:(f - a) * hop]
+        worst = max(worst, (got - whole[e * hop:f * hop]).abs().max().item())
+    assert worst < 1e-12 * whole.abs().max().item(), worst
+
+
+def test_the_reach_walk_reads_the_layers_not_a_table():
+    """Another vocoder shape gives another reach, and the NaN probe agrees with it: the walk reads
+    kernel, stride, padding and dilation off each layer."""
+    from loom_exporter.speecht5_export import mel_context_frames
+
+    model, vocoder = _tiny_models()
+    model, vocoder = model.double(), vocoder.double()
+    left, right = mel_context_frames(model.speech_decoder_postnet.layers, vocoder)
+    n, j, hop = 60, 30, 4
+    spec = torch.randn(1, n, 8, dtype=torch.float64)
+    spec[0, j] = float("nan")
+    with torch.no_grad():
+        wave = vocoder(model.speech_decoder_postnet.postnet(spec))[0]
+    frames = torch.isnan(wave.view(n, hop)).any(dim=1).nonzero().flatten().tolist()
+    assert frames == list(range(j - right, j + left + 1)), (left, right, frames[0], frames[-1])
+    assert (left, right) != (34, 34)
+
+
 # -- voice files (loom.cpp ADR-045, ADR-058) --------------------------------------------------------
 
 def test_the_seven_speakers_become_voice_files_the_model_accepts(checkpoint, tmp_path):
