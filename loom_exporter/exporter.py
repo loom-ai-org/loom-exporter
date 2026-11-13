@@ -1844,6 +1844,8 @@ class LoomGGUFExporter:
             call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr,
                                  retained=False),
             epilogue=DriverReturn(values=("_mono_out",)),
+            # A frame model's live door, when the family measured one (loom.cpp ADR-120).
+            stream=tuple(self.kwargs.get("stream_components") or ()),
         ).build(self._driver_context())
 
     def apply_token_labels_export(self, bindings, input_names, n_tokens_expr):

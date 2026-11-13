@@ -1351,6 +1351,10 @@ class CodecDecodeBuilder(DriverBuilder):
     # Only the chunked path has a library call (`array_slice`); the single-call leaves emit none, so
     # their drivers do not move.
     library: Optional["LuaLibrary"] = None
+    # A live door beside `infer` (loom.cpp ADR-120): top-level constants and the fragment defining
+    # `stream_open` / `stream_feed` / `stream_finish` (`frame_window_stream.stream_components`). Empty for
+    # every leaf without one, so their drivers do not move.
+    stream: Tuple[object, ...] = ()
 
     __links__ = {name: NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN)
                  for name in ("inputs", "call", "epilogue")}
@@ -1361,10 +1365,14 @@ class CodecDecodeBuilder(DriverBuilder):
             "every name it declares against loom_exporter/lua/. Declared separately only because it "
             "is optional."
         ),
+        "stream": CoveredBy(
+            "the same: each is a component DriverBuilder.build registers with the export's checker, and "
+            "LuaFragment checks its calls against the traced topology. Optional, hence not a NestedSpec."
+        ),
     }
 
     def components(self):
-        return [c for c in (self.inputs, self.library, self.call, self.epilogue) if c is not None]
+        return [c for c in (*self.stream, self.inputs, self.library, self.call, self.epilogue) if c is not None]
 
 
 @dataclass
