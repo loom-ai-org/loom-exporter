@@ -203,16 +203,98 @@ def _config(tmp_path):
                                   model_dir=str(_release(tmp_path)))
 
 
-def test_the_sampler_declares_guidance_a_caller_schedule_and_caller_noise(tmp_path):
+DRIVER = Path(__file__).resolve().parents[2] / "loom_exporter" / "chatterbox_driver"
+
+
+def test_the_flow_runs_guided_on_the_callers_schedule_and_noise():
     """Unguided, S3Gen integrates a velocity field it was not trained to; on a uniform schedule it
-    spends its ten steps in the wrong places; and without caller noise nothing can be compared."""
-    spec, = _config(tmp_path).samplers()
-    assert spec.guidance is True
-    assert spec.schedule == "caller"
-    assert spec.caller_noise is True
-    assert spec.method == "euler"
-    assert spec.carried_input == "x"
-    assert spec.fixed_inputs == ["mu", "spks", "cond"]
+    spends its ten steps in the wrong places; and without the driver's own noise nothing can be compared
+    or re-run. The ODE call is hand-written in the stream (ADR-117), so its declaration is read there."""
+    lua = (DRIVER / "00_stream.lua").read_text()
+    assert "loom.run_ode_and_retain('estimator'" in lua
+    assert "{carried = 'x', time = 't', method = 'euler', times = chatterbox_cosine_times(" in lua
+    assert "n_elems = n_frames * N_MEL, state = noise," in lua
+    assert "guidance = {scale = loom.state('flow_cfg'),\n" \
+           "                     inputs = {mu = zeros, spks = chatterbox_zeros(N_MEL), cond = zeros}}" in lua
+
+
+def test_one_pass_is_the_stream_run_in_one_hop():
+    """`infer` opens the stream with `piece_tokens = 0` and feeds it to its end, so the one-pass gate
+    grades the live path's code (ADR-100)."""
+    lua = (DRIVER / "01_generate.lua").read_text()
+    assert "if inputs.piece_tokens == nil then inputs.piece_tokens = 0 end" in lua
+    assert "stream_open(inputs)" in lua and "stream_feed({})" in lua
+    assert sorted(p.name for p in DRIVER.glob("*.lua")) == ["00_header.lua", "00_stream.lua", "01_generate.lua"]
+
+
+def test_the_stream_cut_is_cosyvoice2_models_own():
+    """S3Gen kept CosyVoice2's flow and its `finalize` hook but no loop around it; the stream's hop, its
+    growth and ceiling are `CosyVoice2Model`'s, read off its source (without importing it)."""
+    from loom_exporter.chatterbox_export import STREAM_HOP_SCALE, STREAM_HOP_TOKENS, STREAM_MAX_HOP_TOKENS
+
+    model_py = Path("/home/flavio/Dev/CosyVoice/cosyvoice/cli/model.py")
+    if not model_py.is_file():
+        pytest.skip("no CosyVoice checkout to read CosyVoice2Model from")
+    src = model_py.read_text()
+    src = src[src.index("class CosyVoice2Model"):]
+    src = src[:src.index("\nclass ")]
+    assert f"self.token_hop_len = {STREAM_HOP_TOKENS}" in src
+    assert "self.token_max_hop_len = 4 * self.token_hop_len" in src
+    assert STREAM_MAX_HOP_TOKENS == 4 * STREAM_HOP_TOKENS
+    assert f"self.stream_scale_factor = {STREAM_HOP_SCALE}" in src
+
+
+def _random_vocoder():
+    """A `HiftVocoderPhase` over S3Gen's HiFT layout with random weights, at f64."""
+    if not CHATTERBOX_SRC.is_dir():
+        pytest.skip("no Chatterbox checkout to build HiFT from")
+    import torch
+    from loom_exporter.chatterbox_export import HiftVocoderPhase, import_chatterbox
+
+    import_chatterbox()
+    from chatterbox.models.s3gen.f0_predictor import ConvRNNF0Predictor
+    from chatterbox.models.s3gen.hifigan import HiFTGenerator
+
+    torch.manual_seed(0)
+    hift = HiFTGenerator(sampling_rate=24000, upsample_rates=[8, 5, 3], upsample_kernel_sizes=[16, 11, 7],
+                         source_resblock_kernel_sizes=[7, 7, 11],
+                         source_resblock_dilation_sizes=[[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+                         f0_predictor=ConvRNNF0Predictor())
+    n_trim = 480
+    fade = torch.zeros(2 * n_trim)
+    fade[n_trim:] = (torch.cos(torch.linspace(torch.pi, 0, n_trim)) + 1) / 2
+    return HiftVocoderPhase(hift, fade).eval().double()
+
+
+def test_the_vocoder_holds_back_exactly_its_reach():
+    """The stream re-runs HiFT over every frame so far and hands out all but the last
+    `vocoder_right_frames` frames' samples. At f64 on a random HiFT, those samples over a mel cut at
+    `m` frames are the samples over the whole mel bit for bit; one frame fewer held back and they are not.
+
+    The F0 predictor's bias is raised so the source is VOICED: with random weights F0 sits under the 10 Hz
+    threshold, the sine source ignores it, and the F0 path's reach (its convolutions, then the source's
+    STFT) never shows -- the reach then measures ~13 frames, not 19.2."""
+    import torch
+    from loom_exporter.chatterbox_export import vocoder_right_frames
+
+    voc = _random_vocoder()
+    with torch.no_grad():
+        voc.h.f0_predictor.classifier.bias.fill_(150.0)
+    right = vocoder_right_frames(voc)
+    assert right == 20      # 9,240 samples, 19.25 frames
+    torch.manual_seed(1)
+    n, m = 72, 44
+    mel = torch.randn(1, n, 80, dtype=torch.float64) - 4.0
+    phase = torch.rand(1, voc.harmonics, 1, dtype=torch.float64)
+    noise = torch.randn(1, voc.harmonics, n * 480, dtype=torch.float64)
+    with torch.no_grad():
+        whole = voc(mel, phase, noise)[0]
+        cut = voc(mel[:, :m], phase, noise[:, :, :m * 480])[0]
+    assert float(whole[:m * 480].abs().max()) > 1e-3
+    settled = (m - right) * 480
+    assert bool((cut[:settled] == whole[:settled]).all())
+    # 9,232 samples back is the first that moves (by ~1e-16): inside the 20th frame, past the 19th.
+    assert not bool((cut[:settled + 480] == whole[:settled + 480]).all())
 
 
 def test_the_contract_declares_a_text_door(tmp_path):

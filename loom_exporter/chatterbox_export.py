@@ -10,8 +10,13 @@ Chatterbox is two models in sequence:
 EXPORT-ROADMAP's correction 4 says families 9 and 10 are two stages of one pipeline for most of the
 remaining TTS leaves, and this is the first of them here. Neither half needed a new template: T3 is
 family 10's shape (a KV-cached decoder, a private second stream for guidance, a hand-written loop --
-`dia_export`, `qwen3_tts_export`), and S3Gen is family 9's (`FlowMatchingSpec` with F5-TTS's caller
-schedule, guidance and caller noise). What is new is only that they share one GGUF and one driver.
+`dia_export`, `qwen3_tts_export`), and S3Gen is family 9's (F5-TTS's caller schedule, guidance and
+caller noise on `loom.run_ode`). What is new is only that they share one GGUF and one driver.
+
+The driver is the live stream (`chatterbox_driver/00_stream.lua`, loom.cpp ADR-117): T3 a token per step,
+the flow re-run over every token so far each hop with CosyVoice2's `finalize=False` look-ahead, HiFT re-run
+over all the mel with its last `vocoder_right_frames` frames' samples held back. `infer` runs it to its
+end in one hop, which is the one pass.
 
 Six phases:
   - `t3_prefill_embed`: the voice conditioning (speaker vector, 150 prompt speech tokens through the
@@ -46,6 +51,7 @@ tokenizer, CAMPPlus) and is not in this export.
 Usage:
   loom-export ~/Dev/models/chatterbox -o chatterbox.gguf --task text-to-speech --model chatterbox
 """
+import copy
 import importlib.metadata as _metadata
 import sys
 import types
@@ -60,7 +66,6 @@ import torch.nn.functional as F
 
 from .decomposition import Decomposition, MultiPhase
 from .export_config import LoomExportConfig
-from .flow_matching_export import FlowMatchingSpec
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .spec_protocol import Axis, Unchecked
 
@@ -103,6 +108,14 @@ T3_MAX_POSITIONS = 2048
 N_BOS_ROWS = 2
 # Rows ahead of the text in the prefill: speaker (1) + perceiver queries (32) + emotion (1).
 N_COND_ROWS = 34
+
+# The live stream's hop in speech tokens (loom.cpp ADR-117): CosyVoice2Model's, whose flow and `finalize`
+# hook S3Gen kept -- 25 tokens (1 s), doubling up to 100. CosyVoice2's first hop also pads the prompt and
+# itself onto a 25-token boundary, which aligns them with the chunk mask its flow was trained with; S3Gen
+# attends over everything (`static_chunk_size` 0), so the pad would only delay the first piece.
+STREAM_HOP_TOKENS = 25
+STREAM_MAX_HOP_TOKENS = 100
+STREAM_HOP_SCALE = 2
 
 # The trace lengths. Odd and distinct from every static dimension in the graphs, so no fusion can
 # confuse a sequence axis with a head or channel axis (the Qwen3-TTS lesson about length 8).
@@ -453,6 +466,37 @@ class HiftVocoderPhase(nn.Module):
         return torch.cat([wave[:, :n_fade] * self.trim_fade, wave[:, n_fade:]], dim=1)
 
 
+def vocoder_right_frames(vocoder: nn.Module, n_frames: int = 64, cut: int = 40) -> int:
+    """How many mel frames at the end of a mel the vocoder's samples still read: `vocoder` (a
+    `HiftVocoderPhase`) over `n_frames` frames whose frames from `cut` on are NaN, and the first NaN
+    sample. NaN passes through every operation here whatever the weights and the values (a conv, the
+    activations, the clamps, the voicing threshold, `exp`, the source's cumsum, the iSTFT's overlap-add),
+    so this is the graph's STRUCTURAL reach: a sample before it reads no frame at or after `cut`, so it is
+    the same over a mel cut there as over the whole. HiFT is not causal (`conv_pre`, the F0 predictor's
+    five convolutions, the resblocks' dilations and the source's STFT all look right), and its reach is
+    not a whole number of frames, so this counts it rather than summing it.
+
+    Not a value probe (two mels differing in the tail, the first sample that moves): that is the data's
+    reach, not the graph's. Unvoiced (F0 under the 10 Hz threshold) the source does not depend on F0 and
+    the reach falls to ~13 frames; on a voiced sentence the samples 14 to 19 frames back move by 1e-15 to
+    1e-13, which a value probe at any threshold misses.
+    """
+    mel = torch.zeros(1, n_frames, N_MEL, dtype=torch.float64)
+    mel[:, cut:] = float("nan")
+    harmonics = vocoder.harmonics
+    wrapper = copy.deepcopy(vocoder).double()
+    with torch.no_grad():
+        wave = wrapper(mel, torch.zeros(1, harmonics, 1, dtype=torch.float64),
+                       torch.zeros(1, harmonics, n_frames * SAMPLES_PER_FRAME, dtype=torch.float64))
+    nan = torch.isnan(wave[0]).nonzero()
+    if nan.numel() == 0:
+        raise ValueError("the vocoder's output reads no frame at its end: no NaN reached it")
+    first = int(nan[0])
+    if not 0 < first <= cut * SAMPLES_PER_FRAME:
+        raise ValueError(f"the vocoder's first NaN sample is {first}, outside (0, {cut * SAMPLES_PER_FRAME}]")
+    return -(-(cut * SAMPLES_PER_FRAME - first) // SAMPLES_PER_FRAME)
+
+
 def causal_mask(seq_len: int) -> torch.Tensor:
     """A 4-D additive causal mask, the form `create_causal_mask` passes straight through (see
     `dia_export.causal_mask`, whose reason this is)."""
@@ -488,6 +532,7 @@ class ChatterboxExportConfig(BaseMultiPhaseModelExportConfig):
     driver_script_path: Path = Path(__file__).resolve().parent / "chatterbox_driver"
     _voice: Optional[Dict[str, np.ndarray]] = field(default=None, init=False, repr=False)
     _trim_fade_len: int = field(default=0, init=False, repr=False)
+    _stream: Optional[tuple] = field(default=None, init=False, repr=False)
 
     __links__ = {"root_axis": Axis()}
     __unchecked__ = {
@@ -501,6 +546,8 @@ class ChatterboxExportConfig(BaseMultiPhaseModelExportConfig):
         "_voice": Unchecked(
             "READ off `conds.pt` during phases(); shipped as driver weights and shape-checked there"),
         "_trim_fade_len": Unchecked("read off S3Gen's own `trim_fade` buffer during phases()"),
+        "_stream": Unchecked("the flow's look-ahead in tokens and the vocoder's right reach in frames, read "
+                             "off the modules in phases()"),
     }
 
     def phases(self) -> List[ExportPhase]:
@@ -527,6 +574,12 @@ class ChatterboxExportConfig(BaseMultiPhaseModelExportConfig):
         frame_dim = ct.RangeDim(8, 2 * t3.hp.max_speech_tokens)
         gen_dim = ct.RangeDim(2, 2 * t3.hp.max_speech_tokens)
         harmonics = s3.mel2wav.m_source.l_sin_gen.harmonic_num + 1
+        vocoder = HiftVocoderPhase(s3.mel2wav, s3.trim_fade).eval()
+        if s3.flow.decoder.estimator.static_chunk_size != 0:
+            raise NotImplementedError(
+                f"this S3Gen's U-Net attends in chunks of {s3.flow.decoder.estimator.static_chunk_size} "
+                f"frames; the export runs it with full attention, which is what the English checkpoint does")
+        self._stream = (s3.flow.pre_lookahead_len, vocoder_right_frames(vocoder))
         return [
             ExportPhase(
                 name="t3_prefill_embed",
@@ -603,7 +656,7 @@ class ChatterboxExportConfig(BaseMultiPhaseModelExportConfig):
             ),
             ExportPhase(
                 name="vocoder",
-                wrapper=HiftVocoderPhase(s3.mel2wav, s3.trim_fade).eval(),
+                wrapper=vocoder,
                 dummy_inputs=(torch.randn(1, TRACE_FRAMES, N_MEL),
                               torch.rand(1, harmonics, 1),
                               torch.randn(1, harmonics, TRACE_FRAMES * SAMPLES_PER_FRAME)),
@@ -641,99 +694,48 @@ class ChatterboxExportConfig(BaseMultiPhaseModelExportConfig):
                 f"S3Gen in-fills after the prompt's frames and needs exactly {TOKEN_MEL_RATIO} per "
                 f"token, which is what `S3Token2Mel.embed_ref` trims a reference to.")
 
-    def samplers(self) -> List[FlowMatchingSpec]:
-        return [FlowMatchingSpec(
-            func_name="sample_estimator",
-            estimator="estimator",
-            carried_input="x",
-            time_input="t",
-            fixed_inputs=["mu", "spks", "cond"],
-            # `1 - cos(pi/2 * t)` over a linspace -- `CausalConditionalCFM.forward`'s cosine schedule.
-            schedule="caller",
-            # `(1 + rate) * v_cond - rate * v_uncond` with the unconditional run seeing mu, spks and
-            # cond all zeroed: `solve_euler`'s own batch-of-two, which is ADR-040's form exactly.
-            guidance=True,
-            # See `HiftVocoderPhase`: a reference waveform is only reproducible from its own draws.
-            caller_noise=True,
-            note="Euler over S3Gen's causal U-Net on the cosine schedule, under classifier-free\n"
-                 "guidance: the unconditional evaluation sees mu, spks and cond zeroed.",
-        )]
-
     def driver_components(self) -> List:
-        from .driver_components import (
-            CALLER, DriverInputs, DriverReturn, ExportConstants, FlowMatchingSampler, LuaFragment,
-            SubgraphCallComponent,
-        )
-        from .driver_ir import BinOp, FieldAccess, Len, OutputRef, Var
+        from .driver_components import CALLER, DriverInputs, DriverReturn, ExportConstants, LuaFragment
+        from .driver_ir import Len
 
         fragment = self.driver_script_path
-        n_frames, n_gen = Var("n_frames"), Var("n_gen_frames")
+        look, right = self._stream if self._stream else (0, 0)
+        constants = {
+            "START_TEXT": START_TEXT, "STOP_TEXT": STOP_TEXT,
+            "START_SPEECH": START_SPEECH, "STOP_SPEECH": STOP_SPEECH,
+            "SPEECH_VOCAB": SPEECH_VOCAB,
+            "N_COND_ROWS": N_COND_ROWS, "N_BOS_ROWS": N_BOS_ROWS,
+            "T3_MAX_POSITIONS": T3_MAX_POSITIONS,
+            "TOKEN_MEL_RATIO": TOKEN_MEL_RATIO, "N_MEL": N_MEL,
+            "SAMPLES_PER_FRAME": SAMPLES_PER_FRAME,
+            "NSF_HARMONICS": 9,
+            "FLOW_STEPS": FLOW_STEPS, "FLOW_CFG_RATE": FLOW_CFG_RATE,
+            # `ChatterboxTTS.generate`'s own defaults: the numbers every published sample used.
+            "DEFAULT_CFG_WEIGHT": DEFAULT_CFG_WEIGHT,
+            "DEFAULT_TEMPERATURE": DEFAULT_TEMPERATURE,
+            "DEFAULT_MIN_P": DEFAULT_MIN_P,
+            "DEFAULT_TOP_P": DEFAULT_TOP_P,
+            "DEFAULT_REPETITION_PENALTY": DEFAULT_REPETITION_PENALTY,
+            "DEFAULT_EXAGGERATION": DEFAULT_EXAGGERATION,
+            "DEFAULT_MAX_NEW_TOKENS": DEFAULT_MAX_NEW_TOKENS,
+            # The live stream's cut (ADR-117): the hop, its growth and ceiling; the flow's look-ahead
+            # context; and the frames at the end of the mel the vocoder's samples still read.
+            "STREAM_HOP_TOKENS": STREAM_HOP_TOKENS, "STREAM_MAX_HOP_TOKENS": STREAM_MAX_HOP_TOKENS,
+            "STREAM_HOP_SCALE": STREAM_HOP_SCALE,
+            "LOOKAHEAD_TOKENS": look, "VOCODER_RIGHT_FRAMES": right,
+        }
         return [
             LuaFragment(fragment / "00_header.lua", top_level=True,
                         defines=("chatterbox_voice", "chatterbox_cosine_times", "chatterbox_zeros")),
-            ExportConstants(values={
-                "START_TEXT": START_TEXT, "STOP_TEXT": STOP_TEXT,
-                "START_SPEECH": START_SPEECH, "STOP_SPEECH": STOP_SPEECH,
-                "SPEECH_VOCAB": SPEECH_VOCAB,
-                "N_COND_ROWS": N_COND_ROWS, "N_BOS_ROWS": N_BOS_ROWS,
-                "T3_MAX_POSITIONS": T3_MAX_POSITIONS,
-                "TOKEN_MEL_RATIO": TOKEN_MEL_RATIO, "N_MEL": N_MEL,
-                "SAMPLES_PER_FRAME": SAMPLES_PER_FRAME,
-                "NSF_HARMONICS": 9,
-                "FLOW_STEPS": FLOW_STEPS, "FLOW_CFG_RATE": FLOW_CFG_RATE,
-                # `ChatterboxTTS.generate`'s own defaults: the numbers every published sample used.
-                "DEFAULT_CFG_WEIGHT": DEFAULT_CFG_WEIGHT,
-                "DEFAULT_TEMPERATURE": DEFAULT_TEMPERATURE,
-                "DEFAULT_MIN_P": DEFAULT_MIN_P,
-                "DEFAULT_TOP_P": DEFAULT_TOP_P,
-                "DEFAULT_REPETITION_PENALTY": DEFAULT_REPETITION_PENALTY,
-                "DEFAULT_EXAGGERATION": DEFAULT_EXAGGERATION,
-                "DEFAULT_MAX_NEW_TOKENS": DEFAULT_MAX_NEW_TOKENS,
-            }),
-            # The text's ids are the one required input; every other `inputs.*` the fragments read
-            # (the voice, the sampling knobs, the draws) is optional and defaulted in place.
+            ExportConstants(values=constants, top_level=True),
+            # T3's loop, the flow's re-run and HiFT's settled samples: the live stream, which `infer` runs
+            # to its end in one call.
+            LuaFragment(fragment / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
+            # The text's ids are the one required input; every other `inputs.*` the stream reads (the
+            # voice, the sampling knobs, the draws) is optional and defaulted in place.
             DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
-            LuaFragment(fragment / "01_t3.lua",
-                        reads=("tokens", "START_TEXT", "STOP_TEXT", "START_SPEECH",
-                               "STOP_SPEECH", "SPEECH_VOCAB", "N_COND_ROWS", "N_BOS_ROWS",
-                               "T3_MAX_POSITIONS", "DEFAULT_CFG_WEIGHT", "DEFAULT_TEMPERATURE",
-                               "DEFAULT_MIN_P", "DEFAULT_TOP_P", "DEFAULT_REPETITION_PENALTY",
-                               "DEFAULT_EXAGGERATION", "DEFAULT_MAX_NEW_TOKENS"),
-                        defines=("speech_tokens",)),
-            LuaFragment(fragment / "02_flow_plan.lua",
-                        reads=("speech_tokens", "TOKEN_MEL_RATIO", "N_MEL", "FLOW_STEPS",
-                               "FLOW_CFG_RATE"),
-                        defines=("flow_tokens", "flow_embedding", "n_codes", "n_frames",
-                                 "n_prompt_frames", "n_gen_frames", "step_cond", "zero_cond",
-                                 "zero_spks", "times", "flow_cfg")),
-            SubgraphCallComponent(
-                topology="flow_encoder", outputs=(), retain=True, length=Var("n_codes"),
-                inputs={"tokens": Var("flow_tokens"), "embedding": Var("flow_embedding")},
-                note="--- mu (frame-major) and the projected speaker vector, both RETAINED: the\n"
-                     "    sampler hands them to every conditional evaluation. ---"),
-            FlowMatchingSampler(
-                spec=self.samplers()[0], result="_mel", length=n_frames,
-                n_elems=BinOp("*", n_frames, Var("N_MEL")),
-                n_steps=None, times=Var("times"),
-                step_inputs={"mu": OutputRef("flow_encoder", index=1),
-                             "spks": OutputRef("flow_encoder", index=2),
-                             "cond": Var("step_cond")},
-                uncond_inputs={"mu": Var("zero_cond"), "spks": Var("zero_spks"),
-                               "cond": Var("zero_cond")},
-                guidance_scale=Var("flow_cfg"),
-                state=FieldAccess("inputs", "noise"),
-                note="--- The whole mel grid, in-filled after the voice's prompt frames. ---"),
-            LuaFragment(fragment / "03_mel_tail.lua",
-                        reads=("n_prompt_frames", "n_gen_frames", "N_MEL"),
-                        defines=("mel_tail",), retains=("estimator",)),
-            LuaFragment(fragment / "04_nsf.lua",
-                        reads=("n_gen_frames", "NSF_HARMONICS", "SAMPLES_PER_FRAME"),
-                        defines=("nsf_phase", "nsf_noise")),
-            SubgraphCallComponent(
-                topology="vocoder", outputs=("wave",), length=n_gen,
-                inputs={"mel": Var("mel_tail"), "nsf_phase": Var("nsf_phase"),
-                        "nsf_noise": Var("nsf_noise")},
-                note="--- HiFT: the generated frames -> 24 kHz waveform, fade-in included. ---"),
+            LuaFragment(fragment / "01_generate.lua", reads=("tokens",), defines=("wave",)),
             DriverReturn(values=("wave",)),
         ]
 
