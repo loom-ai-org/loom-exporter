@@ -24,7 +24,7 @@
 --
 -- The functions hold nothing between calls: the text, the voice, the knobs, T3's loop (step, `n_past`,
 -- the penalised history, the kept tokens, the uniforms), the hop, the mel so far and the samples handed
--- out are the stream's state; T3's history is the model's two KV caches, leased or owned (ADR-099). Each
+-- out are the stream's state; T3's history is the model's KV cache, leased or owned (ADR-099). Each
 -- step feeds the previous draw back BEFORE it samples, so no graph output is read across a call.
 
 local function chatterbox_keep(name, value)
@@ -51,53 +51,44 @@ local function chatterbox_save(st)
     for _, name in ipairs(CHATTERBOX_LOOP) do chatterbox_keep(name, st[name]) end
 end
 
--- One T3 step: the decoder brought up to the previous draw (both prefills on the first step), then one
--- draw under guidance, the repetition penalty over the history (which starts at BOS, as `T3.inference`
--- seeds `generated_ids`), temperature and min_p, from the step's own uniform. Sets `ended` at the stop
--- token or the budget; a speech token (below SPEECH_VOCAB) is appended to `kept`. Control ids are fed back
--- like any other draw -- the reference drops them only on the way to S3Gen.
+-- One T3 step: the decoder brought up to the previous draw (the prefill on the first step), then one draw
+-- from the GUIDED logits `t3_lm` returns, the repetition penalty over the history (which starts at BOS, as
+-- `T3.inference` seeds `generated_ids`), temperature and min_p, from the step's own uniform. Sets `ended` at
+-- the stop token or the budget; a speech token (below SPEECH_VOCAB) is appended to `kept`. Control ids are
+-- fed back like any other draw -- the reference drops them only on the way to S3Gen.
+--
+-- Both guidance streams are ONE run of `t3_lm` over a batch of two (conditional, then unconditional:
+-- `T3LMPhase`), which combines them as the reference does, `cond + w * (cond - uncond)`, with `w` its `cfg`
+-- input; at `w = 0` that is the conditional stream's logits.
 local function chatterbox_t3_step(st)
     if st.ended ~= 0 then return end
-    local cfg_weight = loom.state('cfg_weight')
-    local use_cfg = cfg_weight > 0.0
+    local cfg = {loom.state('cfg_weight')}
     if st.n_past == 0 then
-        -- One prefill per guidance stream. The unconditional one is the same graph with `text_keep = 0`:
-        -- the reference zeroes the text's TOKEN embeddings and keeps their positions.
         local text = loom.state('text')
         local n_text = #text
         local prefill = N_COND_ROWS + n_text + N_BOS_ROWS
-        local spk = chatterbox_voice(loom.state('speaker_emb'), 'voice.speaker_emb')
-        local cond_tokens = chatterbox_voice(loom.state('cond_prompt_tokens'), 'voice.cond_prompt_tokens')
-        local function prefill_embed(keep)
-            loom.run_subgraph_and_retain('t3_prefill_embed', {n_tokens = n_text, n_past = 0},
-                {speaker_emb = spk, prompt_tokens = cond_tokens, emotion_adv = {loom.state('exaggeration')},
-                 text_ids = text, text_keep = {keep}})
-            return {inputs_embeds = {from = 't3_prefill_embed'}, position_ids = loom.range(0, prefill),
-                    attention_mask = loom.causal_mask(prefill, 0)}
-        end
-        loom.run_subgraph_and_retain('t3_lm', {n_tokens = prefill, n_past = 0}, prefill_embed(1.0))
-        if use_cfg then
-            loom.run_subgraph_and_retain('t3_lm_uncond', {n_tokens = prefill, n_past = 0}, prefill_embed(0.0))
-        end
+        loom.run_subgraph_and_retain('t3_prefill_embed', {n_tokens = n_text, n_past = 0},
+            {speaker_emb = chatterbox_voice(loom.state('speaker_emb'), 'voice.speaker_emb'),
+             prompt_tokens = chatterbox_voice(loom.state('cond_prompt_tokens'), 'voice.cond_prompt_tokens'),
+             emotion_adv = {loom.state('exaggeration')}, text_ids = text})
+        loom.run_subgraph_and_retain('t3_lm', {n_tokens = prefill, n_past = 0},
+            {inputs_embeds = {from = 't3_prefill_embed'}, position_ids = loom.range(0, prefill),
+             attention_mask = loom.causal_mask(prefill, 0), cfg = cfg})
         st.n_past = prefill
     else
         -- Draw k sits at speech position k: the prefill's BOS rows are position 0.
         loom.run_subgraph_and_retain('t3_step_embed', {n_tokens = 1, n_past = 0},
             {token = {st.history[#st.history]}, position = {st.step}})
         local n_past = st.n_past
-        local input = {inputs_embeds = {from = 't3_step_embed'}, position_ids = {n_past},
-                       attention_mask = loom.causal_mask(1, n_past)}
-        loom.run_subgraph_and_retain('t3_lm', {n_tokens = 1, n_past = n_past}, input)
-        if use_cfg then loom.run_subgraph_and_retain('t3_lm_uncond', {n_tokens = 1, n_past = n_past}, input) end
+        loom.run_subgraph_and_retain('t3_lm', {n_tokens = 1, n_past = n_past},
+            {inputs_embeds = {from = 't3_step_embed'}, position_ids = {n_past},
+             attention_mask = loom.causal_mask(1, n_past), cfg = cfg})
         st.n_past = n_past + 1
     end
-    -- The checkpoint's centring, `cond + w * (cond - uncond)`, is `uncond + (w + 1) * (cond - uncond)` --
-    -- the general form `loom.sample_row` implements. Dia's conversion, for Dia's reason.
-    local opts = {temperature = loom.state('temperature'), min_p = loom.state('min_p'),
-                  top_p = loom.state('top_p'), repetition_penalty = loom.state('repetition_penalty'),
-                  penalized = st.history, uniform = st.draws[st.step + 1]}
-    if use_cfg then opts.guidance = {module = 't3_lm_uncond', scale = cfg_weight + 1.0} end
-    local token = loom.sample_row('t3_lm', -1, opts)
+    local token = loom.sample_row('t3_lm', -1,
+        {temperature = loom.state('temperature'), min_p = loom.state('min_p'), top_p = loom.state('top_p'),
+         repetition_penalty = loom.state('repetition_penalty'), penalized = st.history,
+         uniform = st.draws[st.step + 1]})
     st.step = st.step + 1
     st.history[#st.history + 1] = token
     if token == STOP_SPEECH then
@@ -151,20 +142,18 @@ local function chatterbox_flow(st, n_tokens, offset, finalize)
     -- The voice's own mel in the grid's first rows; the ODE in-fills the rest.
     local cond = chatterbox_zeros(n_frames * N_MEL)
     for i = 1, #prompt_feat do cond[i] = prompt_feat[i] end
-    local zeros = chatterbox_zeros(n_frames * N_MEL)
     chatterbox_draw_frames(st, n_frames, #prompt_feat / N_MEL)
     local source = loom.state('noise') or st.flow_noise
     if source[n_frames * N_MEL] == nil then error('chatterbox: inputs.noise is shorter than the mel grid') end
     local noise = {}
     for i = 1, n_frames * N_MEL do noise[i] = source[i] end
-    -- Euler over S3Gen's causal U-Net on the cosine schedule, under classifier-free guidance: the
-    -- unconditional evaluation sees mu, spks and cond zeroed (`solve_euler`'s batch of two, ADR-040's form).
+    -- Euler over S3Gen's causal U-Net on the cosine schedule, under classifier-free guidance: ONE estimator
+    -- run per step over `solve_euler`'s batch of two (the unconditional half sees mu, spks and cond zeroed),
+    -- combined in the graph with `cfg` as the guidance weight (`EstimatorPhase`).
     loom.run_ode_and_retain('estimator', {n_tokens = n_frames, n_past = 0},
-        {mu = mu, spks = {from = 'flow_encoder', index = 2}, cond = cond},
+        {mu = mu, spks = {from = 'flow_encoder', index = 2}, cond = cond, cfg = {loom.state('flow_cfg')}},
         {carried = 'x', time = 't', method = 'euler', times = chatterbox_cosine_times(loom.state('n_steps')),
-         n_elems = n_frames * N_MEL, state = noise,
-         guidance = {scale = loom.state('flow_cfg'),
-                     inputs = {mu = zeros, spks = chatterbox_zeros(N_MEL), cond = zeros}}})
+         n_elems = n_frames * N_MEL, state = noise})
     local grid = loom.get_output('estimator', 1)
     local mel = {}
     for i = #prompt_feat + TOKEN_MEL_RATIO * offset * N_MEL + 1, n_frames * N_MEL do mel[#mel + 1] = grid[i] end
