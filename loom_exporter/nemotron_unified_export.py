@@ -14,7 +14,7 @@ trained with for offline decoding), then Parakeet's greedy transducer loop.
 **The live door is the streaming mode** (loom.cpp ADR-110): NeMo's BUFFERED streaming, which reruns the
 whole model on up to `left + chunk + right` seconds per step (5.6 + 0.56 + 0.56 by default) under the
 chunked attention mask of those sizes. `encoder_step` is the encoder phase with that mask, its three
-sizes inputs; `nemotron_asr_driver/02_unified_stream.lua` is the script's buffer loop. Its ids are
+sizes inputs; `transducer_driver/11_buffered_stream.lua` (Parakeet's, ADR-122) is the script's buffer loop. Its ids are
 NeMo's streaming ids, which are not the one pass's.
 
 **Everything after the encoder is the transducer template unchanged**: NeMo's `decoder.prediction`
@@ -41,7 +41,7 @@ import torch
 import torch.nn as nn
 
 from .multi_phase_export import ExportPhase
-from .parakeet_export import ASRParakeetExportConfig
+from .parakeet_export import ASRParakeetExportConfig, stream_facts
 from .spec_protocol import Unchecked
 
 # The restore class this leaf is for, as the archive's `model_config.yaml` names it.
@@ -213,7 +213,7 @@ class ASRNemotronUnifiedExportConfig(ASRParakeetExportConfig):
         phase = ExportPhase(name="encoder", wrapper=wrapper, dummy_inputs=dummy,
                             mil_inputs=mil_inputs, root_axis=self.root_axis)
         self._encoder_wrapper = wrapper
-        self.stream_facts = _stream_facts(model, sample_rate)
+        self.stream_facts = stream_facts(model, sample_rate)
         return phase, int(model.cfg.encoder.d_model)
 
     def phases(self) -> List[ExportPhase]:
@@ -249,37 +249,22 @@ class ASRNemotronUnifiedExportConfig(ASRParakeetExportConfig):
         ))
         return phases
 
-    def driver_components(self) -> List:
-        """The template's one-pass decode, and beside it the live door: the shared live decode
-        (`nemotron_asr_driver/00_stream_decode.lua`) and NeMo's buffered loop
-        (`02_unified_stream.lua`), top level so their constants are too."""
-        from .driver_components import ExportConstants, LuaFragment
-        from .nemo_asr_export import MAX_SECONDS
-        from .nemotron_asr_export import stream_decode_fragment
+    def buffered_step_inputs(self) -> tuple:
+        return ("waveform", "length", "prompt", "att_left", "att_chunk", "att_right")
 
-        # The checkpoint's numbers after `phases()`; this release's before it (a catalogue build, which
-        # never traces).
-        facts = dict(getattr(self, "stream_facts", None) or {
-            "SAMPLE_RATE": 16000, "FRAME_SAMPLES": 1280, "FEATURES_PER_SEC": 100.0, "SUBSAMPLING": 8})
-        constants = {"S_" + k: v for k, v in facts.items()}
+    def buffered_stream_constants(self) -> dict:
+        """The Parakeet loop with this model's step: `encoder_step`, which takes the language prompt and
+        the chunked mask's sizes, and the model card's default buffer."""
+        constants = super().buffered_stream_constants()
         constants.update({
-            "S_MAX_BUFFER_SAMPLES": int(MAX_SECONDS * facts["SAMPLE_RATE"]),
-            "S_DEFAULT_LEFT_SECONDS": STREAM_SECONDS[0], "S_DEFAULT_CHUNK_SECONDS": STREAM_SECONDS[1],
-            "S_DEFAULT_RIGHT_SECONDS": STREAM_SECONDS[2],
-            "S_BLANK_ID": self.blank_id if self.blank_id is not None else 4095,
-            "S_PRED_HIDDEN": self.pred_hidden or 640, "S_N_PRED_LAYERS": self.num_pred_layers or 2,
-            "S_MAX_SYMBOLS_PER_STEP": self.max_symbols_per_step,
+            "S_STREAM_NAME": "nemotron-unified-asr", "S_STEP_PHASE": "encoder_step", "S_STEP_PROMPT": 1,
+            "S_STEP_MASK": 1, "S_DEFAULT_LEFT_SECONDS": STREAM_SECONDS[0],
+            "S_DEFAULT_CHUNK_SECONDS": STREAM_SECONDS[1], "S_DEFAULT_RIGHT_SECONDS": STREAM_SECONDS[2],
             "S_DEFAULT_PROMPT": self.default_prompt if self.default_prompt is not None else 127,
         })
-        if self.durations:
-            raise ValueError("the unified stream decodes plain RNN-T; this checkpoint has durations")
-        here = Path(__file__).resolve().parent / "nemotron_asr_driver"
-        return [
-            ExportConstants(values=constants, top_level=True),
-            stream_decode_fragment(here, self.num_pred_layers),
-            LuaFragment(here / "02_unified_stream.lua", top_level=True,
-                        defines=("stream_open", "stream_feed", "stream_finish")),
-        ] + super().driver_components()
+        if self.blank_id is None:
+            constants["S_BLANK_ID"] = 4095
+        return constants
 
     def encoder_inputs(self) -> dict:
         from .driver_ir import FieldAccess, Var
@@ -305,20 +290,6 @@ class ASRNemotronUnifiedExportConfig(ASRParakeetExportConfig):
             contract["asr.language_names"] = names
             contract["asr.language_ids"] = [self.prompt_dictionary[n] for n in names]
         return contract
-
-
-def _stream_facts(model, sample_rate: int) -> dict:
-    """The numbers the buffered loop's arithmetic is in, as NeMo's streaming script derives them: the
-    hop in samples (which it rounds to a multiple of the subsampling, a no-op here, refused otherwise),
-    an encoder frame in samples, and the features per second its seconds-to-frames rounding uses."""
-    stride = float(model.cfg.preprocessor.window_stride)
-    factor = int(model.encoder.subsampling_factor)
-    hop = int(sample_rate * stride)
-    if hop % factor:
-        raise ValueError(f"the hop ({hop} samples) is not a multiple of the subsampling ({factor}); NeMo's "
-                         "streaming script would round it and the driver does not")
-    return {"SAMPLE_RATE": sample_rate, "FRAME_SAMPLES": hop * factor, "FEATURES_PER_SEC": 1.0 / stride,
-            "SUBSAMPLING": factor}
 
 
 def _check_valid_frames(model, wrapper, sample_rate: int, prompt: int) -> None:

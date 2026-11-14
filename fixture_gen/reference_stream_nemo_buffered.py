@@ -1,26 +1,32 @@
-"""Ground truth for the Nemotron-Labs-Unified-ASR live stream (`test_e2e_nemotron_unified_stream.cpp`).
+"""Ground truth for NeMo's buffered transducer stream (`test_e2e_nemo_buffered_stream.cpp`): Parakeet TDT and
+RNN-T (loom.cpp ADR-122) and Nemotron-Labs-Unified-ASR (ADR-110).
 
-The model's streaming mode is NeMo's BUFFERED one (`examples/asr/asr_chunked_inference/rnnt/
-speech_to_text_streaming_infer_rnnt.py`, the recipe its model card gives): every step runs the whole
-model -- preprocessor, encoder, prompt -- over a buffer of up to `left + chunk + right` seconds, under
-the attention mask `set_default_att_context_size([left, chunk, right])` selects, and decodes the
-buffer's chunk frames with the stateful label-looping greedy decoder. This is that loop at batch 1,
-transcribed from the script at NeMo 3.0 / main (the two agree on everything it uses), with NeMo's own
-`StreamingBatchedAudioBuffer` and decoding computer -- not a re-derivation.
+NeMo streams an offline transducer BUFFERED (`examples/asr/asr_chunked_inference/rnnt/
+speech_to_text_streaming_infer_rnnt.py`, and the unified model's card gives the same recipe): every step runs
+the whole model -- preprocessor, encoder, the prompt where the model takes one -- over a buffer of up to
+`left + chunk + right` seconds and decodes the buffer's chunk frames with the stateful label-looping greedy
+decoder. An encoder whose attention style is `chunked_limited_with_rc` (the unified model) runs under the mask
+`set_default_att_context_size([left, chunk, right])` selects; any other runs its own full attention over the
+buffer. This is that loop at batch 1, transcribed from the script at NeMo 3.0 / main (the two agree on
+everything it uses), with NeMo's own `StreamingBatchedAudioBuffer` and decoding computer -- not a
+re-derivation. The decoding config is the script's own default (`RNNTDecodingConfig()`, greedy_batch with
+label looping, `max_symbols` 10), not the checkpoint's.
 
 Per clip and per `left/chunk/right` configuration it writes, in
-`<out_dir>/<clip>.<left>-<chunk>-<right>.<lang>/` (the sizes in seconds, as `%g`):
+`<out_dir>/<clip>.<left>-<chunk>-<right>.<lang>/` (the sizes in seconds, as `%g`; `<lang>` is `none` for a
+model without a language prompt):
 
     ids.npy       (k,)    f32 -- the streamed greedy ids (exact far below 2^24)
     text.txt                  -- and their text
     steps.npy     (S, 3)  f32 -- per step: buffer samples, left frames, frames decoded
+    jumps.npy     (S,)    f32 -- per step: the TDT jump carried into the next (0 for RNN-T)
     rows_<s>.npy  (n, d)  f32 -- step s's decoded encoder rows (the prompt projection included)
     offline_ids.npy (k',) f32 -- the one pass's ids, for the record: buffered streaming is NOT the
                                  one pass, so these differ from `ids.npy` in general
 
 Needs NeMo 3.0 (`~/.venvs/nemo3`).
 
-    python fixture_gen/reference_stream_nemotron_unified.py <model.nemo> <out_dir> <lang> \\
+    python fixture_gen/reference_stream_nemo_buffered.py <model.nemo> <out_dir> <lang|none> \\
         <left_s/chunk_s/right_s>[,...] <clip.npy|clip.wav> [...]
 """
 import sys
@@ -73,7 +79,17 @@ def main() -> int:
         decoding.beam.return_best_hypothesis = True
     model.change_decoding_strategy(decoding)
     computer = model.decoding.decoding.decoding_computer
-    prompt = torch.tensor([int(dict(model.cfg.model_defaults.prompt_dictionary)[lang])])
+    table = (model.cfg.get("model_defaults") or {}).get("prompt_dictionary")
+    if lang == "none":
+        if table:
+            raise SystemExit("this model takes a language prompt; name one")
+        prompt_kwargs = {}
+    else:
+        prompt_kwargs = {"prompt_indices": torch.tensor([int(dict(table)[lang])])}
+    # The script's condition (`att_context_size_as_chunk`, on by default): only a chunked-with-right-context
+    # encoder gets the mask; any other keeps its own attention.
+    masked = model.cfg.encoder.get("att_context_style") == "chunked_limited_with_rc"
+    print(f"decoding computer: {type(computer).__name__}; chunked mask: {masked}", flush=True)
 
     rate = int(model.cfg.preprocessor.sample_rate)
     stride = float(model.cfg.preprocessor.window_stride)
@@ -89,7 +105,9 @@ def main() -> int:
                              right=int(right_s * per_sec / factor))
         samples = ContextSize(left=frames.left * frame_samples, chunk=frames.chunk * frame_samples,
                               right=frames.right * frame_samples)
-        model.encoder.set_default_att_context_size(att_context_size=[frames.left, frames.chunk, frames.right])
+        if masked:
+            model.encoder.set_default_att_context_size(
+                att_context_size=[frames.left, frames.chunk, frames.right])
         tag = f"{left_s:g}-{chunk_s:g}-{right_s:g}"
         for clip in clips:
             audio = torch.from_numpy(_load(clip))[None]
@@ -102,7 +120,7 @@ def main() -> int:
             buffer = StreamingBatchedAudioBuffer(batch_size=1, context_samples=samples, dtype=audio.dtype,
                                                  device="cpu")
             rest = torch.tensor([n])
-            steps = []
+            steps, jumps = [], []
             while left_sample < n:
                 chunk_length = min(right_sample, n) - left_sample
                 last_batch = chunk_length >= rest
@@ -111,8 +129,7 @@ def main() -> int:
                 buffer.add_audio_batch_(audio[:, left_sample:right_sample], audio_lengths=lengths,
                                         is_last_chunk=last, is_last_chunk_batch=last_batch)
                 out, out_len = model(input_signal=buffer.samples,
-                                     input_signal_length=buffer.context_size_batch.total(),
-                                     prompt_indices=prompt)
+                                     input_signal_length=buffer.context_size_batch.total(), **prompt_kwargs)
                 out = out.transpose(1, 2)
                 context = buffer.context_size.subsample(factor=frame_samples)
                 context_batch = buffer.context_size_batch.subsample(factor=frame_samples)
@@ -126,6 +143,9 @@ def main() -> int:
                 k = int(decode_len[0])
                 np.save(where / f"rows_{len(steps)}.npy", np.ascontiguousarray(out[0, :k].float().numpy()))
                 steps.append((buffer.samples.shape[1], context.left, k))
+                # TDT carries how far its last duration reached past the chunk (`time_jumps`); RNN-T none.
+                jump = getattr(state, "time_jumps", None)
+                jumps.append(int(jump[0]) if jump is not None else 0)
                 rest -= lengths
                 left_sample = right_sample
                 right_sample = min(right_sample + samples.chunk, n)
@@ -135,14 +155,17 @@ def main() -> int:
             text = model.tokenizer.ids_to_text(ids)
             np.save(where / "ids.npy", np.asarray(ids, dtype=np.float32))
             np.save(where / "steps.npy", np.asarray(steps, dtype=np.float32))
+            np.save(where / "jumps.npy", np.asarray(jumps, dtype=np.float32))
             (where / "text.txt").write_text(text)
-            print(f"{clip.stem:24s} {tag:12s} {len(steps):3d} steps {len(ids):4d} ids: {text!r}", flush=True)
+            print(f"{clip.stem:24s} {tag:12s} {len(steps):3d} steps {len(ids):4d} ids "
+                  f"{sum(j > 0 for j in jumps):3d} jumps carried: {text!r}", flush=True)
         # The one pass at full context (the encoder's restored default), for the record.
-        model.encoder.set_default_att_context_size(att_context_size=[-1, -1, -1])
+        if masked:
+            model.encoder.set_default_att_context_size(att_context_size=[-1, -1, -1])
         for clip in clips:
             audio = torch.from_numpy(_load(clip))[None]
             enc, enc_len = model(input_signal=audio, input_signal_length=torch.tensor([audio.shape[1]]),
-                                 prompt_indices=prompt)
+                                 **prompt_kwargs)
             hyp = model.decoding.rnnt_decoder_predictions_tensor(
                 encoder_output=enc, encoded_lengths=enc_len, return_hypotheses=True)[0]
             np.save(out_dir / f"{clip.stem}.{tag}.{lang}" / "offline_ids.npy",

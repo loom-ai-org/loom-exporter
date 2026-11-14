@@ -249,6 +249,19 @@ class BaseTransducerExportConfig(BaseMultiPhaseModelExportConfig):
         """
         raise NotImplementedError
 
+    # -- the live decode (loom.cpp ADR-109, ADR-110, ADR-122) -----------------------------------------
+
+    def stream_decode_constants(self, blank_default: int) -> dict:
+        """The `S_` constants `transducer_driver/10_stream_decode.lua` reads: the checkpoint's numbers
+        after `phases()`, and `blank_default` with this family's usual prediction network before it (a
+        catalogue build, which never traces)."""
+        return {
+            "S_BLANK_ID": self.blank_id if self.blank_id is not None else blank_default,
+            "S_PRED_HIDDEN": self.pred_hidden or 640, "S_N_PRED_LAYERS": self.num_pred_layers or 2,
+            "S_MAX_SYMBOLS_PER_STEP": self.max_symbols_per_step,
+            "S_N_DURATIONS": len(self.durations), "S_DURATIONS": list(self.durations),
+        }
+
     # -- everything else is family-wide --------------------------------------------------------------
 
     def phases(self) -> List[ExportPhase]:
@@ -427,3 +440,16 @@ class BaseTransducerExportConfig(BaseMultiPhaseModelExportConfig):
             ),
             LuaFragment(fragment / "03_return.lua", reads=("tokens",)),
         ]
+
+
+def stream_decode_fragment(num_pred_layers: Optional[int]):
+    """`transducer_driver/10_stream_decode.lua`, the live greedy RNN-T/TDT loop every transducer stream
+    decodes with (ADR-109, ADR-110, ADR-122), top level: its functions are chunk locals the stream
+    fragment after it calls. It reads `stream_decode_constants()`."""
+    from .driver_components import ComputedCall, LuaFragment
+
+    here = Path(__file__).resolve().parent / "transducer_driver"
+    return LuaFragment(here / "10_stream_decode.lua", top_level=True,
+                       drives=(ComputedCall(topologies=tuple(f"pred_lstm_l{i}_fwd"
+                                                             for i in range(num_pred_layers or 0)),
+                                            inputs=("layer_input", "h_prev", "c_prev"), written="cell"),))
