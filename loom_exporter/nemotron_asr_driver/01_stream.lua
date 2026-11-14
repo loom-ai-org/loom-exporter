@@ -12,7 +12,7 @@
 -- graph. `stream_finish` runs the rest of the clip, its windows padded with zeros as the one-pass front
 -- end pads them (`n_valid` says where the clip ends), so the stream ends on `infer`'s encoder rows.
 --
--- The decode is `00_stream_decode.lua`'s greedy RNN-T loop over each call's rows; its emissions are
+-- The decode is `transducer_driver/10_stream_decode.lua`'s greedy RNN-T loop over each call's rows; its emissions are
 -- final, so a feed returns the ids its chunks completed.
 --
 -- State: `pcm`, the samples a later window still reads, from clip sample `pcm_start`; `received`;

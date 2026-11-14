@@ -58,7 +58,7 @@ import torch.nn as nn
 
 from .multi_phase_export import ExportPhase
 from .spec_protocol import Unchecked
-from .transducer_export import BaseTransducerExportConfig, TransducerParts
+from .transducer_export import BaseTransducerExportConfig, TransducerParts, stream_decode_fragment
 
 # The checkpoint's model_type. The English-only sibling (`nemotron_asr_streaming`) has no prompt
 # projector; it is the same encoder and would be this leaf minus the prompt, not yet exported.
@@ -503,18 +503,14 @@ class ASRNemotronExportConfig(BaseTransducerExportConfig):
             "ENC_STATES": 75, "HOP": 160, "CHUNK_MEL": 32, "LEAD_MEL": 7, "WINDOW_EXTRA": 353,
             "PAD_LEFT": 256, "MAX_STEP_CHUNKS": MAX_STEP_CHUNKS})
         constants = {"S_" + k: v for k, v in facts.items()}
-        constants.update({
-            "S_BLANK_ID": self.blank_id if self.blank_id is not None else 13087,
-            "S_PRED_HIDDEN": self.pred_hidden or 640, "S_N_PRED_LAYERS": self.num_pred_layers or 2,
-            "S_MAX_SYMBOLS_PER_STEP": self.max_symbols_per_step,
-            "S_DEFAULT_PROMPT": self.default_prompt if self.default_prompt is not None else 101,
-        })
+        constants.update(self.stream_decode_constants(blank_default=13087))
+        constants["S_DEFAULT_PROMPT"] = self.default_prompt if self.default_prompt is not None else 101
         if self.durations:
             raise ValueError("the Nemotron stream decodes plain RNN-T; this checkpoint has durations")
         here = Path(__file__).resolve().parent / "nemotron_asr_driver"
         return [
             ExportConstants(values=constants, top_level=True),
-            stream_decode_fragment(here, self.num_pred_layers),
+            stream_decode_fragment(self.num_pred_layers),
             LuaFragment(here / "01_stream.lua", top_level=True,
                         defines=("stream_open", "stream_feed", "stream_finish")),
         ] + super().driver_components()
@@ -554,18 +550,6 @@ class ASRNemotronExportConfig(BaseTransducerExportConfig):
         if self.language_tag_ids:
             contract["asr.control_ids"] = list(self.language_tag_ids)
         return contract
-
-
-def stream_decode_fragment(here: Path, num_pred_layers: Optional[int]):
-    """`00_stream_decode.lua`, the live greedy RNN-T loop both Nemotron streams decode with (ADR-109,
-    ADR-110), top level: its functions are chunk locals the stream fragment after it calls. It reads the
-    `S_` decode constants (`S_BLANK_ID`, `S_PRED_HIDDEN`, `S_N_PRED_LAYERS`, `S_MAX_SYMBOLS_PER_STEP`)."""
-    from .driver_components import ComputedCall, LuaFragment
-
-    return LuaFragment(here / "00_stream_decode.lua", top_level=True,
-                       drives=(ComputedCall(topologies=tuple(f"pred_lstm_l{i}_fwd"
-                                                             for i in range(num_pred_layers or 0)),
-                                            inputs=("layer_input", "h_prev", "c_prev"), written="cell"),))
 
 
 def _language_tag_ids(tokenizer_json: Path) -> Tuple[int, ...]:
