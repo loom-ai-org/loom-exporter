@@ -17,22 +17,26 @@
 -- window's edges, and equals the whole clip's (bit for bit in PyTorch). A chunk runs once its window's last
 -- sample has arrived; `stream_finish` appends the zero pad and runs the rest, the partial chunk last.
 --
--- State: `pcm` from sample `pcm_start` on, `received`; `next_frame`, the first mel frame of the next chunk;
+-- State: `pcm` from sample `pcm_start` on (an array entry grown with `loom.append_state` and read with
+-- `loom.state_slice`, so a push converts only its own samples), `received`; `next_frame`, the first mel frame of the next chunk;
 -- `buffer`, the mel buffer, frame-major (`S_N_MEL` values per frame); `prev`, the merge's previous id;
 -- `chunk_frames`, `total_frames`, `tokens`, `delay` from `stream_open`'s `chunk_seconds`/`total_seconds`.
 
-local function ctc_window(pcm, start, s0, s1)
-    local w = {}
-    for i = 1, s1 - s0 do w[i] = pcm[s0 - start + i] or 0.0 end
+-- Samples [s0, s1) of the padded clip: what has arrived, then the script's zero pad.
+local function ctc_window(s0, s1)
+    local start, received = loom.state('pcm_start'), loom.state('received')
+    local have = math.max(math.min(s1, received) - s0, 0)
+    local w = have > 0 and loom.state_slice('pcm', s0 - start, have) or {}
+    for i = have + 1, s1 - s0 do w[i] = 0.0 end
     return w
 end
 
 -- Mel frames [f0, f1) of the padded clip, from samples [s0, s1) of it (`s1` the clip's end on the last).
-local function ctc_mel(pcm, start, f0, f1, n_total)
+local function ctc_mel(f0, f1, n_total)
     local s0 = math.max(f0 - S_MEL_MARGIN, 0) * S_HOP
     local s1 = math.min((f1 + S_MEL_MARGIN) * S_HOP, n_total)
     loom.run_subgraph_and_retain('raw_mel', {n_samples = s1 - s0, n_tokens = 0, n_past = 0},
-                                  {waveform = ctc_window(pcm, start, s0, s1), length = {s1 - s0}})
+                                  {waveform = ctc_window(s0, s1), length = {s1 - s0}})
     local out, rows = loom.get_output('raw_mel', 1), {}
     local j0 = f0 - s0 / S_HOP
     for i = 1, (f1 - f0) * S_N_MEL do rows[i] = out[j0 * S_N_MEL + i] end
@@ -98,11 +102,8 @@ function stream_open(inputs)
 end
 
 function stream_feed(inputs)
-    local pcm, start = loom.state('pcm'), loom.state('pcm_start')
-    local n = #pcm
-    local samples = inputs.waveform or {}
-    for i, v in ipairs(samples) do pcm[n + i] = v end
-    local received = loom.state('received') + #samples
+    local start = loom.state('pcm_start')
+    local received = start + loom.append_state('pcm', inputs.waveform)
     loom.set_state('received', received)
     local out = {}
     local chunk = loom.state('chunk_frames')
@@ -110,26 +111,22 @@ function stream_feed(inputs)
     -- A chunk's frames are final once its window's last sample is in: whatever follows, pad or speech, is
     -- outside every kept frame's reach.
     while received >= (f0 + chunk + S_MEL_MARGIN) * S_HOP do
-        ctc_step(ctc_mel(pcm, start, f0, f0 + chunk, received), out)
+        ctc_step(ctc_mel(f0, f0 + chunk, received), out)
         f0 = f0 + chunk
     end
     loom.set_state('next_frame', f0)
     -- Keep what the next window reads.
     local keep = math.max(f0 - S_MEL_MARGIN, 0) * S_HOP
     if keep > start then
-        local rest = {}
-        for i = keep - start + 1, #pcm do rest[#rest + 1] = pcm[i] end
-        pcm, start = rest, keep
+        loom.drop_state('pcm', keep - start)
+        loom.set_state('pcm_start', keep)
     end
-    loom.set_state('pcm', pcm)
-    loom.set_state('pcm_start', start)
     return out
 end
 
 function stream_finish(inputs)
     local received = loom.state('received')
     if received < 1 then error(S_STREAM_NAME .. ': the stream is empty') end
-    local pcm, start = loom.state('pcm'), loom.state('pcm_start')
     -- The script's zero pad, then NeMo's frame count for the padded clip: floor(n / hop).
     local n_total = received + loom.state('pad')
     local features = math.floor(n_total / S_HOP)
@@ -137,12 +134,12 @@ function stream_finish(inputs)
     local f0 = loom.state('next_frame')
     local out = {}
     while f0 + chunk <= features do
-        ctc_step(ctc_mel(pcm, start, f0, f0 + chunk, n_total), out)
+        ctc_step(ctc_mel(f0, f0 + chunk, n_total), out)
         f0 = f0 + chunk
     end
     -- AudioFeatureIterator's last frame: what is left, zero-filled to a chunk -- all zeros when nothing is.
     local frames = {}
-    if f0 < features then frames = ctc_mel(pcm, start, f0, features, n_total) end
+    if f0 < features then frames = ctc_mel(f0, features, n_total) end
     for i = #frames + 1, chunk * S_N_MEL do frames[i] = 0.0 end
     ctc_step(frames, out)
     loom.set_state('next_frame', features)

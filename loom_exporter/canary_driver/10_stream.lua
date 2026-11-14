@@ -24,7 +24,8 @@
 -- One difference from the script, forced by liveness, as in ADR-110: a step runs once a sample past its end
 -- has arrived, and the step that reaches the clip's end runs in `stream_finish`.
 --
--- State: `pcm` from `pcm_start`, `received`, `ls`/`rs` the next step's samples, `steps`; `c_*` (scalar) and
+-- State: `pcm` (an array entry grown with `loom.append_state` and read with `loom.state_slice`, so a push
+-- converts only its own samples) from sample `pcm_start` on, `received`, `ls`/`rs` the next step's samples, `steps`; `c_*` (scalar) and
 -- `b_*` (batch) contexts in samples; `ctx` the sizes in encoder frames; `prompt`; `policy`; `seq` (the prompt
 -- and every kept token), `decoding_step`, `active`.
 
@@ -176,13 +177,11 @@ end
 
 -- One step of the script's loop: `n` new samples (`last` on the clip's final step), the buffer ending at
 -- `stop` in the clip.
-local function canary_step(pcm, start, n, last, stop, out)
-    local extra = canary_add(n, last)
+local function canary_step(n, last, stop, out)
+    canary_add(n, last)
     local total = loom.state('c_left') + loom.state('c_chunk') + loom.state('c_right')
     local length = loom.state('b_left') + loom.state('b_chunk') + loom.state('b_right')
-    local window = {}
-    local first = stop - total
-    for i = 1, total do window[i] = pcm[first - start + i] end
+    local window = loom.state_slice('pcm', stop - total - loom.state('pcm_start'), total)
     loom.run_subgraph_and_retain('encoder', {n_samples = total, n_past = 0}, {waveform = window, length = {length}})
     local rows = loom.output_shape('encoder', 1)[2]
     -- The rows the decoder may see: the batch context's left and chunk, or all of them on the last chunk.
@@ -256,11 +255,8 @@ function stream_open(inputs)
 end
 
 function stream_feed(inputs)
-    local pcm, start = loom.state('pcm'), loom.state('pcm_start')
-    local n = #pcm
-    local samples = inputs.waveform or {}
-    for i, v in ipairs(samples) do pcm[n + i] = v end
-    local received = loom.state('received') + #samples
+    local start = loom.state('pcm_start')
+    local received = start + loom.append_state('pcm', inputs.waveform)
     loom.set_state('received', received)
     local out = {}
     local ctx = loom.state('ctx')
@@ -268,18 +264,16 @@ function stream_feed(inputs)
     -- A step runs once a sample past its end is in: only then is it not the clip's last.
     while received > loom.state('rs') do
         local ls, rs = loom.state('ls'), loom.state('rs')
-        canary_step(pcm, start, rs - ls, false, rs, out)
+        canary_step(rs - ls, false, rs, out)
         loom.set_state('ls', rs)
         loom.set_state('rs', rs + chunk)
     end
+    -- Keep what the next buffer reads.
     local keep = loom.state('ls') - S_FRAME_SAMPLES * (ctx[1] + ctx[2] + ctx[3])
     if keep > start then
-        local rest = {}
-        for i = keep - start + 1, #pcm do rest[#rest + 1] = pcm[i] end
-        pcm, start = rest, keep
+        loom.drop_state('pcm', keep - start)
+        loom.set_state('pcm_start', keep)
     end
-    loom.set_state('pcm', pcm)
-    loom.set_state('pcm_start', start)
     return out
 end
 
@@ -293,7 +287,7 @@ function stream_finish(inputs)
         if loom.state('steps') == 0 then
             loom.set_state('first_window', math.min(loom.state('first_window'), received))
         end
-        canary_step(loom.state('pcm'), loom.state('pcm_start'), received - ls, true, received, out)
+        canary_step(received - ls, true, received, out)
         loom.set_state('ls', received)
     end
     loom.set_state('pcm', {})
