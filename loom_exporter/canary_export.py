@@ -68,6 +68,9 @@ CANARY_V2_LANGUAGES = (
 # A language pair different from the default on BOTH sides, encoded only to find where the two slots
 # sit in the prompt. Any two trained languages that differ from each other and from the default work.
 PROBE_PAIR = ("de", "fr")
+# A stream's default left context, chunk and right context, in seconds: NeMo's streaming script's
+# (`speech_to_text_aed_streaming_infer.py`'s `left_context_secs`, `chunk_secs`, `right_context_secs`).
+STREAM_SECONDS = (10.0, 2.0, 2.0)
 EOS_PIECE = "<|endoftext|>"
 PAD_PIECE = "<pad>"
 
@@ -134,7 +137,12 @@ def cross_kv_input_names(n_layers: int) -> tuple:
 
 
 class _CanaryDecoderWrapper(nn.Module):
-    """`(tokens, position_ids, attention_mask, xk_0, xv_0, ...) -> logits`.
+    """`(tokens, position_ids, attention_mask, xk_0, xv_0, ...) -> (logits, xatt)`.
+
+    **`xatt` is the live door's** (loom.cpp ADR-124): layer `n_layers - 2`'s cross-attention probabilities,
+    averaged over heads, `[1, n_tokens, n_enc]` -- what NeMo's AlignAtt policy reads (`xatt_scores_list[-2]`,
+    `torch.mean(xatt_scores, 1)`) to decide whether a token is too close to the buffer's end. The softmax is
+    in the graph anyway (cross-attention never fuses); a one-pass decode ignores the second output.
 
     `TransformerEmbedding.forward` and `TransformerDecoder.forward` are both bypassed, for one reason
     each: the first derives position ids from Python ints (baked by the trace), and the second builds
@@ -151,13 +159,15 @@ class _CanaryDecoderWrapper(nn.Module):
     does; the engine's KV cache then supplies the past keys a cached NeMo step reads from its `mems`.
     The two are the same because a block's K and V are per-position functions of its input."""
 
-    def __init__(self, model):
+    def __init__(self, model, xatt_scores_layer: int = -2):
         super().__init__()
         self.embedding = model.transf_decoder.embedding
         decoder = model.transf_decoder.decoder
         self.layers = decoder.layers
         self.final_layer_norm = decoder.final_layer_norm
         self.head = model.log_softmax
+        # NeMo's AlignAtt layer, `AEDStreamingDecodingConfig.xatt_scores_layer`, a Python index into the layers.
+        self.xatt_layer = range(len(self.layers))[xatt_scores_layer]
         self._cross = [None] * (2 * len(self.layers))
         for i, layer in enumerate(self.layers):
             layer.second_sub_layer.key_net = _CrossKvSlot(self._cross, 2 * i)
@@ -168,13 +178,16 @@ class _CanaryDecoderWrapper(nn.Module):
             self._cross[i] = tensor
         emb = self.embedding
         hidden = emb.layer_norm(emb.token_embedding(tokens) + emb.position_embedding(position_ids))
-        for layer in self.layers:
+        xatt = None
+        for index, layer in enumerate(self.layers):
             # `cross[0]` as the encoder states: the slots above ignore what they are handed, and the
             # tensor only has to have the encoder output's shape for `MultiHeadAttention` to reach them.
             # `None` as the encoder mask: every row is valid (the encoder phase cut the rest).
-            hidden = layer(hidden, attention_mask, hidden, cross[0], None)[0]
+            hidden, extra = layer(hidden, attention_mask, hidden, cross[0], None)
+            if index == self.xatt_layer:
+                xatt = extra["xatt_scores"].mean(dim=1)
         with self.head.with_log_softmax_enabled(False):
-            return self.head(hidden_states=self.final_layer_norm(hidden))
+            return self.head(hidden_states=self.final_layer_norm(hidden)), xatt
 
 
 def causal_mask(seq_len: int) -> torch.Tensor:
@@ -239,6 +252,44 @@ def long_form_policy(sample_rate: int, subsampling_factor: int, window_stride: f
     }
 
 
+def stream_policy() -> dict:
+    """The live door's decoding numbers, READ off NeMo's own defaults rather than restated: the streaming
+    script decodes with a default `AEDStreamingDecodingConfig` (its policy aside) and a fresh `AEDStreamingState`,
+    and each number below is one of their fields.
+
+    `AEDStreamingDecodingConfig.max_tokens_per_alignatt_step` is NOT among them: the computer reads the STATE's,
+    which `initialize_aed_model_state` sets to `max_tokens_per_one_second * int(chunk_secs + right_context_secs)`,
+    so the driver computes it per stream from the seconds it is opened with. Wait-k is bounded by the config's
+    `max_generation_length`, AlignAtt by the state's -- two different numbers in NeMo, kept apart here."""
+    from nemo.collections.asr.parts.submodules.aed_decoding.aed_batched_streaming import AEDStreamingState
+    from nemo.collections.asr.parts.submodules.multitask_decoding import AEDStreamingDecodingConfig
+
+    cfg, state = AEDStreamingDecodingConfig(), AEDStreamingState()
+    if cfg.use_avgpool_for_alignatt:
+        raise ValueError("canary: NeMo's AlignAtt default now smooths the attention (use_avgpool_for_alignatt); "
+                         "the driver does not.")
+    if cfg.streaming_policy not in ("waitk", "alignatt"):
+        raise ValueError(f"canary: NeMo's default streaming policy is {cfg.streaming_policy!r}")
+    return {
+        "default_policy": 1 if cfg.streaming_policy == "alignatt" else 0,
+        "waitk_lagging": int(cfg.waitk_lagging),
+        "alignatt_thr": float(cfg.alignatt_thr),
+        "exclude_sink_frames": int(cfg.exclude_sink_frames),
+        "xatt_scores_layer": int(cfg.xatt_scores_layer),
+        "waitk_max_generation": int(cfg.max_generation_length),
+        "alignatt_max_generation": int(state.max_generation_length),
+        "tokens_per_second": int(state.max_tokens_per_one_second),
+        "hallucinations": 1 if cfg.hallucinations_detector else 0,
+    }
+
+
+# What `stream_policy()` reads at NeMo 2.6.2 / 3.0, for a build that never traces (the component catalogue).
+STREAM_POLICY_DEFAULTS = {
+    "default_policy": 0, "waitk_lagging": 2, "alignatt_thr": 8.0, "exclude_sink_frames": 8, "xatt_scores_layer": -2,
+    "waitk_max_generation": 512, "alignatt_max_generation": 256, "tokens_per_second": 10, "hallucinations": 1,
+}
+
+
 @dataclass(kw_only=True)
 class ASRCanaryExportConfig(BaseMultiPhaseModelExportConfig):
     """Canary as three traced phases -- `encoder`, `cross_kv`, `decoder` -- and a driver that runs the
@@ -263,6 +314,10 @@ class ASRCanaryExportConfig(BaseMultiPhaseModelExportConfig):
     max_positions: Optional[int] = field(default=None, init=False, repr=False)
     max_generation_delta: Optional[int] = field(default=None, init=False, repr=False)
     prompt_ids: tuple = field(default=(), init=False, repr=False)
+    stream_prompt_ids: tuple = field(default=(), init=False, repr=False)
+    frame_samples: Optional[int] = field(default=None, init=False, repr=False)
+    stream_policy: Optional[dict] = field(default=None, init=False, repr=False)
+    subsampling: Optional[int] = field(default=None, init=False, repr=False)
     source_slot: Optional[int] = field(default=None, init=False, repr=False)
     target_slot: Optional[int] = field(default=None, init=False, repr=False)
     default_language_id: Optional[int] = field(default=None, init=False, repr=False)
@@ -295,6 +350,14 @@ class ASRCanaryExportConfig(BaseMultiPhaseModelExportConfig):
                                    "is both the sinusoid table's length and the KV-cache capacity"),
         "max_generation_delta": Unchecked("READ off the checkpoint's own decoding config"),
         "prompt_ids": Unchecked("NeMo's own PromptFormatter encoding of the turn transcribe() builds"),
+        "stream_policy": Unchecked("READ off NeMo's AEDStreamingDecodingConfig and AEDStreamingState defaults "
+                                   "by `stream_policy()`"),
+        "frame_samples": Unchecked("READ off the checkpoint: hop x subsampling, as the streaming script "
+                                   "derives an encoder frame in samples"),
+        "subsampling": Unchecked("READ off the checkpoint: the encoder's subsampling factor"),
+        "stream_prompt_ids": Unchecked("NeMo's encoding of every default turn, as its streaming script "
+                                       "builds it; checked to start with `prompt_ids` and to hold the language "
+                                       "slots in the same places"),
         "source_slot": Unchecked("found by diffing two encodings, and checked to be one of exactly two "
                                  "positions where they differ"),
         "target_slot": Unchecked("same"),
@@ -382,6 +445,26 @@ class ASRCanaryExportConfig(BaseMultiPhaseModelExportConfig):
             raise ValueError(f"canary: the language slots ({self.source_slot}, {self.target_slot}) are "
                              f"not where the two prompts differ ({diff}).")
         self.prompt_ids = tuple(base)
+        # The live door's prompt is NeMo's streaming script's (`return_decoder_input_ids` with no override):
+        # EVERY default turn encoded, `user` and `user_partial`, so it is `infer`'s plus the partial turn's
+        # opening (13 ids for 10 on canary-1b-v2). Its language slots must be `infer`'s.
+        stream_turns = [dict(role=t["role"], slots=dict(t["slots"])) for t in model.prompt.get_default_dialog_slots()]
+        stream = None
+        for src, tgt in ((source, source), (probe_src, probe_tgt)):
+            for turn in stream_turns:
+                if turn["role"] == "user":
+                    turn["slots"].update(source_lang=src, target_lang=tgt)
+            ids = [int(i) for i in model.prompt.encode_dialog(turns=stream_turns)["context_ids"]]
+            if stream is None:
+                if ids[:len(base)] != base:
+                    raise ValueError(f"canary: the streaming prompt {ids} does not start with the one-pass "
+                                     f"prompt {base}.")
+                stream = ids
+            elif (len(ids) != len(stream) or ids[self.source_slot] != piece(probe_src)
+                  or ids[self.target_slot] != piece(probe_tgt) or ids[:len(base)] != probe):
+                raise ValueError(f"canary: the streaming prompt {ids} does not hold the language slots where "
+                                 f"the one-pass prompt does, or does not start with it.")
+        self.stream_prompt_ids = tuple(stream)
         self.default_language_id = piece(source)
         self.eos_token_id = piece(EOS_PIECE)
         self.pad_token_id = piece(PAD_PIECE)
@@ -406,6 +489,14 @@ class ASRCanaryExportConfig(BaseMultiPhaseModelExportConfig):
         self.long_form = long_form_policy(self.sample_rate, int(model.encoder.subsampling_factor),
                                           float(model.cfg.preprocessor.window_stride))
         self.cross_kv_names = cross_kv_input_names(self.n_layers)
+        # The live door's buffer arithmetic is the streaming script's, in samples of a 10 ms hop.
+        stride = float(model.cfg.preprocessor.window_stride)
+        self.subsampling = int(model.encoder.subsampling_factor)
+        hop = int(self.sample_rate * stride)
+        if abs(stride - 0.01) > 1e-9 or hop % self.subsampling:
+            raise ValueError(f"canary: the live door assumes a 10 ms hop that divides by the subsampling; this "
+                             f"checkpoint's hop is {stride} s, subsampling {self.subsampling}.")
+        self.frame_samples = hop * self.subsampling
 
         n_samples = int(TRACE_SECONDS * self.sample_rate)
         sample_axis = ct.RangeDim(int(MIN_SECONDS * self.sample_rate), int(40 * self.sample_rate))
@@ -423,7 +514,8 @@ class ASRCanaryExportConfig(BaseMultiPhaseModelExportConfig):
 
         # ORDER IS LOAD-BEARING -- see `_CanaryCrossKvWrapper`.
         cross_kv_wrapper = _CanaryCrossKvWrapper(decoder.layers).eval()
-        decoder_wrapper = _CanaryDecoderWrapper(model).eval()
+        self.stream_policy = stream_policy()
+        decoder_wrapper = _CanaryDecoderWrapper(model, self.stream_policy["xatt_scores_layer"]).eval()
         trace_tokens, trace_enc = int(self.trace_tokens), int(self.trace_enc)
 
         return [
@@ -513,7 +605,31 @@ class ASRCanaryExportConfig(BaseMultiPhaseModelExportConfig):
         from .driver_ir import FieldAccess, Len, Lit, OutputRef, Var
 
         waveform = FieldAccess("inputs", "waveform")
+        rate = self.sample_rate or 16000
+        policy = self.stream_policy or STREAM_POLICY_DEFAULTS
+        live = {
+            # The streaming script's buffer, and NeMo's own decoding defaults (`stream_policy()`).
+            "S_DEFAULT_LEFT_SECONDS": STREAM_SECONDS[0], "S_DEFAULT_CHUNK_SECONDS": STREAM_SECONDS[1],
+            "S_DEFAULT_RIGHT_SECONDS": STREAM_SECONDS[2], "S_DEFAULT_POLICY": policy["default_policy"],
+            "S_WAITK_LAGGING": policy["waitk_lagging"], "S_ALIGNATT_THR": policy["alignatt_thr"],
+            "S_EXCLUDE_SINK_FRAMES": policy["exclude_sink_frames"],
+            "S_WAITK_MAX_GENERATION": policy["waitk_max_generation"],
+            "S_ALIGNATT_MAX_GENERATION": policy["alignatt_max_generation"],
+            "S_TOKENS_PER_SECOND": policy["tokens_per_second"], "S_HALLUCINATIONS": policy["hallucinations"],
+            # The buffer's arithmetic: 16 kHz, a 10 ms hop, 8x subsampling (checked in phases()).
+            "S_SAMPLE_RATE": rate, "S_FRAME_SAMPLES": self.frame_samples or 1280,
+            "S_FEATURES_PER_SEC": 100.0, "S_SUBSAMPLING": self.subsampling or 8,
+            "S_MAX_BUFFER_SAMPLES": int(40 * rate), "S_N_LAYERS": self.n_layers or 8,
+            "S_STREAM_PROMPT": list(self.stream_prompt_ids) or [0],
+            "S_SOURCE_SLOT": (self.source_slot or 0) + 1, "S_TARGET_SLOT": (self.target_slot or 0) + 1,
+            "S_DEFAULT_LANGUAGE": self.default_language_id or 0,
+            "S_DEFAULT_TARGET": self.lang_to_id.get(self.default_target, 0),
+            "S_EOS": self.eos_token_id if self.eos_token_id is not None else 3,
+        }
         return [
+            ExportConstants(values=live, top_level=True),
+            LuaFragment(self.driver_script_path / "10_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
             LuaFragment(self.driver_script_path / "00_header.lua", top_level=True),
             ExportConstants(values={
                 "PROMPT": list(self.prompt_ids),
