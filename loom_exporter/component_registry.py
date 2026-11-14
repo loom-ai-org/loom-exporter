@@ -129,6 +129,7 @@ def _entries() -> Tuple[ComponentEntry, ...]:
     from .driver_components import (
         ArgmaxEpilogue, ChunkedCodecCall, PaddedCodecCall, CifBoundary, CtcGreedyEpilogue, DriverInputs, DriverReturn,
         ExportConstants,
+        ExprFunction,
         FlowMatchingSampler,
         LuaFragment, ModularChain,
         MonolithicCall, PrefillDecodeLoop, DecodeLoopStream, PromptSegments, RawLuaDriver, RecurrentCall,
@@ -256,6 +257,12 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "ordinary locals so every read of them is checked by driver_ir.validate -- rather than "
             "interpolated into hand-written Lua through a marker, where a misspelled read is a silent "
             "nil (BACKLOG.md P4.0.18). Top-level locals instead when a stream's functions read them.",
+        ),
+        ComponentEntry(
+            "expr_function", ExprFunction, (PRELUDE,),
+            "A top-level `local function` returning one IR expression, for a stream's top-level "
+            "fragment that needs a number `infer` computes inline (Qwen3-ASR's audio row count, "
+            "ADR-121): the same node rendered twice rather than its arithmetic restated in the fragment.",
         ),
         ComponentEntry(
             "raw_lua_driver", RawLuaDriver, (PRELUDE, STATEMENTS, POSTLUDE),
