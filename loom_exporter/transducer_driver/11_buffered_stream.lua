@@ -18,7 +18,8 @@
 -- end reaches it. A live feed cannot tell the clip has ended, so a step runs only once a sample PAST its
 -- end has arrived; the step that ends at the clip's end runs in `stream_finish`, as the script's last.
 --
--- State: `pcm`, the clip from sample `pcm_start` on (the samples a later buffer still reads);
+-- State: `pcm`, the clip from sample `pcm_start` on (the samples a later buffer still reads), an array entry
+-- grown with `loom.append_state` and read with `loom.state_slice` so a push converts only its own samples;
 -- `received`; `ls`/`rs`, the next step's new samples `[ls, rs)`; `c_left`/`c_chunk`/`c_right`, the
 -- buffer's three parts in samples; `ctx`, the three sizes in encoder frames; `prompt`, the language
 -- prompt id (`stream_open`'s `language`, else the checkpoint's default) where the step takes one.
@@ -28,12 +29,10 @@ local function buffered_frames(seconds)
     return math.floor(seconds * S_FEATURES_PER_SEC / S_SUBSAMPLING)
 end
 
-local function buffered_step(pcm, start, total, last, out)
+local function buffered_step(total, last, out)
     -- The buffer: the `total` samples ending at the step's end, `rs` (or the clip's end on the last).
     local stop = last and loom.state('received') or loom.state('rs')
-    local first = stop - total
-    local window = {}
-    for i = 1, total do window[i] = pcm[first - start + i] end
+    local window = loom.state_slice('pcm', stop - total - loom.state('pcm_start'), total)
     local inputs = {waveform = window, length = {total}}
     if S_STEP_PROMPT == 1 then inputs.prompt = {loom.state('prompt')} end
     if S_STEP_MASK == 1 then
@@ -107,11 +106,8 @@ function stream_open(inputs)
 end
 
 function stream_feed(inputs)
-    local pcm, start = loom.state('pcm'), loom.state('pcm_start')
-    local n = #pcm
-    local samples = inputs.waveform or {}
-    for i, v in ipairs(samples) do pcm[n + i] = v end
-    local received = loom.state('received') + #samples
+    local start = loom.state('pcm_start')
+    local received = start + loom.append_state('pcm', inputs.waveform)
     loom.set_state('received', received)
     local out = {}
     local ctx = loom.state('ctx')
@@ -120,7 +116,7 @@ function stream_feed(inputs)
     while received > loom.state('rs') do
         local ls, rs = loom.state('ls'), loom.state('rs')
         local total = buffered_add(rs - ls, false)
-        buffered_step(pcm, start, total, false, out)
+        buffered_step(total, false, out)
         loom.set_state('ls', rs)
         loom.set_state('rs', rs + chunk)
     end
@@ -129,12 +125,9 @@ function stream_feed(inputs)
     -- clip ends after the previous step's end).
     local keep = loom.state('ls') - S_FRAME_SAMPLES * (ctx[1] + ctx[2] + ctx[3])
     if keep > start then
-        local rest = {}
-        for i = keep - start + 1, #pcm do rest[#rest + 1] = pcm[i] end
-        pcm, start = rest, keep
+        loom.drop_state('pcm', keep - start)
+        loom.set_state('pcm_start', keep)
     end
-    loom.set_state('pcm', pcm)
-    loom.set_state('pcm_start', start)
     return out
 end
 
@@ -146,7 +139,7 @@ function stream_finish(inputs)
     local ls = loom.state('ls')
     if ls < received then
         local total = buffered_add(received - ls, true)
-        buffered_step(loom.state('pcm'), loom.state('pcm_start'), total, true, out)
+        buffered_step(total, true, out)
         loom.set_state('ls', received)
     end
     loom.set_state('pcm', {})
