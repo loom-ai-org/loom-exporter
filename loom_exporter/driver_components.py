@@ -2816,6 +2816,37 @@ class ExportConstants(DriverComponent):
 
 
 @dataclass
+class ExprFunction(DriverComponent):
+    """A top-level `local function NAME(PARAMS) return EXPR end`, rendered from an IR expression.
+
+    For a hand-written top-level fragment that needs a number the entry function computes as IR: a live
+    stream's `stream_feed` (ADR-098) runs outside `infer`, so the expression `infer` inlines -- Qwen3-ASR's
+    audio row count over a sample count -- is out of its reach. Rendering the SAME node here, rather than
+    restating its arithmetic in the fragment, keeps the two from disagreeing: the leaf checks that node
+    against the checkpoint once (`phases()`), and both call sites read it.
+    """
+
+    name: str = ""
+    params: Tuple[str, ...] = ()
+    expr: object = None
+
+    __unchecked__ = {
+        "name": Unchecked("the function's name; a fragment calling another name reads nil and fails on "
+                          "the call, which the family's e2e test reaches on its first update"),
+        "params": Unchecked("the parameters `expr` reads; the leaf builds `expr` over exactly these"),
+        "expr": Unchecked("a driver_ir expression the leaf builds and checks itself (`audio_rows`, checked "
+                          "in `phases()` against the encoder's real output)"),
+    }
+
+    def prelude(self, ctx: DriverContext) -> List[str]:
+        return [f"local function {self.name}({', '.join(self.params)})",
+                f"    return {self.expr.render()}", "end", ""]
+
+    def emit(self, ctx: DriverContext) -> List:
+        return []
+
+
+@dataclass
 class CifBoundary(DriverComponent):
     """Where a CIF predictor's tokens fire, decided HOST-SIDE between two graph phases (family 5, P5).
 
