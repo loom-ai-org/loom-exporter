@@ -17,6 +17,11 @@ speech, and writes the arrays the C++ test needs:
                                                  failure can be localized to that half rather than only
                                                  observed at the end
     ref_asr_generated.npy  (n_new,)       i32 -- the token ids HF greedily generates
+    ref_asr_transcript.npy (n_kept,)      i32 -- the ones after `<asr_text>`, which is what the driver
+                                                 returns (the stock checkpoint answers
+                                                 `language English<asr_text>...`; the driver trims the
+                                                 preamble). All of them when the marker is absent:
+                                                 oruk-loop's prompt holds it, so its answer is all text
     ref_asr_prompt_len.npy ()             i32 -- how many prompt positions HF used, which is the
                                                  driver's own `n_past` when the loop starts, and the
                                                  one number that would let a wrong prompt still decode
@@ -183,6 +188,9 @@ def main() -> int:
     np.save(out_dir / "ref_asr_encoder_in.npy", encoder_in.astype(np.float32))
     np.save(out_dir / "ref_asr_audio.npy", audio.to(torch.float32).numpy())
     np.save(out_dir / "ref_asr_generated.npy", np.asarray(new_tokens, dtype=np.int32))
+    marker = processor.tokenizer.convert_tokens_to_ids("<asr_text>")
+    transcript = new_tokens[new_tokens.index(marker) + 1:] if (not looped and marker in new_tokens) else new_tokens
+    np.save(out_dir / "ref_asr_transcript.npy", np.asarray(transcript, dtype=np.int32))
     np.save(out_dir / "ref_asr_prompt_len.npy", np.asarray(prompt_len, dtype=np.int32))
 
     rows = audio.shape[0]

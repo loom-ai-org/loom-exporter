@@ -10,20 +10,26 @@ Chatterbox is two models in sequence:
 EXPORT-ROADMAP's correction 4 says families 9 and 10 are two stages of one pipeline for most of the
 remaining TTS leaves, and this is the first of them here. Neither half needed a new template: T3 is
 family 10's shape (a KV-cached decoder, a private second stream for guidance, a hand-written loop --
-`dia_export`, `qwen3_tts_export`), and S3Gen is family 9's (`FlowMatchingSpec` with F5-TTS's caller
-schedule, guidance and caller noise). What is new is only that they share one GGUF and one driver.
+`dia_export`, `qwen3_tts_export`), and S3Gen is family 9's (F5-TTS's caller schedule, guidance and
+caller noise on `loom.run_ode`). What is new is only that they share one GGUF and one driver.
+
+The driver is the live stream (`chatterbox_driver/00_stream.lua`, loom.cpp ADR-117): T3 a token per step,
+the flow re-run over every token so far each hop with CosyVoice2's `finalize=False` look-ahead, HiFT re-run
+over all the mel with its last `vocoder_right_frames` frames' samples held back. `infer` runs it to its
+end in one hop, which is the one pass.
 
 Six phases:
   - `t3_prefill_embed`: the voice conditioning (speaker vector, 150 prompt speech tokens through the
                         perceiver resampler, the emotion scalar), the text ids, and two BOS rows -> the
-                        prefill's input embeddings. Called twice, once per guidance stream: the
+                        prefill's input embeddings for BOTH guidance streams, `(2, n, 1024)`: the
                         unconditional one differs ONLY in its text embeddings being zeroed (their
-                        POSITION embeddings stay), which is the `text_keep` input.
-  - `t3_lm`:            the 30-layer Llama, KV-cached, returning the speech head's logits for the LAST
-                        row only. Its unconditional twin `t3_lm_uncond` is an `extra_streams` alias with
-                        a private cache (loom.cpp ADR-023), which is how Dia runs guidance too.
+                        POSITION embeddings stay).
+  - `t3_lm`:            the 30-layer Llama, KV-cached, over both streams as a batch of two (their
+                        attention one attention over twice the heads), returning the GUIDED logits of the
+                        LAST row. It used to be two calls on two caches (an `extra_streams` twin, loom.cpp
+                        ADR-023), each reading every weight for one row (loom.cpp ADR-117's amendment).
   - `t3_step_embed`:    one generated token -> `speech_emb(token) + speech_pos_emb(position)`, the next
-                        step's input for both streams.
+                        step's input, once per stream.
   - `flow_encoder`:     prompt tokens + generated tokens -> `mu` (`[2n, 80]`, frame-major) and the
                         projected speaker vector `spks`. The 6+4-block espnet conformer with its 2x
                         upsample in the middle.
@@ -46,6 +52,7 @@ tokenizer, CAMPPlus) and is not in this export.
 Usage:
   loom-export ~/Dev/models/chatterbox -o chatterbox.gguf --task text-to-speech --model chatterbox
 """
+import copy
 import importlib.metadata as _metadata
 import sys
 import types
@@ -60,7 +67,6 @@ import torch.nn.functional as F
 
 from .decomposition import Decomposition, MultiPhase
 from .export_config import LoomExportConfig
-from .flow_matching_export import FlowMatchingSpec
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .spec_protocol import Axis, Unchecked
 
@@ -103,6 +109,14 @@ T3_MAX_POSITIONS = 2048
 N_BOS_ROWS = 2
 # Rows ahead of the text in the prefill: speaker (1) + perceiver queries (32) + emotion (1).
 N_COND_ROWS = 34
+
+# The live stream's hop in speech tokens (loom.cpp ADR-117): CosyVoice2Model's, whose flow and `finalize`
+# hook S3Gen kept -- 25 tokens (1 s), doubling up to 100. CosyVoice2's first hop also pads the prompt and
+# itself onto a 25-token boundary, which aligns them with the chunk mask its flow was trained with; S3Gen
+# attends over everything (`static_chunk_size` 0), so the pad would only delay the first piece.
+STREAM_HOP_TOKENS = 25
+STREAM_MAX_HOP_TOKENS = 100
+STREAM_HOP_SCALE = 2
 
 # The trace lengths. Odd and distinct from every static dimension in the graphs, so no fusion can
 # confuse a sequence axis with a head or channel axis (the Qwen3-TTS lesson about length 8).
@@ -186,12 +200,12 @@ def fold_weight_norm(module: nn.Module) -> None:
 # ------------------------------------------------------------------------------------------- T3 --
 
 class T3PrefillEmbedPhase(nn.Module):
-    """`(speaker_emb, prompt_tokens, emotion_adv, text_ids, text_keep) -> the prefill's embeddings`.
+    """`(speaker_emb, prompt_tokens, emotion_adv, text_ids) -> both guidance streams' prefill embeddings`,
+    `(2, n, 1024)`: the conditional stream, then the unconditional one.
 
-    `T3.prepare_input_embeds` plus the second BOS row `T3.inference` appends, for one stream at a time.
-    `text_keep` is 1.0 for the conditional stream and 0.0 for the unconditional one: the reference
-    zeroes `text_emb[1]` BEFORE the position embeddings are added, so the unconditional prefill still
-    carries the text's positions -- a multiply on the token embeddings alone reproduces exactly that.
+    `T3.prepare_input_embeds` plus the second BOS row `T3.inference` appends, as the reference's batch of
+    two: the unconditional row differs ONLY in its text token embeddings being zeroed -- the reference zeroes
+    `text_emb[1]` BEFORE the position embeddings are added, so it still carries the text's positions.
 
     The two learned position tables are sliced by length rather than looked up with an `arange`; the
     prompt's rows are a fixed `[0, 150)` and the BOS rows are both position 0.
@@ -208,40 +222,104 @@ class T3PrefillEmbedPhase(nn.Module):
         bos = t3.speech_emb.weight[START_SPEECH] + t3.speech_pos_emb.emb.weight[0]
         self.register_buffer("bos_rows", bos.detach().clone().expand(1, N_BOS_ROWS, -1).contiguous())
 
-    def forward(self, speaker_emb, prompt_tokens, emotion_adv, text_ids, text_keep):
+    def forward(self, speaker_emb, prompt_tokens, emotion_adv, text_ids):
         ce = self.cond_enc
         spk = ce.spkr_enc(speaker_emb).unsqueeze(1)                       # (1, 1, 1024)
         prompt = self.speech_emb(prompt_tokens) + self.prompt_pos         # (1, 150, 1024)
         prompt = ce.perceiver(prompt)                                     # (1, 32, 1024)
         emotion = ce.emotion_adv_fc(emotion_adv).unsqueeze(1)             # (1, 1, 1024)
-        text = self.text_emb(text_ids) * text_keep + self.text_pos[: text_ids.shape[1]]
-        return torch.cat([spk, prompt, emotion, text, self.bos_rows], dim=1)
+        pos = self.text_pos[: text_ids.shape[1]]
+        text = self.text_emb(text_ids)
+        head = torch.cat([spk, prompt, emotion], dim=1)
+        cond = torch.cat([head, text + pos, self.bos_rows], dim=1)
+        uncond = torch.cat([head, text * 0.0 + pos, self.bos_rows], dim=1)
+        return torch.cat([cond, uncond], dim=0)                           # (2, n, 1024)
+
+
+def _rotate_half_matrix(head_dim: int) -> torch.Tensor:
+    """`R` with `x @ R == rotate_half(x)` (`cat(-x2, x1)`): a signed permutation, so each output is one
+    term of +-1 plus zeros and the product is exact. One matmul node where `chunk` makes two views, a
+    negation and a concat, and no slice of the regrouped heads for the lowering to spell (a flattened
+    variant's slice views reached the engine with the sequence length resolved to 0). F5-TTS's rope pair
+    swap."""
+    half = head_dim // 2
+    r = torch.zeros(head_dim, head_dim)
+    for j in range(half):
+        r[j + half, j] = -1.0
+        r[j, j + half] = 1.0
+    return r
 
 
 class T3LMPhase(nn.Module):
-    """`(inputs_embeds, position_ids, attention_mask) -> speech logits of the LAST row`, `(1, 1, 8194)`.
+    """`(inputs_embeds, position_ids, attention_mask, cfg) -> the GUIDED speech logits of the last row`,
+    `(1, 1, 8194)`: `cond + cfg * (cond - uncond)`, the reference's own combination.
+
+    **Both guidance streams in ONE run** (loom.cpp ADR-117's amendment), as `T3.inference` runs them: a
+    batch of two, `inputs_embeds` `(2, n, 1024)`. The decoder used to run them as two calls on two KV
+    caches (`t3_lm` and an `extra_streams` twin), each reading all 2 GB of F32 weights for one row: on the
+    workstation's CPU that was 36 ms a call, twice a token, 72% of a sentence, at the memory's bandwidth.
+    Here every weight matmul sees both rows, so the weights are read once a token.
+
+    The two streams always have the same length and step together, so their attention is ONE attention
+    over twice the heads -- the conditional stream's 16, then the unconditional stream's -- against one
+    cache of twice the width under one causal mask. That is what `fuse_loom_attention` matches (generic
+    SDPA over `[b, heads, seq, dim]`) and what the engine's ATTENTION node runs, so the cache needed no new
+    shape. Llama's decoder is spelled out over HF's own modules for it: the norms, projections and MLP act
+    on `(2, n, 1024)`, and only the attention regroups the streams into heads and back. A batch of two
+    costs the weights' one read: ggml's F32 matmul over T3's 2 GB took 28.6 ms for one column and 28.6 for
+    one column in a batch of two (workstation CPU, 16 threads; flattening the streams into `(2n, 1024)`
+    rows gained nothing and cost the sequence axis its symbol).
 
     The whole head, not a trimmed one (compare `qwen3_tts_export._TalkerWrapper`): the reference draws
-    over all 8194 ids and FEEDS BACK whatever it drew, control ids included, dropping them only on the
-    way to S3Gen. A trimmed head would be a different sampler.
-
-    Last row only, because only the last row is ever sampled; the prefill would otherwise project every
-    prefix row through a 1024 x 8194 head for nothing.
+    over all 8194 ids and FEEDS BACK whatever it drew, control ids included, dropping them only on the way
+    to S3Gen. Last row only, because only the last row is ever sampled.
     """
 
     def __init__(self, t3):
         super().__init__()
         self.model = t3.tfmr
         self.head = t3.speech_head
+        cfg = t3.tfmr.config
+        self.n_head = cfg.num_attention_heads
+        self.head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
+        if cfg.num_key_value_heads != cfg.num_attention_heads:
+            raise NotImplementedError(
+                f"T3 with {cfg.num_key_value_heads} KV heads for {cfg.num_attention_heads}: the batched "
+                f"guidance attention stacks the two streams' heads, which assumes no GQA")
+        self.register_buffer("rotate_half", _rotate_half_matrix(self.head_dim))
 
-    def forward(self, inputs_embeds, position_ids, attention_mask):
-        hidden = self.model(inputs_embeds=inputs_embeds, position_ids=position_ids,
-                            attention_mask=attention_mask, use_cache=False).last_hidden_state
-        return self.head(hidden[:, -1:])
+    def _heads(self, y, n):
+        """`(2, n, H*d)` -> `(1, 2H, n, d)`: the conditional stream's heads, then the unconditional's."""
+        return (y.view(2, n, self.n_head, self.head_dim).transpose(1, 2)
+                 .reshape(1, 2 * self.n_head, n, self.head_dim))
+
+    def forward(self, inputs_embeds, position_ids, attention_mask, cfg):
+        m = self.model
+        n = inputs_embeds.shape[1]
+        h = inputs_embeds                                                 # (2, n, 1024)
+        cos, sin = m.rotary_emb(h, position_ids)                          # (1, n, d)
+        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+        width = self.n_head * self.head_dim
+        for layer in m.layers:
+            a = layer.self_attn
+            x = layer.input_layernorm(h)
+            q, k, v = self._heads(a.q_proj(x), n), self._heads(a.k_proj(x), n), self._heads(a.v_proj(x), n)
+            q = q * cos + (q @ self.rotate_half) * sin
+            k = k * cos + (k @ self.rotate_half) * sin
+            o = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask, scale=a.scaling)
+            o = o.transpose(1, 2).reshape(1, n, 2 * width)                # [b, n, 2H*d]: the fused node's
+            # Back to one row per stream by slices, not a second reshape: MIL merges two reshapes into one,
+            # and the fusion would then replace a `(n, 2, H*d)` var with its `(1, n, 2H*d)` output.
+            o = torch.cat([o[:, :, :width], o[:, :, width:]], dim=0)      # (2, n, H*d)
+            h = h + a.o_proj(o)
+            h = h + layer.mlp(layer.post_attention_layernorm(h))
+        logits = self.head(m.norm(h[:, -1:]))                             # (2, 1, 8194)
+        return logits[:1] + cfg * (logits[:1] - logits[1:])
 
 
 class T3StepEmbedPhase(nn.Module):
-    """`(token, position) -> speech_emb(token) + speech_pos_emb(position)`, one row."""
+    """`(token, position) -> speech_emb(token) + speech_pos_emb(position)`, one row for each guidance
+    stream: both feed the same draw back."""
 
     def __init__(self, t3):
         super().__init__()
@@ -249,7 +327,19 @@ class T3StepEmbedPhase(nn.Module):
         self.speech_pos = t3.speech_pos_emb.emb
 
     def forward(self, token, position):                                   # (1, 1) i32, (1, 1) i32
-        return self.speech_emb(token) + self.speech_pos(position)
+        row = self.speech_emb(token) + self.speech_pos(position)
+        return torch.cat([row, row], dim=0)                               # (2, 1, 1024)
+
+
+def _check_t3_attention(topo: dict, n_layers: int) -> int:
+    """Exactly `n_layers` ATTENTION nodes in `t3_lm`, all cached. An attention the fusion did not match
+    would still export and run -- uncached, so every step would attend over itself alone."""
+    total = [n for n in topo["nodes"] if n["op"] == "ATTENTION"]
+    cached = [n for n in total if n.get("attrs", {}).get("kv_cache", True)]
+    if len(total) != n_layers or len(cached) != n_layers:
+        raise ValueError(f"chatterbox t3_lm: fused {len(total)} ATTENTION node(s) ({len(cached)} cached) for "
+                         f"{n_layers} decoder layers")
+    return n_layers
 
 
 # ---------------------------------------------------------------------------------------- S3Gen --
@@ -332,7 +422,18 @@ class EstimatorPhase(nn.Module):
                 f"stride-1 level, where the skip crop is the identity. A deeper U-Net needs the crop.")
         self.d = decoder
 
-    def forward(self, x, mu, spks, cond, t):
+    def forward(self, x, mu, spks, cond, t, cfg):
+        """The GUIDED velocity, as `CausalConditionalCFM.solve_euler` computes it: ONE run over a batch of
+        two -- the conditioning, and the same state with mu, spks and cond zeroed -- combined as
+        `(1 + cfg) * v_cond - cfg * v_uncond`, in that order and in f32: CosyVoice3's estimator, for its
+        reason (loom.cpp ADR-113), and ADR-117's amendment. The engine's ODE loop used to make the two runs
+        as two calls, 20 a sentence, each over every weight for one batch row."""
+        zeros = lambda v: v * 0.0                                             # noqa: E731 -- exact zeros
+        v = self._velocity(torch.cat([x, x], dim=0), torch.cat([mu, zeros(mu)], dim=0),
+                           torch.cat([spks, zeros(spks)], dim=0), torch.cat([cond, zeros(cond)], dim=0), t)
+        return (1.0 + cfg) * v[:1] - cfg * v[1:]                              # (1, T, 80)
+
+    def _velocity(self, x, mu, spks, cond, t):
         d = self.d
         x, mu, cond = x.transpose(1, 2), mu.transpose(1, 2), cond.transpose(1, 2)
         t_emb = d.time_mlp(d.time_embeddings(t))
@@ -453,6 +554,37 @@ class HiftVocoderPhase(nn.Module):
         return torch.cat([wave[:, :n_fade] * self.trim_fade, wave[:, n_fade:]], dim=1)
 
 
+def vocoder_right_frames(vocoder: nn.Module, n_frames: int = 64, cut: int = 40) -> int:
+    """How many mel frames at the end of a mel the vocoder's samples still read: `vocoder` (a
+    `HiftVocoderPhase`) over `n_frames` frames whose frames from `cut` on are NaN, and the first NaN
+    sample. NaN passes through every operation here whatever the weights and the values (a conv, the
+    activations, the clamps, the voicing threshold, `exp`, the source's cumsum, the iSTFT's overlap-add),
+    so this is the graph's STRUCTURAL reach: a sample before it reads no frame at or after `cut`, so it is
+    the same over a mel cut there as over the whole. HiFT is not causal (`conv_pre`, the F0 predictor's
+    five convolutions, the resblocks' dilations and the source's STFT all look right), and its reach is
+    not a whole number of frames, so this counts it rather than summing it.
+
+    Not a value probe (two mels differing in the tail, the first sample that moves): that is the data's
+    reach, not the graph's. Unvoiced (F0 under the 10 Hz threshold) the source does not depend on F0 and
+    the reach falls to ~13 frames; on a voiced sentence the samples 14 to 19 frames back move by 1e-15 to
+    1e-13, which a value probe at any threshold misses.
+    """
+    mel = torch.zeros(1, n_frames, N_MEL, dtype=torch.float64)
+    mel[:, cut:] = float("nan")
+    harmonics = vocoder.harmonics
+    wrapper = copy.deepcopy(vocoder).double()
+    with torch.no_grad():
+        wave = wrapper(mel, torch.zeros(1, harmonics, 1, dtype=torch.float64),
+                       torch.zeros(1, harmonics, n_frames * SAMPLES_PER_FRAME, dtype=torch.float64))
+    nan = torch.isnan(wave[0]).nonzero()
+    if nan.numel() == 0:
+        raise ValueError("the vocoder's output reads no frame at its end: no NaN reached it")
+    first = int(nan[0])
+    if not 0 < first <= cut * SAMPLES_PER_FRAME:
+        raise ValueError(f"the vocoder's first NaN sample is {first}, outside (0, {cut * SAMPLES_PER_FRAME}]")
+    return -(-(cut * SAMPLES_PER_FRAME - first) // SAMPLES_PER_FRAME)
+
+
 def causal_mask(seq_len: int) -> torch.Tensor:
     """A 4-D additive causal mask, the form `create_causal_mask` passes straight through (see
     `dia_export.causal_mask`, whose reason this is)."""
@@ -488,6 +620,7 @@ class ChatterboxExportConfig(BaseMultiPhaseModelExportConfig):
     driver_script_path: Path = Path(__file__).resolve().parent / "chatterbox_driver"
     _voice: Optional[Dict[str, np.ndarray]] = field(default=None, init=False, repr=False)
     _trim_fade_len: int = field(default=0, init=False, repr=False)
+    _stream: Optional[tuple] = field(default=None, init=False, repr=False)
 
     __links__ = {"root_axis": Axis()}
     __unchecked__ = {
@@ -501,6 +634,8 @@ class ChatterboxExportConfig(BaseMultiPhaseModelExportConfig):
         "_voice": Unchecked(
             "READ off `conds.pt` during phases(); shipped as driver weights and shape-checked there"),
         "_trim_fade_len": Unchecked("read off S3Gen's own `trim_fade` buffer during phases()"),
+        "_stream": Unchecked("the flow's look-ahead in tokens and the vocoder's right reach in frames, read "
+                             "off the modules in phases()"),
     }
 
     def phases(self) -> List[ExportPhase]:
@@ -527,6 +662,12 @@ class ChatterboxExportConfig(BaseMultiPhaseModelExportConfig):
         frame_dim = ct.RangeDim(8, 2 * t3.hp.max_speech_tokens)
         gen_dim = ct.RangeDim(2, 2 * t3.hp.max_speech_tokens)
         harmonics = s3.mel2wav.m_source.l_sin_gen.harmonic_num + 1
+        vocoder = HiftVocoderPhase(s3.mel2wav, s3.trim_fade).eval()
+        if s3.flow.decoder.estimator.static_chunk_size != 0:
+            raise NotImplementedError(
+                f"this S3Gen's U-Net attends in chunks of {s3.flow.decoder.estimator.static_chunk_size} "
+                f"frames; the export runs it with full attention, which is what the English checkpoint does")
+        self._stream = (s3.flow.pre_lookahead_len, vocoder_right_frames(vocoder))
         return [
             ExportPhase(
                 name="t3_prefill_embed",
@@ -535,36 +676,34 @@ class ChatterboxExportConfig(BaseMultiPhaseModelExportConfig):
                               torch.randint(0, SPEECH_VOCAB, (1, COND_PROMPT_LEN), dtype=torch.int32),
                               torch.tensor([[DEFAULT_EXAGGERATION]]),
                               torch.randint(1, t3.hp.text_tokens_dict_size, (1, TRACE_TEXT),
-                                            dtype=torch.int32),
-                              torch.tensor([1.0])),
+                                            dtype=torch.int32)),
                 mil_inputs=[
                     ct.TensorType(name="speaker_emb", shape=(1, t3.hp.speaker_embed_size),
                                   dtype=np.float32),
                     ct.TensorType(name="prompt_tokens", shape=(1, COND_PROMPT_LEN), dtype=np.int32),
                     ct.TensorType(name="emotion_adv", shape=(1, 1), dtype=np.float32),
                     ct.TensorType(name="text_ids", shape=(1, text_dim), dtype=np.int32),
-                    ct.TensorType(name="text_keep", shape=(1,), dtype=np.float32),
                 ],
                 root_axis="n_tokens",
             ),
             ExportPhase(
                 name="t3_lm",
                 wrapper=T3LMPhase(t3).eval(),
-                dummy_inputs=(torch.zeros(1, TRACE_STEPS, hidden),
+                dummy_inputs=(torch.randn(2, TRACE_STEPS, hidden),
                               torch.arange(TRACE_STEPS).view(1, -1),
-                              causal_mask(TRACE_STEPS)),
+                              causal_mask(TRACE_STEPS),
+                              torch.tensor([DEFAULT_CFG_WEIGHT])),
                 mil_inputs=[
-                    ct.TensorType(name="inputs_embeds", shape=(1, seq_dim, hidden), dtype=np.float32),
+                    # Both guidance streams, conditional first (`T3LMPhase`).
+                    ct.TensorType(name="inputs_embeds", shape=(2, seq_dim, hidden), dtype=np.float32),
                     ct.TensorType(name="position_ids", shape=(1, seq_dim), dtype=np.int32),
                     ct.TensorType(name="attention_mask", shape=(1, 1, seq_dim, seq_dim),
                                   dtype=np.float32),
+                    ct.TensorType(name="cfg", shape=(1,), dtype=np.float32),
                 ],
                 fuse_attention=True,
                 kv_cache_size=T3_MAX_POSITIONS,
-                # **A stream with its own KV cache.** Guidance runs the same decoder over a second
-                # prefill (text embeddings zeroed) and the two caches then diverge for the whole
-                # generation, so one cache cannot serve both -- Dia's `decoder_uncond`, exactly.
-                extra_streams=("t3_lm_uncond",),
+                topology_rewrite=lambda topo: _check_t3_attention(topo, t3.cfg.num_hidden_layers),
             ),
             ExportPhase(
                 name="t3_step_embed",
@@ -588,13 +727,15 @@ class ChatterboxExportConfig(BaseMultiPhaseModelExportConfig):
                 wrapper=EstimatorPhase(s3.flow.decoder.estimator).eval(),
                 dummy_inputs=(torch.randn(1, TRACE_FRAMES, N_MEL), torch.randn(1, TRACE_FRAMES, N_MEL),
                               torch.randn(1, N_MEL), torch.randn(1, TRACE_FRAMES, N_MEL),
-                              torch.tensor([0.3])),
+                              torch.tensor([0.3]), torch.tensor([FLOW_CFG_RATE])),
                 mil_inputs=[
                     ct.TensorType(name="x", shape=(1, frame_dim, N_MEL), dtype=np.float32),
                     ct.TensorType(name="mu", shape=(1, frame_dim, N_MEL), dtype=np.float32),
                     ct.TensorType(name="spks", shape=(1, N_MEL), dtype=np.float32),
                     ct.TensorType(name="cond", shape=(1, frame_dim, N_MEL), dtype=np.float32),
                     ct.TensorType(name="t", shape=(1,), dtype=np.float32),
+                    # The guidance weight: the estimator runs both halves of the guidance itself.
+                    ct.TensorType(name="cfg", shape=(1,), dtype=np.float32),
                 ],
                 # `n_tokens`, not `n_enc_frames`: `FlowMatchingSampler` binds its length under that name
                 # (F5-TTS's estimator is declared the same way), and the vocoder below is where the
@@ -603,7 +744,7 @@ class ChatterboxExportConfig(BaseMultiPhaseModelExportConfig):
             ),
             ExportPhase(
                 name="vocoder",
-                wrapper=HiftVocoderPhase(s3.mel2wav, s3.trim_fade).eval(),
+                wrapper=vocoder,
                 dummy_inputs=(torch.randn(1, TRACE_FRAMES, N_MEL),
                               torch.rand(1, harmonics, 1),
                               torch.randn(1, harmonics, TRACE_FRAMES * SAMPLES_PER_FRAME)),
@@ -641,99 +782,48 @@ class ChatterboxExportConfig(BaseMultiPhaseModelExportConfig):
                 f"S3Gen in-fills after the prompt's frames and needs exactly {TOKEN_MEL_RATIO} per "
                 f"token, which is what `S3Token2Mel.embed_ref` trims a reference to.")
 
-    def samplers(self) -> List[FlowMatchingSpec]:
-        return [FlowMatchingSpec(
-            func_name="sample_estimator",
-            estimator="estimator",
-            carried_input="x",
-            time_input="t",
-            fixed_inputs=["mu", "spks", "cond"],
-            # `1 - cos(pi/2 * t)` over a linspace -- `CausalConditionalCFM.forward`'s cosine schedule.
-            schedule="caller",
-            # `(1 + rate) * v_cond - rate * v_uncond` with the unconditional run seeing mu, spks and
-            # cond all zeroed: `solve_euler`'s own batch-of-two, which is ADR-040's form exactly.
-            guidance=True,
-            # See `HiftVocoderPhase`: a reference waveform is only reproducible from its own draws.
-            caller_noise=True,
-            note="Euler over S3Gen's causal U-Net on the cosine schedule, under classifier-free\n"
-                 "guidance: the unconditional evaluation sees mu, spks and cond zeroed.",
-        )]
-
     def driver_components(self) -> List:
-        from .driver_components import (
-            CALLER, DriverInputs, DriverReturn, ExportConstants, FlowMatchingSampler, LuaFragment,
-            SubgraphCallComponent,
-        )
-        from .driver_ir import BinOp, FieldAccess, Len, OutputRef, Var
+        from .driver_components import CALLER, DriverInputs, DriverReturn, ExportConstants, LuaFragment
+        from .driver_ir import Len
 
         fragment = self.driver_script_path
-        n_frames, n_gen = Var("n_frames"), Var("n_gen_frames")
+        look, right = self._stream if self._stream else (0, 0)
+        constants = {
+            "START_TEXT": START_TEXT, "STOP_TEXT": STOP_TEXT,
+            "START_SPEECH": START_SPEECH, "STOP_SPEECH": STOP_SPEECH,
+            "SPEECH_VOCAB": SPEECH_VOCAB,
+            "N_COND_ROWS": N_COND_ROWS, "N_BOS_ROWS": N_BOS_ROWS,
+            "T3_MAX_POSITIONS": T3_MAX_POSITIONS,
+            "TOKEN_MEL_RATIO": TOKEN_MEL_RATIO, "N_MEL": N_MEL,
+            "SAMPLES_PER_FRAME": SAMPLES_PER_FRAME,
+            "NSF_HARMONICS": 9,
+            "FLOW_STEPS": FLOW_STEPS, "FLOW_CFG_RATE": FLOW_CFG_RATE,
+            # `ChatterboxTTS.generate`'s own defaults: the numbers every published sample used.
+            "DEFAULT_CFG_WEIGHT": DEFAULT_CFG_WEIGHT,
+            "DEFAULT_TEMPERATURE": DEFAULT_TEMPERATURE,
+            "DEFAULT_MIN_P": DEFAULT_MIN_P,
+            "DEFAULT_TOP_P": DEFAULT_TOP_P,
+            "DEFAULT_REPETITION_PENALTY": DEFAULT_REPETITION_PENALTY,
+            "DEFAULT_EXAGGERATION": DEFAULT_EXAGGERATION,
+            "DEFAULT_MAX_NEW_TOKENS": DEFAULT_MAX_NEW_TOKENS,
+            # The live stream's cut (ADR-117): the hop, its growth and ceiling; the flow's look-ahead
+            # context; and the frames at the end of the mel the vocoder's samples still read.
+            "STREAM_HOP_TOKENS": STREAM_HOP_TOKENS, "STREAM_MAX_HOP_TOKENS": STREAM_MAX_HOP_TOKENS,
+            "STREAM_HOP_SCALE": STREAM_HOP_SCALE,
+            "LOOKAHEAD_TOKENS": look, "VOCODER_RIGHT_FRAMES": right,
+        }
         return [
             LuaFragment(fragment / "00_header.lua", top_level=True,
                         defines=("chatterbox_voice", "chatterbox_cosine_times", "chatterbox_zeros")),
-            ExportConstants(values={
-                "START_TEXT": START_TEXT, "STOP_TEXT": STOP_TEXT,
-                "START_SPEECH": START_SPEECH, "STOP_SPEECH": STOP_SPEECH,
-                "SPEECH_VOCAB": SPEECH_VOCAB,
-                "N_COND_ROWS": N_COND_ROWS, "N_BOS_ROWS": N_BOS_ROWS,
-                "T3_MAX_POSITIONS": T3_MAX_POSITIONS,
-                "TOKEN_MEL_RATIO": TOKEN_MEL_RATIO, "N_MEL": N_MEL,
-                "SAMPLES_PER_FRAME": SAMPLES_PER_FRAME,
-                "NSF_HARMONICS": 9,
-                "FLOW_STEPS": FLOW_STEPS, "FLOW_CFG_RATE": FLOW_CFG_RATE,
-                # `ChatterboxTTS.generate`'s own defaults: the numbers every published sample used.
-                "DEFAULT_CFG_WEIGHT": DEFAULT_CFG_WEIGHT,
-                "DEFAULT_TEMPERATURE": DEFAULT_TEMPERATURE,
-                "DEFAULT_MIN_P": DEFAULT_MIN_P,
-                "DEFAULT_TOP_P": DEFAULT_TOP_P,
-                "DEFAULT_REPETITION_PENALTY": DEFAULT_REPETITION_PENALTY,
-                "DEFAULT_EXAGGERATION": DEFAULT_EXAGGERATION,
-                "DEFAULT_MAX_NEW_TOKENS": DEFAULT_MAX_NEW_TOKENS,
-            }),
-            # The text's ids are the one required input; every other `inputs.*` the fragments read
-            # (the voice, the sampling knobs, the draws) is optional and defaulted in place.
+            ExportConstants(values=constants, top_level=True),
+            # T3's loop, the flow's re-run and HiFT's settled samples: the live stream, which `infer` runs
+            # to its end in one call.
+            LuaFragment(fragment / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
+            # The text's ids are the one required input; every other `inputs.*` the stream reads (the
+            # voice, the sampling knobs, the draws) is optional and defaulted in place.
             DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
-            LuaFragment(fragment / "01_t3.lua",
-                        reads=("tokens", "START_TEXT", "STOP_TEXT", "START_SPEECH",
-                               "STOP_SPEECH", "SPEECH_VOCAB", "N_COND_ROWS", "N_BOS_ROWS",
-                               "T3_MAX_POSITIONS", "DEFAULT_CFG_WEIGHT", "DEFAULT_TEMPERATURE",
-                               "DEFAULT_MIN_P", "DEFAULT_TOP_P", "DEFAULT_REPETITION_PENALTY",
-                               "DEFAULT_EXAGGERATION", "DEFAULT_MAX_NEW_TOKENS"),
-                        defines=("speech_tokens",)),
-            LuaFragment(fragment / "02_flow_plan.lua",
-                        reads=("speech_tokens", "TOKEN_MEL_RATIO", "N_MEL", "FLOW_STEPS",
-                               "FLOW_CFG_RATE"),
-                        defines=("flow_tokens", "flow_embedding", "n_codes", "n_frames",
-                                 "n_prompt_frames", "n_gen_frames", "step_cond", "zero_cond",
-                                 "zero_spks", "times", "flow_cfg")),
-            SubgraphCallComponent(
-                topology="flow_encoder", outputs=(), retain=True, length=Var("n_codes"),
-                inputs={"tokens": Var("flow_tokens"), "embedding": Var("flow_embedding")},
-                note="--- mu (frame-major) and the projected speaker vector, both RETAINED: the\n"
-                     "    sampler hands them to every conditional evaluation. ---"),
-            FlowMatchingSampler(
-                spec=self.samplers()[0], result="_mel", length=n_frames,
-                n_elems=BinOp("*", n_frames, Var("N_MEL")),
-                n_steps=None, times=Var("times"),
-                step_inputs={"mu": OutputRef("flow_encoder", index=1),
-                             "spks": OutputRef("flow_encoder", index=2),
-                             "cond": Var("step_cond")},
-                uncond_inputs={"mu": Var("zero_cond"), "spks": Var("zero_spks"),
-                               "cond": Var("zero_cond")},
-                guidance_scale=Var("flow_cfg"),
-                state=FieldAccess("inputs", "noise"),
-                note="--- The whole mel grid, in-filled after the voice's prompt frames. ---"),
-            LuaFragment(fragment / "03_mel_tail.lua",
-                        reads=("n_prompt_frames", "n_gen_frames", "N_MEL"),
-                        defines=("mel_tail",), retains=("estimator",)),
-            LuaFragment(fragment / "04_nsf.lua",
-                        reads=("n_gen_frames", "NSF_HARMONICS", "SAMPLES_PER_FRAME"),
-                        defines=("nsf_phase", "nsf_noise")),
-            SubgraphCallComponent(
-                topology="vocoder", outputs=("wave",), length=n_gen,
-                inputs={"mel": Var("mel_tail"), "nsf_phase": Var("nsf_phase"),
-                        "nsf_noise": Var("nsf_noise")},
-                note="--- HiFT: the generated frames -> 24 kHz waveform, fade-in included. ---"),
+            LuaFragment(fragment / "01_generate.lua", reads=("tokens",), defines=("wave",)),
             DriverReturn(values=("wave",)),
         ]
 

@@ -7,8 +7,10 @@
     --
     -- One pass is the live stream (00_stream.lua) opened, fed to its end and finished inside this call,
     -- against the fresh state the engine gives every one-pass call -- so the one-pass gate is the live
-    -- path's gate too.
+    -- path's gate too. A sentence per feed, the reference's non-streaming decode, unless the caller asks
+    -- for rows (`piece_tokens`), which is the live cut run in one call.
     if #tokens == 0 then error('soprano: no text ids') end
+    if inputs.piece_tokens == nil then inputs.piece_tokens = 0 end
     stream_open(inputs)
     wave = {}
     while loom.state('done') == 0 do

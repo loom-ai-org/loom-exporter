@@ -20,7 +20,9 @@ Two phases:
                 hidden row after the final RMSNorm -- HF's `hidden_states[-1]`, which is what the
                 reference keeps (checked: `lm_head(hidden_states[-1]) == logits`). KV-cached.
   - `decoder`:  `SopranoDecoder` over every kept row in one call, as the reference's non-streaming
-                `infer` does: L rows -> `2048 * (L - 1)` samples.
+                `infer` does: L rows -> `2048 * (L - 1)` samples. A stream (loom.cpp ADR-114) runs the
+                same phase over a window of rows with the decoder's receptive field either side
+                (`decoder_context_rows`), as upstream's `infer_stream` does.
 
 Usage:
   loom-export ~/Dev/models/soprano-1.1-80m -o soprano.gguf --task text-to-speech --model soprano
@@ -62,6 +64,12 @@ DEFAULT_TEMPERATURE = 0.001
 DEFAULT_TOP_K = 50
 DEFAULT_TOP_P = 0.95
 DEFAULT_REPETITION_PENALTY = 1.2
+
+# A stream's pieces grow 1, 2, 4, 8, 16 rows (64 ms to 1.02 s), then stay at this many. Each piece's
+# decoder window adds `decoder_context_rows` (3 + 4) rows of context: growing to 8 cost ~14% over the
+# one pass on an 11.3 s text on the dev box, 16 ~7%. Only the first piece's size decides when audio
+# starts (0.32 s either way), since a piece is made ~2x faster than it plays.
+PIECE_TOKENS_GROWN = 16
 
 # Trace lengths: odd and distinct from every static dimension.
 TRACE_TOKENS = 7
@@ -139,6 +147,33 @@ def linear_upsample_kernel(upscale: int) -> torch.Tensor:
     return (1.0 - (k - upscale).abs() / upscale).to(torch.float32)
 
 
+def decoder_context_rows(decoder) -> tuple:
+    """`(left, right)`: how many hidden rows either side of rows `[e, f)` a decoder call must see for
+    their `2048 * (f - e)` samples to be the ones a call over every row gives.
+
+    The decoder is local. Row i is upsampled frame `4i` (linear, so frames between two rows read only
+    those two); each convolution reads `k // 2` frames either side, and a window's own zero padding
+    reaches that far into it per layer, so the first and last `C` (the sum of the halves) frames of a
+    window are not the one-call frames. The centred ISTFT's output sample `n` is the overlap-add of
+    the frames whose `n_fft` window covers `n + n_fft/2`: frames `(n - n_fft/2) / hop` (exclusive, the
+    periodic Hann window is 0 at its first tap) to `(n + n_fft/2) / hop`. So the first sample of row e
+    reads frames from `4(e - a) - h + 1` (h = n_fft / 2 / hop) in a window starting at row a, which
+    must be at least C; the last sample before row f reads frames up to `4(f - a) + h - 1`, which must
+    be at most the window's last frame `4(b - a - 1)` less C. For Soprano-1.1 (k = 3 in 8 blocks, a
+    1-tap embed, h = 2) that is 3 rows left and 4 right; upstream's `RECEPTIVE_FIELD` is 4 both sides.
+    The CI test checks both are tight: one row fewer either side moves the samples."""
+    backbone, head = decoder.decoder, decoder.head.istft
+    frames = backbone.embed.kernel_size[0] // 2 + sum(b.dwconv.kernel_size[0] // 2 for b in backbone.convnext)
+    if (head.n_fft // 2) % head.hop_length != 0:
+        raise NotImplementedError(f"n_fft {head.n_fft} / hop {head.hop_length}: the context arithmetic "
+                                  f"assumes half a window is whole hops")
+    half = head.n_fft // 2 // head.hop_length
+    up = decoder.upscale
+    left = -(-(frames + half - 1) // up)
+    right = -(-(frames + half - 1 + up) // up)
+    return left, right
+
+
 class DecoderPhase(nn.Module):
     """`(hidden) -> waveform`: `SopranoDecoder.forward` over every kept row, then the reference's trim.
 
@@ -210,6 +245,7 @@ class SopranoExportConfig(BaseMultiPhaseModelExportConfig):
     _text_id: int = field(default=1, init=False, repr=False)
     _start_id: int = field(default=2, init=False, repr=False)
     _hidden_size: int = field(default=512, init=False, repr=False)
+    _context_rows: tuple = field(default=(4, 4), init=False, repr=False)
 
     __links__ = {"root_axis": Axis()}
     __unchecked__ = {
@@ -223,6 +259,7 @@ class SopranoExportConfig(BaseMultiPhaseModelExportConfig):
         "_text_id": Unchecked("`[TEXT]`'s id in `tokenizer.json`, read during phases()"),
         "_start_id": Unchecked("`[START]`'s id in `tokenizer.json`, read during phases()"),
         "_hidden_size": Unchecked("`config.json`'s hidden_size, read during phases()"),
+        "_context_rows": Unchecked("the decoder's receptive field in rows, derived during phases()"),
     }
 
     def phases(self) -> List[ExportPhase]:
@@ -236,6 +273,7 @@ class SopranoExportConfig(BaseMultiPhaseModelExportConfig):
             raise ValueError(f"`[STOP]` is id {stop_id} but eos_token_id is {self._eos_id}: the driver "
                              f"splits sentences on the id that both the prompt opens with and EOS is")
         hidden_size = self._hidden_size = int(lm.config.hidden_size)
+        self._context_rows = decoder_context_rows(decoder)
         seq_dim = ct.RangeDim(1, LM_MAX_POSITIONS)
         row_dim = ct.RangeDim(1, MAX_NEW_TOKENS)
         return [
@@ -278,14 +316,18 @@ class SopranoExportConfig(BaseMultiPhaseModelExportConfig):
                 "MAX_PROMPT_TOKENS": MAX_PROMPT_TOKENS,
                 "LM_MAX_POSITIONS": LM_MAX_POSITIONS,
                 "HIDDEN_SIZE": self._hidden_size,
+                "SAMPLES_PER_ROW": SAMPLES_PER_ROW,
+                "DECODER_LEFT_ROWS": self._context_rows[0],
+                "DECODER_RIGHT_ROWS": self._context_rows[1],
+                "PIECE_TOKENS_GROWN": PIECE_TOKENS_GROWN,
                 "DEFAULT_TEMPERATURE": DEFAULT_TEMPERATURE,
                 "DEFAULT_TOP_K": DEFAULT_TOP_K,
                 "DEFAULT_TOP_P": DEFAULT_TOP_P,
                 "DEFAULT_REPETITION_PENALTY": DEFAULT_REPETITION_PENALTY,
             }, top_level=True),
             DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
-            # The live door (loom.cpp ADR-100): one sentence per `stream_feed`. Top level, so the
-            # constants above are too.
+            # The live door (loom.cpp ADR-100, ADR-114): a few rows, or a sentence, per `stream_feed`.
+            # Top level, so the constants above are too.
             LuaFragment(fragment / "00_stream.lua", top_level=True,
                         defines=("stream_open", "stream_feed", "stream_finish")),
             LuaFragment(fragment / "01_generate.lua", reads=("tokens",), defines=("wave",)),

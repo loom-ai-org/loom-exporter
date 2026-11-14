@@ -1351,6 +1351,10 @@ class CodecDecodeBuilder(DriverBuilder):
     # Only the chunked path has a library call (`array_slice`); the single-call leaves emit none, so
     # their drivers do not move.
     library: Optional["LuaLibrary"] = None
+    # A live door beside `infer` (loom.cpp ADR-120): top-level constants and the fragment defining
+    # `stream_open` / `stream_feed` / `stream_finish` (`frame_window_stream.stream_components`). Empty for
+    # every leaf without one, so their drivers do not move.
+    stream: Tuple[object, ...] = ()
 
     __links__ = {name: NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN)
                  for name in ("inputs", "call", "epilogue")}
@@ -1361,10 +1365,14 @@ class CodecDecodeBuilder(DriverBuilder):
             "every name it declares against loom_exporter/lua/. Declared separately only because it "
             "is optional."
         ),
+        "stream": CoveredBy(
+            "the same: each is a component DriverBuilder.build registers with the export's checker, and "
+            "LuaFragment checks its calls against the traced topology. Optional, hence not a NestedSpec."
+        ),
     }
 
     def components(self):
-        return [c for c in (self.inputs, self.library, self.call, self.epilogue) if c is not None]
+        return [c for c in (*self.stream, self.inputs, self.library, self.call, self.epilogue) if c is not None]
 
 
 @dataclass
@@ -2805,6 +2813,37 @@ class ExportConstants(DriverComponent):
 
     def emit(self, ctx: DriverContext) -> List:
         return [] if self.top_level else self._locals()
+
+
+@dataclass
+class ExprFunction(DriverComponent):
+    """A top-level `local function NAME(PARAMS) return EXPR end`, rendered from an IR expression.
+
+    For a hand-written top-level fragment that needs a number the entry function computes as IR: a live
+    stream's `stream_feed` (ADR-098) runs outside `infer`, so the expression `infer` inlines -- Qwen3-ASR's
+    audio row count over a sample count -- is out of its reach. Rendering the SAME node here, rather than
+    restating its arithmetic in the fragment, keeps the two from disagreeing: the leaf checks that node
+    against the checkpoint once (`phases()`), and both call sites read it.
+    """
+
+    name: str = ""
+    params: Tuple[str, ...] = ()
+    expr: object = None
+
+    __unchecked__ = {
+        "name": Unchecked("the function's name; a fragment calling another name reads nil and fails on "
+                          "the call, which the family's e2e test reaches on its first update"),
+        "params": Unchecked("the parameters `expr` reads; the leaf builds `expr` over exactly these"),
+        "expr": Unchecked("a driver_ir expression the leaf builds and checks itself (`audio_rows`, checked "
+                          "in `phases()` against the encoder's real output)"),
+    }
+
+    def prelude(self, ctx: DriverContext) -> List[str]:
+        return [f"local function {self.name}({', '.join(self.params)})",
+                f"    return {self.expr.render()}", "end", ""]
+
+    def emit(self, ctx: DriverContext) -> List:
+        return []
 
 
 @dataclass

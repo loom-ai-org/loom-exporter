@@ -16,6 +16,7 @@ The real checkpoints are the gate half: loom vs transformers on 73 LibriSpeech u
 in ids and text for both sizes, and the tensor numbers are in loom.cpp's Epic-03.
 """
 import json
+import types
 
 import numpy as np
 import pytest
@@ -126,6 +127,66 @@ def test_a_range_indexing_a_gather_reaches_it_as_i32_and_nothing_else_does(tmp_p
     # The float reader keeps the F32 range itself.
     readers = [n for n in nodes if rng in n.get("inputs", []) and n is not cast]
     assert readers and all(n["op"] != "GET_ROWS" for n in readers)
+
+
+class _OffsetPositionTable(nn.Module):
+    """`pos_emb(arange(n) + row_offset)` -- the encoder's position table as the live door's windows read it
+    (loom.cpp ADR-106): the window's first row is an input, the rows after it count on from there."""
+
+    def __init__(self):
+        super().__init__()
+        self.table = nn.Embedding(64, 4)
+
+    def forward(self, x, row_offset):
+        return x + self.table(torch.arange(x.shape[1]) + row_offset)
+
+
+def test_a_row_offset_reaches_the_gather_index(tmp_path):
+    import coremltools as ct
+    from gguf import GGUFReader
+
+    traced = torch.jit.trace(_OffsetPositionTable().eval(), (torch.randn(1, 6, 4), torch.zeros(1, dtype=torch.int32)))
+    program = ct.convert(traced, inputs=[ct.TensorType(name="x", shape=(1, ct.RangeDim(1, 64), 4)),
+                                         ct.TensorType(name="row_offset", shape=(1,), dtype=np.int32)],
+                         convert_to="milinternal", compute_precision=ct.precision.FLOAT32)
+    out = tmp_path / "offset.gguf"
+    loom_exporter.LoomGGUFBackend()(program, output_path=str(out), architecture="offset",
+                                    root_axis="n_frames", flat_namespace=True)
+    reader = GGUFReader(str(out))
+    key = next(k for k in reader.fields if k.startswith("model.graph_topology"))
+    topo = json.loads(reader.fields[key].contents())
+    assert {"name": "row_offset", "dtype": "i32", "shape": ["1"]} in topo["inputs"]
+    nodes = topo["nodes"]
+    by_out = {o: n for n in nodes for o in n["outputs"]}
+    (gather,) = [n for n in nodes if n["op"] == "GET_ROWS"]
+    cast = by_out[gather["inputs"][1]]
+    assert cast["op"] == "CAST" and cast["attrs"] == {"dtype": "i32"}
+    add = by_out[cast["inputs"][0]]
+    assert add["op"] == "ADD" and "row_offset" in add["inputs"]
+    assert by_out[next(i for i in add["inputs"] if i != "row_offset")]["op"] == "RANGE_1D"
+
+
+def test_the_encoder_receptive_field_is_read_off_its_bands_and_convolutions():
+    """`receptive_rows` from the windows and kernels -- (93, 12) for both checkpoints, which the f64 probe
+    measured: 15 rows back per band and the convolutions' 12 frames (3 rows), 3 ahead per look-ahead band."""
+    wrapper = M._MoonshineEncoderWrapper.__new__(M._MoonshineEncoderWrapper)
+    nn.Module.__init__(wrapper)
+    wrapper.windows = [(16, 4), (16, 4), (16, 0), (16, 0), (16, 4), (16, 4)]
+    wrapper.embedder = types.SimpleNamespace(conv1=nn.Conv1d(1, 1, 5, stride=2), conv2=nn.Conv1d(1, 1, 5, stride=2))
+    assert wrapper.receptive_rows() == (93, 12)
+    wrapper.windows = [(16, 4)] * 2 + [(16, 0)] * 6 + [(16, 4)] * 2
+    assert wrapper.receptive_rows() == (153, 12)
+
+
+def test_the_driver_carries_a_live_path():
+    from loom_exporter.driver_components import ExportConstants, LuaFragment
+
+    spec = M.ASRMoonshineStreamingExportConfig(checkpoint="x")
+    components = spec.driver_components()
+    live = [c for c in components if isinstance(c, LuaFragment) and "stream_feed" in c.defines]
+    assert len(live) == 1 and live[0].top_level and live[0].path.is_file()
+    constants = [c for c in components if isinstance(c, ExportConstants) and c.top_level]
+    assert constants and constants[0].values["DECODE_EVERY"] == M.STREAM_DECODE_EVERY
 
 
 class _WindowMaskOnly(nn.Module):

@@ -203,16 +203,99 @@ def _config(tmp_path):
                                   model_dir=str(_release(tmp_path)))
 
 
-def test_the_sampler_declares_guidance_a_caller_schedule_and_caller_noise(tmp_path):
+DRIVER = Path(__file__).resolve().parents[2] / "loom_exporter" / "chatterbox_driver"
+
+
+def test_the_flow_runs_guided_on_the_callers_schedule_and_noise():
     """Unguided, S3Gen integrates a velocity field it was not trained to; on a uniform schedule it
-    spends its ten steps in the wrong places; and without caller noise nothing can be compared."""
-    spec, = _config(tmp_path).samplers()
-    assert spec.guidance is True
-    assert spec.schedule == "caller"
-    assert spec.caller_noise is True
-    assert spec.method == "euler"
-    assert spec.carried_input == "x"
-    assert spec.fixed_inputs == ["mu", "spks", "cond"]
+    spends its ten steps in the wrong places; and without the driver's own noise nothing can be compared
+    or re-run. The ODE call is hand-written in the stream (ADR-117), so its declaration is read there;
+    the guidance itself is the estimator's (`test_the_estimator_guidance_is_solve_eulers`)."""
+    lua = (DRIVER / "00_stream.lua").read_text()
+    assert "loom.run_ode_and_retain('estimator'" in lua
+    assert "{carried = 'x', time = 't', method = 'euler', times = chatterbox_cosine_times(" in lua
+    assert "n_elems = n_frames * N_MEL, state = noise})" in lua
+    # Guidance is the estimator's own (a batch of two, combined in the graph), so the ODE passes its weight.
+    assert "cond = cond, cfg = {loom.state('flow_cfg')}}" in lua and "guidance =" not in lua
+
+
+def test_one_pass_is_the_stream_run_in_one_hop():
+    """`infer` opens the stream with `piece_tokens = 0` and feeds it to its end, so the one-pass gate
+    grades the live path's code (ADR-100)."""
+    lua = (DRIVER / "01_generate.lua").read_text()
+    assert "if inputs.piece_tokens == nil then inputs.piece_tokens = 0 end" in lua
+    assert "stream_open(inputs)" in lua and "stream_feed({})" in lua
+    assert sorted(p.name for p in DRIVER.glob("*.lua")) == ["00_header.lua", "00_stream.lua", "01_generate.lua"]
+
+
+def test_the_stream_cut_is_cosyvoice2_models_own():
+    """S3Gen kept CosyVoice2's flow and its `finalize` hook but no loop around it; the stream's hop, its
+    growth and ceiling are `CosyVoice2Model`'s, read off its source (without importing it)."""
+    from loom_exporter.chatterbox_export import STREAM_HOP_SCALE, STREAM_HOP_TOKENS, STREAM_MAX_HOP_TOKENS
+
+    model_py = Path("/home/flavio/Dev/CosyVoice/cosyvoice/cli/model.py")
+    if not model_py.is_file():
+        pytest.skip("no CosyVoice checkout to read CosyVoice2Model from")
+    src = model_py.read_text()
+    src = src[src.index("class CosyVoice2Model"):]
+    src = src[:src.index("\nclass ")]
+    assert f"self.token_hop_len = {STREAM_HOP_TOKENS}" in src
+    assert "self.token_max_hop_len = 4 * self.token_hop_len" in src
+    assert STREAM_MAX_HOP_TOKENS == 4 * STREAM_HOP_TOKENS
+    assert f"self.stream_scale_factor = {STREAM_HOP_SCALE}" in src
+
+
+def _random_vocoder():
+    """A `HiftVocoderPhase` over S3Gen's HiFT layout with random weights, at f64."""
+    if not CHATTERBOX_SRC.is_dir():
+        pytest.skip("no Chatterbox checkout to build HiFT from")
+    import torch
+    from loom_exporter.chatterbox_export import HiftVocoderPhase, import_chatterbox
+
+    import_chatterbox()
+    from chatterbox.models.s3gen.f0_predictor import ConvRNNF0Predictor
+    from chatterbox.models.s3gen.hifigan import HiFTGenerator
+
+    torch.manual_seed(0)
+    hift = HiFTGenerator(sampling_rate=24000, upsample_rates=[8, 5, 3], upsample_kernel_sizes=[16, 11, 7],
+                         source_resblock_kernel_sizes=[7, 7, 11],
+                         source_resblock_dilation_sizes=[[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+                         f0_predictor=ConvRNNF0Predictor())
+    n_trim = 480
+    fade = torch.zeros(2 * n_trim)
+    fade[n_trim:] = (torch.cos(torch.linspace(torch.pi, 0, n_trim)) + 1) / 2
+    return HiftVocoderPhase(hift, fade).eval().double()
+
+
+def test_the_vocoder_holds_back_exactly_its_reach():
+    """The stream re-runs HiFT over every frame so far and hands out all but the last
+    `vocoder_right_frames` frames' samples. At f64 on a random HiFT, those samples over a mel cut at
+    `m` frames are the samples over the whole mel bit for bit; one frame fewer held back and they are not.
+
+    The F0 predictor's bias is raised so the source is VOICED: with random weights F0 sits under the 10 Hz
+    threshold, the sine source ignores it, and the F0 path's reach (its convolutions, then the source's
+    STFT) never shows -- the reach then measures ~13 frames, not 19.2."""
+    import torch
+    from loom_exporter.chatterbox_export import vocoder_right_frames
+
+    voc = _random_vocoder()
+    with torch.no_grad():
+        voc.h.f0_predictor.classifier.bias.fill_(150.0)
+    right = vocoder_right_frames(voc)
+    assert right == 20      # 9,240 samples, 19.25 frames
+    torch.manual_seed(1)
+    n, m = 72, 44
+    mel = torch.randn(1, n, 80, dtype=torch.float64) - 4.0
+    phase = torch.rand(1, voc.harmonics, 1, dtype=torch.float64)
+    noise = torch.randn(1, voc.harmonics, n * 480, dtype=torch.float64)
+    with torch.no_grad():
+        whole = voc(mel, phase, noise)[0]
+        cut = voc(mel[:, :m], phase, noise[:, :, :m * 480])[0]
+    assert float(whole[:m * 480].abs().max()) > 1e-3
+    settled = (m - right) * 480
+    assert bool((cut[:settled] == whole[:settled]).all())
+    # 9,232 samples back is the first that moves (by ~1e-16): inside the 20th frame, past the 19th.
+    assert not bool((cut[:settled + 480] == whole[:settled + 480]).all())
 
 
 def test_the_contract_declares_a_text_door(tmp_path):
@@ -275,9 +358,107 @@ def test_the_nsf_noise_is_one_symbol_with_the_mel(phases):
     assert phases["vocoder"].declared_axes == {"nsf_noise": {2: f"{SAMPLES_PER_FRAME} * n_enc_frames"}}
 
 
-def test_t3_runs_guidance_on_a_private_second_stream(phases):
-    """The unconditional prefill differs, so its KV cache differs for the whole decode: one cache
-    cannot serve both (loom.cpp ADR-023)."""
+def test_t3_runs_both_guidance_streams_in_one_cached_graph(phases):
+    """One decoder, one cache: the two streams are a batch of two, not a second module with a private
+    cache (loom.cpp ADR-117's amendment)."""
     lm = phases["t3_lm"]
-    assert lm.extra_streams == ("t3_lm_uncond",)
+    assert lm.extra_streams == ()
     assert lm.fuse_attention is True and lm.kv_cache_size
+    assert _shapes(lm)["inputs_embeds"][0] == 2 and "cfg" in _shapes(lm)
+
+
+class _TinyT3:
+    """What `T3LMPhase` reads off T3: a Llama with llama3 rope, and the speech head."""
+
+    def __init__(self, n_kv_heads=4):
+        import torch
+        from transformers import LlamaConfig, LlamaModel
+
+        torch.manual_seed(0)
+        self.tfmr = LlamaModel(LlamaConfig(
+            vocab_size=8, hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4,
+            num_key_value_heads=n_kv_heads, head_dim=16, max_position_embeddings=256, rope_theta=500000.0,
+            rope_scaling=dict(factor=8.0, high_freq_factor=4.0, low_freq_factor=1.0,
+                              original_max_position_embeddings=128, rope_type="llama3"),
+            # SDPA, not eager: HF's eager attention runs its softmax in float32 even in an f64 model,
+            # which put the reference 2e-08 off its own f64 self here.
+            attn_implementation="sdpa")).double().eval()
+        self.speech_head = torch.nn.Linear(64, 11, bias=False).double()
+
+
+def test_the_batched_guidance_is_two_reference_runs_combined():
+    """At f64, the one batched run is the reference's two decoder runs -- each stream through HF's own
+    `LlamaModel` alone -- combined as `cond + w * (cond - uncond)`, for a prefill and for a step over a
+    cache-shaped mask. The streams must not see each other: they share every weight and no attention."""
+    import torch
+    from loom_exporter.chatterbox_export import T3LMPhase, causal_mask
+
+    t3 = _TinyT3()
+    wrapper = T3LMPhase(t3).double().eval()
+    torch.manual_seed(1)
+    n, w = 9, 0.5
+    embeds = torch.randn(2, n, 64, dtype=torch.float64)
+    pos = torch.arange(n).view(1, -1)
+    mask = causal_mask(n).double()
+
+    def reference(rows):
+        hidden = t3.tfmr(inputs_embeds=rows, position_ids=pos, attention_mask=mask,
+                         use_cache=False).last_hidden_state
+        return t3.speech_head(hidden[:, -1:])
+
+    with torch.no_grad():
+        got = wrapper(embeds, pos, mask, torch.tensor([w], dtype=torch.float64))
+        cond, uncond = reference(embeds[:1]), reference(embeds[1:])
+    want = cond + w * (cond - uncond)
+    assert got.shape == (1, 1, 11)
+    assert (got - want).abs().max().item() < 1e-12
+    # Each stream is its own: changing the unconditional rows moves the result only through `uncond`.
+    other = embeds.clone()
+    other[1] = torch.randn(n, 64, dtype=torch.float64)
+    with torch.no_grad():
+        moved = wrapper(other, pos, mask, torch.tensor([0.0], dtype=torch.float64))
+    assert (moved - cond).abs().max().item() < 1e-12
+
+
+def test_the_batched_guidance_refuses_gqa():
+    """Stacking the streams' heads assumes one KV head per query head, which is T3's (16 and 16)."""
+    from loom_exporter.chatterbox_export import T3LMPhase
+
+    with pytest.raises(NotImplementedError, match="KV heads"):
+        T3LMPhase(_TinyT3(n_kv_heads=2))
+
+
+def test_the_estimator_guidance_is_solve_eulers(monkeypatch):
+    """At f64 on a small random U-Net of S3Gen's layout, the wrapper's one guided run is
+    `CausalConditionalCFM.solve_euler`'s step: the estimator over a batch of two (the second with mu, spks
+    and cond zeroed), combined as `(1 + cfg) * v - cfg * v_uncond`."""
+    if not CHATTERBOX_SRC.is_dir():
+        pytest.skip("no Chatterbox checkout to build the U-Net from")
+    import torch
+    from loom_exporter.chatterbox_export import EstimatorPhase, import_chatterbox
+
+    import_chatterbox()
+    from chatterbox.models.s3gen import decoder as s3gen_decoder
+    from chatterbox.models.s3gen.decoder import ConditionalDecoder
+
+    # `mask_to_bias` asserts a 16/32-bit dtype; the arithmetic is the same at 64 (chatterbox_reference.py).
+    monkeypatch.setattr(s3gen_decoder, "mask_to_bias", lambda mask, dtype: (1.0 - mask.to(dtype)) * -1.0e+10)
+    torch.manual_seed(0)
+    unet = ConditionalDecoder(in_channels=320, out_channels=80, causal=True, channels=[64], dropout=0.0,
+                              attention_head_dim=16, n_blocks=1, num_mid_blocks=2, num_heads=2,
+                              act_fn="gelu").double().eval()
+    wrapper = EstimatorPhase(unet).double().eval()
+    n, w = 13, 0.7
+    x, mu, cond = (torch.randn(1, n, 80, dtype=torch.float64) for _ in range(3))
+    spks = torch.randn(1, 80, dtype=torch.float64)
+    t = torch.tensor([0.3], dtype=torch.float64)
+    with torch.no_grad():
+        got = wrapper(x, mu, spks, cond, t, torch.tensor([w], dtype=torch.float64))
+        cm = lambda v: v.transpose(1, 2)                                   # noqa: E731 -- to channel-major
+        zero = torch.zeros_like(cm(mu))
+        v = unet(x=torch.cat([cm(x), cm(x)]), mask=torch.ones(2, 1, n, dtype=torch.float64),
+                 mu=torch.cat([cm(mu), zero]), t=torch.cat([t, t]),
+                 spks=torch.cat([spks, torch.zeros_like(spks)]), cond=torch.cat([cm(cond), zero]))
+    want = ((1.0 + w) * v[:1] - w * v[1:]).transpose(1, 2)
+    assert got.shape == (1, n, 80)
+    assert (got - want).abs().max().item() < 1e-12

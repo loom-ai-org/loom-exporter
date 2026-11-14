@@ -100,6 +100,9 @@ class AudioClassificationExportConfig(LoomExportConfig):
     frame_rate: Optional[float] = field(default=None, init=False, repr=False)
     frame_offset: float = field(default=0.0, init=False, repr=False)
     embedding_dim: Optional[int] = field(default=None, init=False, repr=False)
+    # A frame output's live door (loom.cpp ADR-120), measured on the traced wrapper by `_probe_stream`;
+    # None for a clip output, whose answer needs the whole clip.
+    stream: Optional[dict] = field(default=None, init=False, repr=False)
 
     __links__ = {"root_axis": Axis()}
     __unchecked__ = {
@@ -123,10 +126,44 @@ class AudioClassificationExportConfig(LoomExportConfig):
                                   "i / frame_rate"),
         "embedding_dim": Unchecked("READ off the traced output's last axis by `_check_output`, during "
                                    "the trace -- the one moment the real tensor exists"),
+        "stream": Unchecked("MEASURED on the traced wrapper by `_probe_stream` (a NaN probe of each "
+                            "frame's reach), during build_trace"),
     }
 
     def build_trace(self, model):
-        return build_trace(self, model, self.sample_rate)
+        traced = build_trace(self, model, self.sample_rate)
+        self._probe_stream(*traced)
+        return traced
+
+    def _probe_stream(self, wrapper, dummy_inputs, mil_inputs) -> None:
+        """A frame output's reach, for the window stream beside `infer` (loom.cpp ADR-120): how many samples
+        before and after its own a frame reads, measured on the wrapper the trace is about to run, and the
+        input length the graph takes either side. A clip output has no stream."""
+        if self.output.granularity != "frame":
+            return
+        from .frame_window_stream import frame_reach, window_frames
+
+        hop = round(self.sample_rate / self.frame_rate)
+        if abs(self.sample_rate / hop - self.frame_rate) > 1e-9:
+            raise ValueError(f"{self.architecture}: {self.frame_rate} frames per second is not a whole "
+                             f"number of samples at {self.sample_rate} Hz")
+        names = [t.name for t in mil_inputs]
+        takes_length = "length" in names
+        waveform_dim = mil_inputs[names.index("waveform")].shape.shape[1]
+        lo, hi = int(waveform_dim.lower_bound), int(waveform_dim.upper_bound)
+
+        def run(x):
+            if takes_length:
+                return wrapper(x, torch.tensor([x.shape[1]], dtype=dummy_inputs[1].dtype))
+            return wrapper(x)
+
+        left, right = frame_reach(run, hop, max(8 * self.sample_rate, lo), hi)
+        left_frames, right_frames = window_frames(left, right, hop)
+        width = len(self.labels) if self.output.kind == "class" else int(self.embedding_dim)
+        print(f"  stream: a frame reads {left} samples before it and {right} after: windows of "
+              f"{left_frames} + {right_frames} frames of context")
+        self.stream = dict(hop=hop, left_frames=left_frames, right_frames=right_frames, row_width=width,
+                           takes_length=takes_length, min_samples=lo, max_samples=hi)
 
     def contract(self) -> dict:
         return audio_contract(self.output, self.sample_rate, self.labels, self.frame_rate,
@@ -140,8 +177,12 @@ class AudioClassificationExportConfig(LoomExportConfig):
         return "ReturnOutput"
 
     def backend_kwargs(self) -> dict:
-        return dict(flat_namespace=True, root_axis=self.root_axis,
-                    driver_builder=self.synthesized_builder_key(), hparams=self.hparams())
+        kwargs = dict(flat_namespace=True, root_axis=self.root_axis,
+                      driver_builder=self.synthesized_builder_key(), hparams=self.hparams())
+        if self.stream is not None:
+            from .frame_window_stream import stream_components
+            kwargs["stream_components"] = stream_components(**self.stream)
+        return kwargs
 
 
 def audio_contract(output: AudioOutput, sample_rate: Optional[int], labels: List[str],
@@ -869,7 +910,7 @@ class SileroVadExportConfig(BaseMultiPhaseModelExportConfig):
 
     checkpoint: str
     architecture: Optional[str] = "silero-vad"
-    driver_script_path: Path = Path(__file__).resolve().parent
+    driver_script_path: Path = Path(__file__).resolve().parent / "silero_driver"
     output: AudioOutput = AudioOutput.FRAME_CLASSES
     # The trace length and the RangeDim ceiling. The model is a streaming one with no window of its own,
     # so the ceiling is a declaration, not a limit in the model.
@@ -946,7 +987,8 @@ class SileroVadExportConfig(BaseMultiPhaseModelExportConfig):
         frames), spelled `(n - 1) // 512 + 1` because the driver IR has floor division only.
         """
         from .driver_components import (
-            CALLER, DriverInputs, DriverReturn, RecurrentCall, SubgraphCallComponent,
+            CALLER, DriverInputs, DriverReturn, ExportConstants, LuaFragment, RecurrentCall,
+            SubgraphCallComponent,
         )
         from .driver_ir import BinOp, Len, Lit, OutputRef, Var
 
@@ -955,6 +997,12 @@ class SileroVadExportConfig(BaseMultiPhaseModelExportConfig):
         n_frames = BinOp("+", BinOp("floordiv", BinOp("-", n_samples, Lit(1)), Lit(_SILERO_FRAME)),
                          Lit(1))
         return [
+            # The live door (loom.cpp ADR-106), beside the one pass and not instead of it: the same three
+            # graphs a push of whole frames at a time, the cell's h and c carried between pushes. `infer`
+            # stays the one retained sweep the published file runs. Top level, so the constants are too.
+            ExportConstants(values={"FRAME": _SILERO_FRAME, "HIDDEN": hidden}, top_level=True),
+            LuaFragment(self.driver_script_path / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
             DriverInputs(bindings=(("waveform", CALLER),), n_tokens=n_samples),
             SubgraphCallComponent(
                 topology="frontend", outputs=(), retain=True, length=n_samples,
@@ -1242,7 +1290,9 @@ class WakeHubertExportConfig(AudioClassificationExportConfig):
         n_samples = int(self.trace_seconds * self.sample_rate)
         seq_dim = ct.RangeDim(self._hop, int(self.max_seconds * self.sample_rate))
         mil_inputs = [ct.TensorType(name="waveform", shape=(1, seq_dim), dtype=np.float32)]
-        return self.encoder_wrapper(model), (torch.randn(1, n_samples),), mil_inputs
+        traced = self.encoder_wrapper(model), (torch.randn(1, n_samples),), mil_inputs
+        self._probe_stream(*traced)
+        return traced
 
 
 class _WakeHubertFeatures(nn.Module):

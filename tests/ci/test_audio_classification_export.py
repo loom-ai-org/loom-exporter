@@ -401,6 +401,61 @@ def test_the_silero_driver_counts_whole_frames():
     assert contract["output.frame_rate"] == 31.25 and contract["labels"] == ["non_speech", "speech"]
 
 
+def _silero_pushed(model, wav, piece):
+    """The live driver's arithmetic (`silero_driver/00_stream.lua`) over the rewrite: each push's whole
+    frames behind one frame of lead, the lead's row dropped, the cell's h and c carried, the part frame
+    left at the end run at finish."""
+    lead = torch.zeros(512, dtype=wav.dtype)
+    pending = wav[:0]
+    state, out = None, []
+
+    def run(samples):
+        nonlocal lead, state
+        window = torch.cat([lead, samples])
+        rows = model.frontend(window.unsqueeze(0))[:, 1:]
+        seq, state = model.lstm(rows, state)
+        lead = window[-512:]
+        out.append(model.head(seq)[0])
+
+    for at in range(0, wav.numel(), piece):
+        pending = torch.cat([pending, wav[at:at + piece]])
+        whole = pending.numel() // 512 * 512
+        if whole:
+            run(pending[:whole])
+        pending = pending[whole:]
+    if pending.numel():
+        run(pending)
+    return torch.cat(out)
+
+
+@pytest.mark.parametrize("piece", [1, 160, 512, 700, 4096])
+def test_a_silero_push_behind_one_frame_of_lead_is_the_one_pass(piece):
+    """What the live door rests on: `frontend`'s 64-sample left pad means a window that starts one whole
+    frame back puts every later row on the clip's own frame grid, its context read from inside the lead,
+    and the carried cell makes the pushes one sweep. At f64 the pushes are the one pass to rounding, for
+    pieces shorter than a frame, a frame, and ragged ones, on a clip ending mid-frame."""
+    model = A._SileroWholeClip(_silero_weights(), 256, 128)
+    wav = torch.randn(512 * 9 + 77, generator=torch.Generator().manual_seed(3), dtype=torch.float64)
+    with torch.no_grad():
+        want = model(wav.unsqueeze(0))[0]
+        got = _silero_pushed(model, wav, piece)
+    assert got.shape == want.shape
+    assert torch.allclose(got, want, rtol=0, atol=1e-12)
+
+
+def test_the_silero_driver_carries_its_live_path():
+    """The three live functions beside `infer`, and the two numbers they are written in terms of."""
+    from loom_exporter.driver_components import ExportConstants, LuaFragment
+
+    spec = A.SileroVadExportConfig(checkpoint="x", output_path="x.gguf")
+    components = spec.driver_components()
+    fragment = next(c for c in components if isinstance(c, LuaFragment))
+    assert fragment.top_level and fragment.path.is_file()
+    assert set(fragment.defines) == {"stream_open", "stream_feed", "stream_finish"}
+    constants = next(c for c in components if isinstance(c, ExportConstants))
+    assert constants.values["FRAME"] == 512 and constants.top_level
+
+
 # -- recognizers --------------------------------------------------------------------------------------
 
 def _nemo_archive(path, cfg, dot_slash):

@@ -173,8 +173,9 @@ class TestUsageIsDerived(unittest.TestCase):
         # all three are declarations on the shared template rather than a bespoke loop.
         # Four since the fourth leaf: Chatterbox reaches it too, with the same three declarations.
         # Five since the seventh: CosyVoice3's flow is Chatterbox's solver, declared identically.
-        self.assertEqual(used["flow_matching_sampler"],
-                         ["chatterbox", "cosyvoice3", "f5-tts", "matcha", "supertonic"])
+        # Four again since loom.cpp ADR-117: Chatterbox's flow is called from its live stream, which re-runs
+        # it per hop, so its one ODE call is hand-written there (the same guidance, schedule and noise).
+        self.assertEqual(used["flow_matching_sampler"], ["cosyvoice3", "f5-tts", "matcha", "supertonic"])
         self.assertEqual(used["modular_chain"], ["lfm2-modular"])
         self.assertIn("qwen3", used["monolithic_call"])
         # Supertonic is the one peeled family that declares no loom_lua function, which is a real

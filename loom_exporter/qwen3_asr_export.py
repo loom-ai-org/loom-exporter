@@ -30,7 +30,7 @@ candidate list instead of being exported as a plausible wrong model.
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -144,8 +144,12 @@ class WindowedAudioEncoder(nn.Module):
         return rows + whole * self.rows_per_chunk
 
     def forward(self, waveform, valid_samples):
+        return self.encode_mel(self.mel(waveform), valid_samples)
+
+    def encode_mel(self, mel, valid_samples):
+        """Everything after the frontend. Split out so the live stream's `encoder_window` (ADR-121) runs
+        the same stem, windows and projector over a mel it computed from one window's samples."""
         tower = self.tower
-        mel = self.mel(waveform)
         n_mels = mel.shape[1]
         # Where the caller's real audio stops, in mel frames. `floor(L / hop)` is what the extractor's
         # own attention mask comes to: it rescales a sample-resolution mask by the hop and drops the
@@ -223,6 +227,56 @@ class WindowedAudioEncoder(nn.Module):
         return self.projector(tower.ln_post(hidden))
 
 
+def _window_log_mel(mel: LogMelFrontend, waveform):
+    """The frontend's log-mel BEFORE its clamp, over a window's samples with `n_fft // 2` of real context
+    either side: `center=False` over that context puts every frame on the same samples the whole clip's
+    `center=True` STFT reads, so a window's frames are the clip's own (the whole graph's edges -- its
+    reflection at the start, the padding and its repair at the end -- are the driver's to supply, as it
+    supplies them to `infer`)."""
+    stft = torch.stft(
+        waveform, n_fft=mel.n_fft, hop_length=mel.hop_length, win_length=mel.win_length,
+        window=mel.window, center=False, return_complex=True,
+    )
+    magnitudes = (stft.abs() ** 2)[..., :-1]
+    return torch.clamp(mel.filters @ magnitudes, min=1e-10).log10()
+
+
+class WindowMelRange(nn.Module):
+    """`window (with context) -> [max, min]` of its raw log-mel: what the live stream needs to know whether
+    the clip's dynamic-range floor (`max - 8` over EVERY frame so far) has moved, and whether a window it
+    already encoded is below it (ADR-121)."""
+
+    def __init__(self, mel: LogMelFrontend):
+        super().__init__()
+        self.mel = mel
+
+    def forward(self, waveform):
+        log_spec = _window_log_mel(self.mel, waveform)
+        # min as -max(-x): one reduction kind, the one the whole frontend already lowers.
+        return torch.cat([log_spec.max().reshape(1), (-(-log_spec).max()).reshape(1)])
+
+
+class WindowAudioEncoder(nn.Module):
+    """`(window with context, valid_samples, floor) -> rows`: one attention window of the encoder (8 s for
+    Qwen3-ASR), its frames clamped at the clip's floor rather than its own.
+
+    **Why a window is enough** (ADR-121). The stem convolves each 1 s chunk alone, its positions restart per
+    chunk, and the transformer attends inside fixed `n_window_infer` windows counted from the clip's start
+    (`get_audio_cu_seqlens`; the block-diagonal mask in `WindowedAudioEncoder`). So a window's rows are a
+    function of its own frames and of the clamp floor -- the one global term, `max(log_spec) - 8` over the
+    whole clip. `phases()` checks the composition against the whole-clip encoder on real audio.
+    """
+
+    def __init__(self, encoder: WindowedAudioEncoder):
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(self, waveform, valid_samples, floor):
+        log_spec = _window_log_mel(self.encoder.mel, waveform)
+        log_spec = torch.maximum(log_spec, floor.reshape(1, 1, 1))
+        return self.encoder.encode_mel((log_spec + 4.0) / 4.0, valid_samples)
+
+
 @dataclass
 class ASRQwen3SpeechLMExportConfig(BaseSpeechLMExportConfig):
     """Qwen3-ASR's loader over family 3's template."""
@@ -236,6 +290,9 @@ class ASRQwen3SpeechLMExportConfig(BaseSpeechLMExportConfig):
     # `audio_rows`. Defaults to this checkpoint's own values so `component_registry.usage()` can build
     # the component list without one, the same reason `prompt_constants` is read with `.get`.
     _row_formula: tuple = field(default=(160, 100, 13), init=False, repr=False)
+    # `(samples, rows)` of one encoder attention window -- 8 s and 104 rows here -- read in `phases()`; the
+    # live stream encodes a window at a time (ADR-121). This checkpoint's numbers by default, as above.
+    _window: tuple = field(default=(128000, 104), init=False, repr=False)
 
     __unchecked__ = {
         "_processor": Unchecked(
@@ -243,6 +300,11 @@ class ASRQwen3SpeechLMExportConfig(BaseSpeechLMExportConfig):
             "rather than per phase. Loaded FROM the checkpoint, never constructed with this family's "
             "idea of the defaults -- the filterbank, FFT geometry and chunk length are all properties "
             "of the checkpoint and `processor_config.json` is where it states them."
+        ),
+        "_window": Unchecked(
+            "READ off the traced encoder's own window width in phases(), and checked there: "
+            "`_check_windows` composes the stream's windows over real-shaped audio and requires the "
+            "whole-clip encoder's rows"
         ),
         "_row_formula": Unchecked(
             "READ off the extractor and audio config in audio_geometry(), and checked where it is "
@@ -336,6 +398,130 @@ class ASRQwen3SpeechLMExportConfig(BaseSpeechLMExportConfig):
             rows = BinOp("+", BinOp("floordiv", BinOp("-", rows, Lit(1)), Lit(2)), Lit(1))
         return BinOp("+", rows, BinOp("*", whole, Lit(rows_per_chunk)))
 
+    def phases(self) -> List:
+        """The template's four phases, and the live stream's two over one encoder window at a time
+        (ADR-121): `window_mel_range` (the window's raw log-mel max and min) and `encoder_window` (its rows,
+        clamped at a floor the driver supplies). Both reuse the `encoder` phase's modules, so their weights
+        are the same tensors."""
+        import coremltools as ct
+
+        from .multi_phase_export import ExportPhase
+
+        phases = super().phases()
+        encoder = next(p.wrapper for p in phases if p.name == "encoder")
+        window_samples = encoder.block // encoder.rows_per_chunk * self.samples_per_chunk
+        self._window = (int(window_samples), int(encoder.block))
+        lead = int(encoder.mel.n_fft) // 2
+        self._check_windows(encoder, lead)
+        context = ct.RangeDim(self.samples_per_chunk + 2 * lead, window_samples + 2 * lead)
+        probe = torch.zeros(1, 2 * self.samples_per_chunk + 2 * lead)
+        return phases + [
+            ExportPhase(
+                name="window_mel_range",
+                wrapper=WindowMelRange(encoder.mel).eval(),
+                dummy_inputs=(probe,),
+                mil_inputs=[ct.TensorType(name="waveform", shape=(1, context), dtype=np.float32)],
+                root_axis="n_samples",
+            ),
+            ExportPhase(
+                name="encoder_window",
+                wrapper=WindowAudioEncoder(encoder).eval(),
+                dummy_inputs=(probe, torch.tensor([2.0 * self.samples_per_chunk]), torch.tensor([-8.0])),
+                mil_inputs=[
+                    ct.TensorType(name="waveform", shape=(1, context), dtype=np.float32),
+                    ct.TensorType(name="valid_samples", shape=(1,), dtype=np.float32),
+                    ct.TensorType(name="floor", shape=(1,), dtype=np.float32),
+                ],
+                root_axis="n_samples",
+            ),
+        ]
+
+    def _check_windows(self, encoder, lead: int) -> None:
+        """The stream's composition, against the whole-clip encoder on the same audio, before export.
+
+        20.5 s of noise in three windows (8, 8, 4.5 s), the first second silent so the clamp floor reaches a
+        frame, laid out the way the driver lays it out: the padded clip `transcribe` builds (zeros to a
+        whole chunk, the frontend's reflection over their head), reflected `lead` samples at both ends as
+        `center=True` reflects it, and each window cut from that with `lead` either side. The floor is the
+        max over every window's frames, minus 8. Raises unless the rows agree to f32 rounding.
+        """
+        chunk, (window, _) = self.samples_per_chunk, self._window
+        g = torch.Generator().manual_seed(0)
+        n_real = int(20.5 * self.sample_rate)
+        audio = 0.1 * torch.randn(n_real, generator=g)
+        audio[: self.sample_rate] = 0.0
+        padded = -(-n_real // chunk) * chunk
+        clip = torch.zeros(padded)
+        clip[:n_real] = audio
+        for i in range(1, min(lead, padded - n_real) + 1):
+            clip[n_real + i - 1] = clip[n_real - i - 1]
+        ext = F.pad(clip.reshape(1, 1, -1), (lead, lead), mode="reflect").reshape(-1)
+        starts = list(range(0, padded, window))
+        ctx = [ext[s: s + min(window, padded - s) + 2 * lead].reshape(1, -1) for s in starts]
+        with torch.inference_mode():
+            whole = encoder(clip.reshape(1, -1), torch.tensor([float(n_real)]))
+            ranges = [WindowMelRange(encoder.mel)(c) for c in ctx]
+            floor = torch.tensor([max(float(r[0]) for r in ranges) - 8.0])
+            rows = torch.cat([WindowAudioEncoder(encoder)(c, torch.tensor([float(min(window, n_real - s))]), floor)
+                              for c, s in zip(ctx, starts)])
+        n_rows = sum(int(_evaluate_rows(self, min(window, n_real - s))) for s in starts)
+        if rows.shape != whole.shape:
+            raise ValueError(f"the stream's windows give {tuple(rows.shape)} rows, the whole clip "
+                             f"{tuple(whole.shape)}")
+        diff = float((rows[:n_rows] - whole[:n_rows]).abs().max())
+        scale = float(whole[:n_rows].abs().max())
+        if not diff <= 1e-4 * scale:
+            raise ValueError(f"the stream's encoder windows are {diff:.3g} from the whole clip's rows "
+                             f"(absmax {scale:.3g}); a window's rows are not a function of its own frames and "
+                             f"the floor, which the live stream depends on (ADR-121)")
+        print(f"encoder windows vs the whole clip: max|d| {diff:.3g} (absmax {scale:.3g})")
+
+    def driver_components(self) -> List:
+        """The template's one-pass decode, and beside it the live door: upstream's streaming mode
+        (`speech_lm_driver/01_stream.lua`, loom.cpp ADR-121), top level so its constants are too.
+
+        The stream's own decode reads what `infer`'s does -- the prompt runs, the stop ids, the transcript
+        marker, the chunk framing and reflection -- bound a second time, top level and `S_`-prefixed, and
+        the audio row count as the SAME IR node `infer` inlines (`ExprFunction`). The three cadence numbers
+        are upstream's `init_streaming_state` defaults (qwen-asr 0.0.6): `chunk_size_sec=2.0`,
+        `unfixed_chunk_num=2`, `unfixed_token_num=5`. They are literals because the package that declares
+        them is vLLM-only and is not an export dependency; a host overrides each at `stream_open`.
+        """
+        from .driver_components import ExportConstants, ExprFunction, LuaFragment
+        from .driver_ir import Var
+
+        prompt = self.prompt_constants
+        marker = prompt.get("TRANSCRIPT_AFTER")
+        eos = [prompt.get("EOS", -1), *prompt.get("EOS_EXTRA", ())]
+        constants = {
+            "S_AUDIO_PREFIX": list(prompt.get("AUDIO_PREFIX", ())),
+            "S_AUDIO_SUFFIX": list(prompt.get("AUDIO_SUFFIX", ())),
+            # -1 for a file whose prompt already holds the marker: no id equals it, so the whole answer is
+            # the transcript, `infer`'s rule for an answer without it.
+            "S_TRANSCRIPT_AFTER": -1 if marker is None else int(marker),
+            "S_EOS": [int(e) for e in eos if e is not None and int(e) >= 0],
+            "S_SAMPLE_RATE": int(self.sample_rate or 16000),
+            "S_SAMPLES_PER_CHUNK": int(self.samples_per_chunk or 16000),
+            "S_REFLECT": int(self.reflect_samples or 0),
+            # One encoder attention window, and the decoder's cache: a stream re-encodes only the windows
+            # that changed and keeps the rest's keys, so its length is bounded by the cache, not the
+            # encoder (oruk-loop sized its cache for one 30 s piece; Qwen3-ASR's holds about five minutes).
+            "S_WINDOW_SAMPLES": int(self._window[0]),
+            "S_WINDOW_ROWS": int(self._window[1]),
+            "S_N_CTX": int(self.max_seq_len),
+            "S_MAX_NEW_TOKENS": 256,
+            "S_UPDATE_SECONDS": 2.0,
+            "S_UNFIXED_CHUNKS": 2,
+            "S_UNFIXED_TOKENS": 5,
+        }
+        return super().driver_components() + [
+            ExportConstants(values=constants, top_level=True),
+            ExprFunction(name="S_audio_rows", params=("_audio_samples",),
+                         expr=self.audio_rows(Var("_audio_samples"))),
+            LuaFragment(self.driver_script_path / "01_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
+        ]
+
     def prompt_segment_constants(self, model) -> dict:
         """The token ids the driver's prompt is built from, resolved through the checkpoint's own chat
         template and tokenizer rather than hardcoded.
@@ -398,6 +584,13 @@ class ASRQwen3SpeechLMExportConfig(BaseSpeechLMExportConfig):
 # whether an audio item is PRESENT, never on its contents, and the placeholder run it emits is
 # discarded here -- only the text on either side of it is kept.
 _SILENCE = np.zeros(8000, dtype=np.float32)
+
+
+def _evaluate_rows(spec, samples: int) -> int:
+    """`audio_rows` evaluated -- the driver's own expression, not a restatement."""
+    from .driver_ir import Var, evaluate
+
+    return evaluate(spec.audio_rows(Var("_audio_samples")), {"_audio_samples": samples})
 
 
 def _is_qwen3_asr_hf(path: Path) -> bool:
