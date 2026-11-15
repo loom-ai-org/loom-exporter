@@ -710,7 +710,10 @@ class BaseSpeechLMExportConfig(BaseMultiPhaseModelExportConfig):
             # them rather than published as globals no fragment reads.
             ExportConstants(values={
                 name: value for name, value in self.prompt_constants.items()
-                if name not in ("EOS", "EOS_EXTRA")
+                # None is "this checkpoint has no such id" (oruk-loop's TRANSCRIPT_AFTER: the marker is in
+                # its prompt). Rendered, it was `local TRANSCRIPT_AFTER = None` -- a read of an unset
+                # global, nil by luck rather than by statement; the loop binds the id it compares against.
+                if name not in ("EOS", "EOS_EXTRA") and value is not None
             }),
             WaveformValidLength(
                 waveform=waveform,

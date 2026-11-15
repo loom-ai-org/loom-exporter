@@ -151,6 +151,12 @@ class DriverComponent:
         """Statements appended to the entry function's body, in component order."""
         return []
 
+    def module_names(self) -> tuple:
+        """Names this component binds at MODULE scope (in its prelude), which every function of the
+        driver may read: `driver_ir.validate` takes them as defined. Empty for a component that binds
+        nothing there, which is every component that only emits statements."""
+        return ()
+
     def postlude(self, ctx: DriverContext) -> List[str]:
         """Top-level Lua lines emitted after the entry function."""
         return []
@@ -348,8 +354,14 @@ class DriverBuilder:
         extra_functions = [
             IRFunction(spec.name, list(spec.params), emit_body(spec.components)) for spec in extra
         ]
+        # Module-scope names (a top-level constant, a top-level fragment's functions) are defined in
+        # every function; an entry beside `infer` -- a stream's -- reads them because it has no locals
+        # of `infer`'s to read (loom.cpp ADR-130).
+        module_names = set()
+        for component in components + [c for spec in extra for c in spec.components]:
+            module_names.update(component.module_names())
         for function in [entry] + extra_functions:
-            validate(function)
+            validate(function, module_names)
             check_subgraph_calls(function, ctx.topologies)
 
         # The whole script, not just the entry function: a driver is a Lua module, and a generated

@@ -43,6 +43,14 @@ Phases:
   - `lm`:           `(tokens [n, 33], position_ids, attention_mask) -> text logits` for the last row,
                     KV-cached in a 750-cell ring.
 
+The live door (loom.cpp ADR-108), beside the one pass, which it leaves unchanged:
+  - `mimi_encode_step`: `(waveform, positions, key_positions, first, state_1..27) -> (rows, state')`, the
+                    encoder a few frames per call with moshi's streaming state carried (every causal conv's
+                    last inputs, the transformer's last 250 keys and values per layer); `mimi_encode_init`
+                    makes a fresh state on the device. The one-call encoder to 1e-15 at f64.
+  - `rvq_encode`:   `rows -> codes`, the split RVQ in one graph, its argmax on the device -- the 34 calls of
+                    the chain cost more than a frame lasts when a push is a frame or two.
+
 Usage:
   loom-export ~/Dev/models/kyutai-stt-1b-en-fr -o kyutai_stt.gguf \\
       --task automatic-speech-recognition --model kyutai-stt
@@ -52,7 +60,7 @@ import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -78,6 +86,9 @@ ENCODER_POSITIONS_PER_FRAME = 2
 CHUNK_FRAMES = 250
 CONTEXT_FRAMES = 1008
 MAX_CHUNK_FRAMES = CHUNK_FRAMES + CONTEXT_FRAMES
+# The live door's encoder step (loom.cpp ADR-108) takes up to this many frames (2 s) per call; the driver
+# splits a longer push.
+MAX_STEP_FRAMES = 25
 
 TRACE_FRAMES = 5
 TRACE_TOKENS = 7
@@ -108,6 +119,11 @@ def _inner_conv(streaming_conv) -> nn.Conv1d:
     """moshi's `StreamingConv1d` -> `NormConv1d` -> the `nn.Conv1d` (norm is "none" at inference)."""
     conv = streaming_conv.conv
     return conv.conv if hasattr(conv, "conv") else conv
+
+
+def _conv_pad(conv: nn.Conv1d) -> int:
+    """The left padding a causal conv takes, and so the input columns its streaming state keeps."""
+    return (conv.kernel_size[0] - 1) * conv.dilation[0] + 1 - conv.stride[0]
 
 
 def _causal_conv(streaming_conv, x: torch.Tensor) -> torch.Tensor:
@@ -286,6 +302,133 @@ class MimiEncodePhase(nn.Module):
         return x.transpose(1, 2)
 
 
+def ring_pair_key_mask(positions: torch.Tensor, key_positions: torch.Tensor, context: int) -> torch.Tensor:
+    """`ring_pair_mask` with the keys at positions of their own: the carried window first, then the call's
+    own. A key at a negative position is a slot no frame has written, and is masked, so a stream's first
+    call reads what a fresh encoder reads. Square and over the same positions, this is `ring_pair_mask`."""
+    q = positions.to(torch.float32)[0]
+    k = key_positions.to(torch.float32)[0]
+    delta = (torch.matmul(q.view(-1, 1), torch.ones_like(k).view(1, -1))
+             - torch.matmul(torch.ones_like(q).view(-1, 1), k.view(1, -1)))
+    odd = q - torch.floor(q * 0.5) * 2.0
+    window = (context - 1.0) + odd.view(-1, 1)
+    outside = torch.relu(-delta) + torch.relu(delta - window + 1.0) + torch.relu(-k).view(1, -1)
+    return (torch.clamp(outside, 0.0, 1.0) * -1e30).view(1, 1, q.shape[0], k.shape[0])
+
+
+# The streaming state's conv step, shared with every decoder that streams (`stream_steps`).
+from .stream_steps import conv_step as _conv_step  # noqa: E402
+
+
+class MimiEncodeStepPhase(nn.Module):
+    """`(waveform, positions, key_positions, first, state_1..state_N) -> (rows, state_1'..state_N')`: the
+    next `n` frames of `MimiEncodePhase`, with the encoder's streaming state carried in and out -- what
+    moshi's `mimi.streaming()` keeps between `encode` calls (loom.cpp ADR-108).
+
+    The states, in the order `forward` meets them: each SEANet convolution's last `(k - 1) d + 1 - s`
+    input samples; each transformer layer's last `context` keys (after RoPE) and values,
+    `[1, heads, context, head_dim]`; the x2 downsample's last inputs. `positions` are the `2 n` new
+    transformer positions, absolute; `key_positions` the `context + 2 n` the keys sit at, the state's
+    first.
+
+    `first` is 1 on a stream's first call and 0 after. The downsample pads by REPLICATE: moshi's streaming
+    conv overwrites its state with the first input column on its first call (`state.first`). So the
+    downsample's previous columns are `state * (1 - first) + x[:, :, :1] * first`, exact for `first` 0 or
+    1. The constant-padded SEANet convolutions start from zeros, which the fresh state is."""
+
+    def __init__(self, encoder: MimiEncodePhase):
+        super().__init__()
+        self.e = encoder
+        self.context = encoder.context
+
+    def _stateful(self) -> List[nn.Conv1d]:
+        """The SEANet convolutions that carry a state, in the order `forward` meets them."""
+        out = []
+        for block in self.e.encoder.model:
+            name = type(block).__name__
+            if name == "StreamingConv1d":
+                out.append(_inner_conv(block))
+            elif name == "SEANetResnetBlock":
+                out += [_inner_conv(sub) for sub in block.block if type(sub).__name__ == "StreamingConv1d"]
+        return [c for c in out if _conv_pad(c) > 0]
+
+    def state_shapes(self) -> List[Tuple[int, ...]]:
+        shapes = [(1, c.in_channels, _conv_pad(c)) for c in self._stateful()]
+        for layer in self.e.layers:
+            kv = (1, layer.attn.heads, self.context, layer.attn.head_dim)
+            shapes += [kv, kv]
+        down = _inner_conv(self.e.downsample)
+        shapes.append((1, down.in_channels, _conv_pad(down)))
+        return shapes
+
+    def _attend(self, attn: _Attention, x, cos, sin, mask, k_past, v_past):
+        b, t, _ = x.shape
+        q = attn.q(x).view(b, t, attn.heads, attn.head_dim)
+        k = attn.k(x).view(b, t, attn.heads, attn.head_dim)
+        v = attn.v(x).view(b, t, attn.heads, attn.head_dim)
+        q = q * cos + _rotate_pairs(q) * sin
+        k = k * cos + _rotate_pairs(k) * sin
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        k = torch.cat([k_past, k], dim=2)
+        v = torch.cat([v_past, v], dim=2)
+        scores = torch.matmul(q * (1.0 / math.sqrt(attn.head_dim)), k.transpose(-1, -2)) + mask
+        ctx = torch.matmul(torch.softmax(scores, dim=-1), v)
+        out = attn.out_proj(ctx.transpose(1, 2).reshape(b, t, attn.heads * attn.head_dim))
+        return out, k[:, :, -self.context:], v[:, :, -self.context:]
+
+    def forward(self, waveform, positions, key_positions, first, *states):   # (1, 1920n), (1, 2n), (1, ctx+2n), (1,)
+        e = self.e
+        states = list(states)
+        out_states = []
+        stateful = {id(c) for c in self._stateful()}
+
+        def conv(streaming_conv, v):
+            c = _inner_conv(streaming_conv)
+            if id(c) not in stateful:
+                return c(v)
+            y, s = _conv_step(c, v, states.pop(0))
+            out_states.append(s)
+            return y
+
+        x = waveform.unsqueeze(1)
+        for block in e.encoder.model:
+            name = type(block).__name__
+            if name == "StreamingConv1d":
+                x = conv(block, x)
+            elif name == "SEANetResnetBlock":
+                v = x
+                for sub in block.block:
+                    v = conv(sub, v) if type(sub).__name__ == "StreamingConv1d" else sub(v)
+                x = x + v
+            else:
+                x = block(x)
+        cos, sin = _rope_tables(positions, e.head_dim, e.max_period)
+        mask = ring_pair_key_mask(positions, key_positions, self.context)
+        h = x.transpose(1, 2)
+        for layer in e.layers:
+            update, k, v = self._attend(layer.attn, layer.norm1(h), cos, sin, mask, states.pop(0), states.pop(0))
+            h = h + (update if layer.scale1 is None else layer.scale1 * update)
+            h2 = layer.norm2(h)
+            if layer.gating is not None:
+                gate, value = layer.gating.linear_in(h2).chunk(2, dim=-1)
+                update = layer.gating.linear_out(F.silu(gate) * value)
+            else:
+                update = layer.linear2(F.gelu(layer.linear1(h2)))
+            h = h + (update if layer.scale2 is None else layer.scale2 * update)
+            out_states += [k, v]
+        x = h.transpose(1, 2)
+        if e.downsample.pad_mode != "replicate":
+            raise NotImplementedError(f"downsample pad_mode {e.downsample.pad_mode!r}")
+        previous = states.pop(0) * (1.0 - first) + x[..., :1] * first
+        x, s = _conv_step(_inner_conv(e.downsample), x, previous)
+        out_states.append(s)
+        return (x.transpose(1, 2), *out_states)
+
+
+# `mimi_encode_step`'s fresh state, made on the device from one number (`stream_steps.StateInit`).
+from .stream_steps import StateInit as MimiEncodeInitPhase  # noqa: E402
+
+
 class LMPhase(nn.Module):
     """`(tokens, position_ids, attention_mask) -> text logits` for the LAST row. `tokens` is
     `[1, n, 33]`: the text id, then the 32 audio codes, each looked up in its own table and summed --
@@ -325,6 +468,61 @@ def concatenated_codebooks(mimi) -> torch.Tensor:
     q = mimi.quantizer
     layers = list(q.rvq_first.vq.layers) + list(q.rvq_rest.vq.layers)
     return torch.cat([l._codebook.embedding.detach().float() for l in layers], dim=0)
+
+
+class RvqEncodePhase(nn.Module):
+    """`rows -> codes [1, n, n_q]`, as floats: the split RVQ in ONE graph, for the live door (ADR-108).
+
+    The one pass runs a stage per call (`rvq_step`), the driver taking each argmax: 34 calls a chunk, which
+    cost nothing over 250 frames. A stream pushes a frame or two at a time, and there those calls were ~80 ms a
+    push on the dev box (per-call overhead, not compute) against an 80 ms frame -- more than the Q8_0 LM step
+    (68 ms). So here the argmax stays in the graph (the engine's ARGMAX, P4.53) and each stage's centroid is
+    gathered by it: the same `2 r.e - |e|^2` scores `rvq_step` computes, the same subtraction. The ids come
+    out as floats (exact below 2^24), frame-major, the order the LM reads them.
+
+    Ties: ggml's CPU ARGMAX keeps the last tied index where `argmax_rows` and torch keep the first. No
+    codebook of this checkpoint has a repeated row, and the gate compares this graph's codes with the chain's
+    on every clip."""
+
+    def __init__(self, quantizer):
+        super().__init__()
+        self.first = _RvqProject(quantizer.rvq_first)
+        self.rest = _RvqProject(quantizer.rvq_rest)
+        layers = list(quantizer.rvq_first.vq.layers) + list(quantizer.rvq_rest.vq.layers)
+        self.books = nn.ModuleList()
+        for l in layers:
+            e = nn.Embedding(*l._codebook.embedding.shape)
+            with torch.no_grad():
+                e.weight.copy_(l._codebook.embedding.detach().float())
+            self.books.append(e)
+
+    @staticmethod
+    def _draw(residual, book: nn.Embedding):
+        embed = book.weight
+        scores = residual @ embed.t() * 2.0 - (embed * embed).sum(dim=-1).view(1, 1, -1)
+        return torch.argmax(scores, dim=-1)                              # [1, n]
+
+    def forward(self, rows):                                            # (1, n, width)
+        ids = [self._draw(self.first(rows), self.books[0])]
+        residual = self.rest(rows)
+        for q in range(1, len(self.books)):
+            if q > 1:
+                residual = residual - self.books[q - 1](ids[-1])
+            ids.append(self._draw(residual, self.books[q]))
+        return torch.stack([i.to(torch.float32) for i in ids], dim=-1)
+
+
+class _RvqProject(nn.Module):
+    """One RVQ's kernel-1 input projection as a matmul on rows (`qwen3_tts_export._RvqProjectWrapper`)."""
+
+    def __init__(self, rvq):
+        super().__init__()
+        self.input_proj = rvq.input_proj
+
+    def forward(self, rows):
+        if self.input_proj is None:
+            return rows
+        return self.input_proj(rows.transpose(1, 2)).transpose(1, 2)
 
 
 def causal_mask(seq_len: int) -> torch.Tensor:
@@ -387,10 +585,16 @@ class KyutaiSttExportConfig(BaseMultiPhaseModelExportConfig):
         frame_dim = ct.RangeDim(1, MAX_CHUNK_FRAMES)
         seq_dim = ct.RangeDim(1, self._facts["context"])
         hidden = int(lm.text_emb.weight.shape[1])
+        encode = MimiEncodePhase(mimi).eval()
+        step = MimiEncodeStepPhase(encode).eval()
+        step_shapes = step.state_shapes()
+        self._facts["mimi_states"] = len(step_shapes)
+        self._facts["mimi_context"] = step.context
+        ctx = step.context
         return [
             ExportPhase(
                 name="mimi_encode",
-                wrapper=MimiEncodePhase(mimi).eval(),
+                wrapper=encode,
                 dummy_inputs=(torch.randn(1, TRACE_FRAMES * FRAME_SAMPLES) * 0.1,
                               torch.arange(2 * TRACE_FRAMES, dtype=torch.int32).view(1, -1) + 6),
                 mil_inputs=[
@@ -401,6 +605,46 @@ class KyutaiSttExportConfig(BaseMultiPhaseModelExportConfig):
                 root_axis="n_codes",
                 declared_axes={"waveform": {1: f"{FRAME_SAMPLES} * n_codes"},
                                "positions": {1: f"{ENCODER_POSITIONS_PER_FRAME} * n_codes"}},
+            ),
+            # The live door (loom.cpp ADR-108): the encoder a few frames per call, its streaming state
+            # carried in and out as `state_1..state_N`, which the driver keeps on the device;
+            # `mimi_encode_init` makes a fresh one there. `mimi_encode` above is unchanged.
+            ExportPhase(
+                name="mimi_encode_init",
+                wrapper=MimiEncodeInitPhase(step_shapes).eval(),
+                dummy_inputs=(torch.zeros(1),),
+                mil_inputs=[ct.TensorType(name="zero", shape=(1,), dtype=np.float32)],
+            ),
+            ExportPhase(
+                name="mimi_encode_step",
+                wrapper=step,
+                dummy_inputs=(torch.randn(1, TRACE_FRAMES * FRAME_SAMPLES) * 0.1,
+                              torch.arange(2 * TRACE_FRAMES, dtype=torch.int32).view(1, -1) + 6,
+                              torch.arange(ctx + 2 * TRACE_FRAMES, dtype=torch.int32).view(1, -1) + 6 - ctx,
+                              torch.tensor([0.0]))
+                             + tuple(torch.randn(sh) * 0.1 for sh in step_shapes),
+                mil_inputs=[
+                    ct.TensorType(name="waveform",
+                                  shape=(1, ct.RangeDim(FRAME_SAMPLES, FRAME_SAMPLES * MAX_STEP_FRAMES)),
+                                  dtype=np.float32),
+                    ct.TensorType(name="positions", shape=(1, ct.RangeDim(2, 2 * MAX_STEP_FRAMES)), dtype=np.int32),
+                    ct.TensorType(name="key_positions", shape=(1, ct.RangeDim(ctx + 2, ctx + 2 * MAX_STEP_FRAMES)),
+                                  dtype=np.int32),
+                    ct.TensorType(name="first", shape=(1,), dtype=np.float32),
+                ] + [ct.TensorType(name=f"state_{i + 1}", shape=sh, dtype=np.float32)
+                     for i, sh in enumerate(step_shapes)],
+                root_axis="n_codes",
+                declared_axes={"waveform": {1: f"{FRAME_SAMPLES} * n_codes"},
+                               "positions": {1: f"{ENCODER_POSITIONS_PER_FRAME} * n_codes"},
+                               "key_positions": {1: f"{ENCODER_POSITIONS_PER_FRAME} * n_codes + {ctx}"}},
+            ),
+            ExportPhase(
+                name="rvq_encode",
+                wrapper=RvqEncodePhase(mimi.quantizer).eval(),
+                dummy_inputs=(torch.randn(1, TRACE_FRAMES, width),),
+                mil_inputs=[ct.TensorType(name="rows", shape=(1, ct.RangeDim(1, MAX_STEP_FRAMES), width),
+                                          dtype=np.float32)],
+                root_axis="n_codes",
             ),
             ExportPhase(
                 name="rvq_project_semantic",
@@ -461,7 +705,15 @@ class KyutaiSttExportConfig(BaseMultiPhaseModelExportConfig):
             "PAD_LEFT": f.get("pad_left", 0), "PAD_RIGHT": f.get("pad_right", 36000),
             "TEXT_PAD": f.get("text_pad", 3), "TEXT_UNK": 0,
         }
+        # The live door (loom.cpp ADR-108), beside the one pass. Top level, so its constants are too; the
+        # one-pass block keeps its own locals.
+        stream_constants = {"S_" + k: v for k, v in constants.items()}
+        stream_constants.update({"MIMI_STATES": f.get("mimi_states", 0), "MIMI_CONTEXT": f.get("mimi_context", 250),
+                                 "MAX_STEP_FRAMES": MAX_STEP_FRAMES})
         return [
+            ExportConstants(values=stream_constants, top_level=True),
+            LuaFragment(self.driver_script_path / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
             ExportConstants(values=constants),
             DriverInputs(bindings=(("waveform", CALLER), ("length", CALLER)), n_tokens=Len("waveform")),
             LuaFragment(self.driver_script_path / "01_transcribe.lua",

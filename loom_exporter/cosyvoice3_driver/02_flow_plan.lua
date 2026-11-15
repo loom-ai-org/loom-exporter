@@ -15,8 +15,18 @@
     local n_gen_frames = n_frames - n_prompt_frames
     local step_cond = cosyvoice3_zeros(n_frames * N_MEL)
     for _i = 1, #_prompt_feat do step_cond[_i] = _prompt_feat[_i] end
-    local zero_cond = cosyvoice3_zeros(n_frames * N_MEL)
-    local zero_spks = cosyvoice3_zeros(N_MEL)
     -- `n_steps`, the name every host passes a step count under (the contract's `tts.default_steps`).
     local times = cosyvoice3_cosine_times(inputs.n_steps or FLOW_STEPS)
-    local flow_cfg = inputs.flow_cfg_rate or FLOW_CFG_RATE
+    -- The guidance weight, an estimator INPUT: the estimator runs both halves of the guidance itself.
+    local flow_cfg = {inputs.flow_cfg_rate or FLOW_CFG_RATE}
+    -- The DiT's mode: full attention, as upstream's non-streaming call runs it, unless `streaming` asks
+    -- for the block-causal chunk mask its streaming call runs -- the one pass a live stream joins to
+    -- (00_stream.lua, ADR-112).
+    local chunk_ids = cosyvoice3_chunk_ids(n_frames, (inputs.streaming or 0) ~= 0)
+    -- The grid's noise and the generated frames' sine noise, a frame at a time in the order the live
+    -- stream draws them (00_stream.lua's top), so a seed is the same take both ways. A pinned one is
+    -- the caller's and not drawn.
+    local _draws = {flow_noise = {}, nsf_blocks = {}, frames_drawn = 0}
+    cosyvoice3_draw_frames(_draws, n_frames, n_prompt_frames, inputs.noise ~= nil, inputs.nsf_noise ~= nil)
+    local flow_noise = inputs.noise or _draws.flow_noise
+    local nsf_blocks = _draws.nsf_blocks

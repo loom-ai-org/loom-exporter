@@ -15,7 +15,9 @@ Five phases:
   - `vocoder`:  the separate HiFi-GAN checkpoint, `[1, frames, 80] -> [1, 256 * frames]`.
 
 The loop is hand-written Lua (`speecht5_driver/`), Pocket-TTS's shape: a KV-cached step over a
-continuous frame, a stop head read back, nothing sampled.
+continuous frame, a stop head read back, nothing sampled. It is cut per step for the live door
+(loom.cpp ADR-119): a stream hands back a few mel frames of audio at a time, each piece through the
+postnet and the vocoder over a window holding their receptive field (`mel_context_frames`).
 
 **Three things are this family's own.**
 
@@ -70,6 +72,13 @@ DEFAULT_MAXLENRATIO = 20.0
 # The built-in voice: CMU ARCTIC `slt`, whose `arctic_a0508` x-vector every published SpeechT5 example
 # uses (`embeddings_dataset[7306]`). The other six speakers are voice files (`speecht5_voices`).
 DEFAULT_VOICE = "slt"
+
+# A stream's pieces grow 2, 4, 8, ... mel frames (32 ms up) to this many (4.1 s), then stay at it. Each
+# piece's postnet + vocoder window adds `mel_context_frames` (34 + 34 frames, 1.1 s) of context, and the
+# vocoder is ~30% of a one pass. On the dev box, a 21 s text whose one pass is RTF 1.04, fixed pieces of
+# 32 / 64 / 128 / 256 frames streamed at RTF 1.69 / 1.42 / 1.20 / 1.09, so the margins want long pieces;
+# only the first piece's size decides when audio starts (loom.cpp ADR-119).
+PIECE_FRAMES_GROWN = 256
 
 # Trace lengths: odd, distinct from each other and from every static dimension.
 TRACE_TOKENS = 13
@@ -266,6 +275,63 @@ class VocoderPhase(nn.Module):
         return self.vocoder(mel)
 
 
+def _conv_reach(conv: nn.Conv1d, lo: int, hi: int) -> tuple:
+    """The input positions a stride-1 `Conv1d`'s outputs `[lo, hi]` read: `n - p + j * d`, j < k."""
+    if conv.stride[0] != 1:
+        raise NotImplementedError(f"a strided Conv1d ({conv}): the reach arithmetic assumes stride 1")
+    k, d, p = conv.kernel_size[0], conv.dilation[0], conv.padding[0]
+    return lo - p, hi - p + (k - 1) * d
+
+
+def _conv_transpose_reach(conv: nn.ConvTranspose1d, lo: int, hi: int) -> tuple:
+    """The input positions a `ConvTranspose1d`'s outputs `[lo, hi]` read: output `n = i * s + j - p`
+    for tap j < k, so input i runs from `ceil((n + p - k + 1) / s)` to `floor((n + p) / s)`."""
+    if conv.dilation[0] != 1 or conv.output_padding[0] != 0:
+        raise NotImplementedError(f"{conv}: the reach arithmetic assumes no dilation or output padding")
+    k, s, p = conv.kernel_size[0], conv.stride[0], conv.padding[0]
+    return -(-(lo + p - k + 1) // s), (hi + p) // s
+
+
+def mel_context_frames(postnet_layers, vocoder) -> tuple:
+    """`(left, right)`: how many mel frames either side of frames `[e, f)` a postnet + vocoder call must
+    see for their `hop * (f - e)` samples to be the ones a call over every frame gives (loom.cpp ADR-119).
+
+    Both are local. The postnet is five `Conv1d`s (kernel 5) whose reaches add, and its residual and
+    batch-norm affine are per frame. HiFi-GAN is `conv_pre`, then per upsampler a transposed
+    convolution and the mean of `num_kernels` residual blocks (the widest one's reach counts), then
+    `conv_post`; `normalize_before` is per frame. Walking the dependency interval of one frame's samples
+    back through every layer gives the frames it reads -- exact, not an estimate: a window holding them
+    computes every intermediate position those samples read from the same inputs, because a window's own
+    zero padding only stands in for positions outside it. For `microsoft/speecht5_hifigan` that is 24
+    frames either side, plus the postnet's 10: **34 and 34**. The CI test checks the walk against a NaN
+    probe (structural, since a value probe under-counts a reach whose last taps are near zero: here one
+    frame short moves f64 samples by ~1e-13, invisible next to rounding)."""
+    left = right = 0
+    for layer in postnet_layers:
+        lo, hi = _conv_reach(layer.conv, 0, 0)
+        left, right = left - lo, right + hi
+    hop = 1
+    for up in vocoder.upsampler:
+        hop *= up.stride[0]
+    # Any frame will do: every layer is shift-equivariant, one frame being `hop` samples at the output.
+    e = 4 * hop
+    lo, hi = _conv_reach(vocoder.conv_post, hop * e, hop * (e + 1) - 1)
+    nk = vocoder.num_kernels
+    for i in reversed(range(len(vocoder.upsampler))):
+        reach = []
+        for block in vocoder.resblocks[i * nk:(i + 1) * nk]:
+            a, b = lo, hi
+            # `x = c2(lrelu(c1(lrelu(x)))) + x`, pair by pair: the identity keeps what was read already.
+            for c1, c2 in reversed(list(zip(block.convs1, block.convs2))):
+                a2, b2 = _conv_reach(c1, *_conv_reach(c2, a, b))
+                a, b = min(a, a2), max(b, b2)
+            reach.append((a, b))
+        lo, hi = min(r[0] for r in reach), max(r[1] for r in reach)
+        lo, hi = _conv_transpose_reach(vocoder.upsampler[i], lo, hi)
+    lo, hi = _conv_reach(vocoder.conv_pre, lo, hi)
+    return left + e - lo, right + hi - e
+
+
 def _check_fused_attention(topo: dict, n_layers: int) -> int:
     """Exactly `n_layers` ATTENTION nodes in the decoder, all cached: the self-attention blocks. A
     fused cross-attention block would take a KV cache slot the self-attention blocks address."""
@@ -298,6 +364,8 @@ class SpeechT5ExportConfig(BaseMultiPhaseModelExportConfig):
     _prenet_units: int = field(default=256, init=False, repr=False)
     _eos_token_id: int = field(default=2, init=False, repr=False)
     _speaker_dim: int = field(default=512, init=False, repr=False)
+    _hop: int = field(default=HOP_LENGTH, init=False, repr=False)
+    _context_frames: tuple = field(default=(34, 34), init=False, repr=False)
     cross_kv_names: tuple = field(default=(), init=False, repr=False)
 
     __links__ = {"root_axis": Axis()}
@@ -323,6 +391,9 @@ class SpeechT5ExportConfig(BaseMultiPhaseModelExportConfig):
         "_prenet_units": Unchecked("READ: `config.speech_decoder_prenet_units`"),
         "_eos_token_id": Unchecked("READ: `config.eos_token_id`, which the tokenizer appends"),
         "_speaker_dim": Unchecked("READ: `config.speaker_embedding_dim`, the x-vector width a voice must have"),
+        "_hop": Unchecked("READ: the product of the vocoder's upsampler strides, samples per mel frame"),
+        "_context_frames": Unchecked("the postnet + vocoder receptive field in frames, derived during "
+                                     "phases() by `mel_context_frames`"),
         "cross_kv_names": Unchecked("derived in phases() by `cross_kv_input_names`, which also orders "
                                     "`CrossKvPhase`'s outputs"),
     }
@@ -367,6 +438,8 @@ class SpeechT5ExportConfig(BaseMultiPhaseModelExportConfig):
         self._driver_weights = {"speaker": read_xvector(Path(self.model_dir), self.voice,
                                                         int(cfg.speaker_embedding_dim))}
         self.cross_kv_names = cross_kv_input_names(self._n_layers)
+        self._hop = int(np.prod([up.stride[0] for up in vocoder.upsampler]))
+        self._context_frames = mel_context_frames(model.speech_decoder_postnet.layers, vocoder)
 
         hidden, mels, units = int(cfg.hidden_size), self._num_mel_bins, self._prenet_units
         text_dim = ct.RangeDim(1, self._max_text)
@@ -462,14 +535,21 @@ class SpeechT5ExportConfig(BaseMultiPhaseModelExportConfig):
             "DEFAULT_THRESHOLD": DEFAULT_THRESHOLD,
             "DEFAULT_MINLENRATIO": DEFAULT_MINLENRATIO,
             "DEFAULT_MAXLENRATIO": DEFAULT_MAXLENRATIO,
+            "HOP_LENGTH": self._hop,
+            "MEL_LEFT_FRAMES": self._context_frames[0],
+            "MEL_RIGHT_FRAMES": self._context_frames[1],
+            "PIECE_FRAMES_GROWN": PIECE_FRAMES_GROWN,
         }
         return [
-            ExportConstants(values=constants),
+            # Top level, so the stream functions read them too (they run outside the entry function).
+            ExportConstants(values=constants, top_level=True),
             DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
             LuaFragment(fragment / "00_header.lua", top_level=True,
                         defines=("speecht5_relative_index", "speecht5_draw_mask")),
-            LuaFragment(fragment / "01_speech.lua", reads=("tokens",) + tuple(constants),
-                        defines=("wave",)),
+            # The live door (loom.cpp ADR-100, ADR-119): a few mel frames of audio per `stream_feed`.
+            LuaFragment(fragment / "01_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
+            LuaFragment(fragment / "02_speech.lua", reads=("tokens",), defines=("wave",)),
             DriverReturn(values=("wave",)),
         ]
 

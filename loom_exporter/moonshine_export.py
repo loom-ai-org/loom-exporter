@@ -50,6 +50,10 @@ from .spec_protocol import Unchecked
 
 # The model card's token budget: `max_length = int(n_samples * 6.5 / sample_rate)`, start token included.
 TOKENS_PER_SECOND = 6.5
+# How often the live door re-runs the decoder, in final encoder rows (20 ms each): every 0.5 s of audio, and
+# at the end. Each re-run is a whole decode over every row, so this is the cost knob; the transcript at the
+# end does not depend on it.
+STREAM_DECODE_EVERY = 25
 # What a masked attention score becomes. transformers fills `finfo.min`; anything `exp` takes to exactly
 # 0 after the row max is subtracted is the same softmax, and every row keeps its own diagonal.
 _MASKED_SCORE = -1e30
@@ -80,8 +84,15 @@ def window_mask(n: int, window, dtype=torch.float32, device=None):
 
 
 class _MoonshineEncoderWrapper(nn.Module):
-    """`waveform [1, 80 * n_frames] -> [1, n_enc, d_decoder]`: the front end, the windowed layers, the
-    final norm, the decoder's position table and its projection."""
+    """`waveform [1, 80 * n_frames], row_offset [1] -> [1, n_enc, d_decoder]`: the front end, the windowed
+    layers, the final norm, the decoder's position table and its projection.
+
+    `row_offset` is the clip row the waveform's first row is: 0 for one call, and the window's first row
+    for the live door's windows (loom.cpp ADR-106). Everything before the position table is translation
+    invariant -- per-frame CMVN, causal convolutions, attention bands with no position in them -- so a
+    window over the clip's samples from a row boundary gives the clip's own rows once its left context
+    covers the receptive field; the table is the one place the absolute row enters.
+    """
 
     def __init__(self, model):
         super().__init__()
@@ -95,7 +106,7 @@ class _MoonshineEncoderWrapper(nn.Module):
         self.pos_emb = decoder.pos_emb
         self.proj = decoder.proj
 
-    def forward(self, waveform):
+    def forward(self, waveform, row_offset):
         emb = self.embedder
         frames = waveform.reshape(1, -1, self.frame_len)
         mean = frames.mean(dim=-1, keepdim=True)
@@ -110,8 +121,19 @@ class _MoonshineEncoderWrapper(nn.Module):
         for layer, window in zip(self.layers, self.windows):
             hidden = layer(hidden, attention_mask=masks[window])
         hidden = self.final_norm(hidden)
-        hidden = hidden + self.pos_emb(torch.arange(n))
+        hidden = hidden + self.pos_emb(torch.arange(n) + row_offset)
         return self.proj(hidden)
+
+    def receptive_rows(self) -> tuple:
+        """`(left, right)`: how many encoder rows before and after a row its output reads, through every
+        layer. A band `(l, r)` reads `l - 1` rows back and `r - 1` ahead (`window_mask`'s predicate), and
+        the two causal stride-2 convolutions reach `(k1 - 1) + 2 (k2 - 1)` frames, 4 frames a row, back.
+        Measured at f64 on both checkpoints: a window with this left context and a row this far from its
+        right edge is the one pass to 1e-15; one row less on either side is 1e-07 to 1e-05."""
+        left = sum(int(w[0]) - 1 for w in self.windows)
+        right = sum(max(int(w[1]) - 1, 0) for w in self.windows)
+        reach = (int(self.embedder.conv1.kernel_size[0]) - 1) + 2 * (int(self.embedder.conv2.kernel_size[0]) - 1)
+        return left + -(-reach // 4), right
 
 
 class _MoonshineCrossKvWrapper(nn.Module):
@@ -282,6 +304,8 @@ class ASRMoonshineStreamingExportConfig(BaseMultiPhaseModelExportConfig):
     eos_token_id: Optional[int] = field(default=None, init=False, repr=False)
     cross_kv_names: tuple = field(default=(), init=False, repr=False)
     decoder_bindings: tuple = field(default=(), init=False, repr=False)
+    stream_left_rows: Optional[int] = field(default=None, init=False, repr=False)
+    stream_right_rows: Optional[int] = field(default=None, init=False, repr=False)
 
     __unchecked__ = {
         "checkpoint": Unchecked("the HF directory; the recognizer read its config.json's model_type and "
@@ -307,6 +331,9 @@ class ASRMoonshineStreamingExportConfig(BaseMultiPhaseModelExportConfig):
         "cross_kv_names": Unchecked("derived by `cross_kv_input_names`, which also orders the "
                                     "cross_kv phase's outputs"),
         "decoder_bindings": Unchecked("derived from the same mil_inputs the trace is declared with"),
+        "stream_left_rows": Unchecked("DERIVED from the encoder's bands and convolutions "
+                                      "(`receptive_rows`), measured exact at f64"),
+        "stream_right_rows": Unchecked("same"),
     }
 
     def load_model(self):
@@ -337,6 +364,7 @@ class ASRMoonshineStreamingExportConfig(BaseMultiPhaseModelExportConfig):
         self.max_enc_frames = int(decoder.pos_emb.num_embeddings)
         self.max_positions = int(model.config.max_position_embeddings)
         self.cross_kv_names = cross_kv_input_names(self.n_layers)
+        self.stream_left_rows, self.stream_right_rows = encoder_wrapper.receptive_rows()
 
         n_samples = int(self.trace_seconds * self.sample_rate) // self.frame_len * self.frame_len
         token_axis = ct.RangeDim(1, self.max_positions)
@@ -354,10 +382,12 @@ class ASRMoonshineStreamingExportConfig(BaseMultiPhaseModelExportConfig):
 
         return [
             ExportPhase(
-                name="encoder", wrapper=encoder_wrapper, dummy_inputs=(torch.randn(1, n_samples) * 0.1,),
+                name="encoder", wrapper=encoder_wrapper,
+                dummy_inputs=(torch.randn(1, n_samples) * 0.1, torch.zeros(1, dtype=torch.int32)),
                 # Any length here; the DRIVER makes it a whole number of frames (01_frames.lua).
                 mil_inputs=[ct.TensorType(name="waveform", shape=(1, ct.RangeDim(
-                    self.frame_len, self.max_samples())), dtype=np.float32)],
+                    self.frame_len, self.max_samples())), dtype=np.float32),
+                    ct.TensorType(name="row_offset", shape=(1,), dtype=np.int32)],
                 root_axis="n_samples",
             ),
             ExportPhase(
@@ -416,7 +446,7 @@ class ASRMoonshineStreamingExportConfig(BaseMultiPhaseModelExportConfig):
         from .driver_components import (
             ExportConstants, LuaFragment, PrefillDecodeLoop, SubgraphCallComponent,
         )
-        from .driver_ir import FieldAccess, Len, Lit, OutputRef, Var
+        from .driver_ir import ArrayLit, FieldAccess, Len, Lit, OutputRef, Var
 
         waveform = FieldAccess("inputs", "waveform")
         return [
@@ -429,6 +459,21 @@ class ASRMoonshineStreamingExportConfig(BaseMultiPhaseModelExportConfig):
                 "MAX_POSITIONS": self.max_positions or 0,
                 "DECODER_START": self.decoder_start_id if self.decoder_start_id is not None else 1,
             }),
+            # The live door (loom.cpp ADR-106), beside the one pass: the encoder over windows with its
+            # receptive field either side, the decoder re-run over the final rows. Top level, so its
+            # constants are too; the one-pass block above keeps its own locals.
+            ExportConstants(values={
+                "S_FRAME": self.frame_len or 0, "S_SAMPLE_RATE": self.sample_rate or 0,
+                "S_TOKENS_PER_SECOND": TOKENS_PER_SECOND, "S_MAX_ENC_FRAMES": self.max_enc_frames or 0,
+                "S_MAX_POSITIONS": self.max_positions or 0,
+                "S_DECODER_START": self.decoder_start_id if self.decoder_start_id is not None else 1,
+                "S_EOS": self.eos_token_id if self.eos_token_id is not None else 2,
+                "D_MODEL": self.d_model or 0, "N_LAYERS": self.n_layers or 0,
+                "LEFT_ROWS": self.stream_left_rows or 0, "RIGHT_ROWS": self.stream_right_rows or 0,
+                "DECODE_EVERY": STREAM_DECODE_EVERY,
+            }, top_level=True),
+            LuaFragment(self.driver_script_path / "03_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
             LuaFragment(
                 self.driver_script_path / "01_frames.lua",
                 reads=("FRAME", "SAMPLE_RATE", "TOKENS_PER_SECOND", "MAX_ENC_FRAMES", "MAX_POSITIONS"),
@@ -436,7 +481,7 @@ class ASRMoonshineStreamingExportConfig(BaseMultiPhaseModelExportConfig):
             ),
             SubgraphCallComponent(
                 topology="encoder", outputs=(), retain=True,
-                inputs={"waveform": waveform},
+                inputs={"waveform": waveform, "row_offset": ArrayLit([Lit(0)])},
                 axes={"n_samples": Len(waveform), "n_past": Lit(0)},
                 note="Encoder: frames, sliding-window layers, the position table and the projection.",
             ),

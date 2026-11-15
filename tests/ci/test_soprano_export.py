@@ -103,6 +103,48 @@ def test_the_decoder_phase_is_the_reference_decoder():
     assert torch.allclose(got, want, atol=1e-6 * want.abs().max().item())
 
 
+@needs_reference
+def test_the_stream_context_is_the_decoders_receptive_field_and_no_less():
+    """A stream decodes rows `[e, f)` from a window `left` rows before and `right` after (ADR-114). At
+    f64 on the reference decoder, every such window over a 30-row sentence gives the one-call samples;
+    one row fewer on either side moves some of them. Random weights, so nothing cancels by accident."""
+    from loom_exporter.soprano_export import decoder_context_rows, import_soprano
+
+    import_soprano()
+    from soprano.vocos.decoder import SopranoDecoder
+
+    torch.manual_seed(0)
+    decoder = SopranoDecoder().double().eval()
+    left, right = decoder_context_rows(decoder)
+    assert (left, right) == (3, 4)
+    n = 30
+    hidden = torch.randn(1, 512, n, dtype=torch.float64)
+
+    def decode(a, b):
+        with torch.no_grad():
+            return decoder(hidden[..., a:b])[0].squeeze()
+
+    whole = decode(0, n)
+    scale = whole.abs().max().item()
+
+    def worst(left, right):
+        d = 0.0
+        for e, f in [(0, 1), (1, 3), (5, 9), (12, 20), (20, 25)]:
+            a, b = max(0, e - left), min(n, f + right)
+            got = decode(a, b)[(e - a) * SAMPLES_PER_ROW:(f - a) * SAMPLES_PER_ROW]
+            d = max(d, (got - whole[e * SAMPLES_PER_ROW:f * SAMPLES_PER_ROW]).abs().max().item())
+        return d / scale
+
+    exact, short_left, short_right = worst(left, right), worst(left - 1, right), worst(left, right - 1)
+    print(f"context {left}/{right}: {exact:.3g}; {left - 1} left: {short_left:.3g}; "
+          f"{right - 1} right: {short_right:.3g}")
+    assert exact < 1e-12
+    # One row short on the left still loses only frames the Hann window's first taps (w[1]^2 ~ 2e-6)
+    # weigh, so the miss is far below f32 and still far above f64's rounding: it is a miss.
+    assert short_left > 100 * max(exact, 1e-16)
+    assert short_right > 100 * max(exact, 1e-16)
+
+
 # -- the text front end's data ---------------------------------------------------------------------
 
 @needs_reference

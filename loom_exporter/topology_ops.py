@@ -248,6 +248,12 @@ def _op_linear(self, op, ctx):
     x_var = self.safe_name(x_var_obj.name)
     weight_var = self.safe_name(op.inputs["weight"].name)
     bias_var = self.safe_name(op.inputs["bias"].name) if "bias" in op.inputs and hasattr(op.inputs["bias"], "name") else None
+    # MIL gives a bias-free `nn.Linear` an all-zero bias const. Adding it is a kernel that adds 0.0: four
+    # per Qwen2 layer (o_proj, gate, up, down), 96 per CosyVoice3 LM token on a GPU where each costs ~1.5
+    # us (2026-11-12). `x + 0.0` is `x` but for a -0.0 coming out +0.0, so the ADD is left out.
+    bias_val = getattr(op.inputs.get("bias"), "val", None) if bias_var else None
+    if bias_val is not None and not np.any(np.asarray(bias_val)):
+        bias_var = None
     output_var = self.safe_name(op.outputs[0].name)
 
     # In Loom, MUL_MAT expects [weight, x]

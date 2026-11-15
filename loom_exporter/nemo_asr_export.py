@@ -715,17 +715,17 @@ def _is_parakeet_rnnt(path: Path) -> bool:
 
 
 def _build_conformer_ctc(path: Path, output_path: str):
-    return ASRNemoEncoderExportConfig(
-        checkpoint=str(path), output=EncoderOutput.CTC_LOG_PROBS,
-        architecture="conformer-ctc", output_path=output_path,
-    )
+    # Multi-phase since loom.cpp ADR-123: the one pass unchanged, plus FrameBatchASR's two graphs.
+    from .nemo_ctc_export import ASRNemoCtcExportConfig
+
+    return ASRNemoCtcExportConfig(checkpoint=str(path), architecture="conformer-ctc", output_path=output_path)
 
 
 def _build_citrinet(path: Path, output_path: str):
-    return ASRNemoEncoderExportConfig(
-        checkpoint=str(path), output=EncoderOutput.CTC_LOG_PROBS,
-        architecture="citrinet", output_path=output_path,
-    )
+    # Multi-phase since loom.cpp ADR-123: the one pass unchanged, plus FrameBatchASR's two graphs.
+    from .nemo_ctc_export import ASRNemoCtcExportConfig
+
+    return ASRNemoCtcExportConfig(checkpoint=str(path), architecture="citrinet", output_path=output_path)
 
 
 def _build_parakeet_tdt(path: Path, output_path: str):

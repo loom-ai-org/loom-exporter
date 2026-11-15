@@ -258,7 +258,15 @@ def cross_kv_input_names(n_layers: int) -> tuple:
 
 
 class _WhisperDecoderWrapper(nn.Module):
-    """`(tokens, position_ids, attention_mask, xk_0, xv_0, ...) -> logits`.
+    """`(tokens, position_ids, attention_mask, xk_0, xv_0, ...) -> (logits, align)`.
+
+    **`align` is the live door's** (loom.cpp ADR-128): the cross-attention probabilities of the
+    checkpoint's alignment heads (`generation_config.alignment_heads`, OpenAI's table), `[1, n_heads,
+    n_tokens, n_audio_ctx]` in (layer, head) order -- what SimulStreaming's AlignAtt policy reads to stop
+    decoding before the audio runs out. Each is `softmax(q_h k_h^T / sqrt(head_dim))` from that layer's own
+    query projection (kept by a forward hook, so the module and its weight names are untouched) and `xk_layer`: the attention HF computes, recomputed for ten
+    heads rather than asked for, because `output_attentions` needs the eager attention path and that would
+    change how every self-attention block traces. A one-pass decode ignores it.
 
     The first three inputs are not a free choice. `position_ids` and `attention_mask` are passed
     explicitly for the reason `causal_lm_export._causal_mask` documents -- it is what keeps the token
@@ -277,10 +285,18 @@ class _WhisperDecoderWrapper(nn.Module):
     matches; the cache appears at run time, in the engine, not in the graph.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, alignment_heads=()):
         super().__init__()
         self.decoder = model.model.decoder
         self.proj_out = model.proj_out
+        self.alignment_heads = tuple(sorted((int(l), int(h)) for l, h in alignment_heads))
+        self.n_heads = int(model.config.decoder_attention_heads)
+        self.head_dim = int(model.config.d_model) // self.n_heads
+        self._queries = [None] * len(self.decoder.layers)
+        for layer in sorted({l for l, _ in self.alignment_heads}):
+            def keep(_module, _inputs, output, layer=layer):
+                self._queries[layer] = output
+            self.decoder.layers[layer].encoder_attn.q_proj.register_forward_hook(keep)
         # Every cross-attention projection becomes a slot fed from this call's arguments. See
         # `_CrossKvSlot`: the tensors are the same, they are just no longer recomputed per token.
         self._cross = [None] * (2 * len(self.decoder.layers))
@@ -300,7 +316,17 @@ class _WhisperDecoderWrapper(nn.Module):
             # 4.6 MB input the graph would not otherwise use.
             encoder_hidden_states=cross[0], use_cache=False,
         ).last_hidden_state
-        return self.proj_out(hidden)
+        logits = self.proj_out(hidden)
+        if not self.alignment_heads:
+            return logits
+        rows = []
+        for layer, head in self.alignment_heads:
+            lo, hi = head * self.head_dim, (head + 1) * self.head_dim
+            q = self._queries[layer][:, :, lo:hi]                     # [1, T, dh], the raw projection
+            k = cross[2 * layer][:, :, lo:hi]                         # [1, S, dh]
+            scores = torch.matmul(q, k.transpose(1, 2)) * (self.head_dim ** -0.5)
+            rows.append(torch.softmax(scores, dim=-1))
+        return logits, torch.stack(rows, dim=1)
 
 
 def causal_mask(seq_len: int) -> torch.Tensor:
@@ -385,6 +411,57 @@ def decoder_prompt_constants(generation_config, n_audio_ctx: int, vocab_size: in
         "TS_HI": ts_hi,
         "PREV_SOT": prev_sot,
         "MAX_PREV": (n_text_ctx // 2 - 1) if prev_sot else 0,
+    }
+
+
+# SimulStreaming's defaults (`simulstreaming_whisper.py`'s CLI and `AlignAttConfig`): an update per 1.2 s of
+# audio, a 30 s buffer, `frame_threshold` 25 frames, `rewind_threshold` 200; `DEC_PAD` is its literal 50257.
+STREAM_CHUNK_SECONDS = 1.2
+STREAM_MAX_SECONDS = 30.0
+STREAM_FRAME_THRESHOLD = 25
+STREAM_REWIND_THRESHOLD = 200
+STREAM_DEC_PAD = 50257
+
+
+def stream_constants(generation_config, prompt: dict, model_dir: str, alignment_heads, *, n_samples: int,
+                     sample_rate: int, hop: int, n_audio_ctx: int, n_text_ctx: int) -> dict:
+    """The numbers `whisper_driver/10_stream.lua` (SimulStreaming's AlignAtt, loom.cpp ADR-128) reads, bound at
+    top level beside `infer`'s.
+
+    The suppressed set is SimulStreaming's own: transcribe, translate, start of transcript, start of previous,
+    start of LM, no-timestamps, every language token, and no-speech (`<|nospeech|>`, which HF's tokenizer
+    spells `<|nocaptions|>`). `W_SPACE` is the ids of `encode(" ")`, banned with the end of text on an
+    update's first step."""
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(model_dir)
+
+    def special(*names):
+        for name in names:
+            i = tok.convert_tokens_to_ids(name)
+            if i is not None and i != tok.unk_token_id:
+                return int(i)
+        raise ValueError(f"this Whisper tokenizer has none of {names}")
+
+    lang_lo, lang_hi = int(prompt["LANG_LO"]), int(prompt["LANG_HI"])
+    suppress = {int(prompt["TRANSCRIBE"]), int(prompt["TRANSLATE"]), int(prompt["SOT"]), int(prompt["PREV_SOT"]),
+                special("<|startoflm|>"), int(prompt["NO_TIMESTAMPS"]), special("<|nospeech|>", "<|nocaptions|>")}
+    suppress |= set(range(lang_lo, lang_hi))
+    suppress.discard(0)
+    lang_to_id = {str(k).strip("<|>"): int(v) for k, v in (getattr(generation_config, "lang_to_id", None) or {}).items()}
+    return {
+        "W_SOT": int(prompt["SOT"]), "W_EOT": int(generation_config.eos_token_id),
+        "W_SOT_PREV": int(prompt["PREV_SOT"]), "W_NO_TIMESTAMPS": int(prompt["NO_TIMESTAMPS"]),
+        "W_TRANSCRIBE": int(prompt["TRANSCRIBE"]), "W_LANG_LO": lang_lo, "W_LANG_HI": lang_hi,
+        # SimulStreaming's `--lan` default.
+        "W_LANG_DEFAULT": lang_to_id.get("en", 0),
+        "W_SUPPRESS": sorted(suppress), "W_SPACE": [int(i) for i in tok.encode(" ", add_special_tokens=False)],
+        "W_N_ALIGN": len(alignment_heads), "W_N_AUDIO_CTX": int(n_audio_ctx), "W_N_TEXT_CTX": int(n_text_ctx),
+        "W_N_SAMPLES": int(n_samples), "W_RATE": int(sample_rate), "W_HOP": int(hop),
+        "W_N_TEXT_LAYERS": int(prompt["N_TEXT_LAYERS"]),
+        "W_DEFAULT_CHUNK_SECONDS": STREAM_CHUNK_SECONDS, "W_MAX_SECONDS": STREAM_MAX_SECONDS,
+        "W_FRAME_THRESHOLD": STREAM_FRAME_THRESHOLD, "W_REWIND": STREAM_REWIND_THRESHOLD,
+        "W_DEC_PAD": STREAM_DEC_PAD,
     }
 
 
@@ -577,7 +654,15 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
         # `_WhisperDecoderWrapper.__init__` then replaces the attributes that reached them. Built the
         # other way round the cross_kv phase would trace `_CrossKvSlot`s and export no weights at all.
         cross_kv_wrapper = _WhisperCrossKvWrapper(model).eval()
-        decoder_wrapper = _WhisperDecoderWrapper(model).eval()
+        # The alignment heads as the checkpoint's generation config lists them (OpenAI's table); none on a
+        # checkpoint without them, which then has no live door (`stream_supported`).
+        self.alignment_heads = tuple(tuple(int(v) for v in pair)
+                                     for pair in (getattr(model.generation_config, "alignment_heads", None) or ()))
+        decoder_wrapper = _WhisperDecoderWrapper(model, self.alignment_heads).eval()
+        self.stream_constants = stream_constants(
+            model.generation_config, self.prompt_constants, self.model_dir, self.alignment_heads,
+            n_samples=self.n_samples, sample_rate=self.sample_rate, hop=int(extractor.hop_length),
+            n_audio_ctx=self.n_audio_ctx, n_text_ctx=self.max_target_positions) if self.alignment_heads else None
 
         return [
             ExportPhase(
@@ -736,7 +821,16 @@ class ASRWhisperExportConfig(BaseMultiPhaseModelExportConfig):
         )
         from .driver_ir import FieldAccess, Lit, OutputRef, Var
 
+        # SimulStreaming's live door (loom.cpp ADR-128), for a checkpoint whose decoder has alignment heads.
+        stream = []
+        if getattr(self, "stream_constants", None):
+            stream = [
+                ExportConstants(values=dict(self.stream_constants), top_level=True),
+                LuaFragment(self.driver_script_path / "10_stream.lua", top_level=True,
+                            defines=("stream_open", "stream_feed", "stream_finish")),
+            ]
         return [
+            *stream,
             LuaFragment(self.driver_script_path / "00_header.lua", top_level=True),
             ExportConstants(values=dict(self.prompt_constants)),
             SubgraphCallComponent(
