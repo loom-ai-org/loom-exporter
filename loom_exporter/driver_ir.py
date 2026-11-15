@@ -258,6 +258,29 @@ class OutputRef(Expr):
         return "{" + ", ".join(fields) + "}"
 
 
+@dataclasses.dataclass
+class StateRef(Expr):
+    """`{state = 'name', index = i}` -- an input supplied by a device tensor the STREAM keeps (loom.cpp
+    ADR-098: `loom.keep_state(name, module)`), where `OutputRef` names a module's retained output.
+
+    A retained output belongs to the model and the next call of that module overwrites it, so a value a
+    stream reads across its calls -- an encoder's cross-attention K/V (ADR-130) -- is kept in the stream's
+    own state and read from there. No module is named, so `check_subgraph_calls` has nothing to order:
+    the state entry exists once `stream_open` kept it, which the engine checks when it is read.
+    """
+    name: str
+    index: int = 1
+
+    def reads(self) -> list[str]:
+        return []
+
+    def render(self) -> str:
+        fields = [f"state = '{self.name}'"]
+        if self.index != 1:
+            fields.append(f"index = {self.index}")
+        return "{" + ", ".join(fields) + "}"
+
+
 class RetainedRead(Expr):
     """Base for every expression that reads a module's RETAINED output by name.
 
@@ -614,12 +637,13 @@ class Function:
 _BUILTINS = {"loom", "math", "table", "string", "nil", "true", "false"}
 
 
-def validate(function: Function) -> None:
+def validate(function: Function, module_names=()) -> None:
     """Checks that every symbol read by a statement was defined by an earlier one (or is a function
-    param/known builtin). Raises DriverIRError with the offending node/symbol on failure -- catches the
-    "used a var from a slice that isn't the last op"/spurious-input class of bug at export time instead of
-    a runtime crash or silently wrong Lua."""
-    defined = set(function.params) | _BUILTINS
+    param/known builtin, or one of `module_names`, bound at the driver's top level before any function).
+    Raises DriverIRError with the offending node/symbol on failure -- catches the "used a var from a
+    slice that isn't the last op"/spurious-input class of bug at export time instead of a runtime crash
+    or silently wrong Lua."""
+    defined = set(function.params) | _BUILTINS | set(module_names)
     _validate_block(function.body, defined, function.name)
 
 

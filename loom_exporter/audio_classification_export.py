@@ -738,7 +738,8 @@ class PyannoteSegmentationExportConfig(BaseMultiPhaseModelExportConfig):
         that computes it has already retained its output rather than handed it over.
         """
         from .driver_components import (
-            CALLER, BiRecurrentCall, DriverInputs, DriverReturn, SubgraphCallComponent,
+            CALLER, BiRecurrentCall, DriverInputs, DriverReturn, ExportConstants, LuaFragment,
+            SubgraphCallComponent,
         )
         from .driver_ir import Len, OutputRef, Var
 
@@ -775,15 +776,34 @@ class PyannoteSegmentationExportConfig(BaseMultiPhaseModelExportConfig):
             note="The two linear layers and the powerset softmax; the probabilities are the answer.",
         ))
         components.append(DriverReturn(values=("probs",)))
+        # diart's voice activity detection beside `infer` (loom.cpp ADR-129): `stream_*` at top level, the
+        # one pass run on each chunk. The settings are diart's defaults; a stream may open with others.
+        components += [
+            ExportConstants(top_level=True, values=dict(
+                SAMPLE_RATE=int(self.sample_rate or 16000), MIN_SAMPLES=_SINCNET_MIN_SAMPLES,
+                N_CLASSES=len(_POWERSET_3_2), NON_SPEECH=_POWERSET_3_2.index("non_speech"),
+                DURATION=_DIART_DURATION, STEP=_DIART_STEP)),
+            LuaFragment(_DIART_VAD_DRIVER / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
+        ]
         return components
 
     def contract(self) -> dict:
-        return audio_contract(self.output, self.sample_rate, self.labels, self.frame_rate,
-                              self.frame_offset)
+        contract = audio_contract(self.output, self.sample_rate, self.labels, self.frame_rate,
+                                  self.frame_offset)
+        # The stream answers diart's speech score per row, not the seven powerset classes: the local
+        # speakers of one chunk mean nothing in the next without an embedding model to link them.
+        contract["stream.labels"] = ["speech"]
+        return contract
 
     def backend_kwargs(self) -> dict:
         return dict(hparams=self.hparams())
 
+
+# diart's `VoiceActivityDetectionConfig` defaults: 5 s chunks every 0.5 s (its latency defaults to the step).
+_DIART_DURATION = 5.0
+_DIART_STEP = 0.5
+_DIART_VAD_DRIVER = Path(__file__).resolve().parent / "diart_vad_stream_driver"
 
 # The shortest clip SincNet turns into one frame: its receptive field (251-tap sinc filters at stride
 # 10, three max-pools of 3, two 5-tap convolutions). `_sincnet_frames_expr` is the same arithmetic.

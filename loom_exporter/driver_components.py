@@ -45,7 +45,7 @@ from .driver_ir import (
     ArrayLit, Argmax, Assign, BinOp, Break, Call, CallStmt, FieldAccess, If, Index, IndexAssign, Len,
     Lit, Local, LocalDecl, NumericFor, OutputRef, RawBlock, RetainedArgmax, RetainedArgmaxRows,
     RetainedSample,
-    Return, SubgraphCall, TableLit, Var, While,
+    Return, StateRef, SubgraphCall, TableLit, Var, While,
 )
 from .driver_ir import Function as IRFunction
 from .driver_builder import (
@@ -813,6 +813,15 @@ class PrefillDecodeLoop(DriverComponent):
     # partial answer is worth more than nothing, and the caller can see it is partial.
     transcript_after_token: Optional[int] = None
 
+    # The components that build this loop's PER-CALL CONTEXT -- an encoder's run and its cross-attention
+    # K/V -- for a loop that streams with it (loom.cpp ADR-130). Empty for every loop that reads nothing
+    # but its own tokens and cache, which is what `stream_supported` asks of the rest. Set, `stream_open`
+    # runs them on the caller's input, keeps every module `bound` names by `OutputRef` in the stream's
+    # own state (`loom.keep_state`: another call of that module would overwrite its retained output),
+    # and holds each `extra_axes` value as a state number; the step reads them back from there. The
+    # same component objects as the entry's own, so they are checked once, where `infer` runs them.
+    stream_context: Tuple[object, ...] = ()
+
     # Locals this component binds. Prefixed so they cannot collide with a traced input's own safe_name.
     generated_var: str = "_gen"
     step_var: str = "_step_tokens"
@@ -880,6 +889,11 @@ class PrefillDecodeLoop(DriverComponent):
             "like default_eos_token. The one thing a link could compare it against is that same "
             "vocabulary, which is where the value came from."
         ),
+        "stream_context": CoveredBy(
+            "the entry's own component list: these are the same objects `infer` runs, which "
+            "DriverBuilder.build registers with the export's checker there; the stream entries emit "
+            "their statements again, and driver_ir.validate runs over those functions too"
+        ),
         "generated_var": Unchecked("a local this component binds; reads of it are inside its own loop "
                                    "and are checked by driver_ir.validate over the assembled function"),
         "step_var": Unchecked("same"),
@@ -887,17 +901,21 @@ class PrefillDecodeLoop(DriverComponent):
         "n_tokens_var": Unchecked("same"),
     }
 
-    def _call_inputs(self, ctx: DriverContext):
+    def _call_inputs(self, ctx: DriverContext, stream: bool = False):
         """The `run_subgraph` input table: the step's tokens for the caller-supplied input, and the
         host-computed pair rebuilt per iteration -- which is the difference from `DriverInputs`, whose
-        `cache_position`/`attention_mask` are built once for one prefill."""
+        `cache_position`/`attention_mask` are built once for one prefill. `stream`: a bound retained
+        output is read from where `stream_open` kept it (ADR-130)."""
         out = {}
         for name, kind in self.bindings:
             if name in self.bound:
                 # Checked before `kind` deliberately: an explicitly bound input wins over what its name
                 # would otherwise imply, so a model whose encoder output happens to be called
                 # `attention_mask` is still bound to the encoder rather than to loom.causal_mask.
-                out[name] = self.bound[name]
+                bound = self.bound[name]
+                if stream and isinstance(bound, OutputRef):
+                    bound = StateRef(bound.module, bound.index)
+                out[name] = bound
             elif kind == CALLER and self.embed_topology:
                 # The step's tokens reach a `inputs_embeds`-traced decoder through the embedding
                 # topology this loop just ran, backend-side. `OutputRef` rather than a marshalled
@@ -916,7 +934,15 @@ class PrefillDecodeLoop(DriverComponent):
                 out[name] = Var(self.step_var)
         return out
 
-    def _step_body(self, ctx: DriverContext) -> List:
+    def _kept_modules(self) -> List[str]:
+        """The modules `bound` reads by `OutputRef`, in first-use order: what a stream keeps."""
+        kept = []
+        for expr in self.bound.values():
+            if isinstance(expr, OutputRef) and expr.module not in kept:
+                kept.append(expr.module)
+        return kept
+
+    def _step_body(self, ctx: DriverContext, stream: bool = False) -> List:
         """The calls one iteration makes, before the token is read.
 
         One call for a family whose decoder takes ids and emits logits; up to three for a composition
@@ -932,12 +958,14 @@ class PrefillDecodeLoop(DriverComponent):
                 inputs={ctx.primary_input(self.embed_topology): Var(self.step_var)},
                 retain=True,
             ))
+        extra_axes = ({name: Call("loom.state", [Lit(f"axis_{name}")]) for name in self.extra_axes}
+                      if stream else dict(self.extra_axes))
         body.append(SubgraphCall(
             outputs=[], module=self.topology,
             axes={ctx.root_axis(self.topology): Var(self.n_tokens_var),
                   "n_past": Var(self.n_past_var),
-                  **self.extra_axes},
-            inputs=self._call_inputs(ctx),
+                  **extra_axes},
+            inputs=self._call_inputs(ctx, stream),
             retain=True,
         ))
         if self.head_topology:
@@ -1008,12 +1036,15 @@ class PrefillDecodeLoop(DriverComponent):
     def stream_supported(self) -> Optional[str]:
         """Why this loop cannot be cut per token yet, or None. The fields below carry per-call
         context -- an encoder's output, a built prompt, a transcript marker -- that a stream would have
-        to keep in its own state; none of the causal LMs set them."""
+        to keep in its own state; none of the causal LMs set them. `stream_context` is how a loop
+        declares the context it builds, and then `bound`, `extra_axes` and a constant `prompt` are kept
+        in the stream's state (ADR-130); a prefix or a start in the cache computed per call is not."""
+        allowed = ("bound", "extra_axes", "prompt") if self.stream_context else ()
         for name in ("bound", "extra_axes"):
-            if getattr(self, name):
+            if getattr(self, name) and name not in allowed:
                 return f"`{name}` is set"
         for name in ("prompt", "generated_prefix", "initial_n_past", "transcript_after_token"):
-            if getattr(self, name) is not None:
+            if getattr(self, name) is not None and name not in allowed:
                 return f"`{name}` is set"
         return None
 
@@ -1030,7 +1061,7 @@ class PrefillDecodeLoop(DriverComponent):
                 *[If(cond=BinOp("==", Var("_next_token"), Lit(alt)), then=[Assign("_done", Lit(1))])
                   for alt in self.extra_eos_tokens]]
         return [
-            *self._step_body(ctx),
+            *self._step_body(ctx, stream=True),
             Local("_next_token", read),
             CallStmt(Call("table.insert", [Var("_out"), Var("_next_token")])),
             Assign(self.n_past_var, BinOp("+", Var(self.n_past_var), Var(self.n_tokens_var))),
@@ -1052,8 +1083,16 @@ class PrefillDecodeLoop(DriverComponent):
         if self.sampling is not None:
             knobs = [Local("_knobs", TableLit(_sampling_options(self.sampling)))]
             knobs += [CallStmt(Call("loom.set_state", [Lit(k), FieldAccess("_knobs", k)])) for k in SAMPLING_KNOBS]
+        context = []
+        for component in self.stream_context:
+            context += component.emit(ctx)
+        context += [CallStmt(Call("loom.keep_state", [Lit(m), Lit(m)])) for m in self._kept_modules()]
+        context += [CallStmt(Call("loom.set_state", [Lit(f"axis_{name}"), expr]))
+                    for name, expr in self.extra_axes.items()]
         return [
-            Local(self.step_var, FieldAccess("inputs", GENERIC_PRIMARY_INPUT)),
+            *context,
+            Local(self.step_var, self.prompt if self.prompt is not None
+                  else FieldAccess("inputs", GENERIC_PRIMARY_INPUT)),
             Local(self.n_past_var, Lit(0)),
             Local(self.n_tokens_var, Len(self.step_var)),
             *[Local(f"_{name}", expr) for name, expr in settings],
@@ -2126,6 +2165,9 @@ class LuaFragment(DriverComponent):
     def prelude(self, ctx):
         return list(self.lines) + [""] if self.top_level else []
 
+    def module_names(self) -> tuple:
+        return tuple(self.defines) if self.top_level else ()
+
     def emit(self, ctx):
         if self.top_level:
             return []
@@ -2824,6 +2866,9 @@ class ExportConstants(DriverComponent):
     def emit(self, ctx: DriverContext) -> List:
         return [] if self.top_level else self._locals()
 
+    def module_names(self) -> tuple:
+        return tuple(self.values) if self.top_level else ()
+
 
 @dataclass
 class ExprFunction(DriverComponent):
@@ -2990,6 +3035,17 @@ class MultiPhaseDriverBuilder(DriverBuilder):
 
     def components(self):
         return [self.driver] if self.driver is not None else list(self.peeled)
+
+    def extra_entries(self):
+        """`stream_open` / `stream_feed` / `stream_finish` for a decode loop that declares the per-call
+        context it streams with (`PrefillDecodeLoop.stream_context`, ADR-130): T5's. A loop without one
+        gets none here -- Whisper, Canary, Moonshine and the speech LMs stream through hand-written
+        fragments of their own."""
+        for component in self.peeled or ():
+            if (isinstance(component, PrefillDecodeLoop) and component.stream_context
+                    and component.stream_supported() is None):
+                return component.stream_entries()
+        return []
 
     def build(self, ctx, checker=None):
         if self.driver is not None:
