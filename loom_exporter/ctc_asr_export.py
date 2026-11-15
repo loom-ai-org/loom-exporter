@@ -205,6 +205,7 @@ class ASRCtcExportConfig(LoomExportConfig):
     _sample_rate: Optional[int] = field(default=None, init=False, repr=False)
     _normalize: bool = field(default=True, init=False, repr=False)
     _blank_id: Optional[int] = field(default=None, init=False, repr=False)
+    _align: Optional[int] = field(default=None, init=False, repr=False)
 
     __links__ = {"root_axis": Axis()}
     __unchecked__ = {
@@ -229,6 +230,11 @@ class ASRCtcExportConfig(LoomExportConfig):
         "_normalize": Unchecked(
             "the feature extractor's own `do_normalize`, read alongside the sample rate from the same "
             "file. Same reason: there is no second authority for what the checkpoint's front end does."
+        ),
+        "_align": Unchecked(
+            "the checkpoint's own `inputs_to_logits_ratio` (samples per logit frame), read in load_model. "
+            "The transformers pipeline rounds every chunk size to it, so the live door's sizes are only "
+            "the pipeline's when they are rounded to the same number (loom.cpp ADR-126)."
         ),
         "_blank_id": Unchecked(
             "READ off the tokenizer (`pad_token` -> its id in vocab.json) during build_trace. The "
@@ -257,6 +263,7 @@ class ASRCtcExportConfig(LoomExportConfig):
             raise ValueError(
                 "architecture could not be inferred from model.config.model_type; pass it explicitly")
         strip_weight_norm(model)
+        self._align = int(getattr(model.config, "inputs_to_logits_ratio", 0)) or None
         return model
 
     def export_architecture(self) -> str:
@@ -302,7 +309,16 @@ class ASRCtcExportConfig(LoomExportConfig):
         return {} if self._sample_rate is None else {"sample_rate": self._sample_rate}
 
     def backend_kwargs(self) -> dict:
+        stream = {}
+        if self._blank_id is not None and self._sample_rate is not None and self._align is not None:
+            # The transformers pipeline's strided chunks, live (loom.cpp ADR-126).
+            from .ctc_chunk_stream import stream_components
+            stream["stream_components"] = stream_components(
+                rate=self._sample_rate, align=self._align, blank_id=self._blank_id,
+                min_samples=int(MIN_SECONDS * self._sample_rate),
+                max_samples=int(MAX_SECONDS * self._sample_rate))
         return dict(
+            **stream,
             flat_namespace=True,
             root_axis=self.root_axis,
             driver_builder=self.synthesized_builder_key(),

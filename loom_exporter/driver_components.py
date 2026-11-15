@@ -1224,12 +1224,22 @@ class CtcGreedyBuilder(DriverBuilder):
     inputs: DriverInputs
     call: MonolithicCall
     epilogue: CtcGreedyEpilogue
+    # A live door beside `infer` (loom.cpp ADR-126): top-level constants and the fragment defining
+    # `stream_open` / `stream_feed` / `stream_finish` (`ctc_chunk_stream.stream_components`). Empty for
+    # every leaf without one, so their drivers do not move.
+    stream: Tuple[object, ...] = ()
 
     __links__ = {name: NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN)
                  for name in ("inputs", "call", "epilogue")}
+    __unchecked__ = {
+        "stream": CoveredBy(
+            "each is a component DriverBuilder.build registers with the export's checker, and LuaFragment "
+            "checks its calls against the traced topology. Optional, hence not a NestedSpec."
+        ),
+    }
 
     def components(self):
-        return [self.inputs, self.call, self.epilogue]
+        return [*self.stream, self.inputs, self.call, self.epilogue]
 
 
 @dataclass
