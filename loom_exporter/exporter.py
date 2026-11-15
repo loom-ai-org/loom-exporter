@@ -1892,6 +1892,8 @@ class LoomGGUFExporter:
             call=MonolithicCall(topology="main_topology", inputs=input_names, n_tokens=n_tokens_expr,
                                  retained=True),
             epilogue=CtcGreedyEpilogue(retained_module="main_topology", blank_id=blank_id),
+            # The pipeline's strided chunks, live, when the family declares them (loom.cpp ADR-126).
+            stream=tuple(self.kwargs.get("stream_components") or ()),
         ).build(self._driver_context())
 
     # Ops that mix along the TOKEN axis and carry their own cross-step state, which the KV cache does
