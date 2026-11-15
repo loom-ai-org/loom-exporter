@@ -448,28 +448,8 @@ class MimiDecoderPhase(nn.Module):
         return x[:, 0]
 
 
-# Every slice below has a fixed width counted from one END of the tensor. The frame count is a graph
-# axis, and a slice whose bounds come from a shape mints a fresh symbol the axis algebra cannot follow.
-
-def _conv_step(conv: nn.Conv1d, x: torch.Tensor, previous: torch.Tensor):
-    """`StreamingConv1d` on a later call: the last `(k - 1) * d + 1 - s` input samples of the previous
-    call are prepended, and this call's last ones are the next call's."""
-    x = torch.cat([previous, x], dim=-1)
-    return conv(x), x[..., -previous.shape[-1]:]
-
-
-def _conv_transpose_step(convtr: nn.ConvTranspose1d, x: torch.Tensor, partial: torch.Tensor):
-    """`StreamingConvTranspose1d` on a later call: the previous call's `k - s` overlapping samples are added
-    to this call's first ones, and this call's own overlap (without the bias, which its first samples
-    already carry) is the next call's. Spelled as head + rest, then the overlap dropped, so no slice is
-    empty: the x16 upsampler's one-latent call makes exactly as many samples as it carries."""
-    y = convtr(x)
-    tail = partial.shape[-1]
-    out = torch.cat([y[..., :tail] + partial, y[..., tail:]], dim=-1)[..., :-tail]
-    rest = y[..., -tail:]
-    if convtr.bias is not None:
-        rest = rest - convtr.bias.view(1, -1, 1)
-    return out, rest
+# The streaming state's two conv steps, shared with every decoder that streams (`stream_steps`).
+from .stream_steps import conv_step as _conv_step, conv_transpose_step as _conv_transpose_step  # noqa: E402
 
 
 class MimiStepPhase(nn.Module):
@@ -588,18 +568,8 @@ class MimiStepPhase(nn.Module):
         return (x[:, 0], *out_states)
 
 
-class MimiInitPhase(nn.Module):
-    """`(zero) -> state_1..state_N` of `MimiStepPhase`, each its shape filled with `zero`'s one value: a
-    fresh decoder's state made on the device, so a stream's first step needs no 2 MB array from the host.
-    Every slot of a fresh state is zero in the reference (`init_state`), and the key slots are masked
-    besides."""
-
-    def __init__(self, shapes):
-        super().__init__()
-        self.shapes = [tuple(s) for s in shapes]
-
-    def forward(self, zero):                                            # (1,)
-        return tuple(zero.view(*([1] * len(s))).expand(*s).contiguous() for s in self.shapes)
+# `mimi_step`'s fresh state, made on the device from one number (`stream_steps.StateInit`).
+from .stream_steps import StateInit as MimiInitPhase  # noqa: E402
 
 
 # ------------------------------------------------------------------------------------------ export --

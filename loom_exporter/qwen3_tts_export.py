@@ -1256,18 +1256,12 @@ class TextToCodesQwen3TTSExportConfig(BaseMultiPhaseModelExportConfig):
                 "SUB_TEMPERATURE": _subtalker(self.model_dir, "temperature", 0.0),
                 "SUB_TOP_K": _subtalker(self.model_dir, "top_k", 0),
                 "SUB_TOP_P": _subtalker(self.model_dir, "top_p", 1.0),
-            }),
-            LuaFragment(
-                self.driver_script_path / "01_generate.lua",
-                reads=("N_GROUPS", "CODEBOOK_SIZE", "EOS_INDEX", "PREFILL_LEN", "MIN_NEW_TOKENS",
-                       "MAX_NEW_TOKENS", "DEFAULT_LANGUAGE_ID", "TEMPERATURE", "TOP_K", "TOP_P",
-                       "REPETITION_PENALTY", "SUB_TEMPERATURE", "SUB_TOP_K", "SUB_TOP_P",
-                       "ICL_HEAD_LEN", "TEXT_HEAD", "TEXT_TAIL", "REF_HEAD", "REF_TAIL",
-                       "TEMPLATE_HEAD", "TEXT_TEMPLATE_TAIL", "REF_TEMPLATE_TAIL",
-                       "TTS_PAD_ID", "TTS_EOS_ID", "ENCODE_STRIDE", "CONV_STRIDE",
-                       "REF_SAMPLE_RATE", "REF_CODEBOOK"),
-                defines=("_codes",),
-            ),
+            }, top_level=True),
+            # The live door (loom.cpp ADR-102): one frame of codes per `stream_feed`. Top level, so the
+            # constants above are too; `infer` is the stream run in one call.
+            LuaFragment(self.driver_script_path / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
+            LuaFragment(self.driver_script_path / "01_generate.lua", defines=("_codes",)),
             DriverReturn(values=("_codes",)),
         ]
 
