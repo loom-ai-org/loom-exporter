@@ -996,6 +996,105 @@ class PrefillDecodeLoop(DriverComponent):
             Return([Var(self.generated_var)]),
         ]
 
+    # -- the live door (loom.cpp ADR-099) ------------------------------------------------------------
+    #
+    # `stream_open` / `stream_feed` / `stream_finish` beside `infer_with_past`, the same loop cut at
+    # each drawn token. Nothing survives in Lua between calls: the cursor, the count, the last token,
+    # the ceiling, the eos and the sampling knobs are values in the host's `StreamState`, and the K/V
+    # history is the model's cache, which the engine parks or gives each stream its own. `done` is how
+    # the host learns the loop would have stopped, so the stop rule stays written once, here.
+    # `infer_with_past` is untouched: a file keeps its one-pass loop byte for byte.
+
+    def stream_supported(self) -> Optional[str]:
+        """Why this loop cannot be cut per token yet, or None. The fields below carry per-call
+        context -- an encoder's output, a built prompt, a transcript marker -- that a stream would have
+        to keep in its own state; none of the causal LMs set them."""
+        for name in ("bound", "extra_axes"):
+            if getattr(self, name):
+                return f"`{name}` is set"
+        for name in ("prompt", "generated_prefix", "initial_n_past", "transcript_after_token"):
+            if getattr(self, name) is not None:
+                return f"`{name}` is set"
+        return None
+
+    def _stream_draw(self, ctx: DriverContext) -> List:
+        """One step, its token appended to `_out` and the stop rule `infer_with_past` applies."""
+        knobs = None
+        if self.sampling is not None:
+            knobs = {k: FieldAccess("_knobs", k) for k in SAMPLING_KNOBS}
+        logits_module = self.head_topology or self.topology
+        row = BinOp("-", Var(self.n_tokens_var), Lit(1))
+        read = RetainedArgmax(logits_module, row) if knobs is None else RetainedSample(logits_module, row, knobs)
+        stop = [If(cond=BinOp(">=", Var("_count"), Var("_max_new_tokens")), then=[Assign("_done", Lit(1))]),
+                If(cond=BinOp("==", Var("_next_token"), Var("_eos_token")), then=[Assign("_done", Lit(1))]),
+                *[If(cond=BinOp("==", Var("_next_token"), Lit(alt)), then=[Assign("_done", Lit(1))])
+                  for alt in self.extra_eos_tokens]]
+        return [
+            *self._step_body(ctx),
+            Local("_next_token", read),
+            CallStmt(Call("table.insert", [Var("_out"), Var("_next_token")])),
+            Assign(self.n_past_var, BinOp("+", Var(self.n_past_var), Var(self.n_tokens_var))),
+            Assign("_count", BinOp("+", Var("_count"), Lit(1))),
+            *stop,
+            CallStmt(Call("loom.set_state", [Lit("last"), Var("_next_token")])),
+        ]
+
+    def _stream_save(self) -> List:
+        return [CallStmt(Call("loom.set_state", [Lit(name), Var(var)]))
+                for name, var in (("n_past", self.n_past_var), ("count", "_count"), ("done", "_done"))]
+
+    def stream_open(self, ctx: DriverContext) -> List:
+        """Prefill the prompt and draw the first token."""
+        settings = [("max_new_tokens", BinOp("or", FieldAccess("inputs", "max_new_tokens"),
+                                             Lit(self.default_max_new_tokens))),
+                    ("eos_token", BinOp("or", FieldAccess("inputs", "eos_token"), Lit(self.default_eos_token)))]
+        knobs = []
+        if self.sampling is not None:
+            knobs = [Local("_knobs", TableLit(_sampling_options(self.sampling)))]
+            knobs += [CallStmt(Call("loom.set_state", [Lit(k), FieldAccess("_knobs", k)])) for k in SAMPLING_KNOBS]
+        return [
+            Local(self.step_var, FieldAccess("inputs", GENERIC_PRIMARY_INPUT)),
+            Local(self.n_past_var, Lit(0)),
+            Local(self.n_tokens_var, Len(self.step_var)),
+            *[Local(f"_{name}", expr) for name, expr in settings],
+            *[CallStmt(Call("loom.set_state", [Lit(name), Var(f"_{name}")])) for name, _ in settings],
+            *knobs,
+            Local("_out", ArrayLit([])),
+            Local("_count", Lit(0)),
+            Local("_done", Lit(0)),
+            *self._stream_draw(ctx),
+            *self._stream_save(),
+            Return([Var("_out")]),
+        ]
+
+    def stream_feed(self, ctx: DriverContext) -> List:
+        """Draw up to `inputs.max_tokens` more (default 1), fewer once the loop would have stopped."""
+        state = lambda name: Call("loom.state", [Lit(name)])
+        knobs = []
+        if self.sampling is not None:
+            knobs = [Local("_knobs", TableLit({k: state(k) for k in SAMPLING_KNOBS}))]
+        return [
+            Local("_want", BinOp("or", FieldAccess("inputs", "max_tokens"), Lit(1))),
+            Local(self.n_past_var, state("n_past")),
+            Local("_count", state("count")),
+            Local("_done", state("done")),
+            Local("_max_new_tokens", state("max_new_tokens")),
+            Local("_eos_token", state("eos_token")),
+            *knobs,
+            Local(self.step_var, ArrayLit([state("last")])),
+            Local(self.n_tokens_var, Lit(1)),
+            Local("_out", ArrayLit([])),
+            While(cond=BinOp("and", BinOp("==", Var("_done"), Lit(0)), BinOp("<", Len("_out"), Var("_want"))),
+                  body=[*self._stream_draw(ctx), Assign(self.step_var, ArrayLit([Var("_next_token")]))]),
+            *self._stream_save(),
+            Return([Var("_out")]),
+        ]
+
+    def stream_entries(self) -> List[DriverEntry]:
+        return [DriverEntry(name=f"stream_{part}", params=("inputs",),
+                            components=[DecodeLoopStream(loop=self, part=part)])
+                for part in ("open", "feed", "finish")]
+
     def _trim_preamble(self) -> List:
         """Drop everything up to and including `transcript_after_token`, if it was emitted.
 
@@ -1020,6 +1119,36 @@ class PrefillDecodeLoop(DriverComponent):
             # generation keeps its partial answer rather than being emptied.
             If(cond=Var(seen), then=[Assign(self.generated_var, Var(kept))]),
         ]
+
+
+@dataclass
+class DecodeLoopStream(DriverComponent):
+    """One of `stream_open` / `stream_feed` / `stream_finish` over a `PrefillDecodeLoop` (loom.cpp
+    ADR-099): the tokens-out live door. The statements are the loop's own (`PrefillDecodeLoop.
+    stream_open` and `stream_feed`); `finish` has nothing left to hand back, since a token stream holds
+    no pending input."""
+
+    loop: Optional[PrefillDecodeLoop] = None
+    part: str = "open"
+
+    __unchecked__ = {
+        "loop": CoveredBy(
+            "the builder's own `decode`, which DriverBuilder.build registers with the export's checker "
+            "as a component of `infer_with_past`; these entries emit its statements, so its links are "
+            "the ones that apply"
+        ),
+        "part": Unchecked("which of the three entry points; the entry's name is built from it, and a "
+                          "value outside the three raises in emit"),
+    }
+
+    def emit(self, ctx: DriverContext) -> List:
+        if self.part == "open":
+            return self.loop.stream_open(ctx)
+        if self.part == "feed":
+            return self.loop.stream_feed(ctx)
+        if self.part == "finish":
+            return [Return([ArrayLit([])])]
+        raise ValueError(f"DecodeLoopStream: no stream entry {self.part!r}")
 
 
 # -- builders ----------------------------------------------------------------------------------------
@@ -1072,7 +1201,10 @@ class PrefillArgmaxBuilder(DriverBuilder):
     def extra_entries(self):
         if self.decode is None:
             return []
-        return [DriverEntry(name="infer_with_past", params=("inputs",), components=[self.decode])]
+        entries = [DriverEntry(name="infer_with_past", params=("inputs",), components=[self.decode])]
+        if self.decode.stream_supported() is None:
+            entries += self.decode.stream_entries()
+        return entries
 
 
 @dataclass

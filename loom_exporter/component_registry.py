@@ -131,7 +131,7 @@ def _entries() -> Tuple[ComponentEntry, ...]:
         ExportConstants,
         FlowMatchingSampler,
         LuaFragment, ModularChain,
-        MonolithicCall, PrefillDecodeLoop, PromptSegments, RawLuaDriver, RecurrentCall,
+        MonolithicCall, PrefillDecodeLoop, DecodeLoopStream, PromptSegments, RawLuaDriver, RecurrentCall,
         BiRecurrentCall, SubgraphCallComponent, TokenLabelsEpilogue, WaveformValidLength,
     )
     from .lua_library import LuaLibrary
@@ -196,11 +196,22 @@ def _entries() -> Tuple[ComponentEntry, ...]:
             "decode loop, because a cached ATTENTION node makes the prefill its first iteration. "
             "**The `used by` column over-states this one for the causal LMs**, and it is the only "
             "entry where that is true: it is a field of every flattened causal-LM builder, but the "
-            "exporter sets it only for a topology whose cross-step state is ENTIRELY the KV cache. "
-            "LFM2-monolithic's ten ShortConv layers are not, so it carries the field and exports "
-            "`infer` alone. Whisper is not in that caveat: its family declares this component "
+            "exporter sets it only for a topology whose cross-step state is entirely the KV and "
+            "conv-state caches (LFM2-monolithic's ShortConv history is the latter). Whisper is not in "
+            "that caveat: its family declares this component "
             "outright, with `bound` supplying the encoder's output to every step, which is what makes "
             "the same loop a cross-attention decode loop (BACKLOG.md P4.1).",
+        ),
+        ComponentEntry(
+            "decode_loop_stream", DecodeLoopStream, (STATEMENTS,),
+            "`stream_open` / `stream_feed` / `stream_finish` over a `prefill_decode_loop`: the same loop "
+            "cut at each drawn token, its cursor and stop flag kept in the host's StreamState (loom.cpp "
+            "ADR-099). Added beside `infer_with_past`, which is unchanged.",
+            no_user_reason=(
+                "used, but invisibly to `usage()`, which reads builder FIELDS: PrefillArgmaxBuilder "
+                "emits it from `extra_entries` for its `decode` field, so every causal LM with a "
+                "`prefill_decode_loop` that `stream_supported()` accepts carries it"
+            ),
         ),
         ComponentEntry(
             "waveform_valid_length", WaveformValidLength, (STATEMENTS,),
