@@ -56,6 +56,14 @@ from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase, Re
 from .spec_protocol import Unchecked
 
 
+# Frames of context the live door's windows take either side of what they hand on (ADR-104): `pre` is one
+# kernel-7 convolution, so 3; `post`'s upsampling stack reaches 1 (5.6e-16 from one call at f64 on random
+# codes, where 0 is 0.46). The LSTM between them is carried, not windowed: 32 frames of left context are
+# still O(1) from one call.
+STREAM_PRE_MARGIN = 3
+STREAM_POST_MARGIN = 1
+
+
 def patch_encodec_padding() -> None:
     """Make every length computation on EnCodec's decode path STATIC. Three rewrites, one cause.
 
@@ -282,7 +290,8 @@ class EnCodecExportConfig(BaseMultiPhaseModelExportConfig):
         leaves' synthesized driver computes.
         """
         from .driver_components import (
-            CALLER, DriverInputs, DriverReturn, RecurrentCall, SubgraphCallComponent,
+            CALLER, DriverInputs, DriverReturn, ExportConstants, LuaFragment, RecurrentCall,
+            SubgraphCallComponent,
         )
         from .driver_ir import BinOp, Len, Lit, OutputRef, Var
 
@@ -294,6 +303,16 @@ class EnCodecExportConfig(BaseMultiPhaseModelExportConfig):
         n_lstm_layers = self._n_lstm_layers or 1
         n_codes = BinOp("floordiv", Len(Var("codes")), Lit(n_codebooks))
         components = [
+            # The live door (loom.cpp ADR-104), beside the one pass and not instead of it: `pre` and `post`
+            # over windows with context either side, the LSTM's h and c carried between pushes. Top level,
+            # so these constants are too.
+            ExportConstants(values={"CODES_PER_FRAME": n_codebooks, "HIDDEN": self._hidden or 1,
+                                    "N_LSTM_LAYERS": n_lstm_layers,
+                                    "SAMPLES_PER_FRAME": self._hop_length or 1,
+                                    "PRE_MARGIN": STREAM_PRE_MARGIN, "POST_MARGIN": STREAM_POST_MARGIN},
+                            top_level=True),
+            LuaFragment(self.driver_script_path / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
             # The one binding, for the `inputs.tokens` alias every other family's caller may use --
             # and so the three call sites below read one local rather than re-deriving `#inputs.codes`
             # each time.

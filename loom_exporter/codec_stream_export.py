@@ -30,7 +30,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from .audio_codec_export import AudioCodecExportConfig, CodecFamily, _CodecDecodeWrapper
+from .audio_codec_export import AudioCodecExportConfig, CodecFamily
 from .decomposition import Decomposition, MultiPhase
 from .spec_protocol import Unchecked
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
@@ -38,8 +38,9 @@ from .stream_steps import StateInit, conv_step, conv_transpose_step, window_mask
 
 # A codec whose decoder is NOT causal streams by windows over its one-pass graph (`00_window_stream.lua`),
 # with this many frames of context each side: DAC 44 kHz's receptive field is under 16 (16 each side is
-# 4.1e-07 from one call on random codes, 8 is 5.9e-03).
-WINDOW_FAMILIES = {CodecFamily.DAC: 16}
+# 4.1e-07 from one call on random codes, 8 is 5.9e-03); SNAC 24 kHz's is 3 coarse frames (7e-16 from one
+# call at f64 with the noise held to its frames, 2 is 1.3e-03).
+WINDOW_FAMILIES = {CodecFamily.DAC: 16, CodecFamily.SNAC: 3}
 
 # The most frames one `codec_step` call decodes: a stream's push is a few frames, never a chunk.
 MAX_STEP_FRAMES = 64
@@ -403,13 +404,16 @@ class StreamingCodecExportConfig(BaseMultiPhaseModelExportConfig):
         codec = self._one_pass()
         model = codec.load_model()
         width = codec._codes_per_frame
+        # The one-pass graph `audio_codec_export` traces, a stochastic codec's noise inputs included (SNAC),
+        # each declared as its multiple of the code axis.
+        wrapper, dummy, mil_inputs = codec.build_trace(model)
         decode = ExportPhase(
             name="decode",
-            wrapper=_CodecDecodeWrapper(model, self.family).eval(),
-            dummy_inputs=(torch.zeros((1, codec.n_frames, width), dtype=torch.long),),
-            mil_inputs=[ct.TensorType(name="codes", shape=(1, ct.RangeDim(1, self.max_frames), width),
-                                      dtype=np.int32)],
+            wrapper=wrapper.eval(),
+            dummy_inputs=dummy,
+            mil_inputs=mil_inputs,
             root_axis="n_codes",
+            declared_axes={name: {2: f"{multiple}*n_codes"} for name, multiple in codec._noise_inputs.items()},
         )
         if self.family is CodecFamily.MOSS_AUDIO_TOKENIZER:
             return [decode] + self._moss_stages(model, width)
@@ -495,8 +499,9 @@ class StreamingCodecExportConfig(BaseMultiPhaseModelExportConfig):
     def driver_components(self) -> List:
         """`infer` is the one-pass driver `AudioCodecExportConfig` synthesizes -- the same inputs, the
         same chunk loop -- and the stream's three functions sit beside it at top level."""
-        from .driver_components import (CALLER, ChunkedCodecCall, ComputedCall, DriverInputs, DriverReturn,
-                                        ExportConstants, LuaFragment, MonolithicCall, PaddedCodecCall)
+        from .driver_components import (CALLER, DEFAULT_NOISE_SEED, ChunkedCodecCall, ComputedCall, DriverInputs,
+                                        DriverReturn, ExportConstants, LuaFragment, MonolithicCall,
+                                        PaddedCodecCall)
         from .driver_ir import BinOp, Len, Lit
         from .lua_library import LuaLibrary
 
@@ -538,9 +543,25 @@ class StreamingCodecExportConfig(BaseMultiPhaseModelExportConfig):
                                    inputs=("x", "position_ids", "attention_mask"), written="'stage_' .. k"),)
         elif self.family in WINDOW_FAMILIES:
             margin = WINDOW_FAMILIES[self.family]
-            constants = {"CODES_PER_FRAME": width, "SAMPLES_PER_FRAME": hop * (codec._channels or 1),
-                         "LEFT_FRAMES": margin, "LOOKAHEAD_FRAMES": margin}
+            # Zeros for the one caller with no checkpoint (`component_registry.usage()`), which still has to
+            # see the stochastic branch: the family says it is stochastic, the checkpoint says how.
+            noise = list(codec._noise_multiples or ([0] if self.family is CodecFamily.SNAC else []))
+            # A row is one COARSEST-codebook frame (SNAC's spans 4 hops), so that is what a frame's samples are.
+            samples = hop * (codec._coarse_stride if codec._vq_strides else 1) * (codec._channels or 1)
+            constants = {"CODES_PER_FRAME": width, "SAMPLES_PER_FRAME": samples,
+                         "LEFT_FRAMES": margin, "LOOKAHEAD_FRAMES": margin,
+                         "NOISE_PER_FRAME": noise, "NOISE_SEED": DEFAULT_NOISE_SEED}
             fragment = "00_window_stream.lua"
+            if noise:
+                # A stochastic codec's `infer` draws its noise frame-major, as its stream does, so the two
+                # agree for a seed (ADR-104); the deterministic ones keep the one call they always made.
+                return [
+                    ExportConstants(values=constants, top_level=True),
+                    LuaFragment(self.driver_script_path / fragment, top_level=True,
+                                defines=("stream_open", "stream_feed", "stream_finish", "window_one_pass")),
+                    LuaFragment(self.driver_script_path / "01_window_one_pass.lua", defines=("wave",)),
+                    DriverReturn(values=("wave",)),
+                ]
         else:
             constants = {"CODES_PER_FRAME": width, "CODEC_STATES": self._step[0], "CODEC_WINDOW": self._step[1],
                          "MAX_STEP_FRAMES": MAX_STEP_FRAMES}
