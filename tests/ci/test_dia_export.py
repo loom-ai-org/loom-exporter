@@ -231,7 +231,7 @@ def test_the_decoder_carries_two_independent_dynamic_axes(tmp_path):
         assert "n_enc_frames" in shapes[name], f"{name} -> {shapes[name]}"
         assert "n_tokens" not in str(shapes[name]), f"{name} collapsed onto the step axis: {shapes[name]}"
     # ... and the driver binds it, or the graph is built with the symbol unresolved.
-    assert "n_enc_frames = _n_enc" in exported["driver"]
+    assert "n_enc_frames = n_enc" in exported["driver"]
 
 
 def test_the_head_emits_one_row_per_channel_and_nothing_else(tmp_path):
@@ -339,7 +339,7 @@ def test_the_checkpoints_own_decoding_defaults_are_declared(tmp_path):
     assert "local TOP_K = 50" in driver
     assert "local GUIDANCE_SCALE = 3.0" in driver
     # The `+ 1`, in the driver and nowhere else.
-    assert "scale = _guidance + 1.0" in driver
+    assert "scale = loom.state('guidance') + 1.0" in driver
 
 
 def test_a_checkpoint_that_asks_for_greedy_gets_greedy(tmp_path):

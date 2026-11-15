@@ -613,10 +613,7 @@ class TextToCodesDiaExportConfig(BaseMultiPhaseModelExportConfig):
         realignment after the loop that no other family has. Its own `run_subgraph_and_retain('decoder',
         ...)` call is parsed out of the text and declared against the traced topology regardless.
         """
-        from .driver_components import (
-            DriverReturn, ExportConstants, LuaFragment, SubgraphCallComponent,
-        )
-        from .driver_ir import FieldAccess, Len, Lit, OutputRef
+        from .driver_components import DriverReturn, ExportConstants, LuaFragment
 
         return [
             LuaFragment(self.driver_script_path / "00_header.lua", top_level=True),
@@ -642,35 +639,15 @@ class TextToCodesDiaExportConfig(BaseMultiPhaseModelExportConfig):
                 "TOP_K": self.sampling_defaults.get("top_k", 0),
                 "TOP_P": self.sampling_defaults.get("top_p", 1.0),
                 "GUIDANCE_SCALE": self.guidance_scale,
-            }),
-            SubgraphCallComponent(
-                topology="encoder",
-                # Retained, not bound to a local: `cross_kv` is the only reader and it runs
-                # backend-side, so a Lua table here would marshal `n_bytes * 1024` floats for nothing.
-                outputs=(),
-                retain=True,
-                inputs={"tokens": FieldAccess("inputs", "tokens")},
-                axes={"n_tokens": Len(FieldAccess("inputs", "tokens")), "n_past": Lit(0)},
-                note="Byte encoder: one pass over the caller's text, one frame per byte.",
-            ),
-            SubgraphCallComponent(
-                topology="cross_kv",
-                # Retained for a sharper version of the same reason: these are the tensors the decode
-                # loop reads at every step, and the whole point of the phase is that they are produced
-                # ONCE per utterance rather than re-projected per generated frame.
-                outputs=(),
-                retain=True,
-                inputs={"xa": OutputRef("encoder")},
-                axes={"n_enc_frames": Len(FieldAccess("inputs", "tokens")), "n_past": Lit(0)},
-                note="Cross-attention K/V for every decoder layer, computed once from the encoder "
-                     "output instead of re-projected at every generated frame.",
-            ),
-            LuaFragment(
-                self.driver_script_path / "01_decode.lua",
-                reads=("N_CHANNELS", "N_LAYERS", "DELAY_PATTERN", "MAX_DELAY", "BOS", "EOS", "PAD",
-                       "MAX_CODES", "TEMPERATURE", "TOP_K", "TOP_P", "GUIDANCE_SCALE"),
-                defines=("_codes",),
-            ),
+            }, top_level=True),
+            # The live door (loom.cpp ADR-102): the encoder and cross-attention K/V in `stream_open`, one
+            # decoder row per `stream_feed`, a frame back once every channel has reached it. Top level, so
+            # the constants above are too; `infer` is the stream run in one call. Its own call sites --
+            # `encoder`, `cross_kv`, `decoder` -- are parsed out of the text and checked against the traced
+            # topologies, as the IR components that ran the first two used to be.
+            LuaFragment(self.driver_script_path / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
+            LuaFragment(self.driver_script_path / "01_decode.lua", defines=("_codes",)),
             DriverReturn(values=("_codes",)),
         ]
 
