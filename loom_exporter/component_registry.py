@@ -251,11 +251,11 @@ def _entries() -> Tuple[ComponentEntry, ...]:
         ),
         # -- adopting and peeling a hand-written driver (C.3-C.8) ------------------------------------
         ComponentEntry(
-            "export_constants", ExportConstants, (STATEMENTS,),
+            "export_constants", ExportConstants, (PRELUDE, STATEMENTS),
             "Values only the checkpoint knows (a blank id, a duration set, a hidden width), bound as "
             "ordinary locals so every read of them is checked by driver_ir.validate -- rather than "
             "interpolated into hand-written Lua through a marker, where a misspelled read is a silent "
-            "nil (BACKLOG.md P4.0.18).",
+            "nil (BACKLOG.md P4.0.18). Top-level locals instead when a stream's functions read them.",
         ),
         ComponentEntry(
             "raw_lua_driver", RawLuaDriver, (PRELUDE, STATEMENTS, POSTLUDE),
