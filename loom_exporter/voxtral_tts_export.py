@@ -97,6 +97,8 @@ LM_MAX_POSITIONS = 4096
 # of context still left 1.3e-4 and the field is ~18 frames, so 32 is the context used here.
 CODEC_CHUNK = 256
 CODEC_CONTEXT = 32
+# A stream's pieces grow 1, 2, 4, 8 frames (80 ms to 640 ms), then stay at this many (loom.cpp ADR-116).
+PIECE_FRAMES_GROWN = 8
 # Mistral's special ids (tekken.json's markers). Checked against the tokenizer file at export.
 BOS, AUDIO, BEGIN_AUDIO = 1, 24, 25
 REPEAT_AUDIO_TEXT, NEXT_AUDIO_TEXT = 35, 36
@@ -873,13 +875,18 @@ class VoxtralTTSExportConfig(BaseMultiPhaseModelExportConfig):
             "N_CODEBOOKS": 37, "N_ACOUSTIC": 36, "DIM": 3072,
             "DEFAULT_CFG": DEFAULT_CFG, "MAX_FRAMES": MAX_FRAMES, "LM_MAX_POSITIONS": LM_MAX_POSITIONS,
             "SAMPLES_PER_FRAME": SAMPLES_PER_FRAME, "CODEC_CHUNK": CODEC_CHUNK, "CODEC_CONTEXT": CODEC_CONTEXT,
+            "PIECE_FRAMES_GROWN": PIECE_FRAMES_GROWN,
         }
         fragment = self.driver_script_path
         return [
-            ExportConstants(values=constants),
+            # Top level: the stream functions read them.
+            ExportConstants(values=constants, top_level=True),
             DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
             LuaFragment(fragment / "00_header.lua", top_level=True, defines=("voxtral_slice", "voxtral_decode")),
-            LuaFragment(fragment / "01_generate.lua", reads=("tokens",) + tuple(constants), defines=("wave",)),
+            # The live door (loom.cpp ADR-100, ADR-116): a few frames, or the whole turn, per `stream_feed`.
+            LuaFragment(fragment / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
+            LuaFragment(fragment / "01_generate.lua", reads=("tokens",), defines=("wave",)),
             DriverReturn(values=("wave",)),
         ]
 

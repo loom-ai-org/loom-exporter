@@ -601,45 +601,51 @@ class Text2TextT5ExportConfig(BaseMultiPhaseModelExportConfig):
 
         src_len = Len(FieldAccess("inputs", "tokens"))
         bias_shape = [Var("N_HEAD"), Var("REL_BUCKETS"), Var("REL_MAX_DISTANCE")]
+        constants = {
+            "N_HEAD": self.n_head or 0,
+            "REL_BUCKETS": self.num_buckets or 0,
+            "REL_MAX_DISTANCE": self.max_distance or 0,
+            # The two 32x6 tables, flattened `bucket * n_head + head`. A driver reads no GGUF
+            # metadata, and these are the only model VALUES it needs -- 192 floats each, which is
+            # the same order as Whisper's prompt table and three orders below any real weight.
+            "DEC_REL_BIAS": list(self.decoder_bias),
+        }
+        encoder = SubgraphCallComponent(
+            topology="encoder",
+            # Retained, not bound to a local: `cross_kv` is the only reader and it runs
+            # backend-side, so a Lua table here would marshal `n_src * 512` floats for nothing.
+            outputs=(),
+            retain=True,
+            inputs={
+                "input_ids": FieldAccess("inputs", "tokens"),
+                # `0..n_src-1`. The bias itself is computed in the graph from these
+                # (`_T5EncoderWrapper`), so this is `n_src` integers rather than the
+                # `n_head * n_src^2` table the driver used to build.
+                "positions": Call("loom.range", [Lit(0), src_len]),
+            },
+            axes={"n_tokens": src_len, "n_past": Lit(0)},
+            note="Encoder: one bidirectional pass over the caller's source tokens.",
+        )
+        cross_kv = SubgraphCallComponent(
+            topology="cross_kv",
+            # Retained for a sharper version of the same reason: these are the tensors the decode
+            # loop reads at every step, and the whole point of the phase is that they are produced
+            # ONCE per call rather than re-projected per generated token.
+            outputs=(),
+            retain=True,
+            inputs={"xa": OutputRef("encoder")},
+            axes={"n_enc_frames": src_len, "n_past": Lit(0)},
+            note="Cross-attention K/V for every decoder layer, computed once from the encoder "
+                 "output instead of re-projected at every token.",
+        )
         return [
             LuaFragment(self.driver_script_path / "00_header.lua", top_level=True),
-            ExportConstants(values={
-                "N_HEAD": self.n_head or 0,
-                "REL_BUCKETS": self.num_buckets or 0,
-                "REL_MAX_DISTANCE": self.max_distance or 0,
-                # The two 32x6 tables, flattened `bucket * n_head + head`. A driver reads no GGUF
-                # metadata, and these are the only model VALUES it needs -- 192 floats each, which is
-                # the same order as Whisper's prompt table and three orders below any real weight.
-                "DEC_REL_BIAS": list(self.decoder_bias),
-            }),
-            SubgraphCallComponent(
-                topology="encoder",
-                # Retained, not bound to a local: `cross_kv` is the only reader and it runs
-                # backend-side, so a Lua table here would marshal `n_src * 512` floats for nothing.
-                outputs=(),
-                retain=True,
-                inputs={
-                    "input_ids": FieldAccess("inputs", "tokens"),
-                    # `0..n_src-1`. The bias itself is computed in the graph from these
-                    # (`_T5EncoderWrapper`), so this is `n_src` integers rather than the
-                    # `n_head * n_src^2` table the driver used to build.
-                    "positions": Call("loom.range", [Lit(0), src_len]),
-                },
-                axes={"n_tokens": src_len, "n_past": Lit(0)},
-                note="Encoder: one bidirectional pass over the caller's source tokens.",
-            ),
-            SubgraphCallComponent(
-                topology="cross_kv",
-                # Retained for a sharper version of the same reason: these are the tensors the decode
-                # loop reads at every step, and the whole point of the phase is that they are produced
-                # ONCE per call rather than re-projected per generated token.
-                outputs=(),
-                retain=True,
-                inputs={"xa": OutputRef("encoder")},
-                axes={"n_enc_frames": src_len, "n_past": Lit(0)},
-                note="Cross-attention K/V for every decoder layer, computed once from the encoder "
-                     "output instead of re-projected at every token.",
-            ),
+            # Twice: as `infer`'s locals, where they always were (its text is unchanged), and at top
+            # level for `stream_open` / `stream_feed`, which build the step's bias outside it (ADR-130).
+            ExportConstants(values=constants, top_level=True),
+            ExportConstants(values=constants),
+            encoder,
+            cross_kv,
             PrefillDecodeLoop(
                 topology="decoder",
                 bindings=self.decoder_bindings,
@@ -671,6 +677,10 @@ class Text2TextT5ExportConfig(BaseMultiPhaseModelExportConfig):
                 extra_axes={"n_enc_frames": src_len},
                 prompt=ArrayLit([Lit(self.decoder_start_token_id)]),
                 default_eos_token=self.eos_token_id,
+                # A token stream (loom.cpp ADR-130): `stream_open` encodes the source and keeps the
+                # cross-attention K/V and the source length in the stream's state, then the same loop
+                # runs a draw per feed.
+                stream_context=(encoder, cross_kv),
             ),
         ]
 

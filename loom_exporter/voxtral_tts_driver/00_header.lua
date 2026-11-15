@@ -11,10 +11,11 @@ end
 -- `context` frames before them and drop those frames' samples. The decoder is causal with a finite
 -- receptive field, so with enough context this is the one-call decode (voxtral_tts_export's
 -- CODEC_CONTEXT); a chunk bounds the attention's `[8T, 8T]` bias, which one call over a minute of audio
--- would make gigabytes.
-local function voxtral_decode(codes, n_frames, width, chunk, context, samples_per_frame)
+-- would make gigabytes. `first` (default 0) is the first frame whose samples are wanted: a stream's piece
+-- (00_stream.lua) passes the frames from `CODEC_CONTEXT` before it, and keeps only its own.
+local function voxtral_decode(codes, n_frames, width, chunk, context, samples_per_frame, first)
     local wave = {}
-    local start = 0
+    local start = first or 0
     while start < n_frames do
         local stop = math.min(start + chunk, n_frames)
         local from = math.max(0, start - context)

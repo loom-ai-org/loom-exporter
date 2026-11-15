@@ -26,7 +26,7 @@ from loom_exporter.driver_components import (
     caller_input, parse_run_subgraph_calls, required_input,
 )
 from loom_exporter.driver_ir import (
-    BinOp, DriverIRError, Len, Lit, LuaCodegen, OutputRef, SubgraphCall, Var,
+    ArrayLit, BinOp, DriverIRError, FieldAccess, Len, Lit, LuaCodegen, OutputRef, StateRef, SubgraphCall, Var,
 )
 from loom_exporter.spec_protocol import LinkError
 
@@ -161,6 +161,33 @@ class TestPrefillArgmaxBuilder(unittest.TestCase):
         self.assertIn("{n_samples = math.floor(#audio_signal / 80), n_past = 0}", text)
 
 
+def _encoder_decoder_ctx():
+    return DriverContext(
+        topologies={"encoder": _topo(["tokens"]), "cross_kv": _topo(["xa"], outputs=["k", "v"]),
+                    "decoder": _topo(["tokens", "bias", "xk", "xv"])},
+        axes={"encoder": "n_tokens", "cross_kv": "n_enc_frames", "decoder": "n_tokens"})
+
+
+def _encoder_decoder_builder(stream=True, top_level_constant=True):
+    """T5's shape in miniature: encoder, cross K/V, a decode loop over both and a module constant."""
+    src = Len(FieldAccess("inputs", "tokens"))
+    encoder = SubgraphCallComponent(topology="encoder", outputs=(), retain=True,
+                                    inputs={"tokens": FieldAccess("inputs", "tokens")},
+                                    axes={"n_tokens": src, "n_past": Lit(0)})
+    cross_kv = SubgraphCallComponent(topology="cross_kv", outputs=(), retain=True,
+                                     inputs={"xa": OutputRef("encoder")},
+                                     axes={"n_enc_frames": src, "n_past": Lit(0)})
+    bindings = (("tokens", CALLER), ("bias", CALLER), ("xk", CALLER), ("xv", CALLER))
+    loop = PrefillDecodeLoop(
+        topology="decoder", bindings=bindings, inputs=tuple(n for n, _ in bindings),
+        bound={"bias": Var("BIAS"), "xk": OutputRef("cross_kv", index=1), "xv": OutputRef("cross_kv", index=2)},
+        extra_axes={"n_enc_frames": src}, prompt=ArrayLit([Lit(0)]), default_eos_token=1,
+        stream_context=(encoder, cross_kv) if stream else ())
+    constants = [ExportConstants(values={"BIAS": 2}, top_level=True)] if top_level_constant else []
+    return MultiPhaseDriverBuilder(peeled=constants + [ExportConstants(values={"BIAS": 2}), encoder,
+                                                       cross_kv, loop])
+
+
 class TestPrefillDecodeLoop(unittest.TestCase):
     """`infer_with_past` (KV-CACHE.md 3.3). The properties that matter are the ones a decode loop gets
     wrong by copying the prefill: the axis table has to carry a real `n_past`, the mask and positions
@@ -260,6 +287,11 @@ class TestPrefillDecodeLoop(unittest.TestCase):
         self.assertIn("loom.sample_row('main_topology', (_n_tokens - 1), {temperature = "
                       "_knobs.temperature, top_k = _knobs.top_k, top_p = _knobs.top_p})", fed)
 
+    def test_a_state_ref_names_the_stream_s_entry(self):
+        self.assertEqual(StateRef("cross_kv").render(), "{state = 'cross_kv'}")
+        self.assertEqual(StateRef("cross_kv", 4).render(), "{state = 'cross_kv', index = 4}")
+        self.assertEqual(StateRef("cross_kv").reads(), [])
+
     def test_a_loop_with_per_call_context_gets_no_stream(self):
         """A bound encoder output, a built prompt or a transcript marker would have to live in the
         stream's state too; until a family needs it, such a loop exports `infer_with_past` alone."""
@@ -268,6 +300,38 @@ class TestPrefillDecodeLoop(unittest.TestCase):
         self.assertIsNotNone(builder.decode.stream_supported())
         script = builder.build(self._ctx())
         self.assertEqual([fn.name for fn in script.functions()], ["infer", "infer_with_past"])
+
+    def test_an_encoder_decoder_loop_streams_with_its_context_in_the_state(self):
+        """loom.cpp ADR-130 (T5): the components that build the context run in `stream_open`; the cross
+        K/V a step reads comes from the stream's state, never from the model's retained output, which
+        another call of `cross_kv` would overwrite; the source length is a state number."""
+        script = _encoder_decoder_builder(stream=True).build(_encoder_decoder_ctx())
+        self.assertEqual([fn.name for fn in script.functions()],
+                         ["infer", "stream_open", "stream_feed", "stream_finish"])
+        text = {fn.name: "\n".join(LuaCodegen().emit_function(fn)) for fn in script.functions()}
+        opened = text["stream_open"]
+        self.assertIn("loom.run_subgraph_and_retain('encoder', {n_tokens = #inputs.tokens, n_past = 0}", opened)
+        self.assertIn("loom.keep_state('cross_kv', 'cross_kv')\n"
+                      "    loom.set_state('axis_n_enc_frames', #inputs.tokens)\n"
+                      "    local _step_tokens = {0}", opened)
+        for name in ("stream_open", "stream_feed"):
+            self.assertIn("xk = {state = 'cross_kv'}, xv = {state = 'cross_kv', index = 2}", text[name])
+            self.assertIn("n_enc_frames = loom.state('axis_n_enc_frames')", text[name])
+            self.assertNotIn("from = 'cross_kv'", text[name])
+            # A module-scope constant, read outside `infer`.
+            self.assertIn("bias = BIAS", text[name])
+        # `infer` is the one-pass loop it always was.
+        self.assertIn("xk = {from = 'cross_kv'}", text["infer"])
+        plain = _encoder_decoder_builder(stream=False).build(_encoder_decoder_ctx())
+        self.assertEqual(LuaCodegen().emit_function(plain.entry), LuaCodegen().emit_function(script.entry))
+        self.assertEqual([fn.name for fn in plain.functions()], ["infer"])
+
+    def test_a_stream_entry_reading_an_entry_local_fails_the_export(self):
+        """The constant bound only inside `infer` is out of the stream functions' reach: validate names
+        it, rather than the stream reading nil at run time."""
+        builder = _encoder_decoder_builder(stream=True, top_level_constant=False)
+        with self.assertRaisesRegex(DriverIRError, "symbol 'BIAS'"):
+            builder.build(_encoder_decoder_ctx())
 
     def test_infer_is_byte_identical_with_and_without_the_loop(self):
         """The decode loop adds a function; it must not touch the prefill one. This is the property
