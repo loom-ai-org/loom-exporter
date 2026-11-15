@@ -719,7 +719,7 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
                 "DEFAULT_DECODE_STEPS": DEFAULT_DECODE_STEPS,
                 # Samples of each chunk faded in by the `fade_in` driver weight; 0 for none.
                 "FADE_IN_SAMPLES": self._fade_in,
-            }),
+            }, top_level=True),
             DriverInputs(bindings=(("tokens", CALLER),), n_tokens=Len("tokens")),
             LuaFragment(fragment / "00_header.lua", top_level=True,
                         defines=("pocket_count_words", "pocket_split_chunks")),
@@ -727,14 +727,11 @@ class PocketTTSExportConfig(BaseMultiPhaseModelExportConfig):
             LuaFragment(fragment / ("00_flow_head_lsd.lua" if self._flow_type == "lsd"
                                     else "00_flow_head_one_step.lua"),
                         top_level=True, defines=("pocket_flow_head",)),
-            LuaFragment(fragment / "01_flow_lm.lua",
-                        reads=("tokens", "CHUNK_HEADER_SHORT", "CHUNK_HEADER_LONG", "SHORT_CHUNK_MAX_WORDS",
-                               "SHORT_CHUNK_FRAMES_AFTER_EOS", "LONG_CHUNK_FRAMES_AFTER_EOS",
-                               "FRAMES_AFTER_EOS_PADDING", "LATENT_DIM", "LM_MAX_POSITIONS",
-                               "MIMI_UPSAMPLE", "FRAME_RATE", "TOKENS_PER_SECOND_ESTIMATE",
-                               "GEN_SECONDS_PADDING", "MIN_FRAMES_BEFORE_EOS", "DEFAULT_TEMPERATURE",
-                               "DEFAULT_EOS_THRESHOLD", "DEFAULT_DECODE_STEPS", "FADE_IN_SAMPLES"),
-                        defines=("wave",)),
+            # The live door (loom.cpp ADR-100): one sentence chunk per `stream_feed`. Top level, so the
+            # constants above are too.
+            LuaFragment(fragment / "00_stream.lua", top_level=True,
+                        defines=("stream_open", "stream_feed", "stream_finish")),
+            LuaFragment(fragment / "01_flow_lm.lua", reads=("tokens",), defines=("wave",)),
             DriverReturn(values=("wave",)),
         ]
 
