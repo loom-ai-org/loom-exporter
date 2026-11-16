@@ -14,6 +14,7 @@ import dataclasses
 import sys
 import unittest
 from pathlib import Path
+from typing import Optional
 
 
 from loom_exporter.paths import CONVERTERS, driver_dir
@@ -555,12 +556,14 @@ class TestTheTwoPathsShareComponents(unittest.TestCase):
     def test_the_prologue_and_epilogue_are_the_same_two_classes(self):
         """`EXPORT-PREPARATION.md` §1.5 counts "prefill prologue/epilogue" as ONE inventory item across
         both synthesized paths. This is that claim, as a test rather than an observation -- two of the
-        three components in each builder are literally the same class."""
+        three components in each builder are literally the same class. Since the modular chain carries
+        caches (loom.cpp KV-CACHE.md 2.2b) the optional decode loop is shared too: the same
+        `PrefillDecodeLoop`, its step the chain on one path and the one call on the other."""
         prefill = set(PrefillArgmaxBuilder.__annotations__)
         modular = set(ModularChainBuilder.__annotations__)
         self.assertEqual(
             {PrefillArgmaxBuilder.__annotations__[n] for n in prefill & modular},
-            {DriverInputs, ArgmaxEpilogue},
+            {DriverInputs, ArgmaxEpilogue, Optional[PrefillDecodeLoop]},
         )
 
     def test_the_epilogue_renders_identically_for_both(self):

@@ -1159,10 +1159,19 @@ class fuse_loom_attention(AbstractGraphPass):
     # ADR-085): every block this call fuses is then an UNCACHED node with that causal window. A
     # pattern match cannot see that a mask is banded -- the wrapper that builds it can, so it says so.
     window = None
+    # Set by `apply_loom_mil_passes` for a `Modular` export, whose program is ONE model cut into a
+    # function per submodule (prefix, aux, layer_0..N-1, suffix). Numbering restarts per function
+    # otherwise, which is right for a program whose functions are independent graphs and wrong here:
+    # every layer_i would address slot 0 of the one cache the model shares. Carried across the
+    # functions in their insertion order, which `export_modular` makes the chain's own order, the
+    # slots come out exactly as a flattened trace of the same model numbers them.
+    across_functions = False
 
     def apply(self, prog):
+        self._next_layer = 0
         for f in prog.functions.values():
-            self._next_layer = 0
+            if not self.across_functions:
+                self._next_layer = 0
             self._fuse_block(f)
 
     @block_context_manager
@@ -1550,9 +1559,14 @@ class fuse_loom_short_conv(AbstractGraphPass):
     runs, just without state. A partial match must never half-rewrite.
     """
 
+    # `fuse_loom_attention.across_functions`, for the conv store's slots.
+    across_functions = False
+
     def apply(self, prog):
+        self._next_layer = 0
         for f in prog.functions.values():
-            self._next_layer = 0
+            if not self.across_functions:
+                self._next_layer = 0
             self._fuse_block(f)
 
     @block_context_manager
@@ -1702,7 +1716,8 @@ _LOOM_SHORT_CONV_PASS_NAME = "loom::fuse_loom_short_conv"
 
 
 def apply_loom_mil_passes(prog, fuse_attention: bool = False, fuse_conv: bool = False,
-                          attention_window: Optional[int] = None) -> None:
+                          attention_window: Optional[int] = None,
+                          number_across_functions: bool = False) -> None:
     """
     Runs Loom's own MIL->MIL rewrite passes -- GQA `repeat_kv()` fusion, matmul transpose_x
     normalization (R2a), mutual-broadcast insertion (R2a), replicate-pad and depthwise-conv_transpose
@@ -1725,7 +1740,10 @@ def apply_loom_mil_passes(prog, fuse_attention: bool = False, fuse_conv: bool = 
             if fuse_attention:
                 attention = PASS_REGISTRY[_LOOM_ATTENTION_PASS_NAME]   # a fresh instance per lookup
                 attention.window = attention_window
+                attention.across_functions = number_across_functions
                 attention(prog)
             if fuse_conv:
-                PASS_REGISTRY[_LOOM_SHORT_CONV_PASS_NAME](prog)
+                conv = PASS_REGISTRY[_LOOM_SHORT_CONV_PASS_NAME]
+                conv.across_functions = number_across_functions
+                conv(prog)
         PASS_REGISTRY[pass_name](prog)

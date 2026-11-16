@@ -1606,7 +1606,9 @@ class LoomGGUFExporter:
             apply_loom_mil_passes(self.program,
                                    fuse_attention=bool(self.kwargs.get("fuse_attention")),
                                    fuse_conv=bool(self.kwargs.get("fuse_conv")),
-                                   attention_window=self.kwargs.get("attention_window"))
+                                   attention_window=self.kwargs.get("attention_window"),
+                                   number_across_functions=bool(
+                                       self.kwargs.get("fuse_across_functions")))
             self.facts.annotate_dynamic_shapes(self.program)
         self._mil_passes_applied = True
 
@@ -1991,6 +1993,11 @@ class LoomGGUFExporter:
         bindings = [(first_input, CALLER)] + [
             (self.safe_name(name), _binding_kind(name)) for name in sorted(special_needed)
         ]
+        # The windowed masks `_route_windowed_masks` synthesized on the emitted topologies, host-computed
+        # like every other MASK binding (see `apply_monolithic_export`). None for any model without
+        # sliding-window attention, LFM2 included.
+        bindings += [(name, MASK) for name in sorted(self.mask_windows)
+                     if name not in dict(bindings)]
 
         # 3. Prefix.
         #
@@ -2080,13 +2087,39 @@ class LoomGGUFExporter:
         # something that was never stored.
         final_module = stages[-1].topology
 
-        # 8. Same argmax epilogue the monolithic path uses -- two of this builder's three components
+        # 8. A generation loop beside `infer` when the chain's blocks carry caches -- the monolithic
+        # path's rule, asked of every stage: a decode step runs the whole chain, so one stage left
+        # with token-axis state the caches do not hold (an unfused conv) makes every step wrong.
+        eos_ids = list(self.kwargs.get("eos_token_ids") or [])
+        sampling = self.kwargs.get("sampling_defaults")
+        stage_topologies = [self.topologies[stage.topology] for stage in stages]
+        cached = any(self._topology_uses_kv_cache(topo) for topo in stage_topologies)
+        decode = None
+        if cached:
+            blockers = sorted({op for topo in stage_topologies
+                               for op in self._non_cached_sequence_state(topo)})
+            if blockers:
+                print(f"  no infer_with_past: {', '.join(blockers)} mixes across the token axis with "
+                      f"state the caches do not hold. Exporting infer (prefill) only.")
+                cached = False
+            else:
+                decode = PrefillDecodeLoop(
+                    topology=final_module, bindings=tuple(bindings),
+                    inputs=tuple(declared_inputs(final_module)), mask_windows=self.mask_windows,
+                    default_eos_token=eos_ids[0] if eos_ids else -1,
+                    extra_eos_tokens=tuple(eos_ids[1:]), sampling=sampling, chain=tuple(stages),
+                )
+
+        # 9. Same argmax epilogue the monolithic path uses -- two of this builder's three components
         # are shared with it, which is the smallest real instance of P4.0.7's reuse claim, and since
         # P4.0.14 they are shared in the same MODE as well: both paths retain and reduce by name.
         self.driver_script = SYNTHESIZED_BUILDERS["Modular"](
-            inputs=DriverInputs(bindings=tuple(bindings), n_tokens=n_tokens_expr),
+            inputs=DriverInputs(bindings=tuple(bindings), n_tokens=n_tokens_expr,
+                                mask_windows=self.mask_windows),
             chain=ModularChain(stages=tuple(stages), n_tokens=n_tokens_expr),
-            epilogue=ArgmaxEpilogue(n_tokens=n_tokens_expr, retained_module=final_module),
+            epilogue=ArgmaxEpilogue(n_tokens=n_tokens_expr, retained_module=final_module,
+                                    sampling=sampling if cached else None),
+            decode=decode,
         ).build(self._driver_context())
 
     def transpile_to_lua(self, func: Function, name="infer"):
