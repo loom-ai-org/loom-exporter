@@ -822,6 +822,15 @@ class PrefillDecodeLoop(DriverComponent):
     # same component objects as the entry's own, so they are checked once, where `infer` runs them.
     stream_context: Tuple[object, ...] = ()
 
+    # The step as a CHAIN of topologies rather than one call: a `Modular` export, whose model is one
+    # function per submodule (prefix -> aux -> layer_0..N-1 -> suffix). Empty for every other loop.
+    # Each stage is the same `ChainStage` the chain's own `infer` runs, rebound per iteration: the
+    # caller input reads this step's tokens, the position and mask inputs are rebuilt at `n_past`,
+    # and every stage is called at the step's `n_past`, so the cached blocks append to and attend over
+    # the shared caches the way the flattened export's one call does. `topology` then names the stage
+    # holding the logits (the chain's last), and `bindings` the chain's host-side inputs by kind.
+    chain: Tuple[ChainStage, ...] = ()
+
     # Locals this component binds. Prefixed so they cannot collide with a traced input's own safe_name.
     generated_var: str = "_gen"
     step_var: str = "_step_tokens"
@@ -889,6 +898,12 @@ class PrefillDecodeLoop(DriverComponent):
             "like default_eos_token. The one thing a link could compare it against is that same "
             "vocabulary, which is where the value came from."
         ),
+        "chain": CoveredBy(
+            "the chain's own `infer`: these are the same ChainStage records ModularChain runs, which "
+            "DriverBuilder.build registers with the export's checker there (each against its topology's "
+            "real declared inputs, exactly); the loop only rebinds the host-computed and caller "
+            "locals, and driver_ir.validate runs over the functions it emits"
+        ),
         "stream_context": CoveredBy(
             "the entry's own component list: these are the same objects `infer` runs, which "
             "DriverBuilder.build registers with the export's checker there; the stream entries emit "
@@ -942,6 +957,41 @@ class PrefillDecodeLoop(DriverComponent):
                 kept.append(expr.module)
         return kept
 
+    def _chain_step(self, ctx: DriverContext) -> List:
+        """One iteration of a `chain` step: the host-computed inputs rebuilt once at this step's
+        `n_past`, then every stage at that `n_past`. A mask is built once per step, not once per
+        attention stage that reads it -- six of LFM2-350M's sixteen layers do."""
+        kinds = dict(self.bindings)
+        rebound, body = {}, []
+        for name, kind in self.bindings:
+            if kind == POSITION:
+                expr = Call("loom.range", [Var(self.n_past_var), Var(self.n_tokens_var)])
+            elif kind == MASK:
+                args = [Var(self.n_tokens_var), Var(self.n_past_var)]
+                window = self.mask_windows.get(name)
+                if window:
+                    args.append(Lit(window))
+                expr = Call("loom.causal_mask", args)
+            else:
+                rebound[name] = Var(self.step_var)
+                continue
+            local = f"_step_{name}"
+            body.append(Local(local, expr))
+            rebound[name] = Var(local)
+        for stage in self.chain:
+            inputs = {}
+            for name, expr in stage.inputs.items():
+                if isinstance(expr, Var) and expr.name in kinds:
+                    expr = rebound[expr.name]
+                inputs[name] = expr
+            body.append(SubgraphCall(
+                outputs=[], module=stage.topology,
+                axes={ctx.root_axis(stage.topology): Var(self.n_tokens_var),
+                      "n_past": Var(self.n_past_var)},
+                inputs=inputs, retain=True,
+            ))
+        return body
+
     def _step_body(self, ctx: DriverContext, stream: bool = False) -> List:
         """The calls one iteration makes, before the token is read.
 
@@ -950,6 +1000,8 @@ class PrefillDecodeLoop(DriverComponent):
         marshalled. The middle one is the same cached call in both cases -- what changes is where its
         input comes from and where its output goes, which is exactly what the two topology fields say.
         """
+        if self.chain:
+            return self._chain_step(ctx)
         body = []
         if self.embed_topology:
             body.append(SubgraphCall(
@@ -1432,12 +1484,23 @@ class ModularChainBuilder(DriverBuilder):
     inputs: DriverInputs
     chain: ModularChain
     epilogue: ArgmaxEpilogue
+    # `infer_with_past` and the live door beside `infer`, for a chain whose blocks carry caches --
+    # `PrefillArgmaxBuilder.decode`'s counterpart, with the loop's step the whole chain.
+    decode: Optional[PrefillDecodeLoop] = None
 
     __links__ = {name: NestedSpec(where=_BUILDER_FIELDS_CHECKED_IN)
                  for name in ("inputs", "chain", "epilogue")}
+    __unchecked__ = {
+        "decode": CoveredBy("PrefillArgmaxBuilder.decode's reasoning: DriverBuilder.build registers it "
+                            "with the export's checker like any other component; optional, hence not "
+                            "a NestedSpec"),
+    }
 
     def components(self):
         return [self.inputs, self.chain, self.epilogue]
+
+    def extra_entries(self):
+        return PrefillArgmaxBuilder.extra_entries(self)
 
 
 # Which builder each decomposition's *synthesized* driver path uses, by decomposition class name.

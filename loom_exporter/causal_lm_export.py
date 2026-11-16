@@ -260,14 +260,6 @@ class LMCausalModelExportConfig(LoomExportConfig):
                 # that reaches the engine's KV cache, and declare the cache's capacity so a host can
                 # allocate one from the file alone.
                 #
-                # `Flattened` ONLY, and the reason is the cache's addressing. `fuse_loom_attention`
-                # numbers blocks densely per traced function, which is the whole model here -- but a
-                # `Modular` export traces one function PER SUBMODULE, so every layer_i would restart at
-                # 0 and all of them would share cache slot 0. Making that work means deriving the index
-                # from the submodule's own identity, which is a real design question (the modular
-                # driver would also have to thread n_past through its chain) and is deliberately not
-                # answered by inference here. LFM2-modular therefore keeps exporting exactly as before,
-                # prefill-only, and its e2e test is unaffected.
                 fuse_attention=True,
                 # And the conv family's half (BACKLOG.md P4.0.10). Independent of `fuse_attention`
                 # rather than implied by it: they are different op families and a model can genuinely
@@ -279,6 +271,21 @@ class LMCausalModelExportConfig(LoomExportConfig):
                 # Per-attention-block sliding windows, or None (BACKLOG.md P4.0.11a). A CONFIG fact
                 # rather than a graph one, unlike everything else the exporter derives -- see
                 # `_attention_windows` for why the trace cannot carry it.
+                attention_windows=self._attention_windows(),
+            )
+        elif isinstance(self.decomposition, Modular):
+            # The same caches for the modular form, so its generation loop stops re-feeding the whole
+            # sequence every token (loom.cpp hub, found 2026-11-08 while building tokens out). The
+            # fusion passes number cache slots densely per traced FUNCTION, and this form traces one
+            # function per submodule, so on their own every layer_i would address slot 0 of the
+            # shared cache. `fuse_across_functions` carries the count through the functions in chain
+            # order instead, which gives each attention and conv block the slot the flattened export
+            # gives it. `apply_modular_export` threads `n_past` through the chain.
+            kwargs.update(
+                fuse_attention=True,
+                fuse_conv=True,
+                fuse_across_functions=True,
+                kv_cache_size=self.max_seq_len,
                 attention_windows=self._attention_windows(),
             )
         return kwargs

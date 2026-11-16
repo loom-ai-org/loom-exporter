@@ -154,7 +154,8 @@ class TestUsageIsDerived(unittest.TestCase):
                          ["driver_inputs", "monolithic_call", "argmax_epilogue",
                           "prefill_decode_loop"])
         self.assertEqual(cr.builder_components(ModularChainBuilder),
-                         ["driver_inputs", "modular_chain", "argmax_epilogue"])
+                         ["driver_inputs", "modular_chain", "argmax_epilogue",
+                          "prefill_decode_loop"])
 
     def test_the_exporter_builds_through_the_same_table_the_attribution_reads(self):
         """What makes the attribution non-circular: `apply_monolithic_export`/`apply_modular_export`
