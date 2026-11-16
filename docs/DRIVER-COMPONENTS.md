@@ -75,7 +75,7 @@ differs is entirely what the host does with the one output. The family names its
 | `chunked_codec_call` | `ChunkedCodecCall` | statements | 2 | 6 | qwen3-tts-tokenizer-12hz |
 | `padded_codec_call` | `PaddedCodecCall` | statements | 2 | 6 | moss-audio-tokenizer |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
-| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 17 | canary, granite-speech, hf-causal-lm, lfm2-monolithic, moonshine, moonshine-streaming, oruk-loop, qwen3, qwen3-asr, t5, whisper |
+| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 18 | canary, granite-speech, hf-causal-lm, lfm2-modular, lfm2-monolithic, moonshine, moonshine-streaming, oruk-loop, qwen3, qwen3-asr, t5, whisper |
 | `decode_loop_stream` | `DecodeLoopStream` | statements | 0 | 2 | *nobody* (see below) |
 | `waveform_valid_length` | `WaveformValidLength` | statements | 0 | 5 | granite-speech, oruk-loop, qwen3-asr |
 | `prompt_segments` | `PromptSegments` | statements | 2 | 5 | granite-speech, oruk-loop, qwen3-asr |
@@ -141,7 +141,7 @@ Threads one tensor through an independently-traced submodule chain: prefix -> [a
 
 The `infer_with_past` generation loop: prefill, then decode one token at a time against the KV cache until max_new_tokens or eos_token. One loop rather than a prefill plus a decode loop, because a cached ATTENTION node makes the prefill its first iteration. **The `used by` column over-states this one for the causal LMs**, and it is the only entry where that is true: it is a field of every flattened causal-LM builder, but the exporter sets it only for a topology whose cross-step state is entirely the KV and conv-state caches (LFM2-monolithic's ShortConv history is the latter). Whisper is not in that caveat: its family declares this component outright, with `bound` supplying the encoder's output to every step, which is what makes the same loop a cross-attention decode loop (BACKLOG.md P4.1).
 
-*Emits:* statements. *Used by:* canary, granite-speech, hf-causal-lm, lfm2-monolithic, moonshine, moonshine-streaming, oruk-loop, qwen3, qwen3-asr, t5, whisper.
+*Emits:* statements. *Used by:* canary, granite-speech, hf-causal-lm, lfm2-modular, lfm2-monolithic, moonshine, moonshine-streaming, oruk-loop, qwen3, qwen3-asr, t5, whisper.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
