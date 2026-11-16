@@ -100,6 +100,47 @@ def test_lfm2_modular_registry_entry_matches_direct_construction(tmp_path):
     )
 
 
+
+@pytest.mark.skipif(not LFM2_DIR.exists(), reason="LFM2 checkpoint not available locally")
+def test_lfm2_modular_carries_the_caches_with_slots_numbered_across_the_chain(tmp_path):
+    """The modular form decodes against the caches, not by re-feeding the sequence (loom.cpp hub item,
+    2026-11-08). Its program is one function per submodule, and the fusion passes number cache slots
+    per FUNCTION unless told to carry the count, so the property worth pinning is the slot each block
+    gets: occurrence order across the chain, which is what the flattened export gives the same model.
+    Every layer_i at slot 0 would load, prefill correctly and decode wrong."""
+    import gguf
+    import json
+
+    out = tmp_path / "lfm2_modular.gguf"
+    default_registry().get("text-generation", "lfm2-modular").build_config(LFM2_DIR, str(out)).export()
+    reader = gguf.GGUFReader(str(out))
+    fields = {f.name: f for f in reader.fields.values()}
+
+    def text(name):
+        f = fields[name]
+        return bytes(f.parts[f.data[0]]).decode()
+
+    def number(name):
+        f = fields[name]
+        return int(f.parts[f.data[0]][0])
+
+    slots = {"ATTENTION": [], "SHORT_CONV": []}
+    for i in range(16):
+        for node in json.loads(text(f"model.graph_topology.layer_{i}"))["nodes"]:
+            if node["op"] in slots:
+                slots[node["op"]].append((i, node["attrs"]["layer"]))
+    # LFM2-350M: attention at layers 2, 5, 8, 10, 12, 14; ShortConv everywhere else.
+    assert [i for i, _ in slots["ATTENTION"]] == [2, 5, 8, 10, 12, 14]
+    assert [slot for _, slot in slots["ATTENTION"]] == list(range(6))
+    assert [slot for _, slot in slots["SHORT_CONV"]] == list(range(10))
+    assert number("loom.n_layer") == 6 and number("loom.n_conv_layer") == 10
+
+    driver = text("model.driver_script")
+    for entry in ("function infer(", "function infer_with_past(", "function stream_open(",
+                  "function stream_feed(", "function stream_finish("):
+        assert entry in driver, entry
+
+
 # -- what makes P4.0.4's `_MODEL_TYPE_OVERRIDES` table legitimately empty ------------------------------
 
 @pytest.mark.parametrize("model_dir,expected_pre", [(LFM2_DIR, "llama3"), (QWEN3_DIR, "qwen2")])
