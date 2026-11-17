@@ -106,6 +106,10 @@ def convert_phase(phase, quantize: Optional[str] = None, keep_float=(),
     if phase.attention_window is not None and phase.kv_cache_size is not None:
         raise ValueError(f"phase '{phase.name}' declares both a KV cache and an attention window; a "
                          f"windowed ATTENTION node is uncached (ADR-085)")
+    dense = getattr(phase, "dense_attention", False)
+    if dense and (phase.attention_window is not None or phase.kv_cache_size is not None):
+        raise ValueError(f"phase '{phase.name}' declares dense_attention with a KV cache or a window; a "
+                         f"dense node is uncached and unbanded (ADR-131)")
     traced = torch.jit.trace(phase.wrapper, phase.dummy_inputs)
     mil_prog = ct.convert(
         traced, inputs=phase.mil_inputs, convert_to="milinternal",
@@ -115,8 +119,9 @@ def convert_phase(phase, quantize: Optional[str] = None, keep_float=(),
         mil_prog, root_axis=phase.root_axis, declared_axes=phase.declared_axes,
         # Per-phase, not per-export: an encoder-decoder model caches its decoder's attention and must
         # not cache its encoder's. See ExportPhase.fuse_attention.
-        fuse_attention=phase.fuse_attention or phase.attention_window is not None,
+        fuse_attention=phase.fuse_attention or phase.attention_window is not None or dense,
         kv_cache_size=phase.kv_cache_size, attention_window=phase.attention_window,
+        dense_attention=dense,
         fuse_conv=getattr(phase, "fuse_conv", False),
         # Reaches a PHASE exporter as of P5.0's second change, where it used to reach only the output
         # one. Quantization is what makes packing early worth doing at all -- an F32 pack is a dtype
@@ -160,6 +165,11 @@ def convert_phase(phase, quantize: Optional[str] = None, keep_float=(),
                    for node in topo["nodes"]):
             raise ValueError(f"phase '{phase.name}' declares attention_window={phase.attention_window} but "
                              f"`fuse_loom_attention` fused none of its attention blocks")
+    # Same for a dense declaration: unfused blocks still run, but carry `repeat_kv`'s reshape.
+    if dense and not any(node["op"] == "ATTENTION" and not node.get("attrs", {}).get("kv_cache", True)
+                         for node in topo["nodes"]):
+        raise ValueError(f"phase '{phase.name}' declares dense_attention but `fuse_loom_attention` fused "
+                         f"none of its attention blocks")
     print(f"  {phase.name}: {len(topo['nodes'])} nodes, {len(exporter.weights)} weights{_rss_note()}")
 
     topologies = {phase.name: topo}

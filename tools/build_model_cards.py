@@ -1312,6 +1312,36 @@ anything.""",
             "the model as the reference passes them.",
     ),
     ModelCard(
+        slug="omnivoice", checkpoint=Path("omnivoice"),
+        export_task="text-to-speech", export_model="omnivoice", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="k2-fsa/OmniVoice", license_id="cc-by-nc-4.0",
+        source_url="https://github.com/k2-fsa/OmniVoice", source_name="OmniVoice",
+        language=["multilingual"],
+        # Declared by the export (the codec's own `sample_rate`), restated here like Chatterbox's.
+        sample_rate=24000,
+        title="OmniVoice",
+        summary="k2-fsa's OmniVoice, exported for loom.cpp: a masked-diffusion TTS for 600+ languages, "
+                "a bidirectional Qwen3-0.6B that fills in HiggsAudio-v2 codec tokens in 32 steps, with the "
+                "codec's decoder and encoder in the same file. Voice design from a description, voice "
+                "cloning from a clip and its transcript, or the model's own voice.",
+        limitations=
+            "**Non-commercial weights.** The checkpoint is CC-BY-NC 4.0 because of its training data "
+            "(e.g. Emilia); the upstream code is Apache-2.0. Do not use this file commercially, and "
+            "never to impersonate a real person without their consent.\n\n"
+            "**Slow on a CPU.** Every one of the 32 steps runs the whole 28-layer stack over the prompt "
+            "and the target twice (classifier-free guidance), so a sentence takes tens of seconds on a "
+            "laptop CPU; use a GPU for interactive work. Fewer steps (`n_steps`) trade quality for "
+            "speed.\n\n"
+            "**Streams a text chunk at a time.** Nothing exists before a run's last step, so the stream "
+            "yields one piece per text chunk (upstream cuts texts longer than ~30 s into ~15 s chunks; "
+            "`chunk_threshold` and `chunk_duration` cut earlier). Each streamed piece is levelled and "
+            "silence-trimmed on its own, where the one pass does both over the whole.\n\n"
+            "**Not ported:** upstream's opt-in text normalization (numbers, dates), automatic "
+            "transcription of a reference clip (pass `reference_text`), and sampling the ids "
+            "(`class_temperature`, off by default upstream). The reference clip must be mono 24 kHz.",
+    ),
+    ModelCard(
         slug="pocket-tts", checkpoint=Path("pocket-tts/languages/english_2026-09"),
         export_task="text-to-speech", export_model="pocket-tts", task_type="text-to-speech",
         export_requires=pocket_tts_reference("3.2.0", "3.2.0"),
