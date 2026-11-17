@@ -63,7 +63,10 @@ def read_plamo_vocab(tokenizer_dir: str) -> dict:
     )
 
 
-def write_plamo_vocab(w: GGUFWriter, tokenizer_dir: str) -> dict:
+def write_plamo_vocab(w: GGUFWriter, tokenizer_dir: str, eos_token_ids=None) -> dict:
+    """`eos_token_ids` is the checkpoint's stop SET from `generation_config.json` (`[bos, tag]` for PLaMo
+    3 translate: a translation ends on `<|plamo:tag|>`), written as the engine's eos set (P4.23) so a
+    host's loop and a host's decode know it; the config's single `eos_token` is its first member."""
     v = read_plamo_vocab(tokenizer_dir)
     w.add_tokenizer_model("plamo")
     w.add_token_list(v["pieces"])
@@ -77,6 +80,10 @@ def write_plamo_vocab(w: GGUFWriter, tokenizer_dir: str) -> dict:
                     sub_type=GGUFValueType.UINT8)
     w.add_int32("tokenizer.ggml.plamo.break_spaces", v["break_spaces"])
     w.add_int32("tokenizer.ggml.plamo.break_repeats", v["break_repeats"])
+    eos = [int(i) for i in (eos_token_ids or [])]
+    if eos:
+        v["eos"] = eos[0]
+        w.add_key_value("tokenizer.ggml.eos_token_ids", eos, GGUFValueType.ARRAY, sub_type=GGUFValueType.INT32)
     for key, value in (("bos", v["bos"]), ("eos", v["eos"]), ("padding", v["pad"]), ("unknown", v["unk"])):
         if value >= 0:
             w.add_uint32(f"tokenizer.ggml.{key}_token_id", value)

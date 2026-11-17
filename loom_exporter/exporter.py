@@ -3298,7 +3298,7 @@ class LoomGGUFExporter:
             # PFN's PLaMo (`Plamo3Tokenizer`, remote code): a scored unigram walked by Aho-Corasick,
             # `tokenizer.jsonl` rather than tokenizer.json. Detected by its config's class name.
             from .plamo_tokenizer_export import write_plamo_vocab
-            write_plamo_vocab(w, tokenizer_dir)
+            write_plamo_vocab(w, tokenizer_dir, eos_token_ids=self.kwargs.get("eos_token_ids"))
         elif family == "wordpiece":
             from .wordpiece_tokenizer_export import write_wordpiece_vocab
             write_wordpiece_vocab(w, tokenizer_dir)
