@@ -385,7 +385,8 @@ class OmniVoiceExportConfig(BaseMultiPhaseModelExportConfig):
     def _constants(self) -> dict:
         """The reference's tables as numbers -- ExportConstants binds nothing else, so strings travel
         as `(offsets, utf-8 bytes)` pairs and character sets as codepoints."""
-        if not self.model_dir:
+        # The component registry builds every config over a placeholder path: nothing to read there.
+        if not Path(self.model_dir).is_dir():
             return {}
         from transformers import AutoTokenizer
 
@@ -456,7 +457,7 @@ class OmniVoiceExportConfig(BaseMultiPhaseModelExportConfig):
         contract["input.kind"] = "text"
         contract["text.frontend"] = "vocab"
         contract["sample_rate"] = self._sample_rate or 24000
-        if self.model_dir:
+        if Path(self.model_dir).is_dir():
             contract["languages"] = self.languages()
         return contract
 
