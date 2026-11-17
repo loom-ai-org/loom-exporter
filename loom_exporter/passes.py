@@ -1159,6 +1159,10 @@ class fuse_loom_attention(AbstractGraphPass):
     # ADR-085): every block this call fuses is then an UNCACHED node with that causal window. A
     # pattern match cannot see that a mask is banded -- the wrapper that builds it can, so it says so.
     window = None
+    # Set by `apply_loom_mil_passes` from the phase's `dense_attention` (ADR-131): every block this
+    # call fuses is an UNCACHED node over its own mask, with no window -- a bidirectional stack run
+    # whole every call.
+    dense = False
     # Set by `apply_loom_mil_passes` for a `Modular` export, whose program is ONE model cut into a
     # function per submodule (prefix, aux, layer_0..N-1, suffix). Numbering restarts per function
     # otherwise, which is right for a program whose functions are independent graphs and wrong here:
@@ -1508,6 +1512,8 @@ class fuse_loom_attention(AbstractGraphPass):
                                      name=f"{k_source.name}_attn_k", before_op=anchor)
             # The two inputs only when windowed, so a cached export's ops (and topology) are unchanged.
             windowed = {} if not self.window else {"kv_cache": False, "window": np.int32(self.window)}
+            if self.dense:
+                windowed = {"kv_cache": False}
             fused = mb.loom_fused_attention(
                 q=q_var, k=k_var, v=v_var, mask=mask_var,
                 scale=np.float32(scale), layer=np.int32(self._next_layer),
@@ -1717,7 +1723,8 @@ _LOOM_SHORT_CONV_PASS_NAME = "loom::fuse_loom_short_conv"
 
 def apply_loom_mil_passes(prog, fuse_attention: bool = False, fuse_conv: bool = False,
                           attention_window: Optional[int] = None,
-                          number_across_functions: bool = False) -> None:
+                          number_across_functions: bool = False,
+                          dense_attention: bool = False) -> None:
     """
     Runs Loom's own MIL->MIL rewrite passes -- GQA `repeat_kv()` fusion, matmul transpose_x
     normalization (R2a), mutual-broadcast insertion (R2a), replicate-pad and depthwise-conv_transpose
@@ -1740,6 +1747,7 @@ def apply_loom_mil_passes(prog, fuse_attention: bool = False, fuse_conv: bool = 
             if fuse_attention:
                 attention = PASS_REGISTRY[_LOOM_ATTENTION_PASS_NAME]   # a fresh instance per lookup
                 attention.window = attention_window
+                attention.dense = dense_attention
                 attention.across_functions = number_across_functions
                 attention(prog)
             if fuse_conv:

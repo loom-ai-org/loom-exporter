@@ -215,6 +215,7 @@ _FAMILY_MODULES = (
     "audio_codec_export",
     "dia_export",
     "qwen3_tts_export",
+    "omnivoice_export",
     "t5_export",
     "f5_tts_export",
     "chatterbox_export",
