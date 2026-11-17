@@ -171,6 +171,11 @@ class ExportPhase:
             "test checks the mask against it (Pocket-TTS: `test_pocket_tts_mimi_window`), and the "
             "backend raises if the phase fused no windowed node."
         ),
+        "dense_attention": Unchecked(
+            "a request, like `fuse_attention`, and a fact about the wrapper: that its stack is run whole "
+            "every call, so neither a cache nor a band applies (ADR-131). `phase_conversion` raises if "
+            "it is combined with a cache or a window, or if the phase fused no block at all."
+        ),
         "own_kv_cache": Unchecked(
             "whether this phase's cache is its own, and its ring/window: the driver's choice of how the "
             "phase is stepped, which nothing in the graph states. The geometry itself is read off the "
