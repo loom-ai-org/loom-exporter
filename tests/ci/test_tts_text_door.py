@@ -31,8 +31,10 @@ from loom_exporter.registry import default_registry
 #
 # sanoTTS's two lines take phonemes too: Piper's espeak IPA (piperlite) and misaki's (nano), each declaring
 # its conventions as `tts.phoneme_style` (loom.cpp ADR-071). Vocetta2 is the nano line re-trained: misaki's.
+#
+# tiny-voca reads dizione's phonemes, with stress as part of each id (loom.cpp ADR-133).
 PHONEME_INPUT = {"kokoro", "matcha", "styletts2", "vits", "sanotts", "sanotts-nano", "vocetta2", "vaniq-edge",
-                 "vits-upstream", "auroratts"}
+                 "vits-upstream", "auroratts", "tiny-voca"}
 # ...and the ones that do not. Supertonic encodes graphemes itself and its GGUF carries the codepoint
 # table, so `"vocab"` is the true answer for it and the wrong one for the four above. Here so the rule
 # cannot be satisfied by declaring `"phonemes"` everywhere, which would refuse them a real door.
@@ -53,8 +55,10 @@ PHONEME_INPUT = {"kokoro", "matcha", "styletts2", "vits", "sanotts", "sanotts-na
 # Mistral's tiktoken BPE). Soprano is a character BPE behind tortoise-tts's English normaliser
 # (`loom::SopranoVocab`), a complete door at 20,000/20,000. LFM2.5-Audio's speaking door reads its text
 # through LFM2's own byte-level BPE.
+#
+# OmniVoice reads Qwen3's byte-level BPE (ADR-131).
 GRAPHEME_INPUT = {"supertonic", "f5-tts", "chatterbox", "pocket-tts", "voxcpm2", "cosyvoice3", "voxtral-tts",
-                  "speecht5", "soprano", "lfm2.5-audio-tts"}
+                  "speecht5", "soprano", "lfm2.5-audio-tts", "omnivoice"}
 
 # Families that still declare no `sample_rate`, with the reason it is an EXEMPTION rather than a pass.
 # Each needs its rate taken off its own checkpoint the way Kokoro's and Supertonic's are -- Matcha's and

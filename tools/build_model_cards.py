@@ -233,6 +233,23 @@ def _vocetta2_q8(size: str, what: str, q8_wer: str, f32_wer: str) -> str:
     )
 
 
+def upstream_package(module: str, env: str, src: str = "") -> Callable[[], Optional[str]]:
+    """`export_requires` for a card whose export imports upstream's own model code (`module`), found on
+    sys.path or in the clone `env` names (its `src`, or its root). OmniVoice and tiny-voca: neither is a
+    pip install the export venvs carry."""
+    def check() -> Optional[str]:
+        import importlib.util
+        import os
+
+        repo = os.environ.get(env)
+        if repo and (Path(repo) / src / module).is_dir():
+            return None
+        if importlib.util.find_spec(module) is not None:
+            return None
+        return f"no `{module}` package: set {env} to a clone of its repository"
+    return check
+
+
 def pocket_tts_reference(minimum: str, maximum: Optional[str] = None) -> Callable[[], Optional[str]]:
     """`export_requires` for a Pocket-TTS card: the reference checkout `LOOM_POCKET_TTS_REPO` names
     (default the v3.2.0 clone) must have a version in [minimum, maximum]."""
@@ -1087,6 +1104,47 @@ CATALOG = [
     # waveform upstream's length, 3.9e-6..1.0e-5 from upstream at f64, where upstream's own f32 run sits
     # 3.9e-6..1.5e-5. WER: 30 LibriSpeech references, Whisper small, upstream's espeak ids vs the door.
     ModelCard(
+        slug="tiny-voca", checkpoint=Path("tiny-voca"),
+        export_requires=upstream_package("tiny_voca", "LOOM_TINY_VOCA_REPO", "src"),
+        export_task="text-to-speech", export_model="tiny-voca", task_type="text-to-speech",
+        snippet="text-to-speech-dizione",
+        base_repo="n4ze3m/tiny-voca", license_id="apache-2.0", language=["en"],
+        sample_rate=24000,
+        title="tiny-voca",
+        variants=[
+            ("F32", "full precision, 21.2 MB; every duration upstream's, the waveform within 2.6e-3 of it."),
+            ("Q8_0_PC", "6.9 MB: the projections and convolutions (93% of the weights) in per-channel int8. "
+                        "Whisper small's word error rate on 30 LibriSpeech sentences is 3.8% against F32's 4.4%."),
+        ],
+        summary="n4ze3m's tiny-voca: a 4.5M-parameter English TTS with two voices (F2, M2) and no neural vocoder "
+                "(a source-filter head shapes a pulse train and noise), at 24 kHz, exported for loom.cpp.",
+        copied_files=[
+                      ("phonemizer/LICENSE.cmudict", "tiny-voca/phonemizer/LICENSE.cmudict"),
+                      ("phonemizer/LICENSE.homograph-data", "tiny-voca/phonemizer/LICENSE.homograph-data"),
+                      ("phonemizer/align.json", "tiny-voca/phonemizer/align.json"),
+                      ("phonemizer/g2p.json", "tiny-voca/phonemizer/g2p.json"),
+                      ("phonemizer/g2p.npz", "tiny-voca/phonemizer/g2p.npz"),
+                      ("phonemizer/homographs.json", "tiny-voca/phonemizer/homographs.json"),
+                      ("phonemizer/lexicon.json", "tiny-voca/phonemizer/lexicon.json"),
+                      ("phonemizer/lexicon.tsv", "tiny-voca/phonemizer/lexicon.tsv"),
+                      ("phonemizer/sources.json", "tiny-voca/phonemizer/sources.json"),
+        ],
+        extra_files=[
+            "`phonemizer/` -- dizione's data (CMUdict-derived lexicon, homograph rules, the unknown-word model), "
+            "copied from the upstream repo with its licence files: what `DIZIONE_DATA` points at.",
+        ],
+        limitations=(
+            "**The text door wants dizione.** With it installed, the door is the model's own front end, cut "
+            "into sentences as upstream cuts them. Without it, orthography2ipa's IPA is folded into dizione's "
+            "inventory, which reads worse: Whisper small's word error rate on 30 LibriSpeech sentences is "
+            "4.4% through dizione and 20.0% through the fold.\n\n"
+            "**A sentence at a time.** Like upstream, a text is spoken one sentence per utterance (at most 512 "
+            "phonemes each). The stream yields one piece per sentence, each peak-limited on its own.\n\n"
+            "**Precision.** The engine's waveform is within 2.6e-3 of upstream's (f32); its STFTs are "
+            "convolutions summed in float32 where upstream runs FFTs."
+        ),
+    ),
+    ModelCard(
         slug="vaniq-edge", checkpoint=Path("vaniq-edge"),
         export_task="text-to-speech", export_model="vaniq-edge", task_type="text-to-speech",
         snippet="text-to-speech-lexicon-espeak",
@@ -1334,7 +1392,8 @@ anything.""",
             "glossary within it (the checkpoint itself takes up to 32k).",
     ),
     ModelCard(
-        slug="omnivoice", checkpoint=Path("omnivoice"),
+        slug="omnivoice", checkpoint=Path("omnivoice"), venv="ovos",
+        export_requires=upstream_package("omnivoice", "LOOM_OMNIVOICE_REPO"),
         export_task="text-to-speech", export_model="omnivoice", task_type="text-to-speech",
         takes_text=True,
         base_repo="k2-fsa/OmniVoice", license_id="cc-by-nc-4.0",
@@ -2804,6 +2863,24 @@ audio.save("hello.wav")
 """,
     # The same door for a model trained on espeak-ng's IPA (Vaniq-Edge), whose own front end is
     # phonemizer + espeak-ng -- GPL-3, which is why the door is not that.
+    # tiny-voca's door (loom.cpp ADR-133): its own front end, dizione, with the data this repo ships.
+    "text-to-speech-dizione": """import os
+from huggingface_hub import snapshot_download
+import loom
+
+# dizione (pip install git+https://github.com/n4ze3m/dizione) is the model's own phonemizer; its data
+# ships in this repo. Without dizione the door falls back to orthography2ipa, which reads worse.
+os.environ["DIZIONE_DATA"] = os.path.join(snapshot_download("{repo_id}", allow_patterns=["phonemizer/*"]),
+                                          "phonemizer")
+model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
+# Two built-in speakers: speaker=0 is F2, speaker=1 is M2.
+audio = model.text2speech.infer("Hello! This is tiny voca, a small text to speech model.", speaker=1)
+audio.save("hello.wav")
+
+# A sentence at a time, as it is spoken:
+for piece in model.text2speech.stream("She had never seen the sea before. She stood there a long while."):
+    print(len(piece.samples))
+""",
     "text-to-speech-lexicon-espeak": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
@@ -3510,7 +3587,9 @@ def render_readme(card: ModelCard, gguf_name: str, runtime: Optional[Tuple[str, 
     # Supertonic encodes graphemes itself and needs none of this.
     needs_phonemes = card.task_type == "text-to-speech" and not card.takes_text
     install_extras = "hub,phonemes" if needs_phonemes else "hub"
-    phonemizer_note = PHONEMIZER_NOTE if needs_phonemes else ""
+    # The note describes orthography2ipa as THE front end, which is wrong for a model whose door runs
+    # its own (tiny-voca's dizione, ADR-133): there the fallback is stated in the card's limitations.
+    phonemizer_note = PHONEMIZER_NOTE if needs_phonemes and card.snippet != "text-to-speech-dizione" else ""
     # `pip install -U` reaches the newest runtime, but a reader who already has an older one pinned
     # meets the file before they meet the error; the error names the op and not the release.
     runtime_note = ""
