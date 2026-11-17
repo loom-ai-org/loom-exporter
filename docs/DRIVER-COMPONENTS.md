@@ -70,19 +70,19 @@ differs is entirely what the host does with the one output. The family names its
 
 | component | class | emits | links | unchecked | used by |
 |---|---|---|---|---|---|
-| `driver_inputs` | `DriverInputs` | statements | 0 | 5 | audio8-tts-codec, chatterbox, cosyvoice3, dac, ecapa-tdnn-lid, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, kyutai-stt, lfm2-modular, lfm2-monolithic, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, moss-audio-tokenizer, pocket-tts, pyannote-segmentation, qwen3, qwen3-tts-tokenizer-12hz, silero-vad, soprano, speecht5, titanet, voxcpm2, voxtral-tts, wakehubert, zipformer_streaming |
-| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | audio8-tts-codec, dac, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, qwen3 |
+| `driver_inputs` | `DriverInputs` | statements | 0 | 5 | audio8-tts-codec, chatterbox, cosyvoice3, dac, ecapa-tdnn-lid, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, kyutai-stt, lfm2-modular, lfm2-monolithic, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, moss-audio-tokenizer, plamo3, pocket-tts, pyannote-segmentation, qwen3, qwen3-tts-tokenizer-12hz, silero-vad, soprano, speecht5, titanet, voxcpm2, voxtral-tts, wakehubert, zipformer_streaming |
+| `monolithic_call` | `MonolithicCall` | statements | 2 | 4 | audio8-tts-codec, dac, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, plamo3, qwen3 |
 | `chunked_codec_call` | `ChunkedCodecCall` | statements | 2 | 6 | qwen3-tts-tokenizer-12hz |
 | `padded_codec_call` | `PaddedCodecCall` | statements | 2 | 6 | moss-audio-tokenizer |
 | `modular_chain` | `ModularChain` | statements | 0 | 1 | lfm2-modular |
-| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 18 | canary, granite-speech, hf-causal-lm, lfm2-modular, lfm2-monolithic, moonshine, moonshine-streaming, oruk-loop, qwen3, qwen3-asr, t5, whisper |
+| `prefill_decode_loop` | `PrefillDecodeLoop` | statements | 4 | 18 | canary, granite-speech, hf-causal-lm, lfm2-modular, lfm2-monolithic, moonshine, moonshine-streaming, oruk-loop, plamo3, qwen3, qwen3-asr, t5, whisper |
 | `decode_loop_stream` | `DecodeLoopStream` | statements | 0 | 2 | *nobody* (see below) |
 | `waveform_valid_length` | `WaveformValidLength` | statements | 0 | 5 | granite-speech, oruk-loop, qwen3-asr |
 | `prompt_segments` | `PromptSegments` | statements | 2 | 5 | granite-speech, oruk-loop, qwen3-asr |
 | `ctc_greedy_epilogue` | `CtcGreedyEpilogue` | statements | 1 | 6 | citrinet, conformer-ctc, funasr-sensevoice, hf-ctc-asr |
 | `token_labels_epilogue` | `TokenLabelsEpilogue` | statements | 1 | 0 | funasr-paraformer, hf-token-classifier |
 | `cif_boundary` | `CifBoundary` | statements | 1 | 6 | funasr-paraformer |
-| `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 4 | hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3 |
+| `argmax_epilogue` | `ArgmaxEpilogue` | statements | 1 | 4 | hf-causal-lm, lfm2-modular, lfm2-monolithic, plamo3, qwen3 |
 | `export_constants` | `ExportConstants` | prelude, statements | 0 | 2 | audio8-tts, audio8-tts-codec, auroratts, canary, chatterbox, citrinet, conformer-ctc, cosyvoice3, dac, dia, encodec, f5-tts, gigaam-rnnt, granite-speech, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, matcha, moonshine, moonshine-streaming, moss-audio-tokenizer, moss-tts-local, musicgen, nemotron-asr, nemotron-unified-asr, omnivoice, oruk-loop, parakeet-rnnt, parakeet-tdt, pocket-tts, pyannote-segmentation, qwen3-asr, qwen3-tts, qwen3-tts-tokenizer-12hz, sanotts, sanotts-nano, silero-vad, snac, soprano, speecht5, styletts2, supertonic, t5, vaniq-edge, vits, vits-upstream, vocetta2, voxcpm2, voxtral-tts, whisper, zipformer, zipformer_streaming |
 | `expr_function` | `ExprFunction` | prelude | 0 | 3 | oruk-loop, qwen3-asr |
 | `raw_lua_driver` | `RawLuaDriver` | prelude, statements, postlude | 2 | 2 | *nobody* (see below) |
@@ -98,7 +98,7 @@ differs is entirely what the host does with the one output. The family names its
 
 Binds every name the topologies below are called with: read from the caller's `inputs` table, or computed host-side (`cache_position` via loom.range, `attention_mask` via loom.causal_mask).
 
-*Emits:* statements. *Used by:* audio8-tts-codec, chatterbox, cosyvoice3, dac, ecapa-tdnn-lid, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, kyutai-stt, lfm2-modular, lfm2-monolithic, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, moss-audio-tokenizer, pocket-tts, pyannote-segmentation, qwen3, qwen3-tts-tokenizer-12hz, silero-vad, soprano, speecht5, titanet, voxcpm2, voxtral-tts, wakehubert, zipformer_streaming.
+*Emits:* statements. *Used by:* audio8-tts-codec, chatterbox, cosyvoice3, dac, ecapa-tdnn-lid, encodec, f5-tts, funasr-paraformer, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, kyutai-stt, lfm2-modular, lfm2-monolithic, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, moss-audio-tokenizer, plamo3, pocket-tts, pyannote-segmentation, qwen3, qwen3-tts-tokenizer-12hz, silero-vad, soprano, speecht5, titanet, voxcpm2, voxtral-tts, wakehubert, zipformer_streaming.
 
 * nothing — every field is `__unchecked__`, with its reason
 
@@ -106,7 +106,7 @@ Binds every name the topologies below are called with: read from the caller's `i
 
 The single `run_subgraph` call a flattened export's driver makes, capturing the output's shape alongside its data so the epilogue knows the vocab size -- or, for a KV-cached topology, retaining the output engine-side and binding nothing, so the logits never become a Lua table at all.
 
-*Emits:* statements. *Used by:* audio8-tts-codec, dac, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, qwen3.
+*Emits:* statements. *Used by:* audio8-tts-codec, dac, funasr-sensevoice, hf-causal-lm, hf-ctc-asr, hf-token-classifier, lfm2-monolithic, plamo3, qwen3.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
@@ -141,7 +141,7 @@ Threads one tensor through an independently-traced submodule chain: prefix -> [a
 
 The `infer_with_past` generation loop: prefill, then decode one token at a time against the KV cache until max_new_tokens or eos_token. One loop rather than a prefill plus a decode loop, because a cached ATTENTION node makes the prefill its first iteration. **The `used by` column over-states this one for the causal LMs**, and it is the only entry where that is true: it is a field of every flattened causal-LM builder, but the exporter sets it only for a topology whose cross-step state is entirely the KV and conv-state caches (LFM2-monolithic's ShortConv history is the latter). Whisper is not in that caveat: its family declares this component outright, with `bound` supplying the encoder's output to every step, which is what makes the same loop a cross-attention decode loop (BACKLOG.md P4.1).
 
-*Emits:* statements. *Used by:* canary, granite-speech, hf-causal-lm, lfm2-modular, lfm2-monolithic, moonshine, moonshine-streaming, oruk-loop, qwen3, qwen3-asr, t5, whisper.
+*Emits:* statements. *Used by:* canary, granite-speech, hf-causal-lm, lfm2-modular, lfm2-monolithic, moonshine, moonshine-streaming, oruk-loop, plamo3, qwen3, qwen3-asr, t5, whisper.
 
 * `topology` — TopologyName
 * `inputs` — TopologyInput(FieldRef(field='topology'), exact=True)
@@ -203,7 +203,7 @@ Where a CIF predictor's tokens fire, decided HOST-SIDE between two graph phases:
 
 Returns the next token rather than the raw logits: argmax over the active row, read out of the producing module's retained output by name, or -- for a topology that marshalled its tensor -- over the returned table, guarded for an output that is not an array.
 
-*Emits:* statements. *Used by:* hf-causal-lm, lfm2-modular, lfm2-monolithic, qwen3.
+*Emits:* statements. *Used by:* hf-causal-lm, lfm2-modular, lfm2-monolithic, plamo3, qwen3.
 
 * `retained_module` — WhenSet(TopologyName)
 

@@ -1312,6 +1312,28 @@ anything.""",
             "the model as the reference passes them.",
     ),
     ModelCard(
+        slug="plamo-3-translate-0.8b", checkpoint=Path("plamo-3-translate-0.8b"),
+        export_task="text-generation", export_model="plamo3", task_type="text-generation",
+        pipeline_tag="translation", snippet="text-generation-translate",
+        base_repo="pfnet/plamo-3-translate-0.8b", license_id="other",
+        source_url="https://huggingface.co/pfnet/plamo-3-translate-0.8b",
+        source_name="PLaMo 3 Translate 0.8B",
+        language=["ja", "en", "zh", "ko", "fr", "de", "es", "ru", "ar", "hi", "vi", "th", "id"],
+        title="PLaMo 3 Translate 0.8B",
+        summary="Preferred Networks' PLaMo 3 Translate 0.8B, exported for loom.cpp: a 0.8B translation model "
+                "for 60 languages with its own tokenizer, sliding-window attention and the PFML3 prompt "
+                "(source/target language, context, glossary, polite/plain Japanese, history) built in the file.",
+        limitations=
+            "**Licence.** PLaMo Community License: personal and non-commercial use is free; commercial use "
+            "needs registration with PFN (revenue up to 1 billion yen) or a separate agreement above it. "
+            "Read the licence before deploying this file.\n\n"
+            "**Prompting.** Use `text2text.translate(text, target_lang=...)`, which builds PFML3 from your "
+            "arguments the way the checkpoint's chat template does; `infer` continues raw ids. Greedy by "
+            "default, as the model card recommends.\n\n"
+            "**Context length.** The export allocates a 4096-token cache; keep source, history, context and "
+            "glossary within it (the checkpoint itself takes up to 32k).",
+    ),
+    ModelCard(
         slug="omnivoice", checkpoint=Path("omnivoice"),
         export_task="text-to-speech", export_model="omnivoice", task_type="text-to-speech",
         takes_text=True,
@@ -2700,6 +2722,19 @@ print(model.text2text.chat("Who discovered Brazil?", max_new_tokens=256))
 
 # The same model, one turn at a time, and with the decode rule named rather than inherited:
 print(model.chat([("user", "Name one river in Brazil.")], temperature=0.0))
+""",
+    # A file whose driver builds its translation prompt (PLaMo 3: `model.can_translate`, loom.cpp
+    # ADR-132): the request's arguments, never a hand-written prompt.
+    "text-generation-translate": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}")
+print(model.text2text.translate("会議は来週の月曜日に変更されました。", target_lang="en"))
+
+# Japanese out, polite, with a glossary; and the same request token by token.
+print(model.text2text.translate("Please open the dashboard.", target_lang="ja", source_lang="en",
+                                form="polite", glossary={"dashboard": "ダッシュボード"}))
+for piece in model.text2text.translate_stream("Bonjour tout le monde.", target_lang="en"):
+    print(piece, end="", flush=True)
 """,
     # Two ASR snippets, for the same reason there are two TTS ones: `language=` is not a property of
     # the task. `selects_language` below is what picks between them.

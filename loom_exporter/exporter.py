@@ -1668,7 +1668,17 @@ class LoomGGUFExporter:
         `main` function op by op rather than assembling components) to exactly the same two checks."""
         validate(self.driver_script.entry)
         check_subgraph_calls(self.driver_script.entry, self.topologies)
-        return self.driver_script.render()
+        script = self.driver_script.render()
+        # A synthesized driver plus a hand-written top-level chunk beside it (`driver_appendix`): a
+        # function a HOST calls by name, which runs no topology -- PLaMo's `translation_prompt`, which
+        # builds a PFML3 prompt's ids (loom.cpp ADR-132). Refused if it names `loom.run_subgraph`: a
+        # chunk that ran a graph would bypass both checks above.
+        appendix = self.kwargs.get("driver_appendix")
+        if appendix:
+            if "run_subgraph" in appendix:
+                raise ValueError("driver_appendix runs a topology; it is for host-called helpers only")
+            script = script + "\n" + appendix
+        return script
 
     def _driver_context(self, topologies=None) -> DriverContext:
         """What a `DriverComponent` emits against. Every topology this exporter produces shares one
@@ -3284,6 +3294,11 @@ class LoomGGUFExporter:
             # pretokenizer shape. Named by the family: `tekken.json` is no HF tokenizer directory.
             from .tekken_tokenizer_export import write_tekken_vocab
             write_tekken_vocab(w, tokenizer_dir)
+        elif family == "plamo":
+            # PFN's PLaMo (`Plamo3Tokenizer`, remote code): a scored unigram walked by Aho-Corasick,
+            # `tokenizer.jsonl` rather than tokenizer.json. Detected by its config's class name.
+            from .plamo_tokenizer_export import write_plamo_vocab
+            write_plamo_vocab(w, tokenizer_dir)
         elif family == "wordpiece":
             from .wordpiece_tokenizer_export import write_wordpiece_vocab
             write_wordpiece_vocab(w, tokenizer_dir)

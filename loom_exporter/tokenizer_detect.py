@@ -239,8 +239,12 @@ _SPM_PROTO_NAMES = ("tokenizer.model", "spiece.model", "sentencepiece.bpe.model"
 
 
 def detect_vocab_family(tokenizer_dir: str) -> str:
-    """Returns "bpe" / "wordpiece" / "sentencepiece_proto" / "byte". See module docstring."""
+    """Returns "bpe" / "wordpiece" / "sentencepiece_proto" / "byte" / "plamo". See module docstring."""
     tok_dir = Path(tokenizer_dir)
+    from .plamo_tokenizer_export import is_plamo_tokenizer
+
+    if is_plamo_tokenizer(tokenizer_dir):
+        return "plamo"
     tokenizer_json_path = tok_dir / "tokenizer.json"
     if tokenizer_json_path.exists():
         model_type = json.loads(tokenizer_json_path.read_text())["model"]["type"]
