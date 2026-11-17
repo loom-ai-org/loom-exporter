@@ -584,6 +584,15 @@ class LoomGGUFExporter:
             # survive as ops. ECAPA's first export lost the frame count at the first one and every
             # downstream frame axis, the Res2Net split's included, came out as `n_samples`.
             "batch_norm",
+            # This exporter's own dialect ops whose type is their `x`'s (dialect.py: `return
+            # self.x.sym_type`). `loom_rms_norm` cost VoxCPM2 its token axis: its feature encoder reads
+            # `h[:, 0, :]` after a norm, MIL mints a fresh symbol for that slice, and this walk stopped
+            # at the norm -- so `feat_encode` was exported as ONE row whatever `n_tokens` was, and every
+            # call failed at the first retained copy. It had been missing since the op existed; VoxCPM2
+            # only reached it when `fuse_rms_norm` learned `x * x` (exporter 94416f4, 2026-11-12) and its
+            # norms started fusing. `loom_rope` and `loom_spline` are the same kind of op, waiting to
+            # fail the same way at the first shape-derived slice downstream of one.
+            "loom_rms_norm", "loom_rope", "loom_spline",
         }
         if op.op_type in _UNARY_PASSTHROUGH_OPS:
             # Pure unary, shape-preserving ops -- the axis's real expression is whatever its single
