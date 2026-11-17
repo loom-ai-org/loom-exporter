@@ -932,7 +932,8 @@ def test_the_tts_families_share_one_task():
     packages are told apart by their files (a manifest, or a C runtime's offset header). Seventeen since
     Vocetta2, the nano line re-trained and shipped as torch state_dicts. Twenty since Vaniq-Edge, an
     upstream-VITS directory (its own recognizer, beside a fallback for every such directory), and
-    AuroraTTS-100K, whose BiGRU and DSP synthesizer are its own family."""
+    AuroraTTS-100K, whose BiGRU and DSP synthesizer are its own family. Twenty-one since OmniVoice, a
+    masked-diffusion LM over a codec (ADR-131)."""
     from loom_exporter.registry import default_registry
 
     registry = default_registry()
@@ -940,7 +941,7 @@ def test_the_tts_families_share_one_task():
     assert names == {"kokoro", "styletts2", "vits", "matcha", "supertonic", "f5-tts", "chatterbox",
                      "pocket-tts", "voxcpm2", "cosyvoice3", "voxtral-tts", "speecht5", "soprano",
                      "lfm2.5-audio-tts", "sanotts", "sanotts-nano", "vocetta2", "vaniq-edge",
-                     "vits-upstream", "auroratts"}
+                     "vits-upstream", "auroratts", "omnivoice"}
     for model in names:
         assert registry.get("text-to-speech", model).name == model
 

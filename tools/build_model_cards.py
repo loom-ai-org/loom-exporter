@@ -233,6 +233,23 @@ def _vocetta2_q8(size: str, what: str, q8_wer: str, f32_wer: str) -> str:
     )
 
 
+def upstream_package(module: str, env: str, src: str = "") -> Callable[[], Optional[str]]:
+    """`export_requires` for a card whose export imports upstream's own model code (`module`), found on
+    sys.path or in the clone `env` names (its `src`, or its root). OmniVoice and tiny-voca: neither is a
+    pip install the export venvs carry."""
+    def check() -> Optional[str]:
+        import importlib.util
+        import os
+
+        repo = os.environ.get(env)
+        if repo and (Path(repo) / src / module).is_dir():
+            return None
+        if importlib.util.find_spec(module) is not None:
+            return None
+        return f"no `{module}` package: set {env} to a clone of its repository"
+    return check
+
+
 def pocket_tts_reference(minimum: str, maximum: Optional[str] = None) -> Callable[[], Optional[str]]:
     """`export_requires` for a Pocket-TTS card: the reference checkout `LOOM_POCKET_TTS_REPO` names
     (default the v3.2.0 clone) must have a version in [minimum, maximum]."""
@@ -1312,7 +1329,8 @@ anything.""",
             "the model as the reference passes them.",
     ),
     ModelCard(
-        slug="omnivoice", checkpoint=Path("omnivoice"),
+        slug="omnivoice", checkpoint=Path("omnivoice"), venv="ovos",
+        export_requires=upstream_package("omnivoice", "LOOM_OMNIVOICE_REPO"),
         export_task="text-to-speech", export_model="omnivoice", task_type="text-to-speech",
         takes_text=True,
         base_repo="k2-fsa/OmniVoice", license_id="cc-by-nc-4.0",
