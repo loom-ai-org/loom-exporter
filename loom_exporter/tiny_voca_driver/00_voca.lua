@@ -58,36 +58,40 @@ local function voca_range(n)
     return r
 end
 
--- The band-limited pulse train (`tiny_voca.model.pulse_train`) in double precision, sample by sample:
--- log-linear F0 between frame knots, the phase's running sum, the closed-form sum of the harmonics below
--- HARMONIC_LIMIT * sr with the top one faded in, at unit power. Rounded to float32 at the end, as
--- upstream's `.float()`.
-local function voca_pulses(f0)
+-- `expm1` to a few ulp (Kahan's): the frame sum below divides two of them, each of a small argument.
+local function voca_expm1(x)
+    local u = math.exp(x)
+    if u == 1.0 then return x end
+    local um1 = u - 1.0
+    if um1 == -1.0 then return -1.0 end
+    return um1 * x / math.log(u)
+end
+
+-- What the synth graph needs of the pulse train (`tiny_voca.model.pulse_train`, ADR-133): each frame's
+-- log-F0 knots (`knots`, [T, 2]: its own and the next frame's; the frequency is log-linear between them)
+-- and the phase before its first
+-- sample, in cycles, centred in [-1/2, 1/2]. The graph sums inside a frame in float32; ACROSS frames the
+-- sum is upstream's float64 one, done here a frame at a time: inside frame j the frequency is
+-- exp(a + (b - a) m / HOP), a geometric series, so its cycles are
+-- exp(a) * expm1(b - a) / expm1((b - a) / HOP) / SAMPLE_RATE. Kept modulo 1 (subtracting an integer is
+-- exact), so the phase never grows the way upstream's running sum does.
+local function voca_phases(f0)
     local frames = #f0
     local knots = {}
     for j = 1, frames do knots[j] = math.log(math.max(f0[j], 1.0)) end
     knots[frames + 1] = knots[frames]
-    local out = {}
+    local pairs_, start = {}, {}
     local acc = 0.0
-    local two_pi = 2 * math.pi
-    for s = 0, frames * HOP - 1 do
-        local position = s / HOP
-        local low = math.floor(position)
-        local w = position - low
-        local frequency = math.exp(knots[low + 1] * (1 - w) + knots[low + 2] * w)
-        acc = acc + frequency / SAMPLE_RATE
-        local theta = two_pi * acc
-        theta = theta - two_pi * math.floor(theta / two_pi)
-        local harmonics = math.max(HARMONIC_LIMIT * SAMPLE_RATE / frequency, 1.0)
-        local whole = math.floor(harmonics)
-        local denominator = 2 * math.sin(theta / 2)
-        local core
-        if math.abs(denominator) < 1e-7 then core = whole
-        else core = math.sin((whole + 0.5) * theta) / denominator - 0.5 end
-        local wave = core + (harmonics - whole) * math.cos((whole + 1) * theta)
-        out[s + 1] = to_f32(wave * math.sqrt(2.0 / harmonics))
+    for j = 1, frames do
+        local a, b = knots[j], knots[j + 1]
+        pairs_[2 * j - 1], pairs_[2 * j] = a, b
+        start[j] = acc - math.floor(acc + 0.5)
+        local series = HOP
+        if b ~= a then series = voca_expm1(b - a) / voca_expm1((b - a) / HOP) end
+        acc = acc + math.exp(a) * series / SAMPLE_RATE
+        acc = acc - math.floor(acc)
     end
-    return out
+    return pairs_, start
 end
 
 -- One utterance, `TinyVoca.synthesize` with its defaults (pitch_jitter 0, voiced_vowels on). `pinned` is
@@ -174,9 +178,10 @@ local function voca_speak(u, voice, speed, pitch_shift, pitch_range, seed, pinne
     else
         noise = aten_randn(seed % 4294967296, total * HOP)
     end
+    local knots, start = voca_phases(f0)
     local wave = loom.run_subgraph('synth', {n_enc_frames = total, n_samples = total * HOP, n_past = 0},
         {h = {from = 'acoustic', index = 1}, n = {from = 'acoustic', index = 2}, here = here, following = following,
-         h_sub = h_sub, n_owner = n_owner, n_sub = n_sub, pulses = voca_pulses(f0), noise = noise})
+         h_sub = h_sub, n_owner = n_owner, n_sub = n_sub, knots = knots, start = start, noise = noise})
     return wave, total
 end
 
