@@ -218,6 +218,7 @@ _FAMILY_MODULES = (
     "omnivoice_export",
     "plamo_export",
     "tiny_voca_export",
+    "paradee_export",
     "t5_export",
     "f5_tts_export",
     "chatterbox_export",

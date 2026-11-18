@@ -298,6 +298,10 @@ class LoomGGUFExporter:
         # log by more than the quantized layers after it do. Every name must exist (`pack_weights`
         # raises otherwise), so a renamed tensor cannot silently fall out of its exemption.
         self.keep_float = frozenset(kwargs.get("keep_float") or ())
+        # The weights of a family's float phases (`float_phases`, Paradee's ALBERT): kept float like
+        # `keep_float`, but not required to exist -- a phase's names include constants the passes after
+        # it fold away, which this export then does not write.
+        self.float_weights = frozenset(kwargs.get("float_weights") or ())
         # A family's opt-in to quantizing tables read only through GET_ROWS, which `quantize` otherwise
         # leaves at F32 (they are nobody's MUL_MAT operand). ggml gathers rows out of a packed table
         # directly and the engine serves that path bit-exactly (ADR-075). Opt-in rather than the
@@ -3085,7 +3089,7 @@ class LoomGGUFExporter:
                     continue
                 if usage[name] != {(op, 0)}:
                     continue
-                if name in self.keep_float:
+                if name in self.keep_float or name in self.float_weights:
                     continue
                 spatial = tuple(int(d) for d in array.shape[1:])   # (IC, K) or (IC, KH, KW)
                 fastest = int(np.prod(spatial))
@@ -3402,7 +3406,8 @@ class LoomGGUFExporter:
             report = pad_weight_axes(
                 self.topologies, self.weights, set(pending),
                 {name: self._var_shape_lookup(vars_) for name, vars_ in self.topology_vars.items()},
-                lambda name: name in quantizable and name not in self.keep_float, block_size,
+                lambda name: name in quantizable and name not in self.keep_float and name not in self.float_weights,
+                block_size,
             )
             packing.padded = report.padded
             if report.padded:
@@ -3443,7 +3448,7 @@ class LoomGGUFExporter:
             # (fastest-varying) dimension isn't block-aligned are left F32 rather than erroring, same
             # graceful behavior as the standalone quantize_gguf_q8_0.py POC.
             eligible_by_op = (qtype is not None and name in quantizable and array.dtype == np.float32
-                              and name not in self.keep_float)
+                              and name not in self.keep_float and name not in self.float_weights)
             aligned = array.ndim >= 2 and array.shape[-1] % block_size == 0
             if eligible_by_op and not aligned:
                 packing.n_declined_shape += 1

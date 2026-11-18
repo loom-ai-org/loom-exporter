@@ -418,6 +418,12 @@ class MultiPhase(Decomposition):
         out_kwargs = dict(config.resolved_backend_kwargs())
         quantize = out_kwargs.get("quantize")
         keep_float = tuple(out_kwargs.get("keep_float") or ())
+        # Phases whose weights all stay float under `quantize` (Paradee's ALBERT, ADR-135): named by
+        # phase because a traced weight's name carries a hash of its MIL path, which a family cannot
+        # write down. Each such phase converts unquantized and its names join `keep_float` for the
+        # output exporter, so the artifact records them like any other kept weight.
+        float_phases = frozenset(out_kwargs.pop("float_phases", None) or ())
+        kept_whole = set()
         pad_axes = out_kwargs.get("pad_axes")
         quantize_gathered = bool(out_kwargs.get("quantize_gathered"))
 
@@ -449,17 +455,24 @@ class MultiPhase(Decomposition):
                 print(f"  isolating {len(phases)} phase(s), one process each; parent released its "
                       f"own copy of the model:{_rss_note() or ' (rss unknown)'}")
 
+            unknown = float_phases - {phase.name for phase in phases}
+            if quantize and unknown:
+                raise ValueError(f"float_phases names {sorted(unknown)}, which this export has no phase "
+                                 f"called; its phases are {[phase.name for phase in phases]}")
             for index, phase in enumerate(phases):
+                phase_quantize = None if phase.name in float_phases else quantize
                 if isolate:
                     result = convert_phase_isolated(
-                        blob_path, index, spill_root / f"phase-{index}", quantize=quantize,
+                        blob_path, index, spill_root / f"phase-{index}", quantize=phase_quantize,
                         keep_float=keep_float, pad_axes=pad_axes, quantize_gathered=quantize_gathered,
                     )
                     print(f"  {phase.name}: read back {len(result.weights)} packed weight(s) from its "
                           f"worker's spill{_rss_note()}")
                 else:
-                    result = convert_phase(phase, quantize=quantize, keep_float=keep_float, pad_axes=pad_axes,
-                                           quantize_gathered=quantize_gathered)
+                    result = convert_phase(phase, quantize=phase_quantize, keep_float=keep_float,
+                                           pad_axes=pad_axes, quantize_gathered=quantize_gathered)
+                if phase.name in float_phases:
+                    kept_whole.update(result.weights)
                 own = getattr(phase, "own_kv_cache", None)
                 if own:
                     declare_own_kv_cache(phase, result)
@@ -482,10 +495,10 @@ class MultiPhase(Decomposition):
 
             _check_phase_weight_namespaces(phase_outputs)
             return self._write(config, checker, phases, phase_topologies, phase_outputs,
-                               fused_geometry, packing, out_kwargs)
+                               fused_geometry, packing, out_kwargs, kept_whole=kept_whole)
 
     def _write(self, config, checker, phases, phase_topologies, phase_outputs, fused_geometry,
-               packing, out_kwargs) -> str:
+               packing, out_kwargs, kept_whole=frozenset()) -> str:
         """Merge what the phases produced, build the driver, write the GGUF.
 
         Split out of `export` so the whole of it sits inside the spill directory's lifetime: under
@@ -528,6 +541,9 @@ class MultiPhase(Decomposition):
         out_exporter.topologies = phase_topologies
         out_exporter.weights = merge_phase_weights(
             [(name, weights) for name, _, weights in phase_outputs])
+        # A float phase's weights stay float in the artifact too (`float_weights`, not `keep_float`: a
+        # phase's names include constants later passes fold away, which keep_float would refuse).
+        out_exporter.float_weights = frozenset(kept_whole)
         out_exporter.phase_geometry = fused_geometry
         # The phases packed their own weights, so the writer's job is to hash, alias and add -- and
         # this is where it learns which GGML type each name was packed to. `write_gguf` still calls
