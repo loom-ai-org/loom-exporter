@@ -808,7 +808,7 @@ CATALOG = [
     ),
     # Zipformer small STREAMING (`zipformer_streaming_export`), transducer head, chunk 32 / left 128 (640 ms), run
     # chunk by chunk behind the one-pass door (loom.cpp ADR-097). Measured 2026-11-08 on a loom.cpp main build
-    # (rc21's ARGMAX) against upstream's released `jit_model-chunk-32-left-128.pt` run as `zipformer inference
+    # (1.0.0's ARGMAX) against upstream's released `jit_model-chunk-32-left-128.pt` run as `zipformer inference
     # --streaming 1` runs it, on librispeech_asr_dummy (73 clips, 481 s, upper-cased with punctuation dropped):
     # F32 token-identical on 73/73, WER 12.17% for both; Q8_0 46/73, WER 11.91%. Upstream's table rates this
     # checkpoint 8.15% on LibriSpeech test-clean (16 / 128), against 3.78% for the non-streaming small. 4 threads on
@@ -3786,7 +3786,7 @@ def build_one(card: ModelCard, models_root: Path, output_dir: Path, readme_only:
 OP_FIRST_RUNTIME = {
     "STFT": "1.0.0rc18",   # ADR-080
     "ISTFT": "1.0.0rc18",  # ADR-080
-    "ARGMAX": "1.0.0rc21", # P4.53: Zipformer's joint reduces its logits in the graph
+    "ARGMAX": "1.0.0",     # P4.53: Zipformer's joint reduces its logits in the graph
 }
 
 
