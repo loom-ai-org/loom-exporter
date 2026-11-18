@@ -32,8 +32,11 @@ def _run_topology(topo: dict, weights: dict, inputs: dict) -> np.ndarray:
     for node in topo["nodes"]:
         op, ins, outs = node["op"], node["inputs"], node["outputs"]
         if op == "MUL_MAT":
-            # Loom convention: MUL_MAT(weight, x) == weight @ x (weight-first, matching op_mul_mat).
-            values[outs[0]] = values[ins[0]] @ values[ins[1]]
+            # Loom convention: MUL_MAT(weight, x) == weight @ x (weight-first, matching op_mul_mat). A
+            # SEQUENCE operand is `[T, I]`, one row per timestep as ggml lays `[I, T]` out, so the product
+            # is a row per timestep too (the input projection, ADR-137).
+            w, x = values[ins[0]], values[ins[1]]
+            values[outs[0]] = x @ w.T if x.ndim == 2 else w @ x
         elif op == "ADD":
             values[outs[0]] = values[ins[0]] + values[ins[1]]
         elif op == "MUL":
@@ -81,19 +84,27 @@ def _trace_lstm_op(hidden_dim, input_dim, seq_len, bidirectional):
 
 
 class TestLstmRecurrent(unittest.TestCase):
-    def _check(self, hidden_dim, input_dim, seq_len, bidirectional):
+    def _check(self, hidden_dim, input_dim, seq_len, bidirectional, project=False):
         op, x_np, ref_out = _trace_lstm_op(hidden_dim, input_dim, seq_len, bidirectional)
-        result = build_lstm_cell_topologies(op, weight_namespace="test.")
+        result = build_lstm_cell_topologies(op, weight_namespace="test.", project_input=project)
         self.assertEqual(result["bidirectional"], bidirectional)
         self.assertEqual(result["hidden_dim"], hidden_dim)
+        # A projected LSTM (ADR-137): `W_ih x + b` for the whole sequence first, one output per direction,
+        # and each step's `layer_input` is that direction's row.
+        projected = None
+        if project:
+            self.assertEqual(result["input"]["outputs"], ["gates_0", "gates_1"][:2 if bidirectional else 1])
+            projected = _run_topology(result["input"], result["weights"], {"sequence": x_np})
+        else:
+            self.assertIsNone(result["input"])
 
-        def run_direction(topo, reverse: bool) -> np.ndarray:
+        def run_direction(topo, reverse: bool, rows=None) -> np.ndarray:
             h = np.zeros(hidden_dim, dtype=np.float32)
             c = np.zeros(hidden_dim, dtype=np.float32)
             out = np.zeros((seq_len, hidden_dim), dtype=np.float32)
             order = range(seq_len - 1, -1, -1) if reverse else range(seq_len)
             for t in order:
-                inputs = {"layer_input": x_np[t], "h_prev": h, "c_prev": c}
+                inputs = {"layer_input": (x_np if rows is None else rows)[t], "h_prev": h, "c_prev": c}
                 # One topology, both outputs -- the interpreter reads each declared name out of the
                 # same evaluated node list, which is exactly what the engine now does per call.
                 values = _run_topology(topo, result["weights"], inputs)
@@ -102,9 +113,9 @@ class TestLstmRecurrent(unittest.TestCase):
                 out[t] = h
             return out
 
-        fwd_out = run_direction(result["forward"], reverse=False)
+        fwd_out = run_direction(result["forward"], reverse=False, rows=projected and projected["gates_0"])
         if bidirectional:
-            bwd_out = run_direction(result["backward"], reverse=True)
+            bwd_out = run_direction(result["backward"], reverse=True, rows=projected and projected["gates_1"])
             got = np.concatenate([fwd_out, bwd_out], axis=-1)
         else:
             got = fwd_out
@@ -120,6 +131,21 @@ class TestLstmRecurrent(unittest.TestCase):
 
     def test_lstm_different_dims(self):
         self._check(hidden_dim=13, input_dim=7, seq_len=4, bidirectional=False)
+
+    def test_projected_lstm_unidirectional(self):
+        self._check(hidden_dim=5, input_dim=8, seq_len=6, bidirectional=False, project=True)
+
+    def test_projected_lstm_bidirectional(self):
+        self._check(hidden_dim=13, input_dim=7, seq_len=9, bidirectional=True, project=True)
+
+    def test_a_projected_cell_holds_no_input_weights(self):
+        """The point of the split: the cell's per-step work is `W_hh h` alone."""
+        op, _, _ = _trace_lstm_op(5, 8, 6, True)
+        result = build_lstm_cell_topologies(op, weight_namespace="test.", project_input=True)
+        for topo in (result["forward"], result["backward"]):
+            used = {i for node in topo["nodes"] for i in node["inputs"]}
+            self.assertFalse(any(u.endswith("weight_ih") or u.endswith("bias") for u in used), used)
+            self.assertEqual(topo["inputs"][0]["shape"], [str(4 * 5)])
 
 
 if __name__ == "__main__":
