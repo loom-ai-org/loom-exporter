@@ -233,6 +233,23 @@ def _vocetta2_q8(size: str, what: str, q8_wer: str, f32_wer: str) -> str:
     )
 
 
+def upstream_package(module: str, env: str, src: str = "") -> Callable[[], Optional[str]]:
+    """`export_requires` for a card whose export imports upstream's own model code (`module`), found on
+    sys.path or in the clone `env` names (its `src`, or its root). OmniVoice and tiny-voca: neither is a
+    pip install the export venvs carry."""
+    def check() -> Optional[str]:
+        import importlib.util
+        import os
+
+        repo = os.environ.get(env)
+        if repo and (Path(repo) / src / module).is_dir():
+            return None
+        if importlib.util.find_spec(module) is not None:
+            return None
+        return f"no `{module}` package: set {env} to a clone of its repository"
+    return check
+
+
 def pocket_tts_reference(minimum: str, maximum: Optional[str] = None) -> Callable[[], Optional[str]]:
     """`export_requires` for a Pocket-TTS card: the reference checkout `LOOM_POCKET_TTS_REPO` names
     (default the v3.2.0 clone) must have a version in [minimum, maximum]."""
@@ -1310,6 +1327,37 @@ anything.""",
             "**English only.** The multilingual and Turbo checkpoints are different models and are "
             "not this file. Event tags such as `[laughter]` and `[sigh]` in the text are passed to "
             "the model as the reference passes them.",
+    ),
+    ModelCard(
+        slug="omnivoice", checkpoint=Path("omnivoice"), venv="ovos",
+        export_requires=upstream_package("omnivoice", "LOOM_OMNIVOICE_REPO"),
+        export_task="text-to-speech", export_model="omnivoice", task_type="text-to-speech",
+        takes_text=True,
+        base_repo="k2-fsa/OmniVoice", license_id="cc-by-nc-4.0",
+        source_url="https://github.com/k2-fsa/OmniVoice", source_name="OmniVoice",
+        language=["multilingual"],
+        # Declared by the export (the codec's own `sample_rate`), restated here like Chatterbox's.
+        sample_rate=24000,
+        title="OmniVoice",
+        summary="k2-fsa's OmniVoice, exported for loom.cpp: a masked-diffusion TTS for 600+ languages, "
+                "a bidirectional Qwen3-0.6B that fills in HiggsAudio-v2 codec tokens in 32 steps, with the "
+                "codec's decoder and encoder in the same file. Voice design from a description, voice "
+                "cloning from a clip and its transcript, or the model's own voice.",
+        limitations=
+            "**Non-commercial weights.** The checkpoint is CC-BY-NC 4.0 because of its training data "
+            "(e.g. Emilia); the upstream code is Apache-2.0. Do not use this file commercially, and "
+            "never to impersonate a real person without their consent.\n\n"
+            "**Slow on a CPU.** Every one of the 32 steps runs the whole 28-layer stack over the prompt "
+            "and the target twice (classifier-free guidance), so a sentence takes tens of seconds on a "
+            "laptop CPU; use a GPU for interactive work. Fewer steps (`n_steps`) trade quality for "
+            "speed.\n\n"
+            "**Streams a text chunk at a time.** Nothing exists before a run's last step, so the stream "
+            "yields one piece per text chunk (upstream cuts texts longer than ~30 s into ~15 s chunks; "
+            "`chunk_threshold` and `chunk_duration` cut earlier). Each streamed piece is levelled and "
+            "silence-trimmed on its own, where the one pass does both over the whole.\n\n"
+            "**Not ported:** upstream's opt-in text normalization (numbers, dates), automatic "
+            "transcription of a reference clip (pass `reference_text`), and sampling the ids "
+            "(`class_temperature`, off by default upstream). The reference clip must be mono 24 kHz.",
     ),
     ModelCard(
         slug="pocket-tts", checkpoint=Path("pocket-tts/languages/english_2026-09"),
