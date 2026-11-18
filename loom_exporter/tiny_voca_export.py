@@ -18,13 +18,22 @@ The split is where the data forces it:
   prosody   owner rows gathered, features and voice added -> transformer A -> prosody head.
   (host)    vowels kept voiced, the pitch range widened, the hard conditioning clamps, the F0.
   acoustic  transformer B -> the harmonic and noise heads' per-frame parameters.
-  (host)    the pulse train, in DOUBLE precision (upstream's float64 phase), and the noise draw.
-  synth     sub-frame envelopes, cepstrum -> response (DFT matrices), STFT, multiply, inverse STFT.
+  (host)    each frame's log-F0 knots and its starting phase (float64), and the noise draw.
+  synth     the pulse train; sub-frame envelopes, cepstrum -> response (DFT matrices), STFT, multiply,
+            inverse STFT.
 
-**The pulse train leaves the graph entirely.** Upstream computes it in float64 ("Float64 keeps the phase
-exact"): a log-linear F0 per sample, its running sum, and the closed-form band-limited sum of harmonics.
-ggml has no float64, so the driver (Lua numbers are doubles) computes it sample by sample and hands the
-graph float32 samples -- the same rounding upstream ends with (`.float()`).
+**The pulse train is split where its precision lives.** Upstream computes it in float64 ("Float64 keeps
+the phase exact"): a log-linear F0 per sample, its running sum, and the closed-form band-limited sum of
+harmonics. Summed over an utterance in float32 the phase is useless (ggml's cumsum adds sequentially in
+float32: 1-13 dB SNR against upstream). So the driver sends one number per frame, the phase before its
+first sample -- a geometric series per frame, in doubles, kept modulo 1 -- and the graph sums only inside
+a frame (at most ~6 cycles) and does every per-sample transcendental in float32. Theta is CENTRED,
+`2 pi (cycles - floor(cycles + 1/2))`: the closed form is 2 pi periodic, and in [0, 2 pi) the term
+`sin((W + 1/2) theta)` is evaluated at up to ~1400 rad right where it is divided by `sin(theta / 2) -> 0`
+-- float32 loses ~1e-4 rad there and the waveform 30 dB. Centred, the arguments near a pulse are small.
+Measured against upstream's float64 in upstream's own model (ADR-133): 1e-4 max on the waveform, 94 dB,
+on 5.4 s and 13.7 s utterances -- twenty times under the STFTs' own float32 error. The driver once rendered
+the train sample by sample in Lua: 85 ms of a 664 ms Pi 4 run; this is a few ms of graph.
 
 **Every STFT is a convolution with constant kernels**, the construction upstream's own ONNX export uses
 (`tiny_voca.export.Exportable`): analysis kernels are the windowed DFT basis, the inverse is a transposed
@@ -205,8 +214,8 @@ def _synthesis_kernel(window):
 
 
 class _SynthWrapper(nn.Module):
-    """`(heads, sub-frame indices, pulses, noise) -> waveform`: `SourceFilter.forward` after its linear
-    heads, for one utterance. Index inputs are the driver's (`_subframes`), so nothing here reads a shape."""
+    """`(heads, sub-frame indices, F0 knots and frame phases, noise) -> waveform`: `SourceFilter.forward`
+    after its linear heads, for one utterance. Index inputs are the driver's (`_subframes`), so nothing here reads a shape."""
 
     def __init__(self, vocoder, config):
         super().__init__()
@@ -227,6 +236,9 @@ class _SynthWrapper(nn.Module):
             self.register_buffer(f"{name}_envelope", (window.double() ** 2).float()[None, None].contiguous())
         self.register_buffer("lifter", torch.cat((vocoder.causal_lifter, vocoder.anti_lifter)).float())
         self.register_buffer("noise_lifter", vocoder.noise_lifter.float())
+        ramp = torch.arange(c.hop, dtype=torch.float32) / c.hop
+        self.register_buffer("interpolate", torch.stack((1 - ramp, ramp)))
+        self.sample_rate, self.harmonic_limit = float(c.sample_rate), float(c.harmonic_limit)
 
     def _filter(self, source, real, imaginary, name, fft, hop):
         # `filtered(F.pad(source, (0, fft//2)), ...)` with torch.stft(center=True) = a constant pad of
@@ -247,7 +259,29 @@ class _SynthWrapper(nn.Module):
         angle = cepstrum @ imaginary
         return magnitude * torch.cos(angle), magnitude * torch.sin(angle)
 
-    def forward(self, h, n, here, following, h_sub, n_owner, n_sub, pulses, noise):
+    def _pulses(self, knots, start):
+        """`pulse_train` from each frame's knots `[T, 2]` (log-F0 at its start and at the next frame's) and
+        starting phase (cycles, in [-1/2, 1/2]): the in-frame running sum, the centred theta, upstream's
+        closed form. One row per frame, joined. The log-linear interpolation is a matmul with K = 2
+        (`low (1 - w) + high w`, upstream's own order): ggml's elementwise ops broadcast only their second
+        operand, so `[T, 1] * [hop]` has no lowering."""
+        log_frequency = knots @ self.interpolate
+        frequency = torch.exp(log_frequency)
+        cycles = torch.cumsum(frequency / self.sample_rate, dim=1) + start[:, None]
+        theta = 2 * math.pi * (cycles - torch.floor(cycles + 0.5))
+        # `limit * sr / frequency` and `sqrt(2 / harmonics)` without a constant over a tensor, which MIL
+        # spells `inverse` (an op with an epsilon of its own): the first from the log, the second rsqrt.
+        harmonics = torch.clamp_min(torch.exp(math.log(self.harmonic_limit * self.sample_rate) - log_frequency), 1.0)
+        whole = torch.floor(harmonics)
+        denominator = 2 * torch.sin(theta / 2)
+        tiny = denominator.abs() < 1e-7
+        # Where it is tiny the select takes `whole` (the limit); the +1 only keeps that lane finite.
+        ratio = torch.sin((whole + 0.5) * theta) / (denominator + tiny.to(denominator.dtype))
+        core = torch.where(tiny, whole, ratio - 0.5)
+        wave = core + (harmonics - whole) * torch.cos((whole + 1) * theta)
+        return (wave * (math.sqrt(2.0) * torch.rsqrt(harmonics))).reshape(1, -1)
+
+    def forward(self, h, n, here, following, h_sub, n_owner, n_sub, knots, start, noise):
         split = self.cep_causal + self.cep_anti
         cep = h[:, :split]
         envelope = 0.5 * (cep.index_select(0, here) + cep.index_select(0, following)) * self.lifter
@@ -258,6 +292,7 @@ class _SynthWrapper(nn.Module):
         n_gain = n[:, self.noise_cep:].reshape(-1, 1).index_select(0, n_sub)
         shape = torch.cat((shape[:, :1] + n_gain, shape[:, 1:]), dim=1)
         n_real, n_imag = self._response(shape, self.noise_real, self.noise_imaginary)
+        pulses = self._pulses(knots, start)
         return (self._filter(pulses, h_real, h_imag, "synth", self.synth_fft, self.synth_hop)
                 + self._filter(noise, n_real, n_imag, "noise", self.noise_fft, self.noise_hop)).unsqueeze(0)
 
@@ -310,6 +345,7 @@ class TinyVocaExportConfig(BaseMultiPhaseModelExportConfig):
         steps_h, steps_n = c.hop // c.synth_hop, c.hop // c.noise_hop
         sub_h = torch.minimum(torch.arange(steps_h * t + 3), torch.tensor(steps_h * t - 1))
         sub_n = torch.minimum(torch.arange(steps_n * t + 3), torch.tensor(steps_n * t - 1))
+        knots = torch.log(torch.empty(t + 1).uniform_(c.f0_min, c.f0_max, generator=g))
         return [
             ExportPhase(
                 name="encode", wrapper=_EncodeWrapper(model).eval(),
@@ -348,7 +384,8 @@ class TinyVocaExportConfig(BaseMultiPhaseModelExportConfig):
                 dummy_inputs=(torch.randn(t, h_width, generator=g) * 0.1, torch.randn(t, n_width, generator=g) * 0.1,
                               sub_h // steps_h, torch.minimum((sub_h + 1) // steps_h, torch.tensor(t - 1)), sub_h,
                               sub_n // steps_n, sub_n,
-                              torch.randn(1, t * c.hop, generator=g), torch.randn(1, t * c.hop, generator=g)),
+                              torch.stack((knots[:-1], knots[1:]), dim=1), torch.rand(t, generator=g) - 0.5,
+                              torch.randn(1, t * c.hop, generator=g)),
                 mil_inputs=[ct.TensorType(name="h", shape=(frames_axis, h_width), dtype=np.float32),
                             ct.TensorType(name="n", shape=(frames_axis, n_width), dtype=np.float32),
                             ct.TensorType(name="here", shape=(hsub_axis,), dtype=np.int32),
@@ -356,7 +393,8 @@ class TinyVocaExportConfig(BaseMultiPhaseModelExportConfig):
                             ct.TensorType(name="h_sub", shape=(hsub_axis,), dtype=np.int32),
                             ct.TensorType(name="n_owner", shape=(nsub_axis,), dtype=np.int32),
                             ct.TensorType(name="n_sub", shape=(nsub_axis,), dtype=np.int32),
-                            ct.TensorType(name="pulses", shape=(1, samples_axis), dtype=np.float32),
+                            ct.TensorType(name="knots", shape=(frames_axis, 2), dtype=np.float32),
+                            ct.TensorType(name="start", shape=(frames_axis,), dtype=np.float32),
                             ct.TensorType(name="noise", shape=(1, samples_axis), dtype=np.float32)],
                 root_axis="n_enc_frames",
                 declared_axes={"here": {0: f"{steps_h}*n_enc_frames+3"},
@@ -364,7 +402,7 @@ class TinyVocaExportConfig(BaseMultiPhaseModelExportConfig):
                                "h_sub": {0: f"{steps_h}*n_enc_frames+3"},
                                "n_owner": {0: f"{steps_n}*n_enc_frames+3"},
                                "n_sub": {0: f"{steps_n}*n_enc_frames+3"},
-                               "pulses": {1: "n_samples"}, "noise": {1: "n_samples"}},
+                               "noise": {1: "n_samples"}},
             ),
         ]
 

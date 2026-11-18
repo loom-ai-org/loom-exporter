@@ -163,6 +163,12 @@ class ModelCard:
     # Markdown rendered as a "Known limitations" section. For anything a user would otherwise discover
     # by getting a wrong answer -- a constraint the export carries that the upstream model does not.
     limitations: Optional[str] = None
+    # The GGUFs in this repo that ABORT on a Raspberry Pi Zero / Pi 1-3 under the default
+    # `device="auto"` with `loom-py-rt` 1.0.0rc20 or earlier: ggml-vc4 fused a cropped view of a padded
+    # convolution (loom.cpp Retro-109, fixed for 1.0.0). Each one measured on the board, unfixed against
+    # fixed. The list is not "the files ADR-081 padded": that guess named three unaffected models and
+    # missed most of these. The card tells the reader the switch that avoids it on those releases.
+    vc4_fuse_off: List[str] = field(default_factory=list)
     # Markdown appended after the usage code block, for a model whose API needs more than the shared
     # per-task snippet can say. Supertonic is the case it exists for: its GGUF embeds one voice and the
     # repo ships nine more as loose files, so "how do I use a different voice" is a real question that
@@ -802,7 +808,7 @@ CATALOG = [
     ),
     # Zipformer small STREAMING (`zipformer_streaming_export`), transducer head, chunk 32 / left 128 (640 ms), run
     # chunk by chunk behind the one-pass door (loom.cpp ADR-097). Measured 2026-11-08 on a loom.cpp main build
-    # (rc21's ARGMAX) against upstream's released `jit_model-chunk-32-left-128.pt` run as `zipformer inference
+    # (1.0.0's ARGMAX) against upstream's released `jit_model-chunk-32-left-128.pt` run as `zipformer inference
     # --streaming 1` runs it, on librispeech_asr_dummy (73 clips, 481 s, upper-cased with punctuation dropped):
     # F32 token-identical on 73/73, WER 12.17% for both; Q8_0 46/73, WER 11.91%. Upstream's table rates this
     # checkpoint 8.15% on LibriSpeech test-clean (16 / 128), against 3.78% for the non-streaming small. 4 threads on
@@ -949,6 +955,7 @@ CATALOG = [
         # (`~/.claude/tmp/sano/work/sweep_all.py`); amy 7.2e-6, heart-nano 3.5e-6, heart 1.1e-5;
         # Whisper word-perfect on amy/heart/heart-nano; Pi Zero W timings on the P4.31 engine.
         slug="sanotts", checkpoint=Path("sanotts"),
+        vc4_fuse_off=["sanotts-heartnano.gguf"],
         export_task="text-to-speech", task_type="text-to-speech", snippet="text-to-speech-voices",
         base_repo="ampixa/sanoTTS", license_id="gpl-3.0",
         language=["en", "ar", "cs", "de", "es", "fr", "id", "it", "pt", "ro", "ru", "tr", "vi", "zh"],
@@ -1039,6 +1046,7 @@ CATALOG = [
     # 57 / 57 / 58 MB, Q8_0_PC 56 / 56 / 54 -- the weights are 1-4 MB of it.
     ModelCard(
         slug="vocetta2-276k", checkpoint=Path("vocetta2-276k"),
+        vc4_fuse_off=["vocetta2-276k-f32.gguf", "vocetta2-276k-q8_0_pc.gguf"],
         export_task="text-to-speech", export_model="vocetta2", task_type="text-to-speech",
         snippet="text-to-speech-lexicon",
         base_repo="VantoraLabs/Vocetta2-276k", license_id="mit", language=["en"],
@@ -1058,6 +1066,7 @@ CATALOG = [
     ),
     ModelCard(
         slug="vocetta2-500k", checkpoint=Path("vocetta2-500k"),
+        vc4_fuse_off=["vocetta2-500k-f32.gguf", "vocetta2-500k-q8_0_pc.gguf"],
         export_task="text-to-speech", export_model="vocetta2", task_type="text-to-speech",
         snippet="text-to-speech-lexicon",
         base_repo="VantoraLabs/Vocetta2-500k", license_id="mit", language=["en"],
@@ -1079,6 +1088,7 @@ CATALOG = [
     ),
     ModelCard(
         slug="vocetta2-1m", checkpoint=Path("vocetta2-1m"),
+        vc4_fuse_off=["vocetta2-1m-f32.gguf", "vocetta2-1m-q8_0_pc.gguf"],
         export_task="text-to-speech", export_model="vocetta2", task_type="text-to-speech",
         snippet="text-to-speech-lexicon",
         base_repo="VantoraLabs/Vocetta2-1m", license_id="mit", language=["en"],
@@ -1146,6 +1156,7 @@ CATALOG = [
     ),
     ModelCard(
         slug="vaniq-edge", checkpoint=Path("vaniq-edge"),
+        vc4_fuse_off=["vaniq-edge-f32.gguf"],      # Q8_0_PC: byte-identical output fixed and unfixed
         export_task="text-to-speech", export_model="vaniq-edge", task_type="text-to-speech",
         snippet="text-to-speech-lexicon-espeak",
         base_repo="Abiray/Vaniq-Edge", license_id="mit", language=["en"],
@@ -1896,6 +1907,7 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
     ),
     ModelCard(
         slug="vits-piper-en-gb-miro",
+        vc4_fuse_off=["vits-piper-en-gb-miro.gguf"],
         checkpoint=Path("/home/flavio/Dev/piper/pipertts_en-GB_miro/epoch=9772-step=1494014.ckpt"),
         export_task="text-to-speech", export_model="vits", task_type="text-to-speech",
         base_repo="OpenVoiceOS/pipertts_en-GB_miro", license_id="other",
@@ -3615,6 +3627,16 @@ def render_readme(card: ModelCard, gguf_name: str, runtime: Optional[Tuple[str, 
         older = "; ".join(o for _, o in features)
         runtime_note += (f"\n**Needs `loom-py-rt` {version} or later.** This file uses {uses}, new in that "
                          f"release: {older}.\n")
+    if card.vc4_fuse_off:
+        named = " and ".join(f"`{name}`" for name in card.vc4_fuse_off)
+        one = len(card.vc4_fuse_off) == 1
+        runtime_note += (
+            f"\n**On a Raspberry Pi Zero or Pi 1-3 with `loom-py-rt` 1.0.0rc20 or earlier, set "
+            f"`GGML_VC4_FUSE=0` before loading {named}.** The GPU backend in those releases aborts on "
+            f"{'this file' if one else 'these files'} under the default `device=\"auto\"` (a `GGML_ASSERT` "
+            f"in `conv_f32_run`). The variable turns off its fusion and the GPU still runs the "
+            f"convolutions; `device=\"cpu\"` also works. `loom-py-rt` 1.0.0 fixes it, and no other "
+            f"machine is affected.\n")
     extra_files_section = "".join(f"- {bullet}\n" for bullet in card.extra_files)
     weights_line = ("Weights are unmodified; this repo packages the same parameters into\n"
                     "loom.cpp's GGUF format.")
@@ -3764,7 +3786,7 @@ def build_one(card: ModelCard, models_root: Path, output_dir: Path, readme_only:
 OP_FIRST_RUNTIME = {
     "STFT": "1.0.0rc18",   # ADR-080
     "ISTFT": "1.0.0rc18",  # ADR-080
-    "ARGMAX": "1.0.0rc21", # P4.53: Zipformer's joint reduces its logits in the graph
+    "ARGMAX": "1.0.0",     # P4.53: Zipformer's joint reduces its logits in the graph
 }
 
 
