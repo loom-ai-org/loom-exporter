@@ -78,6 +78,11 @@ class DrivenTopologies:
             "same: compared against the body's own argument table by `drives_mismatches`, and against "
             "each expanded topology's declared inputs by the caller's TopologyInput link"
         ),
+        "more": Unchecked(
+            "further (suffixes, inputs) groups, checked exactly as the first: each group's suffixes against "
+            "the literals the body concatenates and each call's input table against its own group "
+            "(`drives_mismatches`), and every expanded topology against the export (`HelperCall.expand`)"
+        ),
     }
 
     def groups(self) -> Tuple[Tuple[Tuple[str, ...], Tuple[str, ...]], ...]:
