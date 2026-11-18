@@ -31,8 +31,10 @@ from loom_exporter.registry import default_registry
 #
 # sanoTTS's two lines take phonemes too: Piper's espeak IPA (piperlite) and misaki's (nano), each declaring
 # its conventions as `tts.phoneme_style` (loom.cpp ADR-071). Vocetta2 is the nano line re-trained: misaki's.
+#
+# tiny-voca reads dizione's phonemes, with stress as part of each id (loom.cpp ADR-133).
 PHONEME_INPUT = {"kokoro", "matcha", "styletts2", "vits", "sanotts", "sanotts-nano", "vocetta2", "vaniq-edge",
-                 "vits-upstream", "auroratts"}
+                 "vits-upstream", "auroratts", "tiny-voca"}
 # ...and the ones that do not. Supertonic encodes graphemes itself and its GGUF carries the codepoint
 # table, so `"vocab"` is the true answer for it and the wrong one for the four above. Here so the rule
 # cannot be satisfied by declaring `"phonemes"` everywhere, which would refuse them a real door.
