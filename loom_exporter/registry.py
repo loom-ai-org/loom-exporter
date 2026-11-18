@@ -216,6 +216,7 @@ _FAMILY_MODULES = (
     "dia_export",
     "qwen3_tts_export",
     "omnivoice_export",
+    "plamo_export",
     "t5_export",
     "f5_tts_export",
     "chatterbox_export",
