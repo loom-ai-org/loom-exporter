@@ -4,6 +4,7 @@ STFT pair as convolutions with constant kernels. None needs the checkpoint or up
 formulas are copied from `training/scripts/vhead.py` (`sine_bank`) and `torch.stft`/`istft` is the
 reference the head's `torch.stft` calls are."""
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -88,3 +89,39 @@ def test_the_convolution_stft_pair_is_torchs(n, hop):
     got = _SynthWrapper._istft(re * gain, im * gain, inv, w2, n, hop)
     assert got.shape == want.shape
     assert (got - want).abs().max() < 1e-4
+
+
+def test_the_closed_form_is_the_64_row_sine_bank():
+    """`_SynthWrapper._harmonics`: upstream's sum of up to 64 sines with its 11 kHz mute and voicing, as one
+    closed form, in float32 against upstream's own sum in float64. Low voices (many harmonics), high ones
+    (few: 11000 / 500 Hz leaves 21), and unvoiced frames."""
+    frames = 1500
+    t = torch.arange(frames, dtype=torch.float64)
+    f0 = 140 + 60 * torch.sin(t / 23) + 30 * torch.sin(t / 4.1)
+    f0[100:200] = 60 + 0 * f0[100:200]
+    f0[400:450] = 520 + 0 * f0[400:450]
+    f0[300:340] = 0.0
+    want, cyc = _upstream_sine_bank(f0[None])
+    k = torch.arange(1, 65, dtype=torch.float32)[:, None]
+    host = SimpleNamespace(k=k, ones_k=torch.ones(1, 64), ones_hop=torch.ones(1, FRAME_HOP))
+    got = _SynthWrapper._harmonics(host, f0.float(), cyc.float()).double() * 0.1
+    # The 64-row sum in float32, for scale: what the graph computed before the closed form.
+    f0s = f0.float().repeat_interleave(FRAME_HOP)
+    rows = ((k * f0s[None] < 11000) & (f0s[None] > 10)).float()
+    direct = ((torch.sin((2 * torch.pi * k) * cyc.float()[None]) * rows).sum(0) * 0.1).double()
+    err, err_direct = (got - want[0]).abs().max().item(), (direct - want[0]).abs().max().item()
+    print(f"closed form {err:.2e}, 64-row f32 {err_direct:.2e}, peak {want.abs().max():.2f}")
+    assert got.shape == want[0].shape
+    # Measured: 1.5e-4 against the 64-row float32 sum's 2.7e-4 (peak 4.7): no worse than what it replaced.
+    assert err < 2e-4 and err <= err_direct, (err, err_direct)
+
+
+def test_the_closed_form_is_finite_where_its_denominator_vanishes():
+    """Theta = 0 exactly (a whole number of cycles: the first sample after a voiced frame starts at
+    phase 0, or any wrapped integer) is 0/0 in the bare form; the sum there is 0."""
+    k = torch.arange(1, 65, dtype=torch.float32)[:, None]
+    host = SimpleNamespace(k=k, ones_k=torch.ones(1, 64), ones_hop=torch.ones(1, FRAME_HOP))
+    cyc = torch.zeros(FRAME_HOP)
+    cyc[1::2] = 1.0
+    got = _SynthWrapper._harmonics(host, torch.tensor([150.0]), cyc)
+    assert torch.isfinite(got).all() and got.abs().max() == 0

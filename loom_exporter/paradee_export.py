@@ -186,8 +186,6 @@ class _SynthWrapper(nn.Module):
             self.register_buffer(f"{name}_w2", w2)
         k = torch.arange(1, h.K + 1).float()[:, None]                         # [K, 1]
         self.register_buffer("k", k)
-        # `2 * torch.pi * self.k` as upstream evaluates it (left to right, a float32 tensor times a double).
-        self.register_buffer("k2pi", 2 * torch.pi * k)
         # Frequency of every main-STFT bin, `torch.linspace(0, SR / 2, nb)`, as a column.
         self.register_buffer("fr", torch.linspace(0, SAMPLE_RATE / 2, h.nb)[:, None].contiguous())
         self.register_buffer("ramp", phase_ramp().float())
@@ -206,6 +204,23 @@ class _SynthWrapper(nn.Module):
         y = F.conv_transpose1d(torch.cat([re, im], 0)[None], inv, stride=hop)[0, 0]
         env = F.conv_transpose1d(re[:1][None] * 0.0 + 1.0, w2, stride=hop)[0, 0]
         return (y / env.clamp_min(1e-8))[n // 2: -(n // 2)]
+
+    def _harmonics(self, f0, cyc):
+        """`sum_{k=1}^{K} sin(2 pi k cyc)` per sample, K the harmonics under 11 kHz (none where unvoiced):
+        upstream's sine bank without its 64 rows. K is upstream's own test (`k * f0 < 11000`, and `f0 > 10`)
+        counted per F0 frame, which is the same for every sample of the frame; the sum is the closed form
+        `sin(K t/2) sin((K+1) t/2) / sin(t/2)`. Theta is CENTRED in [-pi, pi]: the form is 2 pi periodic,
+        and its denominator then vanishes only at theta = 0, where the numerator does too (the guard makes
+        that 0/1, not 0/0). Measured against upstream's sum in float64 on a 1500-frame curve (2026-11-18,
+        the CI test): 1.5e-4 at most on a 4.7 peak, where the 64-row sum in float32 was 2.7e-4 -- the
+        closed form rounds fewer terms. The [64, samples] SIN, outer product and reduction it replaces
+        were ~15% of a profiled dev-box synthesis."""
+        K = (self.ones_k @ ((self.k @ f0[None]) < 11000.0).float())[0] * (f0 > 10.0).float()
+        Ks = (K[:, None] @ self.ones_hop).reshape(-1)
+        half = torch.pi * (cyc - torch.floor(cyc + 0.5))
+        den = torch.sin(half)
+        tiny = (den.abs() < 1e-7).float()
+        return torch.sin(Ks * half) * torch.sin((Ks + 1.0) * half) / (den + tiny)
 
     def forward(self, asr, f0, n, style, phase, noise, noise_rev):
         # The layouts Kokoro's decoder takes, which are what the retained F0/N projections and the
@@ -253,8 +268,7 @@ class _SynthWrapper(nn.Module):
         cyc = (phase @ self.ramp).reshape(-1)[FRAME_HOP // 2: -(FRAME_HOP // 2)]   # [S], cycles
         f0s = (f0[:, None] @ self.ones_hop).reshape(-1)                           # each F0 frame's value
         uv = (f0s > 10.0).float()
-        amp = ((self.k @ f0s[None]) < 11000.0).float() * uv[None]                   # [K, S]
-        e = (self.ones_k @ (torch.sin(self.k2pi @ cyc[None]) * amp))[0] * 0.1
+        e = self._harmonics(f0, cyc) * 0.1
         n_fft, hop = self.n_fft, self.hop
         Er, Ei = self._stft(e, self.main_fwd, n_fft, hop)
         Nr, Ni = self._stft(noise, self.main_fwd, n_fft, hop)
