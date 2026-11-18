@@ -1966,10 +1966,11 @@ class HelperCall:
             # message the one a reader sees instead of an AttributeError from underneath it.
             return []
         return [
-            RunSubgraphCall(topology=topology, inputs=tuple(driven.inputs),
+            RunSubgraphCall(topology=f"{namespace}{suffix}", inputs=tuple(inputs),
                             line=self.line, origin=f"{self.origin} via {self.helper}")
             for namespace in self.names()
-            for topology in driven.topologies(namespace)
+            for suffixes, inputs in driven.groups()
+            for suffix in suffixes
         ]
 
 

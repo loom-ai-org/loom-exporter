@@ -253,6 +253,12 @@ class RecurrentPhase:
     # family says so once, instead of the driver restating `topologies()`'s rule in Lua and getting it
     # wrong for whichever depth it was not written against.
     number_layers: bool = False
+    # Take the input half of every gate out of the sweep (ADR-137): `{name}_input` computes `W_ih x + b`
+    # for the whole sequence in one product per direction, and the cells add only `W_hh h`. Needs the
+    # caller's sweep to read a sequence per direction (`run_bi_lstm`, `loom.run_bi_recurrent_pair_and_
+    # retain`), and a single layer -- a stack's next layer's input exists only inside the sweep. Off by
+    # default: a sweep of one step (Silero's streaming LSTM) would only gain a graph.
+    project_input: bool = False
 
     __unchecked__ = {
         "name": Unchecked(
@@ -276,6 +282,11 @@ class RecurrentPhase:
             "the dummy sequence length. A cell topology has no time axis, so this cannot affect the "
             "result -- it only has to be long enough for coremltools to build an lstm op at all"
         ),
+        "project_input": Unchecked(
+            "a choice of how this phase's topologies split the work, checked where it can be wrong: "
+            "`topologies()` refuses it for a GRU or a stack, and the caller's driver either drives "
+            "`{name}_input` (run_bi_lstm declares it) or fails the export at `check_subgraph_calls`"
+        ),
         "number_layers": Unchecked(
             "a naming choice for the topologies this phase CREATES, in the same category as `name` -- "
             "it does not refer to anything, so there is nothing to disagree with it. What checks it is "
@@ -295,6 +306,9 @@ class RecurrentPhase:
         # A GRU is read off the module, not traced: it reaches MIL as an unrolled loop with no op to
         # read (recurrent.py's docstring). Same names, same `_fwd`/`_bwd` pair, one cell shape smaller.
         if isinstance(self.module, torch.nn.GRU):
+            if self.project_input:
+                raise NotImplementedError(f"RecurrentPhase({self.name!r}): project_input is built for LSTM "
+                                          f"cells only; a GRU's would split `W_ih x + b_ih` the same way")
             stem = f"{self.name}_l0" if self.number_layers else self.name
             result = build_gru_cell_topologies(self.module, weight_namespace=f"{stem}.")
             topologies = {f"{stem}_fwd": result["forward"]}
@@ -336,7 +350,13 @@ class RecurrentPhase:
             # is untouched by stacks existing. A stack numbers its layers because it has to, and a phase
             # whose driver indexes the layers asks for numbering regardless of depth (`number_layers`).
             stem = self.name if len(ops) == 1 and not self.number_layers else f"{self.name}_l{layer}"
-            result = build_lstm_cell_topologies(op, weight_namespace=f"{stem}.")
+            if self.project_input and len(ops) != 1:
+                raise NotImplementedError(f"RecurrentPhase({self.name!r}): project_input on a {len(ops)}-layer "
+                                          f"stack; only layer 0's input exists before the sweep")
+            result = build_lstm_cell_topologies(op, weight_namespace=f"{stem}.",
+                                                project_input=self.project_input)
+            if result["input"] is not None:
+                topologies[f"{stem}_input"] = result["input"]
             # ONE topology per direction, declaring both `h_new` and `c_new` -- see
             # `_lstm_cell_topology` for why it used to be two and what running both cost. The names lose
             # their `_h`/`_c` half accordingly: `<stem>_fwd`, `<stem>_bwd`.
