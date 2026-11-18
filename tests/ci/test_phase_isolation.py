@@ -276,6 +276,34 @@ def test_a_family_keep_float_reaches_every_phase(tmp_path, monkeypatch, isolate)
 
 
 @pytest.mark.parametrize("isolate", [False, True])
+def test_a_float_phase_keeps_every_weight_it_holds(tmp_path, monkeypatch, isolate):
+    """`float_phases` (Paradee's ALBERT, ADR-135): one phase converts unquantized, the others as asked,
+    and a name that is no phase is refused rather than ignored."""
+    pytest.importorskip("coremltools")
+    from gguf import GGUFReader
+
+    checkpoint = aligned_t5(tmp_path)
+    plain = _export(checkpoint, tmp_path / "all.gguf", quantize="Q8_0", isolate_phases=isolate)
+    quantized = {t.name for t in GGUFReader(str(plain)).tensors if t.tensor_type.name == "Q8_0"}
+    phases = sorted({n.split(".")[0] for n in quantized})
+    assert len(phases) >= 2, phases
+    floated = phases[0]
+
+    base = Text2TextT5ExportConfig.backend_kwargs
+    monkeypatch.setattr(Text2TextT5ExportConfig, "backend_kwargs",
+                        lambda self: dict(base(self), float_phases=(floated,)))
+    kept = _export(checkpoint, tmp_path / "kept.gguf", quantize="Q8_0", isolate_phases=isolate)
+    types = {t.name: t.tensor_type.name for t in GGUFReader(str(kept)).tensors}
+    assert all(types[n] == "F32" for n in quantized if n.startswith(floated + "."))
+    assert all(types[n] == "Q8_0" for n in quantized if not n.startswith(floated + "."))
+
+    monkeypatch.setattr(Text2TextT5ExportConfig, "backend_kwargs",
+                        lambda self: dict(base(self), float_phases=("no_such_phase",)))
+    with pytest.raises(ValueError, match="no_such_phase"):
+        _export(checkpoint, tmp_path / "typo.gguf", quantize="Q8_0", isolate_phases=isolate)
+
+
+@pytest.mark.parametrize("isolate", [False, True])
 def test_quantize_gathered_reaches_every_phase(tmp_path, monkeypatch, isolate):
     """A table read only through GET_ROWS stays F32 under `quantize`, and a family's
     `quantize_gathered` makes it eligible -- in the phase that holds it, in-process and in a worker,

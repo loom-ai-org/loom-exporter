@@ -73,7 +73,29 @@ def _require_activation(op, key, expected: str, op_label: str) -> None:
         )
 
 
-def _lstm_cell_topology(hidden_dim: int, input_dim: int, weight_prefix: str) -> dict:
+def _lstm_input_topology(input_dim: int, hidden_dim: int, weight_prefixes) -> dict:
+    """The input half of every gate, for a whole sequence at once (ADR-137): `sequence` is `[I, T]` (one row
+    per timestep, `n_tokens` of them) and each direction's output is `W_ih x + b`, `[4H, T]`, in
+    `weight_prefixes`' order (forward, then backward). A PROJECTED cell (`_lstm_cell_topology(...,
+    projected=True)`) then reads one row of it per step and adds only `W_hh h`.
+
+    The bias goes here, beside `W_ih x`, where it is one broadcast ADD over the sequence instead of one per
+    step. The sum is therefore `(W_ih x + b) + W_hh h` where the unprojected cell computed
+    `(W_ih x + W_hh h) + b`: the same terms, in another order, so the result moves by float32 rounding."""
+    nodes, outputs = [], []
+    for k, prefix in enumerate(weight_prefixes):
+        nodes.append({"op": "MUL_MAT", "inputs": [f"{prefix}weight_ih", "sequence"], "outputs": [f"x_{k}"]})
+        nodes.append({"op": "ADD", "inputs": [f"x_{k}", f"{prefix}bias"], "outputs": [f"gates_{k}"]})
+        outputs.append(f"gates_{k}")
+    return {
+        "version": 1,
+        "inputs": [{"name": "sequence", "dtype": "f32", "shape": [str(input_dim), "n_tokens"]}],
+        "outputs": outputs,
+        "nodes": nodes,
+    }
+
+
+def _lstm_cell_topology(hidden_dim: int, input_dim: int, weight_prefix: str, projected: bool = False) -> dict:
     """One LSTM cell step, gate order [i, f, o, z] (MIL's own `lstm` op convention -- see module
     docstring), single pre-summed `weight_prefix + 'bias'`.
 
@@ -91,19 +113,27 @@ def _lstm_cell_topology(hidden_dim: int, input_dim: int, weight_prefix: str) -> 
     for a caller threading the cell state onward."""
     h = hidden_dim
     f32 = 4
+    # A projected cell's `layer_input` is its row of `_lstm_input_topology`'s output: `W_ih x + b`, already
+    # the gate block's width. It adds only the recurrent half.
+    head = ([
+        {"op": "MUL_MAT", "inputs": [f"{weight_prefix}weight_hh", "h_prev"], "outputs": ["gates_h"]},
+        {"op": "ADD", "inputs": ["layer_input", "gates_h"], "outputs": ["gates"]},
+    ] if projected else [
+        {"op": "MUL_MAT", "inputs": [f"{weight_prefix}weight_ih", "layer_input"], "outputs": ["gates_x"]},
+        {"op": "MUL_MAT", "inputs": [f"{weight_prefix}weight_hh", "h_prev"], "outputs": ["gates_h"]},
+        {"op": "ADD", "inputs": ["gates_x", "gates_h"], "outputs": ["gates_sum"]},
+        {"op": "ADD", "inputs": ["gates_sum", f"{weight_prefix}bias"], "outputs": ["gates"]},
+    ])
     return {
         "version": 1,
         "inputs": [
-            {"name": "layer_input", "dtype": "f32", "shape": [str(input_dim)]},
+            {"name": "layer_input", "dtype": "f32", "shape": [str(4 * h if projected else input_dim)]},
             {"name": "h_prev", "dtype": "f32", "shape": [str(h)]},
             {"name": "c_prev", "dtype": "f32", "shape": [str(h)]},
         ],
         "outputs": ["h_new", "c_new"],
         "nodes": [
-            {"op": "MUL_MAT", "inputs": [f"{weight_prefix}weight_ih", "layer_input"], "outputs": ["gates_x"]},
-            {"op": "MUL_MAT", "inputs": [f"{weight_prefix}weight_hh", "h_prev"], "outputs": ["gates_h"]},
-            {"op": "ADD", "inputs": ["gates_x", "gates_h"], "outputs": ["gates_sum"]},
-            {"op": "ADD", "inputs": ["gates_sum", f"{weight_prefix}bias"], "outputs": ["gates"]},
+            *head,
             {"op": "VIEW", "inputs": ["gates"], "outputs": ["i_pre"], "attrs": {"shape": [h], "offset": 0 * h * f32}},
             {"op": "VIEW", "inputs": ["gates"], "outputs": ["f_pre"], "attrs": {"shape": [h], "offset": 1 * h * f32}},
             {"op": "VIEW", "inputs": ["gates"], "outputs": ["o_pre"], "attrs": {"shape": [h], "offset": 2 * h * f32}},
@@ -121,7 +151,7 @@ def _lstm_cell_topology(hidden_dim: int, input_dim: int, weight_prefix: str) -> 
     }
 
 
-def build_lstm_cell_topologies(op, weight_namespace: str) -> dict:
+def build_lstm_cell_topologies(op, weight_namespace: str, project_input: bool = False) -> dict:
     """`op` is a MIL `lstm` Operation. `weight_namespace` prefixes every weight tensor name this produces
     (avoids collisions across multiple LSTM instances sharing one GGUF, the same convention
     `write_bilstm_ggufs` uses per-instance today). Returns:
@@ -152,7 +182,7 @@ def build_lstm_cell_topologies(op, weight_namespace: str) -> dict:
         weights[f"{prefix}weight_ih"] = np.asarray(ih, dtype=np.float32)
         weights[f"{prefix}weight_hh"] = np.asarray(hh, dtype=np.float32)
         weights[f"{prefix}bias"] = np.asarray(bias, dtype=np.float32)
-        return _lstm_cell_topology(hidden_dim, input_dim, prefix)
+        return _lstm_cell_topology(hidden_dim, input_dim, prefix, projected=project_input)
 
     forward_topos = _register_direction(
         "fwd.", op.inputs["weight_ih"].val, op.inputs["weight_hh"].val,
@@ -169,6 +199,7 @@ def build_lstm_cell_topologies(op, weight_namespace: str) -> dict:
             _val(op, "bias_back", np.zeros(4 * hidden_dim, dtype=np.float32)),
         )
 
+    prefixes = [f"{weight_namespace}fwd."] + ([f"{weight_namespace}bwd."] if bidirectional else [])
     return {
         "hidden_dim": hidden_dim,
         "input_dim": input_dim,
@@ -176,6 +207,8 @@ def build_lstm_cell_topologies(op, weight_namespace: str) -> dict:
         "bidirectional": bidirectional,
         "forward": forward_topos,
         "backward": backward_topos,
+        # The sequence's input projection, when the cells are projected (ADR-137); None otherwise.
+        "input": _lstm_input_topology(input_dim, hidden_dim, prefixes) if project_input else None,
         "weights": weights,
     }
 

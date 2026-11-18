@@ -256,6 +256,22 @@ def upstream_package(module: str, env: str, src: str = "") -> Callable[[], Optio
     return check
 
 
+def paradee_scripts() -> Optional[str]:
+    """`export_requires` for Paradee: upstream's training scripts (a clone `LOOM_PARADEE_REPO` names) and the
+    `kokoro` package they build their modules from."""
+    import importlib.util
+    import os
+
+    from loom_exporter.paradee_export import DEFAULT_REPO
+
+    repo = Path(os.environ.get("LOOM_PARADEE_REPO", DEFAULT_REPO))
+    if not (repo / "training" / "scripts" / "student.py").is_file():
+        return f"no Paradee training scripts under {repo}: set LOOM_PARADEE_REPO to a clone of its repository"
+    if importlib.util.find_spec("kokoro") is None:
+        return "no `kokoro` package (pip install kokoro): Paradee's modules are Kokoro's"
+    return None
+
+
 def pocket_tts_reference(minimum: str, maximum: Optional[str] = None) -> Callable[[], Optional[str]]:
     """`export_requires` for a Pocket-TTS card: the reference checkout `LOOM_POCKET_TTS_REPO` names
     (default the v3.2.0 clone) must have a version in [minimum, maximum]."""
@@ -1152,6 +1168,57 @@ CATALOG = [
             "phonemes each). The stream yields one piece per sentence, each peak-limited on its own.\n\n"
             "**Precision.** The engine's waveform is within 2.6e-3 of upstream's (f32); its STFTs are "
             "convolutions summed in float32 where upstream runs FFTs."
+        ),
+    ),
+    # sahilmahendrakar/Paradee-8M-v1.3: Kokoro-82M distilled to 7.88M parameters, eight of its voices in four
+    # languages, Apache-2.0 (loom_exporter/paradee_export.py, loom.cpp ADR-135). Measured 2026-11-18 against
+    # upstream's own training code (`TextStudent` + `VDecoder`, torch.stft head) on all eight voices: every
+    # duration upstream's, 55.9-67.2 dB SNR -- upstream's own f32 noise (the synth graph at f64 agrees to
+    # 111 dB). WER: whisper-small through the door -- the native front ends (misaki; Paradee's G2P), the fold,
+    # and the fold with misaki's lexicon -- 20 held-out English sentences (10 for bf_isabella), 15 each in
+    # French, Spanish and Hindi (ADR-135's table).
+    ModelCard(
+        slug="paradee-8m", checkpoint=Path("paradee-8m-v1.3"),
+        export_requires=paradee_scripts,
+        export_task="text-to-speech", export_model="paradee", task_type="text-to-speech",
+        snippet="text-to-speech-kokoro",
+        copied_files=_VOCETTA2_LEXICON + [("lexicons/en_GB-misaki.tsv", "sanotts-lexicons/en_GB-misaki.tsv")],
+        extra_files=[
+            "`lexicons/en_US-misaki.tsv`, `lexicons/en_GB-misaki.tsv` -- [hexgrad/misaki](https://github.com/hexgrad/misaki)'s "
+            "US and British pronunciation dictionaries (`<region>_gold.json` over `<region>_silver.json`, each word's "
+            "default reading; loom-exporter `tools/misaki_lexicon.py`), Apache-2.0 (`lexicons/LICENSE.misaki`), as "
+            "`word<TAB>ipa`: what the door's English falls back on when misaki is not installed.",
+        ],
+        base_repo="sahilmahendrakar/Paradee-8M-v1.3", license_id="apache-2.0", language=["en", "hi", "fr", "es"],
+        sample_rate=24000,
+        title="Paradee-8M v1.3",
+        variants=[
+            ("F32", "full precision, 34.6 MB; every duration upstream's, the waveform 56-67 dB from it."),
+            ("Q8_0_PC", "19.5 MB: the projections and convolutions after ALBERT (60% of the weight bytes) in "
+                        "per-channel int8; ALBERT stays F32, without which English reads at 35% word error rate. "
+                        "Whisper small hears it as it hears F32 (the table under Limitations)."),
+        ],
+        summary="sahilmahendrakar's Paradee 1.3: Kokoro-82M distilled into a 7.88M-parameter TTS with eight of "
+                "its voices in English, Hindi, French and Spanish, and a frame-rate source-filter head in place "
+                "of Kokoro's vocoder, at 24 kHz, exported for loom.cpp.",
+        limitations=(
+            "**The text door wants the model's own front ends.** Upstream phonemizes English with misaki and "
+            "Hindi, French and Spanish with Paradee's own G2P; with them installed the door is them. Without "
+            "them, orthography2ipa's IPA is folded to the same conventions, punctuation kept, and English needs "
+            "the misaki lexicon this repo ships (`lexicons/`, set with `loom.phonemizers.set_lexicon`). Whisper "
+            "small's word error rate:\n\n"
+            "| voice | own front end | fold + lexicon | fold alone |\n|---|---|---|---|\n"
+            "| af_heart (en-US) | 3.7% | 8.9% | 28.2% |\n| bf_isabella (en-GB) | 4.5% | 17.1% | 37.2% |\n"
+            "| ff_siwis (fr) | 2.8% | -- | 6.4% |\n| em_alex (es) | 1.1% | -- | 1.1% |\n"
+            "| hf_alpha (hi) | 13.0% | -- | 20.6% |\n\n"
+            "(20 held-out English sentences, 15 per other language; F32. Q8_0_PC reads the same, Hindi 15.3%.)\n\n"
+            "**The voice picks the language** (`voice=\"ff_siwis\"` reads French) unless `language=` names "
+            "another. Choosing a voice by name needs `loom-py-rt` 1.0.0.\n\n"
+            "**A sentence at a time.** Like upstream, a text is spoken one sentence per pass (at most 510 "
+            "phonemes each), and the stream yields one piece per sentence.\n\n"
+            "**Precision.** The engine's waveform is 56-67 dB from upstream's (f32): its STFTs are convolutions "
+            "summed in float32 where upstream runs FFTs. Upstream draws its noise unseeded; `seed=` makes a "
+            "synthesis repeatable."
         ),
     ),
     ModelCard(
@@ -2893,6 +2960,24 @@ audio.save("hello.wav")
 for piece in model.text2speech.stream("She had never seen the sea before. She stood there a long while."):
     print(len(piece.samples))
 """,
+    # Paradee's door (loom.cpp ADR-135): Kokoro's own front ends when installed, the voice picking the language.
+    "text-to-speech-kokoro": """import loom
+
+# The model's own front ends, as upstream runs it: misaki for English (pip install "misaki[en]") and
+# Paradee's G2P for Hindi, French and Spanish (pip install git+https://github.com/sahilmahendrakar/paradee).
+# Without them the door falls back to orthography2ipa, which reads worse.
+model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
+print(model.voices)   # af_heart (the default), bf_isabella, am_puck, bm_fable, hf_alpha, hm_omega, ff_siwis, em_alex
+model.text2speech.infer("Paradee is a small voice that runs anywhere.").save("hello.wav")
+
+# The voice picks the language, as upstream's does:
+model.text2speech.infer("Il fait très beau aujourd'hui.", voice="ff_siwis").save("bonjour.wav")
+model.text2speech.infer("La biblioteca abre a las nueve.", voice="em_alex", speed=1.1).save("hola.wav")
+
+# A sentence at a time, as it is spoken:
+for piece in model.text2speech.stream("It was the best of times. It was the worst of times.", voice="bm_fable"):
+    print(len(piece.samples))
+""",
     "text-to-speech-lexicon-espeak": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
@@ -3600,8 +3685,10 @@ def render_readme(card: ModelCard, gguf_name: str, runtime: Optional[Tuple[str, 
     needs_phonemes = card.task_type == "text-to-speech" and not card.takes_text
     install_extras = "hub,phonemes" if needs_phonemes else "hub"
     # The note describes orthography2ipa as THE front end, which is wrong for a model whose door runs
-    # its own (tiny-voca's dizione, ADR-133): there the fallback is stated in the card's limitations.
-    phonemizer_note = PHONEMIZER_NOTE if needs_phonemes and card.snippet != "text-to-speech-dizione" else ""
+    # its own (tiny-voca's dizione, ADR-133; Paradee's misaki and G2P, ADR-135): there the fallback is
+    # stated in the card's limitations.
+    phonemizer_note = (PHONEMIZER_NOTE if needs_phonemes
+                       and card.snippet not in ("text-to-speech-dizione", "text-to-speech-kokoro") else "")
     # `pip install -U` reaches the newest runtime, but a reader who already has an older one pinned
     # meets the file before they meet the error; the error names the op and not the release.
     runtime_note = ""
@@ -3838,6 +3925,17 @@ def _declares_style(style: str):
     return check
 
 
+def _sweeps_projected_lstms(fields) -> bool:
+    """A driver whose BiLSTMs read their input projections (ADR-137): `loom.run_bi_recurrent_pair_and_retain`."""
+    field = fields.get("model.driver_script")
+    return field is not None and b"run_bi_recurrent_pair_and_retain" in bytes(field.parts[field.data[0]])
+
+
+def _declares_voice_rows(fields) -> bool:
+    """Voices the file carries and picks by row, with each one's language (`loom.tts.voice_languages`)."""
+    return "loom.tts.voice_languages" in fields
+
+
 def _declares_quiet_split(fields) -> bool:
     """A family-3 file whose long audio `transcribe` cuts at quiet points (`loom.asr.split_*`)."""
     return "loom.asr.split_max_samples" in fields
@@ -3861,6 +3959,15 @@ FEATURE_FIRST_RUNTIME = [
     (_declares_quiet_split, "1.0.0rc20", "long audio cut at quiet points into pieces it decodes one at a time",
      "an older engine decodes the clip in one pass, which this file's cache holds only for short audio "
      "-- past it, the call stops with an error naming `loom.kv_cache_size`"),
+    (_declares_style("kokoro"), "1.0.0", "the text door's `kokoro` phoneme style (Kokoro's own G2P conventions)",
+     "an older loom-py refuses text with `unknown phoneme style 'kokoro'` (`phonemes=` and `tokens=` still "
+     "work)"),
+    (_sweeps_projected_lstms, "1.0.0", "BiLSTMs whose input half is one product before the sweep",
+     "an older engine stops with `attempt to call a nil value (field 'run_bi_recurrent_pair_and_retain')`"),
+    (_declares_voice_rows, "1.0.0", "choosing one of the file's voices by name (`voice=\"bf_isabella\"`), "
+     "and the G2P language following it",
+     "an older loom-py looks for a voice file of that name and fails; without `voice=` the file speaks its "
+     "first voice"),
     (_driver_samples_untempered, "1.0.0rc20", "the sampler's untempered top-k/top-p and dropped crossing id",
      "an older engine ignores both options and samples with `transformers'` truncation instead -- it "
      "still speaks, from a slightly different distribution"),

@@ -1136,13 +1136,14 @@ def build_prosody_phases(text_encoder, predictor) -> List:
 
     # DurationEncoder alternates LSTM / AdaLayerNorm, so its three LSTMs are `lstms[0, 2, 4]` and the
     # AdaLayerNorms between them `lstms[1, 3, 5]`.
+    # Every one projected (ADR-137): `run_bi_lstm` runs `<name>_input` before each sweep.
     phases = [
-        RecurrentPhase(name="text_encoder_lstm", module=text_encoder.lstm),
-        RecurrentPhase(name="top_lstm", module=predictor.lstm),
-        RecurrentPhase(name="f0n_shared_lstm", module=predictor.shared),
+        RecurrentPhase(name="text_encoder_lstm", module=text_encoder.lstm, project_input=True),
+        RecurrentPhase(name="top_lstm", module=predictor.lstm, project_input=True),
+        RecurrentPhase(name="f0n_shared_lstm", module=predictor.shared, project_input=True),
     ]
     phases += [
-        RecurrentPhase(name=f"duration_lstm_{i}", module=predictor.text_encoder.lstms[idx])
+        RecurrentPhase(name=f"duration_lstm_{i}", module=predictor.text_encoder.lstms[idx], project_input=True)
         for i, idx in enumerate((0, 2, 4))
     ]
 
