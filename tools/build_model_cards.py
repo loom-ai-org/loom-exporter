@@ -3925,6 +3925,12 @@ def _declares_style(style: str):
     return check
 
 
+def _sweeps_projected_lstms(fields) -> bool:
+    """A driver whose BiLSTMs read their input projections (ADR-137): `loom.run_bi_recurrent_pair_and_retain`."""
+    field = fields.get("model.driver_script")
+    return field is not None and b"run_bi_recurrent_pair_and_retain" in bytes(field.parts[field.data[0]])
+
+
 def _declares_voice_rows(fields) -> bool:
     """Voices the file carries and picks by row, with each one's language (`loom.tts.voice_languages`)."""
     return "loom.tts.voice_languages" in fields
@@ -3956,6 +3962,8 @@ FEATURE_FIRST_RUNTIME = [
     (_declares_style("kokoro"), "1.0.0", "the text door's `kokoro` phoneme style (Kokoro's own G2P conventions)",
      "an older loom-py refuses text with `unknown phoneme style 'kokoro'` (`phonemes=` and `tokens=` still "
      "work)"),
+    (_sweeps_projected_lstms, "1.0.0", "BiLSTMs whose input half is one product before the sweep",
+     "an older engine stops with `attempt to call a nil value (field 'run_bi_recurrent_pair_and_retain')`"),
     (_declares_voice_rows, "1.0.0", "choosing one of the file's voices by name (`voice=\"bf_isabella\"`), "
      "and the G2P language following it",
      "an older loom-py looks for a voice file of that name and fails; without `voice=` the file speaks its "

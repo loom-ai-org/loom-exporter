@@ -62,6 +62,9 @@ class DrivenTopologies:
 
     suffixes: Tuple[str, ...]
     inputs: Tuple[str, ...]
+    # Further `(suffixes, inputs)` groups, for a function driving topologies whose inputs differ: a
+    # projected BiLSTM runs `<ns>_input` (the input projection, `sequence` in) before its cells (ADR-137).
+    more: Tuple[Tuple[Tuple[str, ...], Tuple[str, ...]], ...] = ()
 
     __unchecked__ = {
         "suffixes": Unchecked(
@@ -77,8 +80,15 @@ class DrivenTopologies:
         ),
     }
 
+    def groups(self) -> Tuple[Tuple[Tuple[str, ...], Tuple[str, ...]], ...]:
+        """Every `(suffixes, inputs)` group, the first being `suffixes`/`inputs` themselves."""
+        return ((tuple(self.suffixes), tuple(self.inputs)),) + tuple(self.more)
+
+    def all_suffixes(self) -> Tuple[str, ...]:
+        return tuple(s for suffixes, _ in self.groups() for s in suffixes)
+
     def topologies(self, namespace: str) -> Tuple[str, ...]:
-        return tuple(f"{namespace}{suffix}" for suffix in self.suffixes)
+        return tuple(f"{namespace}{suffix}" for suffix in self.all_suffixes())
 
 
 @dataclass(frozen=True)
@@ -173,7 +183,8 @@ _FUNCTIONS = (
     # here is arithmetic over Lua tables.
     LuaFunction("run_bi_lstm", drives=DrivenTopologies(
         suffixes=("_fwd", "_bwd"),
-        inputs=("layer_input", "h_prev", "c_prev"))),
+        inputs=("layer_input", "h_prev", "c_prev"),
+        more=((("_input",), ("sequence",)),))),
     # None of the three requires a layout converter any more. They chained through Lua until the blocks
     # and the projection started referencing each other's retained outputs; `run_resblk_stack` still
     # converted its CALLER's rows on the way in, because a BiLSTM's two directions were interleaved
@@ -258,20 +269,25 @@ def drives_mismatches() -> Dict[str, list]:
             complaints.append("declares `drives` but its body never drives a topology by name "
                                f"(looked for {sorted(_DRIVING_BINDINGS)})")
         literals = sorted({lit for site in sites for lit in site[0]})
-        for suffix in fn.drives.suffixes:
+        for suffix in fn.drives.all_suffixes():
             if not any(suffix.startswith(lit) for lit in literals) and (literals or suffix):
                 complaints.append(
                     f"declares suffix {suffix!r}, which no literal its body concatenates begins "
                     f"({literals})")
         for lit in literals:
-            if not any(suffix.startswith(lit) for suffix in fn.drives.suffixes):
+            if not any(suffix.startswith(lit) for suffix in fn.drives.all_suffixes()):
                 complaints.append(
                     f"body concatenates {lit!r}, which begins none of the declared suffixes "
-                    f"{list(fn.drives.suffixes)}")
-        for _, keys in sites:
-            if keys is not None and tuple(keys) != tuple(fn.drives.inputs):
+                    f"{list(fn.drives.all_suffixes())}")
+        for site_literals, keys in sites:
+            if keys is None:
+                continue
+            # The group whose suffixes this call's literals begin: its inputs are what it must supply.
+            wanted = [inputs for suffixes, inputs in fn.drives.groups()
+                      if any(s.startswith(lit) for s in suffixes for lit in site_literals)] or [fn.drives.inputs]
+            if all(tuple(keys) != tuple(inputs) for inputs in wanted):
                 complaints.append(
-                    f"declares inputs {list(fn.drives.inputs)}, but a call in its body supplies "
+                    f"declares inputs {[list(i) for i in wanted]}, but a call in its body supplies "
                     f"{list(keys)}")
         if complaints:
             out[fn.name] = complaints
@@ -293,6 +309,7 @@ _DRIVING_BINDINGS = {
     "loom.run_recurrent(": (None, (0,)),
     "loom.run_recurrent_and_retain(": (None, (0,)),
     "loom.run_bi_recurrent_and_retain(": (None, (0, 1)),
+    "loom.run_bi_recurrent_pair_and_retain(": (None, (0, 1)),
 }
 
 
@@ -433,8 +450,8 @@ def catalogue() -> str:
         # arithmetic over Lua tables and touches no topology at all.
         drives = "—"
         if fn.drives is not None:
-            suffixes = ", ".join(f"`<ns>{s}`" for s in fn.drives.suffixes)
-            drives = f"{suffixes} ← {', '.join(f'`{i}`' for i in fn.drives.inputs)}"
+            drives = "; ".join(f"{', '.join(f'`<ns>{s}`' for s in suffixes)} ← {', '.join(f'`{i}`' for i in inputs)}"
+                               for suffixes, inputs in fn.drives.groups())
         rows.append(f"| `{fn.name}` | {', '.join(f'`{r}`' for r in fn.requires) or '—'} | {drives} | "
                     f"{', '.join(callers)} |")
     return "\n".join(rows)

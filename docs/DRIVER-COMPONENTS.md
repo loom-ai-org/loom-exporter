@@ -326,7 +326,7 @@ namespace their caller passes, and that column is the shape a caller's `HelperCa
 | `pad_last_to_multiple` | — | — | matcha |
 | `repeat_by_duration_tfast` | — | — | matcha |
 | `predict_durations` | `sigmoid`, `round_half_to_even` | — | kokoro, styletts2 |
-| `run_bi_lstm` | — | `<ns>_fwd`, `<ns>_bwd` ← `layer_input`, `h_prev`, `c_prev` | kokoro, styletts2 |
+| `run_bi_lstm` | — | `<ns>_fwd`, `<ns>_bwd` ← `layer_input`, `h_prev`, `c_prev`; `<ns>_input` ← `sequence` | kokoro, styletts2 |
 | `run_resblk_stack` | — | `<ns>_block0`, `<ns>_block1`, `<ns>_block2` ← `x`, `style` | kokoro, styletts2 |
 | `run_proj1x1` | — | `<ns>` ← `x` | kokoro, styletts2 |
 | `to_f32` | `round_half_to_even` | — | *`aten_randn`, `cif_fire`* only |
