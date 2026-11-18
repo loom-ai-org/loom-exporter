@@ -209,3 +209,23 @@ def test_each_pocket_tts_card_names_the_reference_it_needs(cards):
         assert cards.repo_id(card) == f"loom-ai-org/pocket-tts-{size}-loom"
         assert card.export_requires is not None and [v for v, _ in card.variants] == ["F32", "Q8_0_PC"]
         assert "`daan`" in card.usage_extra and card.usage_extra.count("| `") == 27   # every voice, once
+
+
+def test_a_card_names_the_vc4_switch_for_exactly_the_files_that_need_it(cards):
+    """loom.cpp Retro-109: on loom-py-rt 1.0.0rc20 and earlier, ggml-vc4 aborts on nine published files
+    under `device="auto"` on a Pi Zero. Each card lists its own, by file name -- a name that is not one of
+    the card's GGUFs would tell readers to set a switch for a file they cannot find, and a card listing
+    none must say nothing about it."""
+    listed = [c for c in cards.CATALOG if c.vc4_fuse_off]
+    assert {c.slug for c in listed} == {"sanotts", "vocetta2-276k", "vocetta2-500k", "vocetta2-1m",
+                                        "vaniq-edge", "vits-piper-en-gb-miro"}
+    assert sum(len(c.vc4_fuse_off) for c in listed) == 9
+    for card in listed:
+        names = {name for name, _ in cards.gguf_names(card)} | {name for _, name, _ in card.packages}
+        assert set(card.vc4_fuse_off) <= names, (card.slug, card.vc4_fuse_off, names)
+        readme = cards.render_readme(card, cards.gguf_names(card)[0][0])
+        assert "`GGML_VC4_FUSE=0`" in readme and "1.0.0rc20 or earlier" in readme
+        for name in card.vc4_fuse_off:
+            assert f"`{name}`" in readme
+    quiet = next(c for c in cards.CATALOG if c.slug == "kokoro-82m")
+    assert "GGML_VC4_FUSE" not in cards.render_readme(quiet, cards.gguf_names(quiet)[0][0])

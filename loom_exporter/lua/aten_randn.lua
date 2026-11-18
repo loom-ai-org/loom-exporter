@@ -12,8 +12,13 @@
 --
 -- 32-bit arithmetic in doubles: LuaJIT's `bit` ops are signed 32-bit, and the seeding multiply needs
 -- the low 32 bits of a 62-bit product, which a double cannot hold -- so it is done in 16-bit halves.
+--
+-- **An engine that has `loom.aten_randn` (loom.cpp ADR-133) draws the stream in C++** -- ATen's scalar path
+-- bit for bit, in float32 libm, where this Lua is doubles rounded to float32 and ~30x slower (200 ms per
+-- 130k values on a Pi 4). The Lua below stays as the fallback for an older engine.
 local function aten_randn(seed, n)
     if n < 16 then error("aten_randn: ATen's vectorised path starts at 16 values, got " .. n) end
+    if loom ~= nil and loom.aten_randn ~= nil then return loom.aten_randn(seed, n) end
     local bit = require("bit")
     local TWO32 = 4294967296.0
     local function u32(x) return x % TWO32 end
