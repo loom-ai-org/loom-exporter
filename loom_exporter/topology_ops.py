@@ -683,6 +683,9 @@ def _op_loom_fused_attention(self, op, ctx):
     if window:
         # P4.41 (ADR-085): one whole-sequence pass, no state, and only the causal band computed.
         attrs = {"layer": layer, "scale": scale, "kv_cache": False, "window": window}
+    elif op.inputs.get("kv_cache") is not None and not bool(static_scalar(op.inputs.get("kv_cache"), True)):
+        # ADR-131: one whole-sequence pass, no state, dense over the wrapper's own mask.
+        attrs = {"layer": layer, "scale": scale, "kv_cache": False}
     nodes.append({
         "op": "ATTENTION",
         "inputs": [q_in, k_in, v_in, mask_in],
@@ -1932,6 +1935,46 @@ def _op_reduce_max_global(self, op, ctx):
         "inputs": [flat_name],
         "outputs": [out_name],
         "attrs": {"op": "max", "k0": span, "s0": span, "p0": 0},
+    })
+
+
+def _reduce_max_last_axis(self, op):
+    """The static width of the LAST axis when a `reduce_max` reduces exactly that one, else None."""
+    x_var = op.inputs.get("x")
+    if x_var is None:
+        return None
+    shape = self.get_var_info(x_var)["shape"]       # ne order: shape[0] is MIL's last axis
+    axes = static_ints(op.inputs.get("axes"))
+    rank = len(shape)
+    if axes is None or rank < 2 or [a % rank for a in axes] != [rank - 1]:
+        return None
+    return int(shape[0]) if str(shape[0]).isdigit() else None
+
+
+@topology_rule('reduce_max', guard=lambda self, op: _reduce_max_last_axis(self, op) is not None,
+               when="it reduces only the last axis and that axis is static")
+def _op_reduce_max_last_axis(self, op, ctx):
+    # A per-row maximum (OmniVoice's confidence, ADR-131): `ggml_pool_1d` pools `ne[0]`, which is MIL's
+    # last axis, over every row of the higher ones -- so a pool whose kernel and stride are that axis's
+    # width leaves one value per row, and a RESHAPE drops the unit axis (or keeps it, for keep_dims).
+    width = _reduce_max_last_axis(self, op)
+    out_name = self.safe_name(op.outputs[0].name)
+    pooled = f"{out_name}_reduce_max_pool"
+    ctx.nodes.append({
+        "op": "POOL_1D",
+        "inputs": [ctx.resolve(self.safe_name(op.inputs["x"].name))],
+        "outputs": [pooled],
+        "attrs": {"op": "max", "k0": width, "s0": width, "p0": 0},
+    })
+    ctx.nodes.append({
+        "op": "RESHAPE",
+        "inputs": [pooled],
+        "outputs": [out_name],
+        # The INPUT's resolved extents, not the output var's: MIL mints the reduced var a fresh symbol
+        # that this exporter resolved to the wrong root (`n_tokens` where the rows count `n_codes`).
+        "attrs": {"shape": (([1] if bool(static_value(op.inputs.get("keep_dims"), False)) else [])
+                            + [int(d) if str(d).isdigit() else d
+                               for d in self.get_var_info(op.inputs["x"])["shape"][1:]])},
     })
 
 

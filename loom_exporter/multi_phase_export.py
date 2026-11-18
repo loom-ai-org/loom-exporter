@@ -69,6 +69,13 @@ class ExportPhase:
     # engine compute only that band. The wrapper that builds the mask is the only thing that knows it is
     # banded, so it is declared here rather than inferred. Exclusive with `kv_cache_size`.
     attention_window: Optional[int] = None
+    # Fuse this phase's SDPA blocks into UNCACHED, DENSE `ATTENTION` nodes over whatever mask the
+    # wrapper builds (ADR-131). For a bidirectional stack run whole every call -- OmniVoice's
+    # masked-diffusion LM, 28 Qwen3 layers re-read every unmasking step -- where neither a cache nor a
+    # causal band applies, and where an unfused block would carry `repeat_kv`'s reshape (which no
+    # pass converts: `qwen3_tts_export.materialise_gqa`). The mask may be computed in-graph: only a
+    # cached node needs it as a declared input. Exclusive with `kv_cache_size` and `attention_window`.
+    dense_attention: bool = False
     # This phase's KV cache is its OWN (loom.cpp ADR-103): `{"ring": bool, "window": int}`, sized by
     # `kv_cache_size`. Its geometry is read off its own fused blocks and written into its topology as the
     # `kv_cache` object the engine allocates privately, rather than merged into the file's one `loom.*`
@@ -163,6 +170,11 @@ class ExportPhase:
             "a mask built from positions is banded only by what its builder wrote. The wrapper's own "
             "test checks the mask against it (Pocket-TTS: `test_pocket_tts_mimi_window`), and the "
             "backend raises if the phase fused no windowed node."
+        ),
+        "dense_attention": Unchecked(
+            "a request, like `fuse_attention`, and a fact about the wrapper: that its stack is run whole "
+            "every call, so neither a cache nor a band applies (ADR-131). `phase_conversion` raises if "
+            "it is combined with a cache or a window, or if the phase fused no block at all."
         ),
         "own_kv_cache": Unchecked(
             "whether this phase's cache is its own, and its ring/window: the driver's choice of how the "

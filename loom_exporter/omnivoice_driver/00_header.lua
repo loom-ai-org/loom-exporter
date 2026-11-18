@@ -1,0 +1,5 @@
+-- OmniVoice: text (+ a language, a voice-design instruct, or a reference clip and its transcript) in,
+-- 24 kHz audio out. A bidirectional Qwen3 fills eight codebooks of HiggsAudio-v2 codes over a fixed
+-- number of unmasking steps (`lm_step`, one call per step, both guidance halves in one sequence), the
+-- codec decodes them (`codec_decode`), and the reference's post-processing runs on the waveform.
+-- See loom.cpp ADR-131 and omnivoice_export.py.
