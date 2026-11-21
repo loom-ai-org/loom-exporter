@@ -2953,12 +2953,11 @@ os.environ["DIZIONE_DATA"] = os.path.join(snapshot_download("{repo_id}", allow_p
                                           "phonemizer")
 model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
 # Two built-in speakers: speaker=0 is F2, speaker=1 is M2.
-audio = model.text2speech.infer("Hello! This is tiny voca, a small text to speech model.", speaker=1)
+audio = model.text2speech.infer("hello world", speaker=1)
 audio.save("hello.wav")
 
 # A sentence at a time, as it is spoken:
-for piece in model.text2speech.stream("She had never seen the sea before. She stood there a long while."):
-    print(len(piece.samples))
+sizes = [len(piece.samples) for piece in model.text2speech.stream("She had never seen the sea before. She stood there a long while.")]
 """,
     # Paradee's door (loom.cpp ADR-135): Kokoro's own front ends when installed, the voice picking the language.
     "text-to-speech-kokoro": """import loom
@@ -2968,15 +2967,15 @@ for piece in model.text2speech.stream("She had never seen the sea before. She st
 # Without them the door falls back to orthography2ipa, which reads worse.
 model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
 print(model.voices)   # af_heart (the default), bf_isabella, am_puck, bm_fable, hf_alpha, hm_omega, ff_siwis, em_alex
-model.text2speech.infer("Paradee is a small voice that runs anywhere.").save("hello.wav")
+audio = model.text2speech.infer("hello world")
+audio.save("hello.wav")
 
 # The voice picks the language, as upstream's does:
 model.text2speech.infer("Il fait très beau aujourd'hui.", voice="ff_siwis").save("bonjour.wav")
 model.text2speech.infer("La biblioteca abre a las nueve.", voice="em_alex", speed=1.1).save("hola.wav")
 
 # A sentence at a time, as it is spoken:
-for piece in model.text2speech.stream("It was the best of times. It was the worst of times.", voice="bm_fable"):
-    print(len(piece.samples))
+sizes = [len(piece.samples) for piece in model.text2speech.stream("It was the best of times. It was the worst of times.", voice="bm_fable")]
 """,
     "text-to-speech-lexicon-espeak": """import loom
 
