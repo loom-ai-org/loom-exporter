@@ -382,3 +382,13 @@ class TestVitsPhonemeAssembly(unittest.TestCase):
         self.assertEqual((table["bos"], table["eos"], table["blank"]), (1, 2, 0))
         self.assertTrue(table["interleave_blank"])
         self.assertTrue(table["blank_after_bos"])
+
+
+def test_matcha_declares_the_espeak_conventions_it_was_trained_in():
+    """Matcha's LJSpeech recipe phonemizes with espeak-ng en-us, so its card's text door folds the
+    lexicon's British IPA to espeak's (loom.cpp ADR-071). Unfolded, "hello world" was heard as "a low
+    world" (2026-11-21, ipa-dict en_UK through the card's own door)."""
+    from loom_exporter.matcha_export import TTSMatchaExportConfig
+
+    config = TTSMatchaExportConfig.__new__(TTSMatchaExportConfig)   # hparams() reads no checkpoint
+    assert config.hparams()["tts.phoneme_style"] == "espeak"
