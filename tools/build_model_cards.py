@@ -212,6 +212,20 @@ _VOCETTA2_EXTRA_FILES = [
 ]
 
 
+# The lexicon the generic phoneme-input TTS cards ship for their text door (Kokoro, Matcha, StyleTTS2,
+# Piper): open-dict-data/ipa-dict's en_UK.txt at commit 360a943 (MIT), its IPA unwrapped from the slashes
+# and each entry cut to its first variant -- both of which the loader would otherwise reject -- by
+#     sed 's:/::g; s/\t\([^,]*\),.*/\t\1/' en_UK.txt > en_UK.tsv
+_IPA_DICT_LEXICON = [("lexicons/en_UK.tsv", "ipa-dict-lexicons/en_UK.tsv"),
+                     ("lexicons/LICENSE.ipa-dict", "ipa-dict-lexicons/LICENSE.ipa-dict")]
+_IPA_DICT_EXTRA_FILES = [
+    "`lexicons/en_UK.tsv` -- [open-dict-data/ipa-dict](https://github.com/open-dict-data/ipa-dict)'s "
+    "British English wordlist (`data/en_UK.txt`, commit `360a943`, 65,119 words with stress), its IPA "
+    "taken out of the slashes and each word cut to its first reading, as `word<TAB>ipa` -- the shape "
+    "`loom.phonemizers.set_lexicon` reads. MIT (`lexicons/LICENSE.ipa-dict`).",
+]
+
+
 def _vocetta2_limitations(upstream_wer: str, door_wer: str) -> str:
     return (
         "**The text door is not upstream's front end.** Through `text2speech.infer(text)` with the bundled "
@@ -1369,7 +1383,8 @@ anything.""",
             "  voice. See the usage example above.",
             "`VOICES.md` -- upstream's own voice table (language, traits, quality grades), copied\n"
             "  unmodified.",
-        ],
+        ] + _IPA_DICT_EXTRA_FILES,
+        copied_files=_IPA_DICT_LEXICON,
     ),
     ModelCard(
         slug="matcha-tts-ljspeech", checkpoint=Path("matcha_model/ckpt"),
@@ -1381,6 +1396,7 @@ anything.""",
         # `Matcha-TTS/configs/data/ljspeech.yaml`: `sample_rate: 22050`.
         sample_rate=22050,
         title="Matcha-TTS (LJSpeech)", summary="Matcha-TTS's LJSpeech flow-matching TTS checkpoint, exported for loom.cpp. Takes phoneme ids, not text.",
+        copied_files=_IPA_DICT_LEXICON, extra_files=_IPA_DICT_EXTRA_FILES,
     ),
     ModelCard(
         slug="f5-tts-v1-base", checkpoint=Path("f5-tts/F5TTS_v1_Base"),
@@ -1991,6 +2007,7 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         # per-architecture -- another Piper voice may differ, so this belongs to this catalogue entry.
         sample_rate=22050,
         title="Piper VITS en-GB (miro)", summary="OpenVoiceOS's Piper-compatible VITS en-GB \"miro\" voice, exported for loom.cpp. Takes phoneme ids, not text.",
+        copied_files=_IPA_DICT_LEXICON, extra_files=_IPA_DICT_EXTRA_FILES,
         # Measured 2026-10-10: Whisper-small WER on the 30 shortest LibriSpeech-dummy sentences (235
         # words), both framings, three front ends (loom.cpp Retro-081). The espeak-convention fold
         # (ADR-071) made the door WORSE here (25.5% -> 30.2%), so this export declares no phoneme style.
@@ -2017,6 +2034,7 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         # input rate, used in training only, and it is the wrong number to reach for here.
         sample_rate=24000,
         title="StyleTTS2 (LJSpeech)", summary="yl4579's StyleTTS2 LJSpeech checkpoint, exported for loom.cpp. Takes phoneme ids, not text.",
+        copied_files=_IPA_DICT_LEXICON, extra_files=_IPA_DICT_EXTRA_FILES,
     ),
     ModelCard(
         slug="dac-44khz", checkpoint=Path("dac-44khz"),
@@ -3104,14 +3122,10 @@ audio.save("out.wav")
 # shallow orthographies; for English see the note above, and give it a lexicon so it has stress and
 # real vowels to work with -- "time" is /t\u026am/ without one.
 #
-# open-dict-data/ipa-dict (MIT) publishes ~65k-entry wordlists WITH stress for en_UK and en_US, in
-# almost the right shape: its IPA is wrapped in slashes and a rare entry carries two comma-separated
-# variants, both of which the loader rejects. Take the RAW file: a github.com/.../blob/... URL serves
-# an HTML PAGE, and the sed below will turn that into a .tsv that parses to zero entries -- which is
-# indistinguishable from no lexicon at all except for the warning `set_lexicon` raises. Two lines:
-#     curl -LO https://raw.githubusercontent.com/open-dict-data/ipa-dict/master/data/en_UK.txt
-#     sed 's:/::g; s/\\t\\([^,]*\\),.*/\\t\\1/' en_UK.txt > en_UK.tsv
-loom.phonemizers.set_lexicon("en_UK.tsv")    # a path, an http(s):// URL, or hf://<repo>/<path>
+# This repo ships one: open-dict-data/ipa-dict's British English wordlist (MIT,
+# lexicons/LICENSE.ipa-dict), ~65k words with stress, as `word<TAB>ipa`. Any such TSV works in its
+# place -- a local path, an http(s):// URL, or hf://<dataset repo>/<path>.
+loom.phonemizers.set_lexicon("https://huggingface.co/{repo_id}/resolve/main/lexicons/en_UK.tsv")
 
 # sample_rate={sample_rate}: this checkpoint does not carry its own rate, so it is a value you have to
 # know from the model's documentation and pass. It is used only if the GGUF declares none; a wrong rate
