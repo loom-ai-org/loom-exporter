@@ -212,6 +212,20 @@ _VOCETTA2_EXTRA_FILES = [
 ]
 
 
+# The lexicon the generic phoneme-input TTS cards ship for their text door (Kokoro, Matcha, StyleTTS2,
+# Piper): open-dict-data/ipa-dict's en_UK.txt at commit 360a943 (MIT), its IPA unwrapped from the slashes
+# and each entry cut to its first variant -- both of which the loader would otherwise reject -- by
+#     sed 's:/::g; s/\t\([^,]*\),.*/\t\1/' en_UK.txt > en_UK.tsv
+_IPA_DICT_LEXICON = [("lexicons/en_UK.tsv", "ipa-dict-lexicons/en_UK.tsv"),
+                     ("lexicons/LICENSE.ipa-dict", "ipa-dict-lexicons/LICENSE.ipa-dict")]
+_IPA_DICT_EXTRA_FILES = [
+    "`lexicons/en_UK.tsv` -- [open-dict-data/ipa-dict](https://github.com/open-dict-data/ipa-dict)'s "
+    "British English wordlist (`data/en_UK.txt`, commit `360a943`, 65,119 words with stress), its IPA "
+    "taken out of the slashes and each word cut to its first reading, as `word<TAB>ipa` -- the shape "
+    "`loom.phonemizers.set_lexicon` reads. MIT (`lexicons/LICENSE.ipa-dict`).",
+]
+
+
 def _vocetta2_limitations(upstream_wer: str, door_wer: str) -> str:
     return (
         "**The text door is not upstream's front end.** Through `text2speech.infer(text)` with the bundled "
@@ -759,11 +773,13 @@ CATALOG = [
                 "decoder and language-ID prompting, 40 language-locale combinations in one checkpoint, "
                 "exported for loom.cpp.",
         limitations=(
-            "**The whole clip in one pass, not live streaming.** The checkpoint is trained to stream in "
-            "chunks with a cached encoder; this file runs it the way `transformers`' offline "
-            "`generate()` does: every frame at once, attending through the same chunked window "
-            "(320 ms chunks, 4.5 s of left context). The transcripts are `transformers`' own, token for "
-            "token. Incremental streaming is not exported.\n\n"
+            "**`infer` is the whole clip in one pass; `stream()` is live.** The checkpoint is trained to "
+            "stream in chunks with a cached encoder. `speech2text.infer` runs it the way `transformers`' "
+            "offline `generate()` does: every frame at once, attending through the same chunked window "
+            "(320 ms chunks, 4.5 s of left context), with `transformers`' own transcripts, token for "
+            "token. `speech2text.stream()` runs the checkpoint's streaming mode (loom.cpp ADR-109): the "
+            "encoder a few 320 ms chunks per call with its caches carried, the RNN-T decode's state "
+            "carried; it ends on one call's ids, the last partial chunk included.\n\n"
             "**Cost grows with the clip.** Attention is computed over the whole clip, so on a 4-thread "
             "laptop-class CPU 11 s of speech took 4.8 s and 120 s took 82 s, peaking at 4.0 GB of "
             "memory, and memory grows faster than the clip does. There is no length cap (`transformers` "
@@ -848,10 +864,10 @@ CATALOG = [
                      "memory."),
         ],
         limitations=(
-            "**Chunked, but the whole clip in one call.** loom runs upstream's streaming decode, 640 ms at a "
-            "time with 2.56 s of attention to the left, so cost grows linearly with the clip and the "
-            "encoder's memory does not grow at all. The audio is still handed over as one clip and the "
-            "transcript comes back at the end: there is no live, push-as-you-record interface yet.\n\n"
+            "**Chunked, in one call or live.** loom runs upstream's streaming decode, 640 ms at a time "
+            "with 2.56 s of attention to the left, so cost grows linearly with the clip and the encoder's "
+            "memory does not grow at all. `speech2text.infer` takes the clip whole; `speech2text.stream()` "
+            "takes it as it is recorded and gives the same transcript (loom.cpp ADR-098).\n\n"
             "**Less accurate than the non-streaming model.** Upstream rates it 8.15% on LibriSpeech "
             "test-clean against 3.78% for `zipformer-small`; on the 73 clips measured here, 12.17% against "
             "7.22%. Use `zipformer-small-loom` for finished recordings where latency does not matter.\n\n"
@@ -896,10 +912,12 @@ CATALOG = [
                      "53 of 60 FLEURS transcripts are token-identical to NeMo's."),
         ],
         limitations=(
-            "**Offline mode only.** The checkpoint is one model for offline and streaming recognition; "
-            "this file runs it offline -- the whole clip through the encoder at full context, as NeMo's "
-            "offline inference does. NeMo's buffered streaming (chunks with 5.6 s of recomputed left "
-            "context) is not exported.\n\n"
+            "**Offline in `infer`, NeMo's buffered streaming in `stream()`.** The checkpoint is one model "
+            "for offline and streaming recognition. `speech2text.infer` runs it offline -- the whole clip "
+            "through the encoder at full context, as NeMo's offline inference does. `speech2text.stream()` "
+            "runs NeMo's buffered streaming (loom.cpp ADR-110): the encoder over each buffer under the "
+            "chunked mask, with 5.6 s of left context recomputed per chunk. It ends on NeMo's streamed "
+            "ids, which need not be the offline transcript.\n\n"
             "**Name the language when you know it.** `language=` takes the checkpoint's own prompt names "
             "-- two-letter codes such as `\"de\"` or `\"pl\"`, and locales such as `\"de-DE\"` (all 118, "
             "`\"auto\"` included, are in `model.contract[\"asr_languages\"]`). Without it the model identifies the language "
@@ -1365,7 +1383,8 @@ anything.""",
             "  voice. See the usage example above.",
             "`VOICES.md` -- upstream's own voice table (language, traits, quality grades), copied\n"
             "  unmodified.",
-        ],
+        ] + _IPA_DICT_EXTRA_FILES,
+        copied_files=_IPA_DICT_LEXICON,
     ),
     ModelCard(
         slug="matcha-tts-ljspeech", checkpoint=Path("matcha_model/ckpt"),
@@ -1377,6 +1396,7 @@ anything.""",
         # `Matcha-TTS/configs/data/ljspeech.yaml`: `sample_rate: 22050`.
         sample_rate=22050,
         title="Matcha-TTS (LJSpeech)", summary="Matcha-TTS's LJSpeech flow-matching TTS checkpoint, exported for loom.cpp. Takes phoneme ids, not text.",
+        copied_files=_IPA_DICT_LEXICON, extra_files=_IPA_DICT_EXTRA_FILES,
     ),
     ModelCard(
         slug="f5-tts-v1-base", checkpoint=Path("f5-tts/F5TTS_v1_Base"),
@@ -1488,6 +1508,13 @@ anything.""",
             "**Non-commercial weights.** The checkpoint is CC-BY-NC 4.0 because of its training data "
             "(e.g. Emilia); the upstream code is Apache-2.0. Do not use this file commercially, and "
             "never to impersonate a real person without their consent.\n\n"
+            "**A female English voice unless you say otherwise.** A call that names no voice -- no "
+            "`instruct`, no `reference` -- is described as `\"female\"` (the file's `tts.default_instruct`), "
+            "and one that names no language speaks English (`tts.default_language`); pass `instruct=`, "
+            "`reference=` or `language=` (a code from `model.contract[\"languages\"]`) for anything else. "
+            "Upstream's own default is no description at all, and that voice is not speech on a short "
+            "prompt: \"hello world\" came out as music or static on 13 of 13 seeds, where `\"female\"` "
+            "said it on 14 of 14.\n\n"
             "**Slow on a CPU.** Every one of the 32 steps runs the whole 28-layer stack over the prompt "
             "and the target twice (classifier-free guidance), so a sentence takes tens of seconds on a "
             "laptop CPU; use a GPU for interactive work. Fewer steps (`n_steps`) trade quality for "
@@ -1987,6 +2014,7 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         # per-architecture -- another Piper voice may differ, so this belongs to this catalogue entry.
         sample_rate=22050,
         title="Piper VITS en-GB (miro)", summary="OpenVoiceOS's Piper-compatible VITS en-GB \"miro\" voice, exported for loom.cpp. Takes phoneme ids, not text.",
+        copied_files=_IPA_DICT_LEXICON, extra_files=_IPA_DICT_EXTRA_FILES,
         # Measured 2026-10-10: Whisper-small WER on the 30 shortest LibriSpeech-dummy sentences (235
         # words), both framings, three front ends (loom.cpp Retro-081). The espeak-convention fold
         # (ADR-071) made the door WORSE here (25.5% -> 30.2%), so this export declares no phoneme style.
@@ -2013,6 +2041,7 @@ Plain lists are fine -- this package has no runtime dependencies and accepts any
         # input rate, used in training only, and it is the wrong number to reach for here.
         sample_rate=24000,
         title="StyleTTS2 (LJSpeech)", summary="yl4579's StyleTTS2 LJSpeech checkpoint, exported for loom.cpp. Takes phoneme ids, not text.",
+        copied_files=_IPA_DICT_LEXICON, extra_files=_IPA_DICT_EXTRA_FILES,
     ),
     ModelCard(
         slug="dac-44khz", checkpoint=Path("dac-44khz"),
@@ -2435,7 +2464,9 @@ licence is its recording's, and so is the consent: clone only voices you have th
             "audio-in/codes-out, a different contract, and no model that decodes through this codec "
             "calls it. It is also what voice cloning with MOSS-TTS would need, so cloning is not "
             "available through these two repos.\n\n"
-            "**A clip is decoded in ONE call, never in chunks**, because nothing else is exact here. "
+            "**`infer` decodes a clip in ONE call, never in overlapping chunks**, because no chunking is "
+            "exact here; `codes2speech.stream()` is, the other way: each of the six transformer stages "
+            "carries a ring KV cache of its own from one push to the next (loom.cpp ADR-103). "
             "The decoder is six causal transformer stacks (12.5 Hz up to 400 Hz) with windowed "
             "attention, and 92 layers of windows reach further back than any chunk could carry: a "
             "chunked decode with 8 s of overlap is still 48% away from the model's own answer. The "
@@ -2759,8 +2790,10 @@ licence is its recording's, and so is the consent: clone only voices you have th
             "that post-processing is left to you, because every consumer of a VAD wants different "
             "onset and offset behaviour.\n\n"
             "One row per 512 samples (32 ms) of input, starting at 0 s: `result.times` gives each "
-            "row's start. The whole clip is one call -- the model's streaming state is carried across "
-            "every frame of it, exactly as upstream's frame loop carries it. Audio must be mono "
+            "row's start. In `infer` the whole clip is one call -- the model's streaming state is carried "
+            "across every frame of it, exactly as upstream's frame loop carries it -- and "
+            "`speech2class.stream()` carries the same state from one push to the next (loom.cpp ADR-106), "
+            "so a live stream's rows are one call's. Audio must be mono "
             "16 kHz; upstream's 8 kHz model, in the same JIT, is not exported.\n\n"
             "The weights are upstream's, RE-LAID OUT: the per-frame reflect pad is folded into the "
             "STFT kernel and the four per-frame convolutions become dense pointwise maps, so the whole "
@@ -2807,11 +2840,12 @@ licence is its recording's, and so is the consent: clone only voices you have th
             "`dim`, `frame_rate`), cut by the width the file declares. rc14 and earlier refuse the "
             "file at that door with an error naming the granularity; there, `model.infer(waveform=audio)` "
             "returns the same frames as one flat row-major list, 128 values per frame.\n\n"
-            "**One call is one whole clip, offline.** The model is strictly causal -- frame *t* depends "
-            "only on audio before sample 320 x (t + 1), within a 2.5 s receptive field -- and it was "
-            "trained to describe each HuBERT frame 100 ms late, so a detector built on it reacts about "
-            "that long after the word ends. To stream it, call it on a sliding buffer that keeps 40,000 "
-            "samples (2.5 s) of context and take the newest frames: those then equal the offline ones. "
+            "**`infer` is one whole clip; `stream()` is live.** The model is strictly causal -- frame *t* "
+            "depends only on audio before sample 320 x (t + 1), within a 2.5 s receptive field -- and it "
+            "was trained to describe each HuBERT frame 100 ms late, so a detector built on it reacts about "
+            "that long after the word ends. `speech2embeddings.stream()` runs the one-pass graph over the "
+            "last 122 frames (2.44 s) per push, as upstream advises (loom.cpp ADR-120): each frame's row "
+            "as soon as its 320 samples are in, within 4.8e-06 of one call's. "
             "A clip shorter than 320 samples gives no frames. Audio must be mono 16 kHz.\n\n"
             "**Every precision keeps the front end in F32.** The log-mel's DFT basis is the one weight "
             "this model cannot spare precision in: at F16 its rounding in the near-empty high bins of a "
@@ -2953,12 +2987,8 @@ os.environ["DIZIONE_DATA"] = os.path.join(snapshot_download("{repo_id}", allow_p
                                           "phonemizer")
 model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
 # Two built-in speakers: speaker=0 is F2, speaker=1 is M2.
-audio = model.text2speech.infer("Hello! This is tiny voca, a small text to speech model.", speaker=1)
+audio = model.text2speech.infer("hello world", speaker=1)
 audio.save("hello.wav")
-
-# A sentence at a time, as it is spoken:
-for piece in model.text2speech.stream("She had never seen the sea before. She stood there a long while."):
-    print(len(piece.samples))
 """,
     # Paradee's door (loom.cpp ADR-135): Kokoro's own front ends when installed, the voice picking the language.
     "text-to-speech-kokoro": """import loom
@@ -2968,15 +2998,12 @@ for piece in model.text2speech.stream("She had never seen the sea before. She st
 # Without them the door falls back to orthography2ipa, which reads worse.
 model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
 print(model.voices)   # af_heart (the default), bf_isabella, am_puck, bm_fable, hf_alpha, hm_omega, ff_siwis, em_alex
-model.text2speech.infer("Paradee is a small voice that runs anywhere.").save("hello.wav")
+audio = model.text2speech.infer("hello world")
+audio.save("hello.wav")
 
 # The voice picks the language, as upstream's does:
 model.text2speech.infer("Il fait très beau aujourd'hui.", voice="ff_siwis").save("bonjour.wav")
 model.text2speech.infer("La biblioteca abre a las nueve.", voice="em_alex", speed=1.1).save("hola.wav")
-
-# A sentence at a time, as it is spoken:
-for piece in model.text2speech.stream("It was the best of times. It was the worst of times.", voice="bm_fable"):
-    print(len(piece.samples))
 """,
     "text-to-speech-lexicon-espeak": """import loom
 
@@ -3102,14 +3129,10 @@ audio.save("out.wav")
 # shallow orthographies; for English see the note above, and give it a lexicon so it has stress and
 # real vowels to work with -- "time" is /t\u026am/ without one.
 #
-# open-dict-data/ipa-dict (MIT) publishes ~65k-entry wordlists WITH stress for en_UK and en_US, in
-# almost the right shape: its IPA is wrapped in slashes and a rare entry carries two comma-separated
-# variants, both of which the loader rejects. Take the RAW file: a github.com/.../blob/... URL serves
-# an HTML PAGE, and the sed below will turn that into a .tsv that parses to zero entries -- which is
-# indistinguishable from no lexicon at all except for the warning `set_lexicon` raises. Two lines:
-#     curl -LO https://raw.githubusercontent.com/open-dict-data/ipa-dict/master/data/en_UK.txt
-#     sed 's:/::g; s/\\t\\([^,]*\\),.*/\\t\\1/' en_UK.txt > en_UK.tsv
-loom.phonemizers.set_lexicon("en_UK.tsv")    # a path, an http(s):// URL, or hf://<repo>/<path>
+# This repo ships one: open-dict-data/ipa-dict's British English wordlist (MIT,
+# lexicons/LICENSE.ipa-dict), ~65k words with stress, as `word<TAB>ipa`. Any such TSV works in its
+# place -- a local path, an http(s):// URL, or hf://<dataset repo>/<path>.
+loom.phonemizers.set_lexicon("https://huggingface.co/{repo_id}/resolve/main/lexicons/en_UK.tsv")
 
 # sample_rate={sample_rate}: this checkpoint does not carry its own rate, so it is a value you have to
 # know from the model's documentation and pass. It is used only if the GGUF declares none; a wrong rate
@@ -3544,6 +3567,138 @@ audio.save("out.wav")
 }
 
 
+# The STREAMING section each card gets (loom-py-rt 1.0.0's stream doors; loom.cpp Epic-06): one block, after
+# the usage snippet, continuing from the `model` it loaded. Which block is the door's, and what it says is
+# whether the FILE's driver has the live path (`stream_open` / `stream_feed` / `stream_finish`,
+# `driver_streams`) -- a door without one still streams for a TTS (a sentence per `infer`) and a recogniser
+# (Silero VAD lines, ADR-127), and does not for the others, which then get no section.
+#
+# **A block binds no result the card gate grades.** The gate grades the LAST value of a shape the card binds
+# (a waveform, a transcription, a frame answer), and a stream's pieces have those shapes; a block that left
+# one bound would have the gate grade a piece instead of the card's own result -- which is how Paradee's
+# card failed on the 1.0.0 sweep. So pieces stay inside comprehensions, and what is bound is a stream, a
+# list or a number.
+_ASR_LIVE = """# Live: push audio as it arrives -- here a second at a time, as a microphone would hand it over -- and
+# read the transcript as it grows. `update.revised` is True when earlier text changed (a model that
+# re-decodes as audio arrives); `finish()` decodes what is left.
+stream = model.speech2text.stream()
+step = {rate}                              # one second of audio
+for start in range(0, len({speech}), step):
+    update = stream.push({speech}[start:start + step])
+    if update.delta:
+        print(f"{update.seconds:5.1f} s  {update.text}")
+print(stream.finish().text)
+"""
+_ASR_LINES = """# Live, in lines of speech: this file has no live path of its own, so the stream cuts the audio into lines
+# with Silero VAD and re-runs the one pass over each line a push touches (loom.cpp ADR-127). Push audio as
+# it arrives -- here a second at a time -- and read the lines that changed.
+vad = loom.Model.from_pretrained("loom-ai-org/silero-vad-loom")
+stream = model.speech2text.stream(vad=vad)
+step = 16000                              # one second of audio
+for start in range(0, len({speech}), step):
+    for line in stream.push({speech}[start:start + step]):
+        print(("final " if line.complete else "...   ") + line.text)
+for line in stream.finish():
+    print("final " + line.text)
+"""
+_TTS_LIVE = """# Live: the audio a piece at a time, cut by the model's own driver -- joined, the pieces are `infer`'s
+# waveform (`stream.exact`). Play each piece as it comes.
+stream = model.text2speech.stream("Hello there. How are you today?"{tts_args})
+sizes = [len(piece) for piece in stream]
+print(stream.exact, len(sizes), "pieces,", round(stream.seconds, 2), "s")
+"""
+_TTS_SENTENCES = """# A sentence at a time: this file has no live path of its own, so the stream speaks the text one sentence
+# per `infer` call (`stream.exact` is False: the joins differ from one call over the whole text). Play
+# each piece as it comes.
+stream = model.text2speech.stream("Hello there. How are you today?"{tts_args})
+sizes = [len(piece) for piece in stream]
+print(stream.exact, len(sizes), "pieces,", round(stream.seconds, 2), "s")
+"""
+_FRAMES_LIVE = """# Live: push audio as it arrives -- here a second at a time -- and read each frame's answer once its audio
+# is in. The rows of every push joined are what one `infer` over the whole audio returns.
+stream = model.{door}.stream()
+step = 16000                              # one second of audio
+answers = [stream.push(audio[start:start + step]) for start in range(0, len(audio), step)]
+answers.append(stream.finish())
+print(sum(len(answer) for answer in answers), "rows,", stream.frame_rate, "per second")
+"""
+_CODEC_LIVE = """# Live: push codes as they arrive and get their audio back; the pieces joined are what one `infer` over
+# every frame pushed returns.
+stream = model.codes2speech.stream()
+pieces = [stream.push(codes[i:i + 4]) for i in range(0, len(codes), 4)]
+pieces.append(stream.finish())
+print(sum(len(piece) for piece in pieces), "samples")
+"""
+_CODES_LIVE = """# Live: the codes as they are drawn, each piece decoded as it arrives -- the two streams chained
+# (loom.cpp ADR-102). Play each piece as it comes.
+sizes = [len(piece) for piece in codec.codes2speech.stream(model.text2codes.stream({codes_args}))]
+print(len(sizes), "pieces,", sum(sizes), "samples")
+"""
+_TOKENS_LIVE = """# The same, handed back as it is drawn:
+for piece in model.text2text.{call}:
+    print(piece, end="", flush=True)
+print()
+"""
+# Per usage snippet: (live-path block, block for a file without one) -- None where that case gets no section.
+_ASR = (_ASR_LIVE.replace("{speech}", "audio").replace("{rate}", "16000"), _ASR_LINES.replace("{speech}", "audio"))
+STREAM_SNIPPETS = {
+    "automatic-speech-recognition": _ASR,
+    "automatic-speech-recognition-variants": _ASR,
+    "automatic-speech-recognition-multilingual": _ASR,
+    "automatic-speech-recognition-canary": _ASR,
+    "automatic-speech-recognition-nemotron": _ASR,
+    "automatic-speech-recognition-language-variants": _ASR,
+    # Kyutai's rate is 24 kHz, and the snippet resamples to `audio_24k` (VAD lines are 16 kHz: live only).
+    "automatic-speech-recognition-24khz": (_ASR_LIVE.replace("{speech}", "audio_24k").replace("{rate}", "24000"), None),
+}
+for _key, _args in (("text-to-speech-with-vocab", ", sample_rate={sample_rate}"),
+                    ("text-to-speech-with-vocab-variants", ", sample_rate={sample_rate}"),
+                    ("text-to-speech-voices", ""), ("text-to-speech-lexicon", ""),
+                    ("text-to-speech-lexicon-espeak", ""), ("text-to-speech-arpabet", ""),
+                    ("text-to-speech-kokoro", ""), ("text-to-speech-dizione", ", speaker=1"),
+                    # After the snippet's `set_lexicon`, so its text door has the lexicon it set.
+                    ("text-to-speech", ", sample_rate={sample_rate}"),
+                    ("text-to-speech-voice-clone",
+                     ", reference=reference.tolist(), reference_text=reference_text, seed=42")):
+    STREAM_SNIPPETS[_key] = (_TTS_LIVE.replace("{tts_args}", _args), _TTS_SENTENCES.replace("{tts_args}", _args))
+for _key in ("audio-classification-vad", "audio-classification-segmentation"):
+    STREAM_SNIPPETS[_key] = (_FRAMES_LIVE.replace("{door}", "speech2class"), None)
+STREAM_SNIPPETS["audio-frame-embedding"] = (_FRAMES_LIVE.replace("{door}", "speech2embeddings"), None)
+STREAM_SNIPPETS["audio-codec"] = (_CODEC_LIVE, None)
+for _key, _args in (("text-to-codes", '"[S1] Hello there.", max_new_tokens=60, seed=1234'),
+                    ("text-to-codes-voice-clone",
+                     '"Hello there.", waveform=reference.tolist(), language_id=2050, max_new_tokens=40, seed=1234'),
+                    ("text-to-codes-musicgen", '"80s pop track with bassy drums and synth", max_new_tokens=100, seed=1'),
+                    ("text-to-codes-moss", '"Hello there.", language="en", max_new_tokens=40, seed=1'),
+                    ("text-to-codes-audio8", '"Hello there.", max_new_tokens=40, seed=1')):
+    STREAM_SNIPPETS[_key] = (_CODES_LIVE.replace("{codes_args}", _args), None)
+for _key, _call in (("text-generation", 'stream("The capital of France is", max_new_tokens=14)'),
+                    ("text-generation-chat", 'chat_stream("Name one river in Brazil.", max_new_tokens=64)'),
+                    ("text2text-generation",
+                     'stream("translate English to German: The weather is cold.", max_new_tokens=32)')):
+    STREAM_SNIPPETS[_key] = (_TOKENS_LIVE.replace("{call}", _call), None)
+
+
+def stream_snippet(card: "ModelCard", live: bool) -> Optional[str]:
+    """The streaming block for this card, or None: see `STREAM_SNIPPETS`."""
+    pair = STREAM_SNIPPETS.get(snippet_key(card))
+    return None if pair is None else pair[0 if live else 1]
+
+
+def driver_streams(gguf_path: Path) -> bool:
+    """Whether the file's driver has the live path every engine stream opens: `stream_open`, `stream_feed`
+    and `stream_finish` (loom.cpp's `TranscriptionStream` / `SpeechStream` / `FrameStream::supported`)."""
+    import re
+    from gguf import GGUFReader
+
+    field = GGUFReader(str(gguf_path)).fields.get("model.driver_script")
+    if field is None:
+        return False
+    source = bytes(field.parts[field.data[0]]).decode("utf-8", "replace")
+    return all(re.search(rf"(?:\bfunction\s+{fn}\s*\(|\b{fn}\s*=\s*function\b)", source)
+               for fn in ("stream_open", "stream_feed", "stream_finish"))
+
+
 #: The only placeholders a usage snippet may carry. Substituted by name rather than through
 #: `str.format`, which was the previous mechanism and is wrong for this content: a snippet is PYTHON,
 #: and Python has braces. The first card to write `{n_codebooks}` inside an explanatory comment
@@ -3604,7 +3759,8 @@ def export_args(card: ModelCard) -> List[str]:
 
 def render_readme(card: ModelCard, gguf_name: str, runtime: Optional[Tuple[str, List[str]]] = None,
                   text_runtime: Optional[Tuple[str, List[str]]] = None,
-                  feature_runtime: Optional[Tuple[str, List[Tuple[str, str]]]] = None) -> str:
+                  feature_runtime: Optional[Tuple[str, List[Tuple[str, str]]]] = None,
+                  live: bool = False) -> str:
     # A TTS snippet interpolates `sample_rate`, so an entry that never set one would render the literal
     # `sample_rate=None` into a card telling readers to pass it -- a wrong example is worse than no
     # example, and this is the only field where the value cannot be checked against anything on disk.
@@ -3675,6 +3831,14 @@ def render_readme(card: ModelCard, gguf_name: str, runtime: Optional[Tuple[str, 
     # Both land verbatim: `usage_extra` right after the snippet's closing fence, `extra_files` as
     # further bullets under the GGUF's own.
     usage_extra_section = f"\n{card.usage_extra}\n" if card.usage_extra else ""
+    # Right after the usage snippet, so it continues from the `model` that loaded and every later block
+    # still runs after it, as before.
+    streaming = stream_snippet(card, live)
+    streaming_section = (
+        "\n### Streaming\n\n```python\n"
+        + render_snippet(streaming, repo_id=repo_id(card), slug=card.slug, sample_rate=card.sample_rate,
+                         frame_ms=card.frame_ms, gguf=gguf_name)
+        + "```\n") if streaming else ""
 
     # Phoneme-input TTS needs one more extra than everything else, and needs saying WHY. The phonemizer
     # is optional (`loom-py-rt` declares no runtime dependencies on purpose), so a card that installs
@@ -3792,7 +3956,7 @@ pip install -U "loom-py-rt[{install_extras}]"
 {runtime_note}{phonemizer_note}
 ```python
 {render_snippet(USAGE_SNIPPETS[snippet_key(card)], repo_id=repo_id(card), slug=card.slug, sample_rate=card.sample_rate, frame_ms=card.frame_ms, gguf=gguf_name)}```
-{usage_extra_section}
+{streaming_section}{usage_extra_section}
 ### The layer underneath
 
 {layer_line}
@@ -3863,7 +4027,7 @@ def build_one(card: ModelCard, models_root: Path, output_dir: Path, readme_only:
     text_runtime = required_text_runtime([model_dir / name for name, _ in files])
     feature_runtime = required_feature_runtime([model_dir / name for name, _ in files])
     (model_dir / "README.md").write_text(render_readme(card, gguf_name, runtime, text_runtime,
-                                                       feature_runtime))
+                                                       feature_runtime, driver_streams(model_dir / gguf_name)))
     print(f"  [ok] {card.slug}: {model_dir}")
 
 

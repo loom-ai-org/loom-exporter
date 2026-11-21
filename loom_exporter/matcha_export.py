@@ -434,6 +434,14 @@ class TTSMatchaExportConfig(TTSFlowMatchingModelExportConfig):
     # fragment. See `driver_components`.
     driver_script_path: Path = driver_dir("convert_matcha", "matcha_driver")
 
+    def hparams(self) -> dict:
+        """The phoneme conventions the checkpoint was trained in (`tts.phoneme_style`, which the text
+        door folds a G2P's IPA to -- loom.cpp ADR-071): Matcha's LJSpeech recipe phonemizes with
+        espeak-ng en-us. Measured 2026-11-21 through the card's own door (ipa-dict en_UK lexicon,
+        Whisper-small on six sentences): WER 0.33 unfolded -> 0.12 folded, and "hello world" was heard
+        as "a low world" until the fold moved the British /əʊ/ and the stress back to espeak's."""
+        return {**super().hparams(), "tts.phoneme_style": "espeak"}
+
     def contract(self) -> dict:
         """The task default, plus what this sampler needs to be callable at all.
 
