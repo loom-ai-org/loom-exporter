@@ -450,7 +450,16 @@ class OmniVoiceExportConfig(BaseMultiPhaseModelExportConfig):
         # `tts.reference`: a host's `reference=` passes the clip, its transcript and the text as three
         # inputs (the driver joins them the reference's way). `tts.instruct`: the file designs a voice
         # from words. Both are hparams by ADR-020's split: they say how the host builds the door's inputs.
-        return {"hop_length": self._hop, "tts.reference": "transcript", "tts.instruct": "text"}
+        # `tts.default_instruct` / `tts.default_language`: what a host passes when its caller names no voice
+        # (no instruct, no reference clip) or no language. Upstream's defaults are neither -- the model's
+        # own undescribed voice, "language-agnostic" -- and that voice is not speech on a short prompt:
+        # "hello world" came out as music, static or nothing on 13 of 13 fresh seeds (torch's draws or the
+        # engine's, with or without `en`), and a full sentence failed 1 of 6. Described as "female" it was
+        # said right on 14 of 14 ("male": 3 of 6). The language made no measured difference; upstream's
+        # own docstring says naming one helps, and English is what a call without one most likely is.
+        # Measured 2026-11-21, Whisper-small reading the audio back.
+        return {"hop_length": self._hop, "tts.reference": "transcript", "tts.instruct": "text",
+                "tts.default_instruct": "female", "tts.default_language": "en"}
 
     def contract(self) -> dict:
         contract = super().contract()
@@ -458,7 +467,7 @@ class OmniVoiceExportConfig(BaseMultiPhaseModelExportConfig):
         contract["text.frontend"] = "vocab"
         contract["sample_rate"] = self._sample_rate or 24000
         if Path(self.model_dir).is_dir():
-            contract["languages"] = self.languages()
+            contract["text.languages"] = self.languages()   # `loom.text.languages`, the key the engine reads
         return contract
 
     def backend_kwargs(self) -> dict:

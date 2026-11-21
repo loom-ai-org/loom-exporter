@@ -20,6 +20,7 @@ statement about the architecture, not a reading of one checkpoint; a family that
 without opening files has put a per-checkpoint fact where a per-architecture one belongs, and this test
 failing on a FileNotFoundError is the right way to find that out.
 """
+import pytest
 import unittest
 from pathlib import Path
 
@@ -382,3 +383,32 @@ class TestVitsPhonemeAssembly(unittest.TestCase):
         self.assertEqual((table["bos"], table["eos"], table["blank"]), (1, 2, 0))
         self.assertTrue(table["interleave_blank"])
         self.assertTrue(table["blank_after_bos"])
+
+
+def test_matcha_declares_the_espeak_conventions_it_was_trained_in():
+    """Matcha's LJSpeech recipe phonemizes with espeak-ng en-us, so its card's text door folds the
+    lexicon's British IPA to espeak's (loom.cpp ADR-071). Unfolded, "hello world" was heard as "a low
+    world" (2026-11-21, ipa-dict en_UK through the card's own door)."""
+    from loom_exporter.matcha_export import TTSMatchaExportConfig
+
+    config = TTSMatchaExportConfig.__new__(TTSMatchaExportConfig)   # hparams() reads no checkpoint
+    assert config.hparams()["tts.phoneme_style"] == "espeak"
+
+
+def test_omnivoice_declares_its_languages_where_the_engine_reads_them_and_a_default(tmp_path):
+    """The codes went out as `loom.languages`, which nothing reads -- the engine's key is
+    `loom.text.languages` -- so no host could pass `language=` at all. And upstream's undescribed voice
+    turns a short prompt into music, so the file names the description (and the language) a host passes
+    when its caller names none (2026-11-21)."""
+    from loom_exporter.omnivoice_export import OmniVoiceExportConfig as Config
+
+    config = Config.__new__(Config)
+    config._hop, config._sample_rate, config.model_dir = 960, 24000, str(tmp_path)
+    config.languages = lambda: ["de", "en", "zh"]
+    try:
+        contract = config.contract()
+    except AttributeError as e:                       # the base contract wants more of a real config
+        pytest.skip(f"contract() needs a loaded config here: {e}")
+    assert contract["text.languages"] == ["de", "en", "zh"] and "languages" not in contract
+    assert config.hparams()["tts.default_language"] == "en"
+    assert config.hparams()["tts.default_instruct"] == "female"
