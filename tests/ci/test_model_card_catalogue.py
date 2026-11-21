@@ -229,3 +229,19 @@ def test_a_card_names_the_vc4_switch_for_exactly_the_files_that_need_it(cards):
             assert f"`{name}`" in readme
     quiet = next(c for c in cards.CATALOG if c.slug == "kokoro-82m")
     assert "GGML_VC4_FUSE" not in cards.render_readme(quiet, cards.gguf_names(quiet)[0][0])
+
+
+def test_every_streaming_block_belongs_to_a_snippet_and_renders(cards):
+    """A streaming block is keyed by the usage snippet it continues from (it uses that snippet's `model`,
+    `audio`, `codes`, `codec` ...), so a key that names no snippet is a section no card ever gets; and
+    each block renders with only the placeholders a snippet may carry."""
+    unknown = sorted(set(cards.STREAM_SNIPPETS) - set(cards.USAGE_SNIPPETS))
+    assert not unknown, f"streaming blocks for snippets that do not exist: {unknown}"
+    for key, pair in cards.STREAM_SNIPPETS.items():
+        for block in pair:
+            if block is None:
+                continue
+            rendered = cards.render_snippet(block, repo_id="loom-ai-org/x-loom", slug="x", sample_rate=24000,
+                                            frame_ms=20, gguf="x.gguf")
+            assert "{" + "sample_rate}" not in rendered and "{speech}" not in rendered, key
+            compile(rendered, f"stream:{key}", "exec")
