@@ -3269,6 +3269,12 @@ class LoomGGUFExporter:
             # auto-detected as byte-level "gpt2" and mis-tokenize every non-ASCII character.
             from .chatterbox_tokenizer_export import write_chatterbox_vocab
             write_chatterbox_vocab(w, tokenizer_dir)
+        elif family == "kale_tts":
+            # kale-tts-1-tiny's JavaScript front end as data (loom.cpp ADR-142): Ettin's byte-level BPE under
+            # this tag, plus the lexicons, dizione's tables and rule patterns and the GRU guesser the
+            # engine's `KaleTtsVocab` runs. Named by the family: the `tokenizer.json` alone is a plain BPE.
+            from .kale_tts_tokenizer_export import write_kale_tts_vocab
+            write_kale_tts_vocab(w, tokenizer_dir, self.kwargs["kale_ettin_dir"])
         elif family == "pocket_tts":
             # Family 9's fifth leaf: a SentencePiece Unigram wrapped in the reference's text path
             # (prepare, split into sentence chunks). Named by the family: the `.model` alone would be

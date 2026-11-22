@@ -1239,6 +1239,42 @@ CATALOG = [
             "synthesis repeatable."
         ),
     ),
+    # KaleComputer/kale-tts-1-tiny: 45.7M parameters, ten voices designed with Maya-1, Apache-2.0
+    # (loom_exporter/kale_tts_export.py, loom.cpp ADR-142). Exported from the PyTorch release with
+    # KaleComputer/kale-tts-1-base as the teacher (the tiny repo's own teacher .pth is not the one its release graph
+    # was built from) and jhu-clsp/ettin-encoder-17m (MIT) as the word encoder. Measured 2026-11-22: the front end
+    # identical to upstream's JavaScript on 8678 texts; every duration upstream's, 56-74 dB from it.
+    ModelCard(
+        slug="kale-tts-1-tiny", checkpoint=Path("kale-tts-1-tiny"),
+        export_task="text-to-speech", export_model="kale-tts", task_type="text-to-speech",
+        takes_text=True, snippet="text-to-speech-kale",
+        base_repo="KaleComputer/kale-tts-1-tiny", license_id="apache-2.0", language=["en"],
+        sample_rate=24000,
+        title="kale-tts-1-tiny",
+        variants=[
+            ("F32", "full precision, 201.6 MB (Ettin's 67 MB and the front end's word lists and rules included); every "
+                    "duration upstream's, the waveform 56-74 dB from it."),
+            ("Q8_0_PC", "112.8 MB: the projections and convolutions in per-channel int8. Whisper small hears it as it "
+                        "hears F32: 3.7% / 4.3% / 3.5% for Kenzie, Amy and Magnus against F32's 3.7% / 5.8% / 3.2%."),
+        ],
+        summary="KaleComputer's kale-tts-1-tiny: a 45.7M-parameter English TTS with ten designed voices, an Ettin "
+                "word encoder in front of a Kokoro-distilled predictor and a source-filter decoder, at 24 kHz, "
+                "exported for loom.cpp with its own text front end.",
+        limitations=(
+            "**The front end is upstream's, in the engine.** Upstream's JavaScript front end (Kale's terms, "
+            "dizione's number, date, money and unit rules, a CMUdict word list with Kale's hand-checked "
+            "overrides, homographs, a GRU guesser for unknown words, British files for Amy and Jack) is the "
+            "file's tokenizer: identical to upstream's on 8678 test texts. Whisper small's word error rate through `text2speech.infer(text)` on 20 held-out English sentences (numbers, names and dates included; Paradee's set) is 3.5% over the ten voices (2.0-5.8% per voice; Amy 5.8%, Jack 4.3%).\n\n"
+            "**Ten voices, by name** (`voice=\"magnus\"`); the default is Kenzie. The voice picks the accent, "
+            "as upstream's does. `phonemes=` is not a door for this model; `tokens=` takes the front end's "
+            "packed records.\n\n"
+            "**A sentence at a time.** Like upstream, a text is spoken one sentence per pass and `infer` "
+            "follows each with 0.12 s of silence; the stream yields one piece per sentence.\n\n"
+            "**Precision.** The waveform is 56-74 dB from upstream's modules (f32). Upstream draws its noise "
+            "unseeded; `seed=` makes a synthesis repeatable.\n\n"
+            "**Needs `loom-py-rt` 1.0.0**, the first release with the `kale_tts` tokenizer kind."
+        ),
+    ),
     ModelCard(
         slug="vaniq-edge", checkpoint=Path("vaniq-edge"),
         vc4_fuse_off=["vaniq-edge-f32.gguf"],      # Q8_0_PC: byte-identical output fixed and unfixed
@@ -3005,6 +3041,21 @@ audio.save("hello.wav")
 model.text2speech.infer("Il fait très beau aujourd'hui.", voice="ff_siwis").save("bonjour.wav")
 model.text2speech.infer("La biblioteca abre a las nueve.", voice="em_alex", speed=1.1).save("hola.wav")
 """,
+    # kale-tts-1-tiny: the file carries upstream's own JavaScript front end (loom.cpp ADR-142), so text goes in as
+    # written; ten voices by name, the British two reading the British front end by themselves.
+    "text-to-speech-kale": """import loom
+
+model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
+
+# The front end is in the file: numbers, dates, money and units said as words, Kale's word list and its
+# homograph rules, and a guesser for words it has never seen. No phonemiser to install.
+audio = model.text2speech.infer("Hello world! It is 9:30 on March 3.", voice="kenzie")
+audio.save("hello.wav")
+
+# Ten voices, by name. Amy and Jack read British English ("the third of March") on their own.
+print(model.contract["voices"])
+model.text2speech.infer("The meeting moved to 3/4 at 10 a.m.", voice="amy").save("amy.wav")
+""",
     "text-to-speech-lexicon-espeak": """import loom
 
 model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
@@ -3656,6 +3707,7 @@ for _key, _args in (("text-to-speech-with-vocab", ", sample_rate={sample_rate}")
                     ("text-to-speech-voices", ""), ("text-to-speech-lexicon", ""),
                     ("text-to-speech-lexicon-espeak", ""), ("text-to-speech-arpabet", ""),
                     ("text-to-speech-kokoro", ""), ("text-to-speech-dizione", ", speaker=1"),
+                    ("text-to-speech-kale", ', voice="kenzie"'),
                     # After the snippet's `set_lexicon`, so its text door has the lexicon it set.
                     ("text-to-speech", ", sample_rate={sample_rate}"),
                     ("text-to-speech-voice-clone",

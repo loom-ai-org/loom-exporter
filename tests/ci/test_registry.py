@@ -934,7 +934,8 @@ def test_the_tts_families_share_one_task():
     upstream-VITS directory (its own recognizer, beside a fallback for every such directory), and
     AuroraTTS-100K, whose BiGRU and DSP synthesizer are its own family. Twenty-two since OmniVoice, a
     masked-diffusion LM over a codec (ADR-131), and tiny-voca, a source-filter head with no vocoder
-    (ADR-133). Twenty-three since Paradee, Kokoro's modules distilled with a source-filter head (ADR-135)."""
+    (ADR-133). Twenty-three since Paradee, Kokoro's modules distilled with a source-filter head (ADR-135).
+    Twenty-four since kale-tts, Paradee's head behind Kokoro's predictor and an Ettin text side (ADR-142)."""
     from loom_exporter.registry import default_registry
 
     registry = default_registry()
@@ -942,7 +943,7 @@ def test_the_tts_families_share_one_task():
     assert names == {"kokoro", "styletts2", "vits", "matcha", "supertonic", "f5-tts", "chatterbox",
                      "pocket-tts", "voxcpm2", "cosyvoice3", "voxtral-tts", "speecht5", "soprano",
                      "lfm2.5-audio-tts", "sanotts", "sanotts-nano", "vocetta2", "vaniq-edge",
-                     "vits-upstream", "auroratts", "omnivoice", "tiny-voca", "paradee"}
+                     "vits-upstream", "auroratts", "omnivoice", "tiny-voca", "paradee", "kale-tts"}
     for model in names:
         assert registry.get("text-to-speech", model).name == model
 
