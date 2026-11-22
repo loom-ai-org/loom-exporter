@@ -380,6 +380,9 @@ class KaleTtsExportConfig(BaseMultiPhaseModelExportConfig):
 
     def backend_kwargs(self) -> dict:
         kwargs = super().backend_kwargs()
+        # The text front end (`kale_tts_tokenizer_export`): the release's own files, and Ettin's vocabulary.
+        kwargs.update(tokenizer_dir=self.model_dir, tokenizer_family="kale_tts",
+                      kale_ettin_dir=str(self._ettin_dir) if self._ettin_dir else None)
         if self._voices:
             kwargs["driver_weights"] = {
                 PACKS: np.stack([v["prosody"] for v in self._voices]).astype(np.float32),
@@ -427,6 +430,8 @@ class KaleTtsExportConfig(BaseMultiPhaseModelExportConfig):
     def contract(self) -> dict:
         contract = super().contract()
         contract["sample_rate"] = SAMPLE_RATE
+        # The file's own front end: text in, the packed records out (`loom::KaleTtsVocab`).
+        contract["text.frontend"] = "vocab"
         voices = self._voices or []
         # The driver's `voice` is a row of the tables, named here in that order; each voice reads one accent
         # (upstream picks the front end by the voice: Amy and Jack read the British one).
