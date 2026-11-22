@@ -162,8 +162,13 @@ def test_a_card_names_the_runtime_its_ops_need(cards, tmp_path):
     card = next(c for c in cards.CATALOG if not c.variants and not c.packages)
     name = cards.gguf_names(card)[0][0]
     assert "or later.**" not in cards.render_readme(card, name)
+    # Every card installs at least RUNTIME_FLOOR, so an op of an older release needs no note of its own...
     readme = cards.render_readme(card, name, ("1.0.0rc18", ["ISTFT", "STFT"]))
-    assert "**Needs `loom-py-rt` 1.0.0rc18 or later.**" in readme
+    assert f'"loom-py-rt[hub]>={cards.RUNTIME_FLOOR}"' in readme
+    assert "or later.**" not in readme
+    # ...and one of a newer release still gets it.
+    readme = cards.render_readme(card, name, ("1.0.1", ["ISTFT", "STFT"]))
+    assert "**Needs `loom-py-rt` 1.0.1 or later.**" in readme
     assert "`ISTFT` and `STFT` ops" in readme and "`unknown op 'ISTFT'`" in readme
 
 
@@ -194,8 +199,9 @@ def test_a_card_names_the_runtime_its_text_rules_need(cards, tmp_path):
 
     card = cards.CATALOG_BY_SLUG["pocket-tts-2m"]
     name = cards.gguf_names(card)[0][0]
-    readme = cards.render_readme(card, name, None, (version, rules))
-    assert "**Needs `loom-py-rt` 1.0.0rc19 or later to read text exactly" in readme
+    assert "to read text exactly" not in cards.render_readme(card, name, None, (version, rules))   # under the floor
+    readme = cards.render_readme(card, name, None, ("1.0.1", rules))
+    assert "**Needs `loom-py-rt` 1.0.1 or later to read text exactly" in readme
     assert "unknown op" not in readme
 
 
@@ -214,8 +220,8 @@ def test_each_pocket_tts_card_names_the_reference_it_needs(cards):
 def test_a_card_names_the_vc4_switch_for_exactly_the_files_that_need_it(cards):
     """loom.cpp Retro-109: on loom-py-rt 1.0.0rc20 and earlier, ggml-vc4 aborts on nine published files
     under `device="auto"` on a Pi Zero. Each card lists its own, by file name -- a name that is not one of
-    the card's GGUFs would tell readers to set a switch for a file they cannot find, and a card listing
-    none must say nothing about it."""
+    the card's GGUFs would tell readers to set a switch for a file they cannot find. Every card installs at
+    least 1.0.0 now, which fixes it, so no README names the switch any more."""
     listed = [c for c in cards.CATALOG if c.vc4_fuse_off]
     assert {c.slug for c in listed} == {"sanotts", "vocetta2-276k", "vocetta2-500k", "vocetta2-1m",
                                         "vaniq-edge", "vits-piper-en-gb-miro"}
@@ -224,9 +230,7 @@ def test_a_card_names_the_vc4_switch_for_exactly_the_files_that_need_it(cards):
         names = {name for name, _ in cards.gguf_names(card)} | {name for _, name, _ in card.packages}
         assert set(card.vc4_fuse_off) <= names, (card.slug, card.vc4_fuse_off, names)
         readme = cards.render_readme(card, cards.gguf_names(card)[0][0])
-        assert "`GGML_VC4_FUSE=0`" in readme and "1.0.0rc20 or earlier" in readme
-        for name in card.vc4_fuse_off:
-            assert f"`{name}`" in readme
+        assert "GGML_VC4_FUSE" not in readme and f">={cards.RUNTIME_FLOOR}" in readme
     quiet = next(c for c in cards.CATALOG if c.slug == "kokoro-82m")
     assert "GGML_VC4_FUSE" not in cards.render_readme(quiet, cards.gguf_names(quiet)[0][0])
 

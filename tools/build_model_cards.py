@@ -36,6 +36,11 @@ sys.path.insert(0, str(REPO_ROOT))
 DEFAULT_MODELS_ROOT = Path("/home/flavio/Dev/models")
 DEFAULT_OUTPUT_DIR = REPO_ROOT.parent / "hf-models"
 
+# The oldest `loom-py-rt` every card installs (`pip install -U "loom-py-rt[...]>=RUNTIME_FLOOR"`). 1.0.0 is the
+# first final release: below it are only the rcs, which a bare `pip install` skips once a final exists, but an
+# existing install or an exact pin would keep. Every capability note for a release at or below the floor is
+# implied by the install line and left out; one for a newer release is still written.
+RUNTIME_FLOOR = "1.0.0"
 LOOM_PY_URL = "https://github.com/loom-ai-org/loom-py"
 LOOM_CPP_URL = "https://github.com/loom-ai-org/loom.cpp"
 EXPORTER_URL = "https://github.com/loom-ai-org/loom-exporter"
@@ -1231,7 +1236,7 @@ CATALOG = [
             "| hf_alpha (hi) | 13.0% | -- | 20.6% |\n\n"
             "(20 held-out English sentences, 15 per other language; F32. Q8_0_PC reads the same, Hindi 15.3%.)\n\n"
             "**The voice picks the language** (`voice=\"ff_siwis\"` reads French) unless `language=` names "
-            "another. Choosing a voice by name needs `loom-py-rt` 1.0.0.\n\n"
+            "another.\n\n"
             "**A sentence at a time.** Like upstream, a text is spoken one sentence per pass (at most 510 "
             "phonemes each), and the stream yields one piece per sentence.\n\n"
             "**Precision.** The engine's waveform is 56-67 dB from upstream's (f32): its STFTs are convolutions "
@@ -1271,8 +1276,7 @@ CATALOG = [
             "**A sentence at a time.** Like upstream, a text is spoken one sentence per pass and `infer` "
             "follows each with 0.12 s of silence; the stream yields one piece per sentence.\n\n"
             "**Precision.** The waveform is 56-74 dB from upstream's modules (f32). Upstream draws its noise "
-            "unseeded; `seed=` makes a synthesis repeatable.\n\n"
-            "**Needs `loom-py-rt` 1.0.0**, the first release with the `kale_tts` tokenizer kind."
+            "unseeded; `seed=` makes a synthesis repeatable."
         ),
     ),
     ModelCard(
@@ -1451,13 +1455,12 @@ anything.""",
             "**It clones a voice, so it needs one.** Every call takes a reference clip at 24 kHz, the "
             "transcript of that clip, and the text to speak -- the model in-fills one spectrogram "
             "whose first frames are the reference, so there is no way to synthesise without a prompt.\n\n"
-            "**The door is `text2speech.infer(text, reference=, reference_text=)`, which needs "
-            "loom-py-rt 1.0.0rc12 or later.** It joins the transcript to the text and passes the "
+            "**The door is `text2speech.infer(text, reference=, reference_text=)`.** It joins the "
+            "transcript to the text and passes the "
             "file's own inputs: `waveform` (the clip, mono, 24 kHz), `text_ids` (the transcript's ids, a "
             "space, then the text's) and `n_ref_text` (how many of those ids are the transcript -- the "
             "duration estimate is a ratio of the two lengths, and nothing in the ids marks the join). "
-            "On 1.0.0rc11 and earlier call `model.infer(waveform=, text_ids=, n_ref_text=)` with that join "
-            "spelled out; the audio is identical. Text alone is refused: this model has no voice of its own. "
+            "Text alone is refused: this model has no voice of its own. "
             "`loom_cli --wav ref.wav --ref-text \"...\" --prompt \"...\" --out out.wav` does the same "
             "from the shell. Optional knobs: `n_steps`, `cfg_scale`, `sway_coef`, `speed`, `duration` "
             "(total frames), `seed`.\n\n"
@@ -3909,6 +3912,12 @@ def render_readme(card: ModelCard, gguf_name: str, runtime: Optional[Tuple[str, 
     # `pip install -U` reaches the newest runtime, but a reader who already has an older one pinned
     # meets the file before they meet the error; the error names the op and not the release.
     runtime_note = ""
+    # A release at or below the floor is what the install line already asks for.
+    from packaging.version import Version
+    floor = Version(RUNTIME_FLOOR)
+    runtime = runtime if runtime and Version(runtime[0]) > floor else None
+    text_runtime = text_runtime if text_runtime and Version(text_runtime[0]) > floor else None
+    feature_runtime = feature_runtime if feature_runtime and Version(feature_runtime[0]) > floor else None
     if runtime and feature_runtime:
         from packaging.version import Version
         if Version(feature_runtime[0]) >= Version(runtime[0]):
@@ -3931,7 +3940,7 @@ def render_readme(card: ModelCard, gguf_name: str, runtime: Optional[Tuple[str, 
         older = "; ".join(o for _, o in features)
         runtime_note += (f"\n**Needs `loom-py-rt` {version} or later.** This file uses {uses}, new in that "
                          f"release: {older}.\n")
-    if card.vc4_fuse_off:
+    if card.vc4_fuse_off and floor < Version("1.0.0"):   # 1.0.0 fixes the VC4 fusion (Retro-109)
         named = " and ".join(f"`{name}`" for name in card.vc4_fuse_off)
         one = len(card.vc4_fuse_off) == 1
         runtime_note += (
@@ -4004,7 +4013,7 @@ Exported from {source_line}. {weights_line}
 Run it with [loom-py]({LOOM_PY_URL}) -- `loom-py-rt` on PyPI:
 
 ```sh
-pip install -U "loom-py-rt[{install_extras}]"
+pip install -U "loom-py-rt[{install_extras}]>={RUNTIME_FLOOR}"
 ```
 {runtime_note}{phonemizer_note}
 ```python
