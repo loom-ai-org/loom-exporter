@@ -59,8 +59,12 @@ PHONEME_INPUT = {"kokoro", "matcha", "styletts2", "vits", "sanotts", "sanotts-na
 # through LFM2's own byte-level BPE.
 #
 # OmniVoice reads Qwen3's byte-level BPE (ADR-131).
+#
+# kale-tts reads phonemes, but its GGUF carries the front end that makes them (`loom::KaleTtsVocab`, ADR-142:
+# upstream's JavaScript text rules, lexicons, homographs and GRU guesser, 8678/8678 texts identical), so a
+# host hands it text and `"vocab"` is the true answer.
 GRAPHEME_INPUT = {"supertonic", "f5-tts", "chatterbox", "pocket-tts", "voxcpm2", "cosyvoice3", "voxtral-tts",
-                  "speecht5", "soprano", "lfm2.5-audio-tts", "omnivoice"}
+                  "speecht5", "soprano", "lfm2.5-audio-tts", "omnivoice", "kale-tts"}
 
 # Families that still declare no `sample_rate`, with the reason it is an EXEMPTION rather than a pass.
 # Each needs its rate taken off its own checkpoint the way Kokoro's and Supertonic's are -- Matcha's and

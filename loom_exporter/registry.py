@@ -219,6 +219,7 @@ _FAMILY_MODULES = (
     "plamo_export",
     "tiny_voca_export",
     "paradee_export",
+    "kale_tts_export",
     "t5_export",
     "f5_tts_export",
     "chatterbox_export",
