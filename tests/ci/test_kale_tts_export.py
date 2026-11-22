@@ -1,4 +1,4 @@
-"""kale-tts-1-tiny's export (kale_tts_export.py, kale_tts_tokenizer_export.py; loom.cpp ADR-138).
+"""kale-tts-1-tiny's export (kale_tts_export.py, kale_tts_tokenizer_export.py; loom.cpp ADR-142).
 
 The Ettin wrapper is held to transformers' own ModernBERT on a small random encoder whose sequence outruns its
 sliding window; the front end's rules to upstream's JavaScript sources, verbatim, when a release is on disk

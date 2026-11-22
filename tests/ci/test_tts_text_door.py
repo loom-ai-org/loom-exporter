@@ -60,7 +60,7 @@ PHONEME_INPUT = {"kokoro", "matcha", "styletts2", "vits", "sanotts", "sanotts-na
 #
 # OmniVoice reads Qwen3's byte-level BPE (ADR-131).
 #
-# kale-tts reads phonemes, but its GGUF carries the front end that makes them (`loom::KaleTtsVocab`, ADR-138:
+# kale-tts reads phonemes, but its GGUF carries the front end that makes them (`loom::KaleTtsVocab`, ADR-142:
 # upstream's JavaScript text rules, lexicons, homographs and GRU guesser, 8678/8678 texts identical), so a
 # host hands it text and `"vocab"` is the true answer.
 GRAPHEME_INPUT = {"supertonic", "f5-tts", "chatterbox", "pocket-tts", "voxcpm2", "cosyvoice3", "voxtral-tts",
