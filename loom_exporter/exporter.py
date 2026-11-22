@@ -3270,7 +3270,7 @@ class LoomGGUFExporter:
             from .chatterbox_tokenizer_export import write_chatterbox_vocab
             write_chatterbox_vocab(w, tokenizer_dir)
         elif family == "kale_tts":
-            # kale-tts-1-tiny's JavaScript front end as data (loom.cpp ADR-138): Ettin's byte-level BPE under
+            # kale-tts-1-tiny's JavaScript front end as data (loom.cpp ADR-142): Ettin's byte-level BPE under
             # this tag, plus the lexicons, dizione's tables and rule patterns and the GRU guesser the
             # engine's `KaleTtsVocab` runs. Named by the family: the `tokenizer.json` alone is a plain BPE.
             from .kale_tts_tokenizer_export import write_kale_tts_vocab

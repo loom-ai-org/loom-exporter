@@ -1272,7 +1272,7 @@ CATALOG = [
             "follows each with 0.12 s of silence; the stream yields one piece per sentence.\n\n"
             "**Precision.** The waveform is 56-74 dB from upstream's modules (f32). Upstream draws its noise "
             "unseeded; `seed=` makes a synthesis repeatable.\n\n"
-            "**Needs a newer runtime.** The `kale_tts` tokenizer kind is in loom-py-rt releases after 1.0.0."
+            "**Needs `loom-py-rt` 1.0.0**, the first release with the `kale_tts` tokenizer kind."
         ),
     ),
     ModelCard(

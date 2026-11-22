@@ -1,4 +1,4 @@
-"""kale-tts-1-tiny's text front end as GGUF data: `tokenizer.ggml.model = "kale_tts"` (loom.cpp ADR-138).
+"""kale-tts-1-tiny's text front end as GGUF data: `tokenizer.ggml.model = "kale_tts"` (loom.cpp ADR-142).
 
 Upstream's front end is JavaScript (`frontend/`, run by every one of its runtimes, Python's through QuickJS):
 text -> Kale's terms table -> dizione's text rules (numbers, money, dates, times, units, codes, addresses) ->
