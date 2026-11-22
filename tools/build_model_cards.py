@@ -3049,8 +3049,9 @@ model = loom.Model.from_pretrained("{repo_id}", "{gguf}")
 
 # The front end is in the file: numbers, dates, money and units said as words, Kale's word list and its
 # homograph rules, and a guesser for words it has never seen. No phonemiser to install.
-audio = model.text2speech.infer("Hello world! It is 9:30 on March 3.", voice="kenzie")
+audio = model.text2speech.infer("Hello world.", voice="kenzie")
 audio.save("hello.wav")
+model.text2speech.infer("It is 9:30 on March 3, and it costs $4.50.", voice="kenzie").save("numbers.wav")
 
 # Ten voices, by name. Amy and Jack read British English ("the third of March") on their own.
 print(model.contract["voices"])
