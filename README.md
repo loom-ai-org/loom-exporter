@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://huggingface.co/loom-ai-org"><img alt="Models on Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20exported%20models-64-ffcc4d"></a>
+  <a href="https://huggingface.co/loom-ai-org"><img alt="Models on Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20exported%20models-77-ffcc4d"></a>
   <a href="LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-1a7f37"></a>
 </p>
 
