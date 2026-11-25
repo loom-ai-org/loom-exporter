@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://huggingface.co/loom-ai-org"><img alt="Models on Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20exported%20models-64-ffcc4d"></a>
+  <a href="https://huggingface.co/loom-ai-org"><img alt="Models on Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20exported%20models-77-ffcc4d"></a>
   <a href="LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-1a7f37"></a>
 </p>
 
@@ -103,6 +103,11 @@ The project's knowledge base lives with the engine, in
 | [**loom.cpp**](https://github.com/loom-ai-org/loom.cpp) | the engine that runs what this produces |
 | [**loom-py**](https://github.com/loom-ai-org/loom-py) | Python bindings, on PyPI as `loom-py-rt` |
 | [**loom-exporter**](https://github.com/loom-ai-org/loom-exporter) | this one: tracing, lowering, driver synthesis |
+
+## Acknowledgements
+
+The coding, debugging and documentation of loom-exporter were assisted by
+[Claude Code](https://claude.com/claude-code) agents.
 
 ## Licence
 
