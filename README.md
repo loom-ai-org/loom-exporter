@@ -104,6 +104,11 @@ The project's knowledge base lives with the engine, in
 | [**loom-py**](https://github.com/loom-ai-org/loom-py) | Python bindings, on PyPI as `loom-py-rt` |
 | [**loom-exporter**](https://github.com/loom-ai-org/loom-exporter) | this one: tracing, lowering, driver synthesis |
 
+## Acknowledgements
+
+The coding, debugging and documentation of loom-exporter were assisted by
+[Claude Code](https://claude.com/claude-code) agents.
+
 ## Licence
 
 MIT, see [`LICENSE`](LICENSE). An exported model keeps the licence of the checkpoint it came from.
