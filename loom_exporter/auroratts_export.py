@@ -397,7 +397,7 @@ class TTSAuroraExportConfig(BaseMultiPhaseModelExportConfig):
                 note="Embedding and the looped encoder; both outputs stay in the store."),
             BiRecurrentCall(
                 forward_topology="ctx_gru_fwd", backward_topology="ctx_gru_bwd", out_var="_gru_gen",
-                sequence=OutputRef("encode", index=2), seq_len=n, input_dim=d, hidden_dim=gru_h,
+                sequence=OutputRef("encode", index=2), seq_len=n, input_dim=d, hidden_dim=gru_h, cell="gru",
                 note="The BiGRU over the tokens, swept in C++: one [h_fwd | h_bwd] row per token."),
             SubgraphCallComponent(
                 topology="predict", outputs=(), retain=True, length=n,

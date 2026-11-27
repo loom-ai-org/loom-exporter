@@ -314,6 +314,7 @@ _DRIVING_BINDINGS = {
     "loom.run_recurrent(": (None, (0,)),
     "loom.run_recurrent_and_retain(": (None, (0,)),
     "loom.run_bi_recurrent_and_retain(": (None, (0, 1)),
+    "loom.run_bi_lstm_and_retain(": (None, (0, 1)),
     "loom.run_bi_recurrent_pair_and_retain(": (None, (0, 1)),
 }
 

@@ -872,7 +872,7 @@ def _check_retained_reads(function: Function, topologies: dict) -> None:
 
 # The binding whose retained sequence `_check_retained_reads` must know about, spelled once.
 RECURRENT_RETAIN_FN = "loom.run_recurrent_and_retain"
-RECURRENT_RETAIN_FNS = (RECURRENT_RETAIN_FN, "loom.run_bi_recurrent_and_retain")
+RECURRENT_RETAIN_FNS = (RECURRENT_RETAIN_FN, "loom.run_bi_recurrent_and_retain", "loom.run_bi_lstm_and_retain")
 
 
 def _output_refs_in(expr):

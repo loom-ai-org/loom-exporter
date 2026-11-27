@@ -2446,6 +2446,10 @@ class BiRecurrentCall(DriverComponent):
 
     The `rows` layout, `[2 * hidden_dim, seq_len]`, is what both of its consumers read: the next
     layer's sequence and a time-major graph input.
+
+    An LSTM cell (`cell="lstm"`) emits `loom.run_bi_lstm_and_retain`, which takes the same arguments and
+    runs the whole layer as one graph (loom.cpp ADR-143); a driver from it needs an engine with that
+    binding. A GRU cell (`cell="gru"`) keeps the per-timestep `loom.run_bi_recurrent_and_retain`.
     """
 
     forward_topology: str
@@ -2455,6 +2459,7 @@ class BiRecurrentCall(DriverComponent):
     seq_len: object
     input_dim: int
     hidden_dim: int
+    cell: str = "lstm"
     note: Optional[str] = None
 
     __links__ = {"forward_topology": TopologyName(), "backward_topology": TopologyName()}
@@ -2467,13 +2472,23 @@ class BiRecurrentCall(DriverComponent):
         "input_dim": Unchecked("the cell's input width, from the traced `lstm` op via RecurrentPhase; "
                                "the binding checks it against the sequence and the cell topology"),
         "hidden_dim": Unchecked("same, for the h/c width each direction's cell declares"),
+        "cell": Unchecked("'lstm' or 'gru', checked in __post_init__; the binding refuses a cell "
+                          "topology that is not an LSTM"),
     }
 
+    def __post_init__(self):
+        if self.cell not in ("lstm", "gru"):
+            raise ValueError(f"BiRecurrentCall: cell={self.cell!r} -- it is 'lstm' or 'gru'")
+
+    @property
+    def binding(self) -> str:
+        return "loom.run_bi_lstm_and_retain" if self.cell == "lstm" else "loom.run_bi_recurrent_and_retain"
+
     def link_label(self) -> str:
-        return f"loom.run_bi_recurrent_and_retain({self.forward_topology!r}, {self.backward_topology!r})"
+        return f"{self.binding}({self.forward_topology!r}, {self.backward_topology!r})"
 
     def emit(self, ctx):
-        return _note_block(self.note) + [Local(self.out_var, Call("loom.run_bi_recurrent_and_retain", [
+        return _note_block(self.note) + [Local(self.out_var, Call(self.binding, [
             Lit(self.forward_topology), Lit(self.backward_topology), self.sequence, self.seq_len,
             Lit(self.input_dim), Lit(self.hidden_dim), Lit("rows"),
         ]))]

@@ -296,8 +296,9 @@ def _entries() -> Tuple[ComponentEntry, ...]:
         ),
         ComponentEntry(
             "bi_recurrent_call", BiRecurrentCall, (STATEMENTS,),
-            "One `loom.run_bi_recurrent_and_retain`: a bidirectional LSTM layer, both directions swept "
-            "in C++ and retained as one `[h_fwd | h_bwd]` row per timestep. A stack is one per layer.",
+            "One bidirectional recurrent layer, retained as one `[h_fwd | h_bwd]` row per timestep: "
+            "`loom.run_bi_lstm_and_retain` (one graph) for an LSTM, `loom.run_bi_recurrent_and_retain` "
+            "for a GRU. A stack is one per layer.",
         ),
         ComponentEntry(
             "flow_matching_sampler", FlowMatchingSampler, (PRELUDE, STATEMENTS),

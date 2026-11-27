@@ -313,8 +313,14 @@ def test_a_bidirectional_layer_retains_into_its_forward_cell():
                            hidden_dim=3)
     stmts = call.emit(None)
     rendered = stmts[-1].expr.render()
-    assert "loom.run_bi_recurrent_and_retain('lstm_l0_fwd', 'lstm_l0_bwd', {from = 'pre'}, 10, 4, 3, " \
+    assert "loom.run_bi_lstm_and_retain('lstm_l0_fwd', 'lstm_l0_bwd', {from = 'pre'}, 10, 4, 3, " \
            "'rows')" in rendered
+    gru = BiRecurrentCall(forward_topology="lstm_l0_fwd", backward_topology="lstm_l0_bwd", out_var="gen",
+                          sequence=OutputRef("pre"), seq_len=Lit(10), input_dim=4, hidden_dim=3, cell="gru")
+    assert "loom.run_bi_recurrent_and_retain('lstm_l0_fwd'" in gru.emit(None)[-1].expr.render()
+    with pytest.raises(ValueError):
+        BiRecurrentCall(forward_topology="a", backward_topology="b", out_var="g", sequence=OutputRef("pre"),
+                        seq_len=Lit(10), input_dim=4, hidden_dim=3, cell="rnn")
 
     pre = SubgraphCall(outputs=[], module="pre", axes={"n_samples": Lit(10)}, inputs={}, retain=True)
 
