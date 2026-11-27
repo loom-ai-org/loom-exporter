@@ -2446,6 +2446,14 @@ class BiRecurrentCall(DriverComponent):
 
     The `rows` layout, `[2 * hidden_dim, seq_len]`, is what both of its consumers read: the next
     layer's sequence and a time-major graph input.
+
+    **`input_topology` takes the input half of the gates out of the sweep** (ADR-137, ADR-144): the
+    layer's `RecurrentPhase(project_input=True)` topology `<stem>_input`, run once over the whole
+    sequence (`W_ih x + b`, one `[4H, T]` output per direction), and the projected cells add only
+    `W_hh h` per step, through `loom.run_bi_recurrent_pair_and_retain`. Every layer of a stack can do
+    this here, because each layer is its own call and its input -- the previous layer's retained rows --
+    exists before its sweep. That was 56% of the multiply-adds of rawi's two-layer BiLSTMs (input 128
+    and 512, hidden 256), streamed once per step as matrix-vector products.
     """
 
     forward_topology: str
@@ -2455,9 +2463,11 @@ class BiRecurrentCall(DriverComponent):
     seq_len: object
     input_dim: int
     hidden_dim: int
+    input_topology: Optional[str] = None
     note: Optional[str] = None
 
-    __links__ = {"forward_topology": TopologyName(), "backward_topology": TopologyName()}
+    __links__ = {"forward_topology": TopologyName(), "backward_topology": TopologyName(),
+                 "input_topology": WhenSet(TopologyName())}
     __unchecked__ = {
         "note": _NOTE_IS_COSMETIC,
         "out_var": Unchecked("the local this call binds (the store generation); reads of it are "
@@ -2469,13 +2479,28 @@ class BiRecurrentCall(DriverComponent):
         "hidden_dim": Unchecked("same, for the h/c width each direction's cell declares"),
     }
 
+    @property
+    def binding(self) -> str:
+        return ("loom.run_bi_recurrent_pair_and_retain" if self.input_topology
+                else "loom.run_bi_recurrent_and_retain")
+
     def link_label(self) -> str:
-        return f"loom.run_bi_recurrent_and_retain({self.forward_topology!r}, {self.backward_topology!r})"
+        return f"{self.binding}({self.forward_topology!r}, {self.backward_topology!r})"
 
     def emit(self, ctx):
-        return _note_block(self.note) + [Local(self.out_var, Call("loom.run_bi_recurrent_and_retain", [
-            Lit(self.forward_topology), Lit(self.backward_topology), self.sequence, self.seq_len,
-            Lit(self.input_dim), Lit(self.hidden_dim), Lit("rows"),
+        if not self.input_topology:
+            return _note_block(self.note) + [Local(self.out_var, Call(self.binding, [
+                Lit(self.forward_topology), Lit(self.backward_topology), self.sequence, self.seq_len,
+                Lit(self.input_dim), Lit(self.hidden_dim), Lit("rows"),
+            ]))]
+        # The projection is an ordinary retained subgraph call, so `check_subgraph_calls` checks its
+        # input against the topology and the sweep's two references against what it retained.
+        project = SubgraphCall(outputs=[], module=self.input_topology, axes={"n_tokens": self.seq_len},
+                               inputs={"sequence": self.sequence}, retain=True)
+        return _note_block(self.note) + [project, Local(self.out_var, Call(self.binding, [
+            Lit(self.forward_topology), Lit(self.backward_topology),
+            OutputRef(self.input_topology, index=1), OutputRef(self.input_topology, index=2),
+            self.seq_len, Lit(4 * self.hidden_dim), Lit(self.hidden_dim), Lit("rows"),
         ]))]
 
 

@@ -138,6 +138,48 @@ class TestLstmRecurrent(unittest.TestCase):
     def test_projected_lstm_bidirectional(self):
         self._check(hidden_dim=13, input_dim=7, seq_len=9, bidirectional=True, project=True)
 
+    def test_a_projected_stack_runs_a_layer_at_a_time(self):
+        """ADR-144: every layer of a stack projected, driven the way `BiRecurrentCall` drives it -- layer k's
+        `_input` reads layer k-1's `[h_fwd | h_bwd]` rows, then both directions sweep their own rows."""
+        from loom_exporter.multi_phase_export import RecurrentPhase
+
+        torch.manual_seed(0)
+        hidden, width, seq_len = 6, 5, 7
+        lstm = torch.nn.LSTM(width, hidden, num_layers=2, bidirectional=True).eval()
+        x = torch.randn(seq_len, 1, width)
+        with torch.no_grad():
+            ref = lstm(x)[0].squeeze(1).numpy()
+        topologies, weights = RecurrentPhase(name="s", module=lstm, number_layers=True,
+                                             project_input=True).topologies()
+        self.assertEqual(sorted(topologies), ["s_l0_bwd", "s_l0_fwd", "s_l0_input",
+                                              "s_l1_bwd", "s_l1_fwd", "s_l1_input"])
+        self.assertEqual(topologies["s_l1_input"]["inputs"][0]["shape"], [str(2 * hidden), "n_tokens"])
+
+        def sweep(topo, rows, reverse):
+            h = np.zeros(hidden, dtype=np.float32)
+            c = np.zeros(hidden, dtype=np.float32)
+            out = np.zeros((seq_len, hidden), dtype=np.float32)
+            for t in (range(seq_len - 1, -1, -1) if reverse else range(seq_len)):
+                v = _run_topology(topo, weights, {"layer_input": rows[t], "h_prev": h, "c_prev": c})
+                h, c = v["h_new"], v["c_new"]
+                out[t] = h
+            return out
+
+        def run(swap_layer=None):
+            seq = x.squeeze(1).numpy()
+            for k in range(2):
+                gates = _run_topology(topologies[f"s_l{k}_input"], weights, {"sequence": seq})
+                fwd_rows, bwd_rows = gates["gates_0"], gates["gates_1"]
+                if k == swap_layer:
+                    fwd_rows, bwd_rows = bwd_rows, fwd_rows
+                seq = np.concatenate([sweep(topologies[f"s_l{k}_fwd"], fwd_rows, False),
+                                      sweep(topologies[f"s_l{k}_bwd"], bwd_rows, True)], axis=-1)
+            return seq
+
+        self.assertLess(np.abs(run() - ref).max(), 1e-4)
+        # The check can fail: layer 1's directions reading each other's projection is far off.
+        self.assertGreater(np.abs(run(swap_layer=1) - ref).max(), 1e-2)
+
     def test_a_projected_cell_holds_no_input_weights(self):
         """The point of the split: the cell's per-step work is `W_hh h` alone."""
         op, _, _ = _trace_lstm_op(5, 8, 6, True)
