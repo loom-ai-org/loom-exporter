@@ -720,7 +720,9 @@ class PyannoteSegmentationExportConfig(BaseMultiPhaseModelExportConfig):
                 mil_inputs=[ct.TensorType(name="waveform", dtype=np.float32, shape=(
                     1, ct.RangeDim(_SINCNET_MIN_SAMPLES, int(self.max_seconds * self.sample_rate))))],
             ),
-            RecurrentPhase(name="lstm", module=lstm, number_layers=True),
+            # Every layer's input half (`W_ih x + b`) is one product over the whole window before its
+            # sweep (ADR-144): each layer is its own `BiRecurrentCall`, reading the previous layer's rows.
+            RecurrentPhase(name="lstm", module=lstm, number_layers=True, project_input=True),
             ExportPhase(
                 name="head", wrapper=_PyannoteHead(model, self), root_axis="n_enc_frames",
                 dummy_inputs=(torch.randn(1, frames, width),),
@@ -765,6 +767,7 @@ class PyannoteSegmentationExportConfig(BaseMultiPhaseModelExportConfig):
                 forward_topology=forward, backward_topology=f"lstm_l{layer}_bwd",
                 out_var=f"lstm_{layer}_gen", sequence=OutputRef(previous), seq_len=n_frames,
                 input_dim=in_width if layer == 0 else 2 * hidden, hidden_dim=hidden,
+                input_topology=f"lstm_l{layer}_input",
                 note=("Both directions of one BiLSTM layer, swept in C++ and retained as one "
                       "[h_fwd | h_bwd] row per frame -- the layout the next layer and the head read."
                       if layer == 0 else None),
