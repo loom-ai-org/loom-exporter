@@ -388,6 +388,12 @@ class TestVitsPhonemeAssembly(unittest.TestCase):
         self.assertTrue(table["interleave_blank"])
         self.assertTrue(table["blank_after_bos"])
 
+    def test_a_phoonnx_map_of_bare_ids_reads_like_piper_lists(self):
+        """phoonnx writes `{symbol: id}` where Piper writes `{symbol: [id]}`."""
+        table = self._table({"_": 0, "^": 1, "$": 2, "a": 14, "ɣ": 15})
+        self.assertEqual(table["symbols"], ["_", "^", "$", "a", "ɣ"])
+        self.assertEqual(table["ids"], [0, 1, 2, 14, 15])
+
 
 def test_matcha_declares_the_espeak_conventions_it_was_trained_in():
     """Matcha's LJSpeech recipe phonemizes with espeak-ng en-us, so its card's text door folds the

@@ -51,6 +51,7 @@ Usage:
   loom-export /path/to/piper.ckpt -o vits_mil.gguf --task text-to-speech --model vits
 """
 import math
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,8 +68,10 @@ from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .spec_protocol import Unchecked
 
 # Where the Piper checkout lives. `piper_train` is not a PyPI package -- it is a git clone put on
-# `sys.path` -- so this module was importable on exactly one machine, and CI could not import it at all.
-PIPER_REPO = "/home/flavio/Dev/piper/src/python"
+# `sys.path`. `$LOOM_PIPER_REPO` names any directory that holds a `piper_train` package, which is also
+# how a checkpoint trained by a Piper fork with the same module tree (phoonnx's `phoonnx_train.vits`)
+# is loaded.
+PIPER_REPO = os.environ.get("LOOM_PIPER_REPO", "/home/flavio/Dev/piper/src/python")
 
 # Piper's classes, bound by `load_piper()` rather than imported here -- see `kokoro_export`'s note for
 # the reasoning and why these are module globals rather than per-site local imports.
@@ -487,7 +490,9 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
                 )
             config = candidates[0]
 
-        id_map = json.loads(config.read_text())["phoneme_id_map"]
+        # Piper writes `{symbol: [id]}`; phoonnx writes `{symbol: id}`.
+        id_map = {sym: ids if isinstance(ids, list) else [ids]
+                  for sym, ids in json.loads(config.read_text())["phoneme_id_map"].items()}
         multi = {sym: ids for sym, ids in id_map.items() if len(ids) != 1}
         if multi:
             raise ValueError(
@@ -601,6 +606,9 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
         """`SynthesizerTrn(**self.hp)` with the Lightning checkpoint's generator loaded, strictly."""
         full_sd = load_piper_checkpoint(self.checkpoint_path)
         sd = {k[len("model_g."):]: v for k, v in full_sd.items() if k.startswith("model_g.")}
+        # The vocabulary is the voice's own: Piper's 256 is a default, not the architecture, and a
+        # voice trained on another phoneme set has another row count.
+        self.hp["n_vocab"] = sd["enc_p.emb.weight"].shape[0]
         model = SynthesizerTrn(**self.hp)
         missing, unexpected = model.load_state_dict(sd, strict=True)
         assert not missing and not unexpected, (missing, unexpected)
