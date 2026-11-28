@@ -51,6 +51,8 @@ Usage:
   loom-export /path/to/piper.ckpt -o vits_mil.gguf --task text-to-speech --model vits
 """
 import math
+import importlib
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,14 +63,16 @@ import torch
 import torch.nn.functional as F
 import coremltools as ct
 
+from . import vits_spline_op
 from .paths import CONVERTERS, driver_dir
 from .checkpoint_probe import probe_torch_checkpoint
 from .multi_phase_export import BaseMultiPhaseModelExportConfig, ExportPhase
 from .spec_protocol import Unchecked
 
 # Where the Piper checkout lives. `piper_train` is not a PyPI package -- it is a git clone put on
-# `sys.path` -- so this module was importable on exactly one machine, and CI could not import it at all.
-PIPER_REPO = "/home/flavio/Dev/piper/src/python"
+# `sys.path`, named by `$LOOM_PIPER_REPO`. Without it, `load_piper` imports phoonnx's installed
+# `phoonnx_train.vits`, a Piper fork with the same module tree.
+PIPER_REPO = os.environ.get("LOOM_PIPER_REPO", "/home/flavio/Dev/piper/src/python")
 
 # Piper's classes, bound by `load_piper()` rather than imported here -- see `kokoro_export`'s note for
 # the reasoning and why these are module globals rather than per-site local imports.
@@ -84,9 +88,15 @@ def load_piper() -> None:
 
     sys.path.insert(0, PIPER_REPO)
     sys.path.insert(0, str((CONVERTERS / "convert_piper_vits")))
-    from piper_train.vits.models import SynthesizerTrn as _SynthesizerTrn
-    from piper_train.vits import modules as _vits_modules
-    from piper_train.vits.attentions import MultiHeadAttention as _MultiHeadAttention
+    try:
+        package = importlib.import_module("piper_train.vits").__name__
+    except ImportError:
+        # phoonnx's trainer is a Piper fork with the same module tree, installed with `phoonnx`.
+        package = importlib.import_module("phoonnx_train.vits").__name__
+    _SynthesizerTrn = importlib.import_module(package + ".models").SynthesizerTrn
+    _vits_modules = importlib.import_module(package + ".modules")
+    _MultiHeadAttention = importlib.import_module(package + ".attentions").MultiHeadAttention
+    vits_spline_op.TRANSFORMS = importlib.import_module(package + ".transforms")
     from vits_common import load_piper_checkpoint as _load_piper_checkpoint
 
     vits_modules, MultiHeadAttention = _vits_modules, _MultiHeadAttention
@@ -474,8 +484,13 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
         """
         import json
 
+        phoonnx = Path(self.checkpoint_path).parent / "phoonnx.json"
         config = Path(str(self.checkpoint_path) + ".json")
-        if not config.is_file():
+        if phoonnx.is_file():
+            # The only config of a phoonnx voice that declares its framing, so it wins over the
+            # Piper-format copies beside it.
+            config = phoonnx
+        elif not config.is_file():
             # A voice's config sits beside its checkpoint; piper names it `<voice>.onnx.json` and the
             # trainer's own `.ckpt` has it one directory up. Look for the single JSON rather than
             # pinning one layout, and say so plainly when there is not exactly one.
@@ -487,7 +502,12 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
                 )
             config = candidates[0]
 
-        id_map = json.loads(config.read_text())["phoneme_id_map"]
+        data = json.loads(config.read_text())
+        # Piper writes `{symbol: [id]}`; phoonnx writes `{symbol: id}`.
+        id_map = {sym: ids if isinstance(ids, list) else [ids]
+                  for sym, ids in data["phoneme_id_map"].items()}
+        if config.name == "phoonnx.json":
+            check_piper_framing(config, data, id_map)
         multi = {sym: ids for sym, ids in id_map.items() if len(ids) != 1}
         if multi:
             raise ValueError(
@@ -601,6 +621,9 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
         """`SynthesizerTrn(**self.hp)` with the Lightning checkpoint's generator loaded, strictly."""
         full_sd = load_piper_checkpoint(self.checkpoint_path)
         sd = {k[len("model_g."):]: v for k, v in full_sd.items() if k.startswith("model_g.")}
+        # The vocabulary is the voice's own: Piper's 256 is a default, not the architecture, and a
+        # voice trained on another phoneme set has another row count.
+        self.hp["n_vocab"] = sd["enc_p.emb.weight"].shape[0]
         model = SynthesizerTrn(**self.hp)
         missing, unexpected = model.load_state_dict(sd, strict=True)
         assert not missing and not unexpected, (missing, unexpected)
@@ -612,6 +635,7 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
         print(f"Loading checkpoint {self.checkpoint_path}...")
         model = self.load_model().eval()
         HP = self.hp
+        check_ids_fit(self.phoneme_table(), HP["n_vocab"])
         # TextWrapper walks the duration predictor's flows by index, which is n_flows=4's layout.
         assert len(model.dp.flows) == 9, f"duration predictor has {len(model.dp.flows)} flows, not 9"
 
@@ -636,6 +660,32 @@ class TTSVitsExportConfig(BaseMultiPhaseModelExportConfig):
                 mil_inputs=[ct.TensorType(name="z_p", shape=(1, HP["inter_channels"], seq_dim), dtype=np.float32)],
             ),
         ]
+
+
+# phoonnx.json's framing keys with the values that give Piper's assembly, which `phoneme_table` declares.
+PIPER_FRAMING = {"use_eos_bos": True, "add_blank_char": True, "add_blank_word": False,
+                 "blank_at_start": True, "blank_at_end": True}
+PIPER_SPECIAL_IDS = {"bos": 1, "eos": 2, "blank": 0}
+
+
+def check_piper_framing(config: Path, data: dict, id_map: dict) -> None:
+    """Refuse a phoonnx voice whose declared framing is not Piper's: it would export, and be fed the
+    wrong ids, with nothing failing."""
+    wrong = {key: data.get(key) for key, want in PIPER_FRAMING.items() if data.get(key, want) != want}
+    for key, want in PIPER_SPECIAL_IDS.items():
+        symbol = data.get(key)
+        if symbol is not None and id_map.get(symbol) != [want]:
+            wrong[key] = f"{symbol!r} -> {id_map.get(symbol)}"
+    if wrong:
+        raise NotImplementedError(
+            f"{config} declares a framing that is not Piper's ({wrong}); this export declares only "
+            f"[BOS, blank, p1, blank, ..., pn, blank, EOS] with BOS 1, EOS 2 and blank 0")
+
+
+def check_ids_fit(table: dict, n_rows: int) -> None:
+    """An id at or past the embedding's row count reaches the engine as an out-of-range GET_ROWS."""
+    if max(table["ids"]) >= n_rows:
+        raise ValueError(f"the phoneme map has id {max(table['ids'])}, but the embedding has {n_rows} rows")
 
 
 def _is_vits(path: Path) -> bool:
