@@ -256,7 +256,10 @@ class RecurrentPhase:
     # Take the input half of every gate out of the sweep (ADR-137): `{name}_input` computes `W_ih x + b`
     # for the whole sequence in one product per direction, and the cells add only `W_hh h`. Needs the
     # caller's sweep to read a sequence per direction (`run_bi_lstm`, `loom.run_bi_recurrent_pair_and_
-    # retain`), and a single layer -- a stack's next layer's input exists only inside the sweep. Off by
+    # retain`). A stack gets one `{stem}_l{k}_input` per layer: a driver that sweeps it a layer at a time
+    # (`BiRecurrentCall`) has each layer's input -- the previous layer's retained rows -- before that
+    # layer's sweep starts. A driver that steps the whole stack per timestep (a transducer's prediction
+    # network) does not, and calls no `_input` topology, which `check_subgraph_calls` reports. Off by
     # default: a sweep of one step (Silero's streaming LSTM) would only gain a graph.
     project_input: bool = False
 
@@ -284,8 +287,9 @@ class RecurrentPhase:
         ),
         "project_input": Unchecked(
             "a choice of how this phase's topologies split the work, checked where it can be wrong: "
-            "`topologies()` refuses it for a GRU or a stack, and the caller's driver either drives "
-            "`{name}_input` (run_bi_lstm declares it) or fails the export at `check_subgraph_calls`"
+            "`topologies()` refuses it for a GRU, and the caller's driver either drives each "
+            "`_input` topology (run_bi_lstm declares it; BiRecurrentCall names it in `input_topology`) "
+            "or fails the export at `check_subgraph_calls`"
         ),
         "number_layers": Unchecked(
             "a naming choice for the topologies this phase CREATES, in the same category as `name` -- "
@@ -350,9 +354,6 @@ class RecurrentPhase:
             # is untouched by stacks existing. A stack numbers its layers because it has to, and a phase
             # whose driver indexes the layers asks for numbering regardless of depth (`number_layers`).
             stem = self.name if len(ops) == 1 and not self.number_layers else f"{self.name}_l{layer}"
-            if self.project_input and len(ops) != 1:
-                raise NotImplementedError(f"RecurrentPhase({self.name!r}): project_input on a {len(ops)}-layer "
-                                          f"stack; only layer 0's input exists before the sweep")
             result = build_lstm_cell_topologies(op, weight_namespace=f"{stem}.",
                                                 project_input=self.project_input)
             if result["input"] is not None:

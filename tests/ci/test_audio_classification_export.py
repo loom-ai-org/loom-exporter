@@ -329,6 +329,37 @@ def test_a_bidirectional_layer_retains_into_its_forward_cell():
         check_subgraph_calls(Function("infer", ["inputs"], [pre, *stmts, head("lstm_l0_bwd")]), {})
 
 
+def test_a_projected_layer_runs_its_input_half_first():
+    """ADR-144: with `input_topology`, a layer is its projection (retained) and the paired sweep over its
+    two outputs, and a stack's next layer projects from this layer's forward store."""
+    from loom_exporter.driver_components import BiRecurrentCall
+    from loom_exporter.driver_ir import (
+        DriverIRError, Function, Lit, OutputRef, SubgraphCall, check_subgraph_calls,
+    )
+
+    def layer(k, reads):
+        return BiRecurrentCall(forward_topology=f"lstm_l{k}_fwd", backward_topology=f"lstm_l{k}_bwd",
+                               out_var=f"gen{k}", sequence=OutputRef(reads), seq_len=Lit(10),
+                               input_dim=4 if k == 0 else 6, hidden_dim=3, input_topology=f"lstm_l{k}_input")
+
+    l0 = layer(0, "pre").emit(None)
+    project, sweep = l0[-2], l0[-1]
+    assert isinstance(project, SubgraphCall) and project.retain and project.module == "lstm_l0_input"
+    assert list(project.axes) == ["n_tokens"] and project.inputs["sequence"] == OutputRef("pre")
+    assert sweep.expr.render() == (
+        "loom.run_bi_recurrent_pair_and_retain('lstm_l0_fwd', 'lstm_l0_bwd', {from = 'lstm_l0_input'}, "
+        "{from = 'lstm_l0_input', index = 2}, 10, 12, 3, 'rows')")
+    assert layer(0, "pre").link_label().startswith("loom.run_bi_recurrent_pair_and_retain(")
+
+    pre = SubgraphCall(outputs=[], module="pre", axes={"n_samples": Lit(10)}, inputs={}, retain=True)
+    head = SubgraphCall(outputs=["probs"], module="head", axes={"n_enc_frames": Lit(10)},
+                        inputs={"lstm_out": OutputRef("lstm_l1_fwd")})
+    check_subgraph_calls(Function("infer", ["inputs"], [pre, *l0, *layer(1, "lstm_l0_fwd").emit(None), head]), {})
+    # The sweep's references are checked like any other: without the projection, nothing retained them.
+    with pytest.raises(DriverIRError):
+        check_subgraph_calls(Function("infer", ["inputs"], [pre, sweep]), {})
+
+
 # -- Silero VAD: the whole-clip rewrite ------------------------------------------------------------------
 
 def _silero_weights(seed=0):

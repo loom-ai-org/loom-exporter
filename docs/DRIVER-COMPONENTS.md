@@ -89,7 +89,7 @@ differs is entirely what the host does with the one output. The family names its
 | `lua_fragment` | `LuaFragment` | prelude, statements | 4 | 4 | audio8-tts, audio8-tts-codec, auroratts, canary, chatterbox, citrinet, conformer-ctc, cosyvoice3, dac, dia, encodec, f5-tts, gigaam-rnnt, granite-speech, kale-tts, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, matcha, moonshine, moonshine-streaming, moss-audio-tokenizer, moss-tts-local, musicgen, nemotron-asr, nemotron-unified-asr, omnivoice, oruk-loop, paradee, parakeet-rnnt, parakeet-tdt, pocket-tts, pyannote-segmentation, qwen3-asr, qwen3-tts, qwen3-tts-tokenizer-12hz, sanotts, sanotts-nano, silero-vad, snac, soprano, speecht5, styletts2, supertonic, t5, tiny-voca, vaniq-edge, vits, vits-upstream, vocetta2, voxcpm2, voxtral-tts, whisper, zipformer, zipformer_streaming |
 | `subgraph_call` | `SubgraphCallComponent` | statements | 2 | 9 | auroratts, canary, citrinet, conformer-ctc, cosyvoice3, encodec, f5-tts, funasr-paraformer, gigaam-rnnt, granite-speech, kokoro, matcha, moonshine, moonshine-streaming, nemotron-asr, nemotron-unified-asr, oruk-loop, parakeet-rnnt, parakeet-tdt, pyannote-segmentation, qwen3-asr, sanotts, sanotts-nano, silero-vad, styletts2, supertonic, t5, vaniq-edge, vits, vits-upstream, vocetta2, whisper, zipformer |
 | `recurrent_call` | `RecurrentCall` | statements | 1 | 8 | encodec, silero-vad |
-| `bi_recurrent_call` | `BiRecurrentCall` | statements | 2 | 6 | auroratts, pyannote-segmentation |
+| `bi_recurrent_call` | `BiRecurrentCall` | statements | 3 | 6 | auroratts, pyannote-segmentation |
 | `flow_matching_sampler` | `FlowMatchingSampler` | prelude, statements | 0 | 11 | cosyvoice3, f5-tts, matcha, supertonic |
 | `driver_return` | `DriverReturn` | statements | 0 | 1 | audio8-tts, audio8-tts-codec, auroratts, chatterbox, cosyvoice3, dac, dia, ecapa-tdnn-lid, encodec, f5-tts, kale-tts, kokoro, kyutai-stt, lfm2.5-audio, lfm2.5-audio-tts, marblenet-vad, matcha, moss-audio-tokenizer, moss-tts-local, musicgen, omnivoice, paradee, pocket-tts, pyannote-segmentation, qwen3-tts, qwen3-tts-tokenizer-12hz, sanotts, sanotts-nano, silero-vad, snac, soprano, speecht5, styletts2, supertonic, tiny-voca, titanet, vaniq-edge, vits, vits-upstream, vocetta2, voxcpm2, voxtral-tts, wakehubert, zipformer_streaming |
 | `lua_library` | `LuaLibrary` | prelude | 1 | 0 | auroratts, f5-tts, funasr-paraformer, kale-tts, kokoro, matcha, moss-audio-tokenizer, omnivoice, paradee, qwen3-tts-tokenizer-12hz, sanotts, sanotts-nano, styletts2, tiny-voca, vaniq-edge, vits, vits-upstream, vocetta2 |
@@ -271,12 +271,13 @@ One `loom.run_recurrent`: a whole sequence through one LSTM cell topology, with 
 
 ### `bi_recurrent_call` — `BiRecurrentCall`
 
-One `loom.run_bi_recurrent_and_retain`: a bidirectional LSTM layer, both directions swept in C++ and retained as one `[h_fwd | h_bwd]` row per timestep. A stack is one per layer.
+One bidirectional recurrent layer, both directions swept in C++ and retained as one `[h_fwd | h_bwd]` row per timestep: `loom.run_bi_recurrent_and_retain`, or with `input_topology` the layer's input projection and `loom.run_bi_recurrent_pair_and_retain` (ADR-144). A stack is one per layer.
 
 *Emits:* statements. *Used by:* auroratts, pyannote-segmentation.
 
 * `forward_topology` — TopologyName
 * `backward_topology` — TopologyName
+* `input_topology` — WhenSet(TopologyName)
 
 ### `flow_matching_sampler` — `FlowMatchingSampler`
 
