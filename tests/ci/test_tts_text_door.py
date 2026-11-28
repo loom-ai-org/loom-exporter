@@ -394,6 +394,48 @@ class TestVitsPhonemeAssembly(unittest.TestCase):
         self.assertEqual(table["symbols"], ["_", "^", "$", "a", "ɣ"])
         self.assertEqual(table["ids"], [0, 1, 2, 14, 15])
 
+    PHOONNX_FRAMING = {"bos": "^", "eos": "$", "blank": "_", "use_eos_bos": True, "add_blank_char": True,
+                       "add_blank_word": False, "blank_at_start": True, "blank_at_end": True}
+
+    def _phoonnx_repo_table(self, framing):
+        """A phoonnx voice repo's layout: phoonnx.json and two Piper-format copies beside the checkpoint."""
+        import json
+        import tempfile
+
+        from loom_exporter.vits_export import TTSVitsExportConfig
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ckpt = Path(tmp) / "epoch=1-step=1.ckpt"
+            ckpt.write_bytes(b"")
+            piper_copy = {"phoneme_id_map": {"_": [0], "^": [1], "$": [2], "x": [3]}}
+            (Path(tmp) / "voice.json").write_text(json.dumps(piper_copy))
+            (Path(tmp) / "voice.piper.json").write_text(json.dumps(piper_copy))
+            phoonnx = {"phoneme_id_map": {"_": 0, "^": 1, "$": 2, "a": 14}, **framing}
+            (Path(tmp) / "phoonnx.json").write_text(json.dumps(phoonnx))
+            config = TTSVitsExportConfig(architecture="loom-vits-mil", output_path="/tmp/does-not-matter.gguf",
+                                         checkpoint_path=str(ckpt))
+            return config.phoneme_table()
+
+    def test_phoonnx_json_wins_over_the_piper_copies_beside_it(self):
+        self.assertEqual(self._phoonnx_repo_table(self.PHOONNX_FRAMING)["symbols"], ["_", "^", "$", "a"])
+
+    def test_a_phoonnx_framing_that_is_not_pipers_is_refused(self):
+        for key, value in [("add_blank_word", True), ("blank_at_start", False), ("use_eos_bos", False)]:
+            with self.subTest(key=key), self.assertRaisesRegex(NotImplementedError, key):
+                self._phoonnx_repo_table({**self.PHOONNX_FRAMING, key: value})
+
+    def test_a_phoonnx_bos_with_another_id_is_refused(self):
+        with self.assertRaisesRegex(NotImplementedError, "bos"):
+            self._phoonnx_repo_table({**self.PHOONNX_FRAMING, "bos": "$"})
+
+    def test_an_id_past_the_embedding_is_refused(self):
+        from loom_exporter.vits_export import check_ids_fit
+
+        table = self._table({"_": 0, "^": 1, "$": 2, "a": 162})
+        check_ids_fit(table, 163)
+        with self.assertRaisesRegex(ValueError, "id 162, but the embedding has 162 rows"):
+            check_ids_fit(table, 162)
+
 
 def test_matcha_declares_the_espeak_conventions_it_was_trained_in():
     """Matcha's LJSpeech recipe phonemizes with espeak-ng en-us, so its card's text door folds the

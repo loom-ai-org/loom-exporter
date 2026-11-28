@@ -44,6 +44,9 @@ MIN_BIN_WIDTH = 1e-3
 MIN_BIN_HEIGHT = 1e-3
 MIN_DERIVATIVE = 1e-3
 
+# The `transforms` module of the VITS package that `vits_export.load_piper` resolved (Piper's or a fork's).
+TRANSFORMS = None
+
 
 @torch.library.custom_op("loom::spline_inverse", mutates_args=())
 def spline_inverse(x1: Tensor, uw: Tensor, uh: Tensor, ud: Tensor) -> Tensor:
@@ -53,9 +56,7 @@ def spline_inverse(x1: Tensor, uw: Tensor, uh: Tensor, ud: Tensor) -> Tensor:
     from ground truth -- the whole point of the custom-op boundary is to keep the TRACER from seeing
     this body, not to avoid calling the real math when actually executed.
     """
-    from piper_train.vits.transforms import piecewise_rational_quadratic_transform
-
-    out, _logabsdet = piecewise_rational_quadratic_transform(
+    out, _logabsdet = TRANSFORMS.piecewise_rational_quadratic_transform(
         x1, uw, uh, ud, inverse=True, tails="linear", tail_bound=TAIL_BOUND,
         min_bin_width=MIN_BIN_WIDTH, min_bin_height=MIN_BIN_HEIGHT, min_derivative=MIN_DERIVATIVE,
     )
